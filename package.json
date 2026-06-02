@@ -1,0 +1,34 @@
+{
+  "name": "local-oauth-cli-api-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "ggui-oauth-cli": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "generate:mock": "tsx src/cli.ts generate --runtime mock --prompt \"Render a compact project status card\"",
+    "serve:mock": "tsx src/cli.ts serve --runtime mock --port 6781",
+    "serve:codex": "tsx src/cli.ts serve --runtime codex --port 6781",
+    "serve:claude": "tsx src/cli.ts serve --runtime claude --port 6781",
+    "proxy:codex": "tsx src/cli.ts proxy --port 8787"
+  },
+  "dependencies": {
+    "@ggui-ai/mcp-server": "link:../ggui/packages/mcp-server",
+    "@ggui-ai/mcp-server-core": "link:../ggui/packages/mcp-server-core",
+    "@ggui-ai/protocol": "link:../ggui/packages/protocol",
+    "@ggui-ai/ui-gen": "link:../ggui/packages/ui-gen",
+    "esbuild": "^0.27.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "packageManager": "pnpm@10.23.0"
+}
