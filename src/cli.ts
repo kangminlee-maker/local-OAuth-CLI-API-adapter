@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
 import { createCliGenerator } from './generator.js';
+import { ClaudeCodeBackend } from './proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from './proxy/codex-app-server-backend.js';
 import { startLocalApiProxy } from './proxy/http-server.js';
 import { createRuntime } from './runtimes/index.js';
@@ -72,13 +73,22 @@ async function proxy(args: readonly string[]): Promise<number> {
   const host = options.host ?? '127.0.0.1';
   const port = parseIntOption(options.port, 8787);
   const timeoutMs = parseIntOption(options.timeoutMs, 180_000);
-  const backend = new CodexAppServerBackend({
-    command: options.command,
-    cwd: options.cwd ?? process.cwd(),
-    model: options.model,
-    timeoutMs,
-    reasoningEffort: parseReasoningEffort(options.reasoningEffort),
-  });
+  const runtimeName = parseProxyRuntimeName(options.runtime ?? 'codex');
+  const backend = runtimeName === 'claude'
+    ? new ClaudeCodeBackend({
+        command: options.command,
+        cwd: options.cwd ?? process.cwd(),
+        model: options.model,
+        timeoutMs,
+        extraArgs: options.extraArg,
+      })
+    : new CodexAppServerBackend({
+        command: options.command,
+        cwd: options.cwd ?? process.cwd(),
+        model: options.model,
+        timeoutMs,
+        reasoningEffort: parseReasoningEffort(options.reasoningEffort),
+      });
   const started = await startLocalApiProxy({
     backend,
     host,
@@ -214,6 +224,11 @@ function parseRuntimeName(value: string): RuntimeName {
   throw new Error(`Unsupported runtime: ${value}`);
 }
 
+function parseProxyRuntimeName(value: string): 'codex' | 'claude' {
+  if (value === 'codex' || value === 'claude') return value;
+  throw new Error(`Unsupported proxy runtime: ${value}`);
+}
+
 function parseIntOption(value: string | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   const parsed = Number.parseInt(value, 10);
@@ -268,7 +283,8 @@ Examples:
   ggui-oauth-cli generate --runtime mock --prompt "Render a status card"
   ggui-oauth-cli serve --runtime codex --port 6781
   ggui-oauth-cli serve --runtime claude --port 6781
-  ggui-oauth-cli proxy --port 8787
+  ggui-oauth-cli proxy --runtime codex --port 8787
+  ggui-oauth-cli proxy --runtime claude --port 8788
 `;
 }
 

@@ -1,5 +1,6 @@
 export { createCliGenerationDeps, createCliGenerator, CliUiGenerator } from './generator.js';
 export { CliGenerationApi } from './cli-api.js';
+export { ClaudeCodeBackend } from './proxy/claude-code-backend.js';
 export { CodexAppServerBackend } from './proxy/codex-app-server-backend.js';
 export { startLocalApiProxy } from './proxy/http-server.js';
 export { startAddonServer } from './server.js';

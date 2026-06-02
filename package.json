@@ -14,7 +14,8 @@
     "serve:mock": "tsx src/cli.ts serve --runtime mock --port 6781",
     "serve:codex": "tsx src/cli.ts serve --runtime codex --port 6781",
     "serve:claude": "tsx src/cli.ts serve --runtime claude --port 6781",
-    "proxy:codex": "tsx src/cli.ts proxy --port 8787"
+    "proxy:codex": "tsx src/cli.ts proxy --runtime codex --port 8787",
+    "proxy:claude": "tsx src/cli.ts proxy --runtime claude --port 8788"
   },
   "dependencies": {
     "@ggui-ai/mcp-server": "link:../ggui/packages/mcp-server",

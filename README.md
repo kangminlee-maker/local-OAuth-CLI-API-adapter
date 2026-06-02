@@ -3,9 +3,10 @@
 Experimental local adapter that makes an already-authenticated OAuth CLI look
 like a small API server.
 
-The first backend is Codex CLI via a long-lived `codex app-server` process. The
-adapter exposes a local OpenAI/Anthropic-compatible subset so local tools can use
-OAuth CLI login instead of provider API keys.
+The first backends are Codex CLI via a long-lived `codex app-server` process and
+Claude Code via its local OAuth CLI session. The adapter exposes a local
+OpenAI/Anthropic-compatible subset so local tools can use OAuth CLI login instead
+of provider API keys.
 
 It also includes a ggui MCP add-on mode that swaps ggui's UI generator for a CLI
 runtime without patching the upstream `ggui` repository.
@@ -16,6 +17,8 @@ runtime without patching the upstream `ggui` repository.
 pnpm install
 pnpm build
 pnpm proxy:codex
+# or
+pnpm proxy:claude
 ```
 
 Run the local compatibility tests:
@@ -38,7 +41,7 @@ Supported subset:
 - `POST /v1/responses`
 - `POST /v1/messages`
 - non-stream text generation
-- live SSE text deltas from Codex `app-server`
+- live SSE text deltas from Codex `app-server` and Claude Code
 - synthetic SSE streaming for tool-call responses after the CLI decision completes
 - OpenAI JSON object/schema output where supported by the backend
 - OpenAI Chat tool calls and tool-result follow-up messages
@@ -65,6 +68,17 @@ curl http://127.0.0.1:8787/v1/chat/completions \
     ]
   }'
 ```
+
+Claude proxy:
+
+```bash
+pnpm proxy:claude
+```
+
+Plain text Claude requests use one long-lived
+`claude -p --input-format stream-json --output-format stream-json` process and
+clear context with `/clear` after each request. Tool-call and JSON-schema
+requests use a one-shot Claude process so `--json-schema` can be set per request.
 
 ## ggui Add-on
 
@@ -119,6 +133,6 @@ http://127.0.0.1:6781/mcp
 - This avoids provider API keys, but it still consumes the selected CLI's plan,
   credits, rate limits, and applicable usage policy.
 - Codex text streaming maps `item/agentMessage/delta` notifications to the
-  local API stream. Claude Code can expose comparable text deltas through
-  `claude -p --output-format stream-json --include-partial-messages`, where
-  `stream_event.event.content_block_delta` carries `text_delta` chunks.
+  local API stream. Claude Code text streaming maps
+  `stream_event.event.content_block_delta` `text_delta` chunks to the same local
+  API stream.
