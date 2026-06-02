@@ -9,6 +9,7 @@ import {
   parseBackendOutput,
   usageFor,
 } from './backend-contract.js';
+import { claudeMessageContentFor, hasImageInputs } from './multimodal.js';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
@@ -78,7 +79,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     signal?: AbortSignal,
   ): AsyncIterable<LocalStreamEvent> {
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const shouldStreamText = this.canUsePersistentText(request);
+    const shouldStreamText = this.canStreamTextDeltas(request);
     const run = this.runRequest(
       request,
       signal,
@@ -119,8 +120,12 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     return this.runOneShotTurn(request, signal, onTextDelta);
   }
 
-  private canUsePersistentText(request: NormalizedRequest): boolean {
+  private canStreamTextDeltas(request: NormalizedRequest): boolean {
     return !hasToolDecisionSchema(request) && !request.jsonSchema;
+  }
+
+  private canUsePersistentText(request: NormalizedRequest): boolean {
+    return this.canStreamTextDeltas(request) && !hasImageInputs(request);
   }
 
   private async runPersistentTurn(
@@ -130,7 +135,11 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   ): Promise<LocalCompletionResult> {
     const startedAt = Date.now();
     await this.ensureStarted();
-    const turn = await this.sendPersistentMessage(buildPrompt(request), signal, onTextDelta);
+    const turn = await this.sendPersistentMessage(
+      await claudeMessageContentFor(request, buildPrompt(request)),
+      signal,
+      onTextDelta,
+    );
     await this.clearPersistentSession(signal);
     return this.resultFromTurn(request, turn, startedAt);
   }
@@ -145,8 +154,11 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     onTextDelta?: (delta: string) => void,
   ): Promise<LocalCompletionResult> {
     const startedAt = Date.now();
+    const prompt = buildPrompt(request);
+    const useStreamJsonInput = hasImageInputs(request);
     const argv = [
       '-p',
+      ...(useStreamJsonInput ? ['--input-format', 'stream-json'] : []),
       '--output-format',
       'stream-json',
       '--verbose',
@@ -157,8 +169,18 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       ...(this.configuredModel ? ['--model', this.configuredModel] : []),
       ...schemaArgsFor(request),
       ...this.extraArgs,
-      buildPrompt(request),
+      ...(useStreamJsonInput ? [] : [prompt]),
     ];
+    const stdinMessage = useStreamJsonInput
+      ? {
+          type: 'user',
+          message: {
+            role: 'user',
+            content: await claudeMessageContentFor(request, prompt),
+          },
+          parent_tool_use_id: null,
+        }
+      : undefined;
     let turn: ClaudeTurnResult | null = null;
     let lastError: Error | null = null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -168,6 +190,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
           timeoutMs: this.timeoutMs,
           signal,
           onTextDelta,
+          stdinMessage,
         });
         break;
       } catch (err) {
@@ -242,7 +265,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   private sendPersistentMessage(
-    text: string,
+    content: string | readonly unknown[],
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
   ): Promise<ClaudeTurnResult> {
@@ -290,7 +313,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
         type: 'user',
         message: {
           role: 'user',
-          content: [{ type: 'text', text }],
+          content: typeof content === 'string' ? [{ type: 'text', text: content }] : content,
         },
         parent_tool_use_id: null,
       })}\n`);
@@ -351,6 +374,7 @@ function runClaudeProcess(
     readonly timeoutMs: number;
     readonly signal?: AbortSignal;
     readonly onTextDelta?: (delta: string) => void;
+    readonly stdinMessage?: unknown;
   },
 ): Promise<ClaudeTurnResult> {
   const controller = new AbortController();
@@ -367,7 +391,7 @@ function runClaudeProcess(
       shell: false,
       env: processEnv(),
       signal: controller.signal,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: options.stdinMessage ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
     });
     let stderr = '';
     const waiter: ClaudeWaiter = {
@@ -384,6 +408,10 @@ function runClaudeProcess(
       if (err) reject(err);
       else if (value) resolve(value);
     };
+    if (!child.stdout || !child.stderr) {
+      finish(new Error('claude process did not expose stdout/stderr pipes'));
+      return;
+    }
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk) => {
@@ -412,6 +440,10 @@ function runClaudeProcess(
       if (code === 0) return;
       finish(new Error(stderr.trim() || `claude exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`));
     });
+    if (options.stdinMessage && child.stdin) {
+      child.stdin.write(`${JSON.stringify(options.stdinMessage)}\n`);
+      child.stdin.end();
+    }
   }).finally(() => {
     clearTimeout(timeout);
     if (options.signal) options.signal.removeEventListener('abort', abortFromParent);

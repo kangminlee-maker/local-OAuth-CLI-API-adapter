@@ -11,6 +11,7 @@ import {
   parseBackendOutput,
   usageFor,
 } from './backend-contract.js';
+import { prepareCodexInput } from './multimodal.js';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
@@ -140,32 +141,31 @@ export class CodexAppServerBackend implements LocalCliBackend {
     }
 
     try {
-      const turn = await this.send('turn/start', {
-        threadId,
-        input: [
-          {
-            type: 'text',
-            text: buildPrompt(request),
-            text_elements: [],
-          },
-        ],
-        model: this.modelOverrideFor(request.model),
-        effort: this.reasoningEffort,
-        outputSchema: outputSchemaFor(request),
-      });
-      turnId = readPath<string>(turn, ['result', 'turn', 'id']);
-      if (!turnId) throw new Error('codex app-server did not return a turn id');
-      const text = await this.waitForTurn(threadId, turnId, signal, onTextDelta);
-      const parsed = parseBackendOutput(request, text);
-      const usage = usageFor(request, parsed.text, parsed.toolCalls);
-      return {
-        id: `local_${randomUUID()}`,
-        model: request.model,
-        text: parsed.text,
-        toolCalls: parsed.toolCalls,
-        usage,
-        latencyMs: Date.now() - startedAt,
-      };
+      const preparedInput = await prepareCodexInput(request, buildPrompt(request));
+      try {
+        const turn = await this.send('turn/start', {
+          threadId,
+          input: preparedInput.input,
+          model: this.modelOverrideFor(request.model),
+          effort: this.reasoningEffort,
+          outputSchema: outputSchemaFor(request),
+        });
+        turnId = readPath<string>(turn, ['result', 'turn', 'id']);
+        if (!turnId) throw new Error('codex app-server did not return a turn id');
+        const text = await this.waitForTurn(threadId, turnId, signal, onTextDelta);
+        const parsed = parseBackendOutput(request, text);
+        const usage = usageFor(request, parsed.text, parsed.toolCalls);
+        return {
+          id: `local_${randomUUID()}`,
+          model: request.model,
+          text: parsed.text,
+          toolCalls: parsed.toolCalls,
+          usage,
+          latencyMs: Date.now() - startedAt,
+        };
+      } finally {
+        await preparedInput.cleanup();
+      }
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
       await this.send('thread/archive', { threadId }).catch(() => undefined);

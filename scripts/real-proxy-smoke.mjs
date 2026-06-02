@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { deflateSync } from 'node:zlib';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from '../dist/proxy/codex-app-server-backend.js';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
@@ -7,6 +8,7 @@ const options = parseArgs(process.argv.slice(2));
 const runtime = options.runtime ?? 'codex';
 const timeoutMs = numberOption(options.timeoutMs, 180_000);
 const speedRepeats = numberOption(options.speedRepeats, 0);
+const only = options.only ?? 'all';
 const cwd = options.cwd ?? process.cwd();
 const backend = runtime === 'claude'
   ? new ClaudeCodeBackend({
@@ -36,8 +38,12 @@ const requestModel = runtime === 'claude'
 const rows = [];
 
 try {
-  await runExactSmoke(started.url, requestModel);
-  if (speedRepeats > 0) await runSpeedSmoke(started.url, requestModel, speedRepeats);
+  if (only === 'multimodal') {
+    await runMultimodalSmoke(started.url, requestModel);
+  } else {
+    await runExactSmoke(started.url, requestModel);
+    if (speedRepeats > 0) await runSpeedSmoke(started.url, requestModel, speedRepeats);
+  }
 } finally {
   await started.close();
 }
@@ -46,6 +52,7 @@ const failed = rows.filter((row) => !row.ok);
 console.log(`\nREAL_SMOKE_SUMMARY ${JSON.stringify({
   runtime,
   model: requestModel,
+  only,
   passed: rows.length - failed.length,
   failed: failed.length,
   rows,
@@ -53,6 +60,8 @@ console.log(`\nREAL_SMOKE_SUMMARY ${JSON.stringify({
 process.exit(failed.length > 0 ? 1 : 0);
 
 async function runExactSmoke(baseUrl, model) {
+  const visionImage = visionDataUrl();
+
   await run('models', async () => {
     const startedAt = performance.now();
     const res = await fetch(`${baseUrl}/v1/models`, { signal: AbortSignal.timeout(10_000) });
@@ -85,6 +94,8 @@ async function runExactSmoke(baseUrl, model) {
     assert(result.done, 'chat stream missing DONE');
     return result;
   });
+
+  await runOpenAiChatImageColor(baseUrl, model, visionImage);
 
   await run('openai_chat_json_exact', async () => {
     const { body, totalMs } = await postJson(baseUrl, '/v1/chat/completions', {
@@ -179,6 +190,8 @@ async function runExactSmoke(baseUrl, model) {
     return result;
   });
 
+  await runOpenAiResponsesImageColor(baseUrl, model, visionImage);
+
   await run('anthropic_messages_text_exact', async () => {
     const token = tokenFor('ANTHROPIC');
     const { body, totalMs } = await postJson(baseUrl, '/v1/messages', {
@@ -204,6 +217,8 @@ async function runExactSmoke(baseUrl, model) {
     return result;
   });
 
+  await runAnthropicMessagesImageColor(baseUrl, model, visionImage);
+
   await run('anthropic_tool_use_exact', async () => {
     const { body, totalMs } = await postJson(baseUrl, '/v1/messages', {
       model,
@@ -222,6 +237,83 @@ async function runExactSmoke(baseUrl, model) {
     assertEqual(toolUse?.name, 'get_weather', 'anthropic tool name');
     assertEqual(toolUse?.input?.city, 'Seoul', 'anthropic tool city');
     return { totalMs, toolName: toolUse.name, input: toolUse.input };
+  });
+}
+
+async function runMultimodalSmoke(baseUrl, model) {
+  const visionImage = visionDataUrl();
+  await runOpenAiChatImageColor(baseUrl, model, visionImage);
+  await runOpenAiResponsesImageColor(baseUrl, model, visionImage);
+  await runAnthropicMessagesImageColor(baseUrl, model, visionImage);
+}
+
+async function runOpenAiChatImageColor(baseUrl, model, visionImage) {
+  await run('openai_chat_image_color_exact', async () => {
+    const { body, totalMs } = await postJson(baseUrl, '/v1/chat/completions', {
+      model,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Identify the dominant color of the attached image. Reply exactly one uppercase word: RED, GREEN, or BLUE.',
+          },
+          { type: 'image_url', image_url: { url: visionImage, detail: 'high' } },
+        ],
+      }],
+    });
+    const text = body.choices?.[0]?.message?.content;
+    assertEqual(text, 'RED', 'chat image color text');
+    return { totalMs, text };
+  });
+}
+
+async function runOpenAiResponsesImageColor(baseUrl, model, visionImage) {
+  await run('openai_responses_image_color_exact', async () => {
+    const { body, totalMs } = await postJson(baseUrl, '/v1/responses', {
+      model,
+      input: [{
+        role: 'user',
+        content: [
+          { type: 'input_image', image_url: visionImage, detail: 'high' },
+          {
+            type: 'input_text',
+            text: 'Identify the dominant color of the attached image. Reply exactly one uppercase word: RED, GREEN, or BLUE.',
+          },
+        ],
+      }],
+    });
+    assertEqual(body.output_text, 'RED', 'responses image color text');
+    return { totalMs, text: body.output_text };
+  });
+}
+
+async function runAnthropicMessagesImageColor(baseUrl, model, visionImage) {
+  await run('anthropic_messages_image_color_exact', async () => {
+    const { body, totalMs } = await postJson(baseUrl, '/v1/messages', {
+      model,
+      max_tokens: 32,
+      messages: [{
+        role: 'user',
+        content: [
+          {
+            type: 'image',
+            source: {
+              type: 'base64',
+              media_type: 'image/png',
+              data: visionImage.split(',')[1],
+            },
+          },
+          {
+            type: 'text',
+            text: 'Identify the dominant color of the attached image. Reply exactly one uppercase word: RED, GREEN, or BLUE.',
+          },
+        ],
+      }],
+    });
+    const text = body.content?.[0]?.text;
+    assertEqual(text, 'RED', 'anthropic image color text');
+    return { totalMs, text };
   });
 }
 
@@ -445,6 +537,73 @@ function headers() {
   };
 }
 
+function visionDataUrl() {
+  const width = 320;
+  const height = 180;
+  const rgba = Buffer.alloc(width * height * 4, 255);
+  fillRect(rgba, width, 0, 0, width, height, 220, 20, 20);
+  return `data:image/png;base64,${pngBuffer(width, height, rgba).toString('base64')}`;
+}
+
+function fillRect(rgba, width, x, y, w, h, r, g, b) {
+  for (let yy = y; yy < y + h; yy += 1) {
+    for (let xx = x; xx < x + w; xx += 1) {
+      const index = (yy * width + xx) * 4;
+      rgba[index] = r;
+      rgba[index + 1] = g;
+      rgba[index + 2] = b;
+      rgba[index + 3] = 255;
+    }
+  }
+}
+
+function pngBuffer(width, height, rgba) {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y += 1) {
+    const rowStart = y * (stride + 1);
+    raw[rowStart] = 0;
+    rgba.copy(raw, rowStart + 1, y * stride, (y + 1) * stride);
+  }
+
+  return Buffer.concat([
+    signature,
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function pngChunk(type, data) {
+  const typeBuffer = Buffer.from(type, 'ascii');
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuffer, data])), 0);
+  return Buffer.concat([length, typeBuffer, data, crc]);
+}
+
+function crc32(data) {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let i = 0; i < 8; i += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 function parseArgs(argv) {
   const out = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -461,6 +620,9 @@ function parseArgs(argv) {
   }
   if (out.runtime && out.runtime !== 'codex' && out.runtime !== 'claude') {
     throw new Error(`Unsupported runtime: ${out.runtime}`);
+  }
+  if (out.only && out.only !== 'all' && out.only !== 'multimodal') {
+    throw new Error(`Unsupported --only value: ${out.only}`);
   }
   return out;
 }

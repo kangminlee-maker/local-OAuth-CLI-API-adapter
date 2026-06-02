@@ -3,6 +3,21 @@ export type ApiShape = 'openai-chat' | 'openai-responses' | 'anthropic-messages'
 export interface NormalizedMessage {
   readonly role: 'system' | 'user' | 'assistant' | 'tool';
   readonly content: string;
+  readonly images: readonly NormalizedImage[];
+}
+
+export type NormalizedImageDetail = 'low' | 'high' | 'auto' | 'original';
+
+export type NormalizedImageSource =
+  | { readonly type: 'url'; readonly url: string }
+  | { readonly type: 'base64'; readonly mediaType: string; readonly data: string }
+  | { readonly type: 'path'; readonly path: string; readonly mediaType?: string }
+  | { readonly type: 'file_id'; readonly fileId: string };
+
+export interface NormalizedImage {
+  readonly source: NormalizedImageSource;
+  readonly detail?: NormalizedImageDetail;
+  readonly raw: unknown;
 }
 
 export interface NormalizedTool {

@@ -34,6 +34,13 @@ pnpm smoke:real:codex
 pnpm smoke:real:claude
 ```
 
+Run only real multimodal image checks:
+
+```bash
+pnpm smoke:real:codex:multimodal
+pnpm smoke:real:claude:multimodal
+```
+
 These commands use the actual logged-in CLI sessions and may consume plan
 credits/rate limits. They verify exact text assembly, JSON values, tool names and
 arguments, provider finish reasons, and optional latency samples:
@@ -80,11 +87,16 @@ Supported subset:
 - OpenAI Chat tool calls and tool-result follow-up messages
 - OpenAI Responses function calls and function-call outputs
 - Anthropic `tool_use` and `tool_result`
+- image inputs for OpenAI Chat `image_url`, OpenAI Responses `input_image`, and
+  Anthropic Messages `image` blocks
+- image sources as remote URLs, data URLs/base64, and local `file://` URLs
 
 Not yet supported:
 
 - partial tool-call argument streaming from the underlying CLI
-- multimodal inputs
+- provider `file_id` image sources, because the local CLI proxy cannot read the
+  provider Files API storage for the caller
+- image/audio output generation
 - exact provider token usage
 - full API compatibility
 
@@ -112,6 +124,8 @@ Plain text Claude requests use one long-lived
 `claude -p --input-format stream-json --output-format stream-json` process and
 clear context with `/clear` after each request. Tool-call and JSON-schema
 requests use a one-shot Claude process so `--json-schema` can be set per request.
+Image requests also use a one-shot `stream-json` input process to avoid carrying
+image attachment state across persistent turns.
 
 ## ggui Add-on
 

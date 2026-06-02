@@ -15,6 +15,7 @@ import type {
   ProxyServerOptions,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
+import { unsupportedImageFileIds } from './multimodal.js';
 import {
   normalizeAnthropicMessagesRequest,
   normalizeOpenAiChatRequest,
@@ -154,9 +155,17 @@ async function* runStreamWithTimeout(
 }
 
 function rejectDeferredFeatures(
-  _request: NormalizedRequest,
-  _provider: 'openai' | 'anthropic' = 'openai',
+  request: NormalizedRequest,
+  provider: 'openai' | 'anthropic' = 'openai',
 ): void {
+  const fileIds = unsupportedImageFileIds(request);
+  if (fileIds.length > 0) {
+    throw new ProxyRequestError(
+      'file_id image sources are not supported by this local CLI proxy; use an image URL, data URL, or base64 image source.',
+      400,
+      provider,
+    );
+  }
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -165,7 +174,7 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   for await (const chunk of req) {
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     total += buf.length;
-    if (total > 2_000_000) {
+    if (total > 50_000_000) {
       throw new ProxyRequestError('Request body is too large.', 413);
     }
     chunks.push(buf);

@@ -4,6 +4,7 @@ import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 
 let started;
 let seenRequests;
+const pngDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
 
 beforeEach(async () => {
   seenRequests = [];
@@ -68,6 +69,93 @@ test('POST /v1/chat/completions returns text in OpenAI chat shape', async () => 
   assert.equal(body.choices[0].message.content, 'OK');
   assert.equal(body.choices[0].finish_reason, 'stop');
   assert.equal(seenRequests[0].shape, 'openai-chat');
+});
+
+test('POST /v1/chat/completions preserves OpenAI image_url input parts', async () => {
+  const res = await postJson('/v1/chat/completions', {
+    model: 'fake-local-model',
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Describe the image.' },
+        { type: 'image_url', image_url: { url: pngDataUrl, detail: 'high' } },
+      ],
+    }],
+  });
+  await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenRequests[0].messages[0].content, 'Describe the image.');
+  assert.equal(seenRequests[0].messages[0].images[0].source.type, 'base64');
+  assert.equal(seenRequests[0].messages[0].images[0].source.mediaType, 'image/png');
+  assert.equal(seenRequests[0].messages[0].images[0].detail, 'high');
+});
+
+test('POST /v1/responses preserves input_image URL parts', async () => {
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    input: [{
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: 'https://example.com/image.png', detail: 'low' },
+        { type: 'input_text', text: 'Describe the image.' },
+      ],
+    }],
+  });
+  await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenRequests[0].shape, 'openai-responses');
+  assert.equal(seenRequests[0].messages[0].content, 'Describe the image.');
+  assert.equal(seenRequests[0].messages[0].images[0].source.type, 'url');
+  assert.equal(seenRequests[0].messages[0].images[0].source.url, 'https://example.com/image.png');
+  assert.equal(seenRequests[0].messages[0].images[0].detail, 'low');
+});
+
+test('POST /v1/messages preserves Anthropic image blocks', async () => {
+  const res = await postJson('/v1/messages', {
+    model: 'fake-local-model',
+    max_tokens: 16,
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: 'image/png',
+            data: pngDataUrl.split(',')[1],
+          },
+        },
+        { type: 'text', text: 'Describe the image.' },
+      ],
+    }],
+  });
+  await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenRequests[0].shape, 'anthropic-messages');
+  assert.equal(seenRequests[0].messages[0].content, 'Describe the image.');
+  assert.equal(seenRequests[0].messages[0].images[0].source.type, 'base64');
+  assert.equal(seenRequests[0].messages[0].images[0].source.mediaType, 'image/png');
+});
+
+test('file_id image inputs return a clear error instead of pretending to see them', async () => {
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    input: [{
+      role: 'user',
+      content: [
+        { type: 'input_image', file_id: 'file_abc123' },
+        { type: 'input_text', text: 'Describe the image.' },
+      ],
+    }],
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.match(body.error.message, /file_id image sources are not supported/);
+  assert.equal(seenRequests.length, 0);
 });
 
 test('POST /v1/chat/completions returns OpenAI tool calls', async () => {

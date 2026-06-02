@@ -97,6 +97,7 @@ if (isPersistent) {
       ? content.map((part) => part?.text ?? '').join('')
       : String(content ?? '');
     if (text.trim() === '/clear') emitText('');
+    else if (hasSchema) emitStructured();
     else emitText('OK');
   });
   rl.on('close', () => process.exit(0));

@@ -18,6 +18,8 @@
     "proxy:claude": "tsx src/cli.ts proxy --runtime claude --port 8788",
     "smoke:real:codex": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime codex",
     "smoke:real:claude": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model sonnet",
+    "smoke:real:codex:multimodal": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime codex --only multimodal",
+    "smoke:real:claude:multimodal": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model sonnet --only multimodal",
     "bench:api": "pnpm build && node scripts/api-comparison-benchmark.mjs"
   },
   "dependencies": {

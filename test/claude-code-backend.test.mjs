@@ -35,6 +35,29 @@ test('ClaudeCodeBackend streams persistent text deltas', async () => {
   }
 });
 
+test('ClaudeCodeBackend streams one-shot image text deltas', async () => {
+  const backend = new ClaudeCodeBackend({
+    command: fakeClaude,
+    cwd: process.cwd(),
+    timeoutMs: 10_000,
+  });
+  try {
+    const events = [];
+    for await (const event of backend.stream(imageTextRequest())) {
+      events.push(event);
+    }
+
+    assert.deepEqual(
+      events.filter((event) => event.type === 'text_delta').map((event) => event.delta),
+      ['O', 'K'],
+    );
+    const completed = events.find((event) => event.type === 'completed');
+    assert.equal(completed.result.text, 'OK');
+  } finally {
+    await backend.close();
+  }
+});
+
 test('ClaudeCodeBackend parses structured tool decisions from one-shot schema output', async () => {
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
@@ -58,6 +81,30 @@ function textRequest() {
     shape: 'openai-chat',
     model: 'claude-code-cli',
     messages: [{ role: 'user', content: 'Say OK' }],
+    stream: true,
+    jsonMode: false,
+    tools: [],
+    toolChoice: { type: 'auto' },
+    raw: {},
+  };
+}
+
+function imageTextRequest() {
+  return {
+    shape: 'openai-chat',
+    model: 'claude-code-cli',
+    messages: [{
+      role: 'user',
+      content: 'Describe the image',
+      images: [{
+        source: {
+          type: 'base64',
+          mediaType: 'image/png',
+          data: 'iVBORw0KGgo=',
+        },
+        raw: {},
+      }],
+    }],
     stream: true,
     jsonMode: false,
     tools: [],

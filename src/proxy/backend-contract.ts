@@ -1,6 +1,8 @@
 import type {
   LocalToolCall,
   LocalUsage,
+  NormalizedImage,
+  NormalizedMessage,
   NormalizedRequest,
 } from './types.js';
 import { estimateTokens } from './types.js';
@@ -14,7 +16,7 @@ export function buildPrompt(request: NormalizedRequest): string {
     : 'Return only the assistant response text.';
   const messages = request.messages.map((message) => [
     `<${message.role}>`,
-    message.content,
+    renderMessageContent(message),
     `</${message.role}>`,
   ].join('\n')).join('\n\n');
   const maxTokens = request.maxTokens
@@ -24,6 +26,7 @@ export function buildPrompt(request: NormalizedRequest): string {
     'Handle this local API-compatible request.',
     mode,
     'Do not run commands, edit files, browse, or call host tools.',
+    'If image references appear in a message, inspect the attached native image inputs for the visual content.',
     maxTokens,
     '',
     messages,
@@ -71,12 +74,16 @@ export function usageFor(
   toolCalls: readonly LocalToolCall[],
 ): LocalUsage {
   const input = request.messages.map((message) => `${message.role}: ${message.content}`).join('\n');
+  const imageInput = request.messages
+    .flatMap((message) => message.images ?? [])
+    .map(formatImageReference)
+    .join('\n');
   const output = [
     text,
     ...toolCalls.map((call) => `${call.name}: ${call.arguments}`),
   ].join('\n');
   return {
-    inputTokens: estimateTokens(input),
+    inputTokens: estimateTokens([input, imageInput].filter(Boolean).join('\n')),
     outputTokens: estimateTokens(output),
   };
 }
@@ -172,6 +179,26 @@ function ensureJsonString(value: string): string {
   } catch {
     return JSON.stringify({ input: value });
   }
+}
+
+function renderMessageContent(message: NormalizedMessage): string {
+  const imageReferences = (message.images ?? []).map(formatImageReference).join('\n');
+  return [imageReferences, message.content].filter(Boolean).join('\n');
+}
+
+function formatImageReference(image: NormalizedImage, index: number): string {
+  const label = `[image ${index + 1}]`;
+  const detail = image.detail ? ` detail=${image.detail}` : '';
+  if (image.source.type === 'url') {
+    return `${label} source=url${detail}`;
+  }
+  if (image.source.type === 'base64') {
+    return `${label} source=base64 media_type=${image.source.mediaType}${detail}`;
+  }
+  if (image.source.type === 'path') {
+    return `${label} source=file media_type=${image.source.mediaType ?? 'unknown'}${detail}`;
+  }
+  return `${label} source=file_id${detail}`;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
