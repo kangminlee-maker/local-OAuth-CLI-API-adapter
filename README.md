@@ -43,6 +43,23 @@ pnpm smoke:real:codex -- --speed-repeats 3
 pnpm smoke:real:claude -- --speed-repeats 3
 ```
 
+Run a comparison benchmark against direct provider APIs:
+
+```bash
+pnpm bench:api
+```
+
+The benchmark loads `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment
+or `.env`, starts both local proxy backends, and compares exactness plus latency
+against direct API calls. Defaults:
+
+- OpenAI API: `gpt-5.5`
+- Anthropic API Opus: `claude-opus-4-8`
+- Anthropic API Sonnet: `claude-sonnet-4-6`
+- Anthropic API Haiku: `claude-haiku-4-5-20251001`
+
+It performs real provider calls and may consume paid credits/rate limits.
+
 The default base URLs are:
 
 ```text

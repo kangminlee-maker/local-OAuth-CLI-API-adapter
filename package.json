@@ -17,7 +17,8 @@
     "proxy:codex": "tsx src/cli.ts proxy --runtime codex --port 8787",
     "proxy:claude": "tsx src/cli.ts proxy --runtime claude --port 8788",
     "smoke:real:codex": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime codex",
-    "smoke:real:claude": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model sonnet"
+    "smoke:real:claude": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model sonnet",
+    "bench:api": "pnpm build && node scripts/api-comparison-benchmark.mjs"
   },
   "dependencies": {
     "@ggui-ai/mcp-server": "link:../ggui/packages/mcp-server",
