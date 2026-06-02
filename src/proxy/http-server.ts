@@ -1,5 +1,11 @@
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http';
 import { randomUUID } from 'node:crypto';
+import type { AddressInfo } from 'node:net';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
@@ -33,9 +39,11 @@ export async function startLocalApiProxy(
       resolve();
     });
   });
+  const address = server.address();
+  const actualPort = address && isAddressInfo(address) ? address.port : options.port;
   return {
     server,
-    url: `http://${options.host}:${options.port}`,
+    url: `http://${options.host}:${actualPort}`,
     async close() {
       await Promise.all([
         new Promise<void>((resolve, reject) => {
@@ -586,6 +594,10 @@ function readObjectField(value: unknown, key: string): string | undefined {
 function asObjectPayload(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
+}
+
+function isAddressInfo(value: string | AddressInfo | null): value is AddressInfo {
+  return Boolean(value) && typeof value === 'object';
 }
 
 function writeError(res: ServerResponse, err: unknown): void {

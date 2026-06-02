@@ -18,6 +18,12 @@ pnpm build
 pnpm proxy:codex
 ```
 
+Run the local compatibility tests:
+
+```bash
+pnpm test
+```
+
 The default base URLs are:
 
 ```text
