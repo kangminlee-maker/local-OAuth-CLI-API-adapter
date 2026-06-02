@@ -25,6 +25,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
     temperature: readOptionalNumber(input.temperature),
     stream: input.stream === true,
+    streamOptions: readStreamOptions(input.stream_options),
     jsonMode: isOpenAiJsonMode(input.response_format),
     jsonSchema: readOpenAiJsonSchema(input.response_format),
     tools,
@@ -49,6 +50,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     maxTokens: readOptionalNumber(input.max_output_tokens),
     temperature: readOptionalNumber(input.temperature),
     stream: input.stream === true,
+    streamOptions: readStreamOptions(input.stream_options),
     jsonMode: format?.type === 'json_object' || format?.type === 'json_schema',
     jsonSchema: format?.schema,
     tools: readOpenAiTools(input.tools),
@@ -70,6 +72,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     maxTokens: readOptionalNumber(input.max_tokens),
     temperature: readOptionalNumber(input.temperature),
     stream: input.stream === true,
+    streamOptions: readStreamOptions(undefined),
     jsonMode: false,
     tools: readAnthropicTools(input.tools),
     toolChoice: readAnthropicToolChoice(input.tool_choice),
@@ -447,6 +450,14 @@ function readOpenAiToolChoice(value: unknown): NormalizedToolChoice {
     return { type: 'tool', name: fn.name };
   }
   return { type: 'auto' };
+}
+
+function readStreamOptions(value: unknown) {
+  const options = asRecord(value);
+  return {
+    includeUsage: options?.include_usage === true,
+    includeObfuscation: options?.include_obfuscation !== false,
+  };
 }
 
 function readAnthropicToolChoice(value: unknown): NormalizedToolChoice {

@@ -14,8 +14,10 @@ import type {
   LocalCliBackend,
   LocalCompletionResult,
   LocalStreamEvent,
+  LocalUsage,
   NormalizedRequest,
 } from './types.js';
+import { ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface ClaudeCodeBackendOptions {
   readonly command?: string;
@@ -79,11 +81,18 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     signal?: AbortSignal,
   ): AsyncIterable<LocalStreamEvent> {
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const shouldStreamText = this.canStreamTextDeltas(request);
+    const toolExtractor = hasToolDecisionSchema(request)
+      ? new ToolCallDeltaExtractor()
+      : null;
+    const shouldStreamText = !toolExtractor && this.canStreamTextDeltas(request);
     const run = this.runRequest(
       request,
       signal,
-      shouldStreamText
+      toolExtractor
+        ? (delta) => {
+            for (const event of toolExtractor.push(delta)) queue.push(event);
+          }
+        : shouldStreamText
         ? (delta) => queue.push({ type: 'text_delta', delta })
         : undefined,
     )
@@ -156,13 +165,15 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     const startedAt = Date.now();
     const prompt = buildPrompt(request);
     const useStreamJsonInput = hasImageInputs(request);
+    const includePartialMessages = Boolean(onTextDelta);
     const argv = [
       '-p',
       ...(useStreamJsonInput ? ['--input-format', 'stream-json'] : []),
       '--output-format',
       'stream-json',
       '--verbose',
-      '--include-partial-messages',
+      ...(includePartialMessages ? ['--include-partial-messages'] : []),
+      ...claudeContextIsolationArgs(),
       '--tools',
       '',
       '--no-session-persistence',
@@ -237,6 +248,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       'stream-json',
       '--verbose',
       '--include-partial-messages',
+      ...claudeContextIsolationArgs(),
       '--tools',
       '',
       '--no-session-persistence',
@@ -366,6 +378,25 @@ function schemaArgsFor(request: NormalizedRequest): string[] {
   return schema ? ['--json-schema', JSON.stringify(schema)] : [];
 }
 
+function claudeContextIsolationArgs(): string[] {
+  return [
+    '--system-prompt',
+    [
+      'You are an API completion backend inside a local proxy.',
+      'Treat each user message as a standalone provider API request.',
+      'Do not use or mention repository files, git status, host tools, commands, browsing, memory, or inability to inspect them unless the user explicitly asks.',
+      'Do not add prefaces, caveats, file-status notes, or extra headings unless requested.',
+      'Preserve exact requested output counts, formats, and word limits.',
+    ].join(' '),
+    '--disable-slash-commands',
+    '--strict-mcp-config',
+    '--mcp-config',
+    '{"mcpServers":{}}',
+    '--setting-sources',
+    'user',
+  ];
+}
+
 function runClaudeProcess(
   command: string,
   args: readonly string[],
@@ -473,14 +504,24 @@ function consumeClaudeMessage(waiter: ClaudeWaiter, message: JsonObject): void {
   }
 }
 
-function usageFromClaude(value: unknown): { inputTokens: number; outputTokens: number } | null {
+function usageFromClaude(value: unknown): LocalUsage | null {
   const usage = asRecord(value);
-  const inputTokens = readNumber(usage?.input_tokens)
-    + readNumber(usage?.cache_creation_input_tokens)
-    + readNumber(usage?.cache_read_input_tokens);
+  const inputTokens = readNumber(usage?.input_tokens);
+  const cacheCreationInputTokens = readNumber(usage?.cache_creation_input_tokens);
+  const cacheReadInputTokens = readNumber(usage?.cache_read_input_tokens);
+  const cachedInputTokens = cacheCreationInputTokens + cacheReadInputTokens;
   const outputTokens = readNumber(usage?.output_tokens);
-  if (inputTokens === 0 && outputTokens === 0) return null;
-  return { inputTokens, outputTokens };
+  if (inputTokens === 0 && cachedInputTokens === 0 && outputTokens === 0) return null;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens: inputTokens + cachedInputTokens + outputTokens,
+    cachedInputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    source: 'provider',
+    raw: value,
+  };
 }
 
 function readNumber(value: unknown): number {

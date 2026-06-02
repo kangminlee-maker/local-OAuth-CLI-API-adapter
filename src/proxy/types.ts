@@ -33,6 +33,11 @@ export type NormalizedToolChoice =
   | { readonly type: 'required' }
   | { readonly type: 'tool'; readonly name: string };
 
+export interface NormalizedStreamOptions {
+  readonly includeUsage: boolean;
+  readonly includeObfuscation: boolean;
+}
+
 export interface NormalizedRequest {
   readonly shape: ApiShape;
   readonly model: string;
@@ -40,6 +45,7 @@ export interface NormalizedRequest {
   readonly maxTokens?: number;
   readonly temperature?: number;
   readonly stream: boolean;
+  readonly streamOptions: NormalizedStreamOptions;
   readonly jsonMode: boolean;
   readonly jsonSchema?: unknown;
   readonly tools: readonly NormalizedTool[];
@@ -50,6 +56,13 @@ export interface NormalizedRequest {
 export interface LocalUsage {
   readonly inputTokens: number;
   readonly outputTokens: number;
+  readonly totalTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly cacheCreationInputTokens?: number;
+  readonly cacheReadInputTokens?: number;
+  readonly reasoningOutputTokens?: number;
+  readonly source?: 'provider' | 'estimated';
+  readonly raw?: unknown;
 }
 
 export interface LocalToolCall {
@@ -69,6 +82,13 @@ export interface LocalCompletionResult {
 
 export type LocalStreamEvent =
   | { readonly type: 'text_delta'; readonly delta: string }
+  | {
+      readonly type: 'tool_call_delta';
+      readonly index: number;
+      readonly id?: string;
+      readonly name?: string;
+      readonly argumentsDelta?: string;
+    }
   | { readonly type: 'completed'; readonly result: LocalCompletionResult };
 
 export interface LocalCliBackend {

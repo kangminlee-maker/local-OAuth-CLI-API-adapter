@@ -9,6 +9,9 @@ loadEnvFile('.env');
 const options = parseArgs(process.argv.slice(2));
 const timeoutMs = numberOption(options.timeoutMs, 240_000);
 const repeats = numberOption(options.repeats, 1);
+const qualityRepeats = numberOption(options.qualityRepeats, 0);
+const semanticQualityRepeats = numberOption(options.semanticQualityRepeats, 0);
+const includeMultimodal = booleanOption(options.includeMultimodal, false);
 const cwd = options.cwd ?? process.cwd();
 const openAiModel = options.openaiModel ?? 'gpt-5.5';
 const anthropicModels = {
@@ -16,9 +19,20 @@ const anthropicModels = {
   sonnet: options.anthropicSonnetModel ?? 'claude-sonnet-4-6',
   haiku: options.anthropicHaikuModel ?? 'claude-haiku-4-5-20251001',
 };
+const outputPath = options.output;
+const baselinePath = options.baseline;
+const regressionTargets = options.regressionTargets ?? 'proxy';
+const latencyRegressionPct = numberOption(options.latencyRegressionPct, 30);
+const latencyRegressionMs = numberOption(options.latencyRegressionMs, 750);
+const qualityRegressionPoints = numberOption(options.qualityRegressionPoints, 5);
+const semanticQualityTargets = options.semanticQualityTargets ?? 'proxy';
+const semanticQualityJudgeModel = options.semanticQualityJudgeModel ?? openAiModel;
+const semanticQualityReference = booleanOption(options.semanticQualityReference, true);
+const minSemanticQuality = numberOption(options.minSemanticQuality, 0);
 
 const rows = [];
 const servers = [];
+const semanticReferenceCache = new Map();
 
 try {
   const proxyCodex = await startProxy(new CodexAppServerBackend({
@@ -35,9 +49,12 @@ try {
     timeoutMs,
   }));
 
+  await benchmarkOpenAiChatCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
+  await benchmarkOpenAiChatCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   await benchmarkOpenAiCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
   await benchmarkOpenAiCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   if (process.env.OPENAI_API_KEY) {
+    await benchmarkOpenAiChatCompatible('openai-api:gpt-5.5', 'https://api.openai.com', openAiModel, true);
     await benchmarkOpenAiCompatible('openai-api:gpt-5.5', 'https://api.openai.com', openAiModel, true);
   } else {
     rows.push({ target: 'openai-api:gpt-5.5', ok: false, skipped: true, error: 'OPENAI_API_KEY missing' });
@@ -57,16 +74,38 @@ try {
 }
 
 const failed = rows.filter((row) => !row.ok && !row.skipped);
-const summary = {
+const summaryBase = {
   repeats,
+  qualityRepeats,
+  semanticQualityRepeats,
+  semanticQualityTargets,
+  semanticQualityJudgeModel,
+  semanticQualityReference,
+  minSemanticQuality,
+  includeMultimodal,
   openAiModel,
   anthropicModels,
   passed: rows.length - failed.length,
   failed: failed.length,
   rows,
 };
+const regressionGate = baselinePath
+  ? compareWithBaseline(loadSummaryFile(baselinePath), summaryBase, {
+      regressionTargets,
+      latencyRegressionPct,
+      latencyRegressionMs,
+      qualityRegressionPoints,
+    })
+  : null;
+const summary = {
+  ...summaryBase,
+  ...(regressionGate ? { regressionGate } : {}),
+};
+if (outputPath) {
+  fs.writeFileSync(outputPath, `${JSON.stringify(summary, null, 2)}\n`);
+}
 console.log(`\nAPI_COMPARISON_SUMMARY ${JSON.stringify(summary, null, 2)}`);
-process.exit(failed.length > 0 ? 1 : 0);
+process.exit(failed.length > 0 || (regressionGate?.regressions.length ?? 0) > 0 ? 1 : 0);
 
 async function startProxy(backend) {
   const server = await startLocalApiProxy({
@@ -79,6 +118,169 @@ async function startProxy(backend) {
   return { url: server.url, model: backend.model };
 }
 
+async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
+  await benchmarkCase(target, 'openai.chat.text.schema_exact', repeats, async (index) => {
+    const token = tokenFor(target, 'CHAT_TEXT', index);
+    const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+      model,
+      messages: [{ role: 'user', content: exactPrompt(token) }],
+      max_completion_tokens: 64,
+    }, openAiHeaders(isApi));
+    assertOpenAiChatResponseShape(response.body, 'stop');
+    const text = response.body.choices?.[0]?.message?.content;
+    assertEqual(text, token, 'chat content');
+    return { totalMs: response.totalMs, text, usage: response.body.usage };
+  });
+
+  await benchmarkCase(target, 'openai.chat.stream.schema_exact', repeats, async (index) => {
+    const token = tokenFor(target, 'CHAT_STREAM', index);
+    const response = await postSse(`${baseUrl}/v1/chat/completions`, {
+      model,
+      stream: true,
+      messages: [{ role: 'user', content: exactPrompt(token) }],
+      max_completion_tokens: 64,
+    }, openAiHeaders(isApi), (_event, payload) => payload?.choices?.[0]?.delta?.content ?? '');
+    assertEqual(response.text, token, 'chat stream text');
+    assert(response.done, 'chat stream missing DONE');
+    assertOpenAiChatStreamShape(response.events, { includeUsage: false });
+    return responseSummary(response);
+  });
+
+  await benchmarkCase(target, 'openai.chat.stream_usage.schema_exact', repeats, async (index) => {
+    const token = tokenFor(target, 'CHAT_STREAM_USAGE', index);
+    const response = await postSse(`${baseUrl}/v1/chat/completions`, {
+      model,
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: 'user', content: exactPrompt(token) }],
+      max_completion_tokens: 64,
+    }, openAiHeaders(isApi), (_event, payload) => payload?.choices?.[0]?.delta?.content ?? '');
+    assertEqual(response.text, token, 'chat stream usage text');
+    assert(response.done, 'chat stream usage missing DONE');
+    assertOpenAiChatStreamShape(response.events, { includeUsage: true });
+    return responseSummary(response);
+  });
+
+  await benchmarkCase(target, 'openai.chat.json_schema.schema_exact', repeats, async () => {
+    const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+      model,
+      messages: [{
+        role: 'user',
+        content: 'Return JSON with adapter exactly "local-oauth-cli" and ok exactly true.',
+      }],
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'adapter_exactness',
+          strict: true,
+          schema: adapterSchema(),
+        },
+      },
+      max_completion_tokens: 128,
+    }, openAiHeaders(isApi));
+    assertOpenAiChatResponseShape(response.body, 'stop');
+    const parsed = parseJson(response.body.choices?.[0]?.message?.content, 'chat json content');
+    assertEqual(parsed.adapter, 'local-oauth-cli', 'json adapter');
+    assertEqual(parsed.ok, true, 'json ok');
+    return { totalMs: response.totalMs, parsed, usage: response.body.usage };
+  });
+
+  let toolCall;
+  await benchmarkCase(target, 'openai.chat.tool_call.schema_exact', repeats, async () => {
+    const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+      model,
+      messages: [{ role: 'user', content: 'Use get_weather for Seoul. Return a tool call only.' }],
+      tools: [openAiChatWeatherTool()],
+      tool_choice: 'required',
+      max_completion_tokens: 128,
+    }, openAiHeaders(isApi));
+    assertOpenAiChatResponseShape(response.body, 'tool_calls');
+    toolCall = response.body.choices?.[0]?.message?.tool_calls?.[0];
+    assertEqual(toolCall?.type, 'function', 'chat tool type');
+    assertEqual(toolCall?.function?.name, 'get_weather', 'chat tool name');
+    const args = parseJson(toolCall?.function?.arguments, 'chat tool arguments');
+    assertEqual(args.city, 'Seoul', 'chat tool city');
+    return { totalMs: response.totalMs, toolName: toolCall.function.name, args, usage: response.body.usage };
+  });
+
+  await benchmarkCase(target, 'openai.chat.tool_result.schema_exact', repeats, async () => {
+    if (!toolCall) throw new Error('chat tool_call prerequisite did not run');
+    const expected = 'WEATHER_RESULT_CITY=Seoul;TEMP_C=23;CONDITION=clear';
+    const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+      model,
+      messages: [
+        { role: 'user', content: `Use get_weather, then reply with exactly: ${expected}` },
+        { role: 'assistant', content: null, tool_calls: [toolCall] },
+        {
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: '{"city":"Seoul","temperature_c":23,"condition":"clear"}',
+        },
+      ],
+      tools: [openAiChatWeatherTool()],
+      tool_choice: 'auto',
+      max_completion_tokens: 128,
+    }, openAiHeaders(isApi));
+    assertOpenAiChatResponseShape(response.body, 'stop');
+    assertEqual(response.body.choices?.[0]?.message?.content, expected, 'chat tool result text');
+    return { totalMs: response.totalMs, text: expected, usage: response.body.usage };
+  });
+
+  if (includeMultimodal) {
+    await benchmarkCase(target, 'openai.chat.image.schema_exact', repeats, async () => {
+      const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+        model,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'text', text: 'Identify the dominant color. Reply exactly one uppercase word: RED, GREEN, or BLUE.' },
+            { type: 'image_url', image_url: { url: visionDataUrl(), detail: 'high' } },
+          ],
+        }],
+        max_completion_tokens: 32,
+      }, openAiHeaders(isApi));
+      assertOpenAiChatResponseShape(response.body, 'stop');
+      assertEqual(response.body.choices?.[0]?.message?.content, 'RED', 'chat image color');
+      return { totalMs: response.totalMs, text: 'RED', usage: response.body.usage };
+    });
+  }
+
+  if (qualityRepeats > 0) {
+    await benchmarkQualityCase(target, 'openai.chat.quality_distribution', qualityRepeats, async () => {
+      const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+        model,
+        messages: [{ role: 'user', content: qualityPrompt() }],
+        max_completion_tokens: 640,
+      }, openAiHeaders(isApi));
+      const text = response.body.choices?.[0]?.message?.content ?? '';
+      assertOpenAiChatResponseShape(response.body, 'stop');
+      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text) };
+    });
+  }
+
+  if (shouldRunSemanticQuality(target)) {
+    await benchmarkQualityCase(target, 'openai.chat.semantic_quality', semanticQualityRepeats, async (index) => {
+      const prompt = qualityPrompt();
+      const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        max_completion_tokens: 640,
+      }, openAiHeaders(isApi));
+      const text = response.body.choices?.[0]?.message?.content ?? '';
+      assertOpenAiChatResponseShape(response.body, 'stop');
+      const reference = await semanticReference('openai.chat', target, index, prompt);
+      const judged = await scoreSemanticQuality({
+        target,
+        caseName: 'openai.chat.semantic_quality',
+        prompt,
+        text,
+        reference,
+      });
+      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text), ...judged };
+    });
+  }
+}
+
 async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
   await benchmarkCase(target, 'openai.responses.text', repeats, async (index) => {
     const token = tokenFor(target, 'OPENAI_TEXT', index);
@@ -87,8 +289,9 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
       input: exactPrompt(token),
       max_output_tokens: 64,
     }, openAiHeaders(isApi));
-    const text = response.body.output_text ?? extractOpenAiResponseText(response.body);
-    assertEqual(text, token, 'output_text');
+    const text = extractOpenAiResponseText(response.body);
+    assertOpenAiResponsesShape(response.body);
+    assertEqual(text, token, 'responses text');
     return { totalMs: response.totalMs, text };
   });
 
@@ -106,7 +309,8 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
       return '';
     });
     assertEqual(response.text, token, 'stream text');
-    return response;
+    assertOpenAiResponsesStreamShape(response.events, ['response.created', 'response.in_progress']);
+    return responseSummary(response);
   });
 
   await benchmarkCase(target, 'openai.responses.tool_call', repeats, async () => {
@@ -117,12 +321,94 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
       tools: [openAiWeatherTool()],
       tool_choice: 'required',
     }, openAiHeaders(isApi));
+    assertOpenAiResponsesShape(response.body);
     const call = extractOpenAiFunctionCall(response.body);
     assertEqual(call?.name, 'get_weather', 'tool name');
     const args = parseJson(call?.arguments, 'tool arguments');
     assertEqual(args.city, 'Seoul', 'tool city');
     return { totalMs: response.totalMs, toolName: call.name, args };
   });
+
+  await benchmarkCase(target, 'openai.responses.tool_call_stream.schema_exact', repeats, async () => {
+    const response = await postSse(`${baseUrl}/v1/responses`, {
+      model,
+      input: 'Use get_weather for Seoul. Return a tool call only.',
+      max_output_tokens: 128,
+      stream: true,
+      stream_options: isApi ? { include_obfuscation: false } : undefined,
+      tools: [openAiWeatherTool()],
+      tool_choice: 'required',
+    }, openAiHeaders(isApi), (event, payload) => {
+      if (event === 'response.function_call_arguments.delta') return payload.delta ?? '';
+      return '';
+    });
+    const args = parseJson(response.text, 'responses streamed tool arguments');
+    assertEqual(args.city, 'Seoul', 'responses streamed tool city');
+    assertOpenAiResponsesStreamShape(response.events, [
+      'response.created',
+      'response.in_progress',
+      'response.output_item.added',
+      'response.function_call_arguments.delta',
+      'response.function_call_arguments.done',
+      'response.output_item.done',
+      'response.completed',
+    ]);
+    return responseSummary(response);
+  });
+
+  if (includeMultimodal) {
+    await benchmarkCase(target, 'openai.responses.image.schema_exact', repeats, async () => {
+      const response = await postJson(`${baseUrl}/v1/responses`, {
+        model,
+        input: [{
+          role: 'user',
+          content: [
+            { type: 'input_image', image_url: visionDataUrl(), detail: 'high' },
+            { type: 'input_text', text: 'Identify the dominant color. Reply exactly one uppercase word: RED, GREEN, or BLUE.' },
+          ],
+        }],
+        max_output_tokens: 32,
+      }, openAiHeaders(isApi));
+      assertOpenAiResponsesShape(response.body);
+      assertEqual(extractOpenAiResponseText(response.body), 'RED', 'responses image color');
+      return { totalMs: response.totalMs, text: 'RED', usage: response.body.usage };
+    });
+  }
+
+  if (qualityRepeats > 0) {
+    await benchmarkQualityCase(target, 'openai.responses.quality_distribution', qualityRepeats, async () => {
+      const response = await postJson(`${baseUrl}/v1/responses`, {
+        model,
+        input: qualityPrompt(),
+        max_output_tokens: 640,
+      }, openAiHeaders(isApi));
+      assertOpenAiResponsesShape(response.body);
+      const text = extractOpenAiResponseText(response.body) ?? '';
+      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text) };
+    });
+  }
+
+  if (shouldRunSemanticQuality(target)) {
+    await benchmarkQualityCase(target, 'openai.responses.semantic_quality', semanticQualityRepeats, async (index) => {
+      const prompt = qualityPrompt();
+      const response = await postJson(`${baseUrl}/v1/responses`, {
+        model,
+        input: prompt,
+        max_output_tokens: 640,
+      }, openAiHeaders(isApi));
+      assertOpenAiResponsesShape(response.body);
+      const text = extractOpenAiResponseText(response.body) ?? '';
+      const reference = await semanticReference('openai.responses', target, index, prompt);
+      const judged = await scoreSemanticQuality({
+        target,
+        caseName: 'openai.responses.semantic_quality',
+        prompt,
+        text,
+        reference,
+      });
+      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text), ...judged };
+    });
+  }
 }
 
 async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
@@ -134,8 +420,8 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
       messages: [{ role: 'user', content: exactPrompt(token) }],
     }, anthropicHeaders(isApi));
     const text = response.body.content?.find((block) => block.type === 'text')?.text;
+    assertAnthropicMessageShape(response.body, 'end_turn');
     assertEqual(text, token, 'message text');
-    assertEqual(response.body.stop_reason, 'end_turn', 'stop_reason');
     return { totalMs: response.totalMs, text };
   });
 
@@ -152,7 +438,8 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
       return '';
     });
     assertEqual(response.text, token, 'stream text');
-    return response;
+    assertAnthropicStreamShape(response.events);
+    return responseSummary(response);
   });
 
   await benchmarkCase(target, 'anthropic.messages.tool_use', repeats, async () => {
@@ -167,12 +454,106 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
       }],
       tool_choice: { type: 'any' },
     }, anthropicHeaders(isApi));
+    assertAnthropicMessageShape(response.body, 'tool_use');
     const call = response.body.content?.find((block) => block.type === 'tool_use');
-    assertEqual(response.body.stop_reason, 'tool_use', 'stop_reason');
     assertEqual(call?.name, 'get_weather', 'tool name');
     assertEqual(call?.input?.city, 'Seoul', 'tool city');
     return { totalMs: response.totalMs, toolName: call.name, args: call.input };
   });
+
+  await benchmarkCase(target, 'anthropic.messages.tool_result.schema_exact', repeats, async () => {
+    const expected = 'WEATHER_RESULT_CITY=Seoul;TEMP_C=23;CONDITION=clear';
+    const response = await postJson(`${baseUrl}/v1/messages`, {
+      model,
+      max_tokens: 128,
+      messages: [
+        { role: 'user', content: `Use get_weather, then reply with exactly: ${expected}` },
+        {
+          role: 'assistant',
+          content: [{
+            type: 'tool_use',
+            id: 'toolu_bench_weather',
+            name: 'get_weather',
+            input: { city: 'Seoul' },
+          }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_bench_weather',
+            content: '{"city":"Seoul","temperature_c":23,"condition":"clear"}',
+          }],
+        },
+      ],
+    }, anthropicHeaders(isApi));
+    assertAnthropicMessageShape(response.body, 'end_turn');
+    const text = response.body.content?.find((block) => block.type === 'text')?.text;
+    assertEqual(text, expected, 'anthropic tool result text');
+    return { totalMs: response.totalMs, text, usage: response.body.usage };
+  });
+
+  if (includeMultimodal) {
+    await benchmarkCase(target, 'anthropic.messages.image.schema_exact', repeats, async () => {
+      const response = await postJson(`${baseUrl}/v1/messages`, {
+        model,
+        max_tokens: 32,
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: visionDataUrl().split(',')[1],
+              },
+            },
+            { type: 'text', text: 'Identify the dominant color. Reply exactly one uppercase word: RED, GREEN, or BLUE.' },
+          ],
+        }],
+      }, anthropicHeaders(isApi));
+      assertAnthropicMessageShape(response.body, 'end_turn');
+      const text = response.body.content?.find((block) => block.type === 'text')?.text;
+      assertEqual(text, 'RED', 'anthropic image color');
+      return { totalMs: response.totalMs, text, usage: response.body.usage };
+    });
+  }
+
+  if (qualityRepeats > 0) {
+    await benchmarkQualityCase(target, 'anthropic.messages.quality_distribution', qualityRepeats, async () => {
+      const response = await postJson(`${baseUrl}/v1/messages`, {
+        model,
+        max_tokens: 640,
+        messages: [{ role: 'user', content: qualityPrompt() }],
+      }, anthropicHeaders(isApi));
+      assertAnthropicMessageShape(response.body, 'end_turn');
+      const text = response.body.content?.find((block) => block.type === 'text')?.text ?? '';
+      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text) };
+    });
+  }
+
+  if (shouldRunSemanticQuality(target)) {
+    await benchmarkQualityCase(target, 'anthropic.messages.semantic_quality', semanticQualityRepeats, async (index) => {
+      const prompt = qualityPrompt();
+      const response = await postJson(`${baseUrl}/v1/messages`, {
+        model,
+        max_tokens: 640,
+        messages: [{ role: 'user', content: prompt }],
+      }, anthropicHeaders(isApi));
+      assertAnthropicMessageShape(response.body, 'end_turn');
+      const text = response.body.content?.find((block) => block.type === 'text')?.text ?? '';
+      const reference = await semanticReference('anthropic.messages', target, index, prompt);
+      const judged = await scoreSemanticQuality({
+        target,
+        caseName: 'anthropic.messages.semantic_quality',
+        prompt,
+        text,
+        reference,
+      });
+      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text), ...judged };
+    });
+  }
 }
 
 async function benchmarkCase(target, caseName, count, fn) {
@@ -199,10 +580,55 @@ async function benchmarkCase(target, caseName, count, fn) {
     case: caseName,
     ok: true,
     totalMs: summarize(samples.map((sample) => sample.totalMs)),
+    firstDataMs: summarize(samples.map((sample) => sample.firstDataMs).filter(Number.isFinite)),
     firstTextMs: summarize(samples.map((sample) => sample.firstTextMs).filter(Number.isFinite)),
     chunks: samples.map((sample) => sample.chunks).filter(Number.isFinite),
     sample: samples.at(-1),
   });
+}
+
+async function benchmarkQualityCase(target, caseName, count, fn) {
+  const samples = [];
+  for (let i = 0; i < count; i += 1) {
+    try {
+      const sample = await fn(i + 1);
+      samples.push(sample);
+      console.log(`PASS ${target} ${caseName} #${i + 1}: ${JSON.stringify({
+        totalMs: sample.totalMs,
+        quality: sample.quality,
+        semanticQuality: sample.semanticQuality,
+        judgeMs: sample.judgeMs,
+      })}`);
+    } catch (err) {
+      const row = {
+        target,
+        case: caseName,
+        ok: false,
+        error: errorMessage(err),
+      };
+      rows.push(row);
+      console.log(`FAIL ${target} ${caseName} #${i + 1}: ${row.error}`);
+      return;
+    }
+  }
+  const row = {
+    target,
+    case: caseName,
+    ok: true,
+    totalMs: summarize(samples.map((sample) => sample.totalMs)),
+    quality: summarize(samples.map((sample) => sample.quality.score)),
+    sample: samples.at(-1),
+  };
+  const semanticScores = samples.map((sample) => sample.semanticQuality?.score).filter(Number.isFinite);
+  if (semanticScores.length > 0) row.semanticQuality = summarize(semanticScores);
+  const judgeMs = samples.map((sample) => sample.judgeMs).filter(Number.isFinite);
+  if (judgeMs.length > 0) row.judgeMs = summarize(judgeMs);
+  const lowestSemanticScore = Math.min(...semanticScores);
+  if (semanticScores.length > 0 && minSemanticQuality > 0 && lowestSemanticScore < minSemanticQuality) {
+    row.ok = false;
+    row.error = `semantic quality below ${minSemanticQuality}: ${lowestSemanticScore}`;
+  }
+  rows.push(row);
 }
 
 async function postJson(url, body, headers) {
@@ -241,6 +667,8 @@ async function postSse(url, body, headers, collectText) {
   let firstTextMs = null;
   let chunks = 0;
   let text = '';
+  let done = false;
+  const events = [];
 
   while (true) {
     const read = await reader.read();
@@ -253,7 +681,11 @@ async function postSse(url, body, headers, collectText) {
       const lines = frame.split(/\n/);
       const event = lines.find((line) => line.startsWith('event: '))?.slice(7) ?? 'message';
       const data = lines.find((line) => line.startsWith('data: '))?.slice(6);
-      if (!data || data === '[DONE]') continue;
+      if (!data) continue;
+      if (data === '[DONE]') {
+        done = true;
+        continue;
+      }
       if (firstDataMs === null) firstDataMs = elapsed(startedAt);
       let payload;
       try {
@@ -261,6 +693,7 @@ async function postSse(url, body, headers, collectText) {
       } catch {
         continue;
       }
+      events.push({ event, payload });
       const delta = collectText(event, payload);
       if (delta) {
         if (firstTextMs === null) firstTextMs = elapsed(startedAt);
@@ -269,7 +702,7 @@ async function postSse(url, body, headers, collectText) {
       }
     }
   }
-  return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, chunks, text };
+  return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, chunks, text, done, events };
 }
 
 function openAiHeaders(isApi) {
@@ -300,6 +733,30 @@ function openAiWeatherTool() {
   };
 }
 
+function openAiChatWeatherTool() {
+  return {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Get current weather by city.',
+      parameters: weatherSchema(),
+      strict: true,
+    },
+  };
+}
+
+function adapterSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      adapter: { type: 'string' },
+      ok: { type: 'boolean' },
+    },
+    required: ['adapter', 'ok'],
+  };
+}
+
 function weatherSchema() {
   return {
     type: 'object',
@@ -308,6 +765,121 @@ function weatherSchema() {
       city: { type: 'string' },
     },
     required: ['city'],
+  };
+}
+
+function visionDataUrl() {
+  // 8x8 red PNG.
+  return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAFElEQVR4nGP8z4AdMDEQqgsA0ZIBCfL8IFwAAAAASUVORK5CYII=';
+}
+
+function assertOpenAiChatResponseShape(body, finishReason) {
+  assertEqual(body.object, 'chat.completion', 'chat object');
+  assert(typeof body.id === 'string' && body.id.startsWith('chatcmpl-'), 'chat id shape');
+  assert(typeof body.created === 'number', 'chat created must be number');
+  assert(typeof body.model === 'string', 'chat model must be string');
+  const choice = body.choices?.[0];
+  assert(choice && typeof choice === 'object', 'chat choice missing');
+  assertEqual(choice.index, 0, 'chat choice index');
+  assertEqual(choice.finish_reason, finishReason, 'chat finish_reason');
+  assertEqual(choice.message?.role, 'assistant', 'chat message role');
+  assertUsageShape(body.usage, 'openai-chat');
+  if (finishReason === 'tool_calls') {
+    assert(Array.isArray(choice.message.tool_calls), 'chat tool_calls must be array');
+    assertEqual(choice.message.content, null, 'chat tool message content');
+  } else {
+    assert(typeof choice.message.content === 'string', 'chat content must be string');
+  }
+}
+
+function assertOpenAiChatStreamShape(events, { includeUsage }) {
+  assert(events.length > 0, 'chat stream must emit events');
+  for (const { payload } of events) {
+    assertEqual(payload.object, 'chat.completion.chunk', 'chat stream object');
+    assert(typeof payload.id === 'string' && payload.id.startsWith('chatcmpl-'), 'chat stream id shape');
+    assert(typeof payload.created === 'number', 'chat stream created');
+    if (includeUsage) assert('usage' in payload, 'chat stream usage field missing');
+  }
+  if (includeUsage) {
+    const usageChunk = events.find(({ payload }) => Array.isArray(payload.choices) && payload.choices.length === 0);
+    assert(usageChunk, 'chat stream final usage chunk missing');
+    assertUsageShape(usageChunk.payload.usage, 'openai-chat');
+  }
+}
+
+function assertOpenAiResponsesShape(body) {
+  assertEqual(body.object, 'response', 'responses object');
+  assert(typeof body.id === 'string' && body.id.startsWith('resp_'), 'responses id shape');
+  assert(typeof body.created_at === 'number', 'responses created_at');
+  assert(typeof body.model === 'string', 'responses model');
+  assert(typeof body.status === 'string', 'responses status');
+  assert(Array.isArray(body.output), 'responses output array');
+  assert(!('output_text' in body), 'responses output_text must not be top-level');
+  assertUsageShape(body.usage, 'openai-responses');
+}
+
+function assertOpenAiResponsesStreamShape(events, requiredEventTypes) {
+  assert(events.length > 0, 'responses stream must emit events');
+  let previousSequence = -1;
+  const eventTypes = events.map(({ event }) => event);
+  for (const required of requiredEventTypes) {
+    assert(eventTypes.includes(required), `responses stream missing ${required}`);
+  }
+  for (const { event, payload } of events) {
+    assertEqual(payload.type, event, `responses payload type for ${event}`);
+    assert(typeof payload.sequence_number === 'number', `responses ${event} sequence_number`);
+    assert(payload.sequence_number === previousSequence + 1, `responses ${event} sequence order`);
+    previousSequence = payload.sequence_number;
+    if (event === 'response.function_call_arguments.done') {
+      assert(typeof payload.arguments === 'string', 'responses function_call_arguments.done arguments');
+    }
+  }
+}
+
+function assertUsageShape(usage, provider) {
+  assert(usage && typeof usage === 'object', `${provider} usage missing`);
+  if (provider.startsWith('openai')) {
+    const promptTokens = usage.prompt_tokens ?? usage.input_tokens;
+    const completionTokens = usage.completion_tokens ?? usage.output_tokens;
+    assert(typeof promptTokens === 'number', `${provider} input tokens`);
+    assert(typeof completionTokens === 'number', `${provider} output tokens`);
+    assert(typeof usage.total_tokens === 'number', `${provider} total tokens`);
+    return;
+  }
+  assert(typeof usage.input_tokens === 'number', `${provider} input tokens`);
+  assert(typeof usage.output_tokens === 'number', `${provider} output tokens`);
+}
+
+function assertAnthropicMessageShape(body, stopReason) {
+  assertEqual(body.type, 'message', 'anthropic message type');
+  assert(typeof body.id === 'string' && body.id.startsWith('msg_'), 'anthropic id shape');
+  assertEqual(body.role, 'assistant', 'anthropic role');
+  assert(typeof body.model === 'string', 'anthropic model');
+  assert(Array.isArray(body.content), 'anthropic content array');
+  assertEqual(body.stop_reason, stopReason, 'anthropic stop_reason');
+  assert('stop_sequence' in body, 'anthropic stop_sequence missing');
+  assertUsageShape(body.usage, 'anthropic');
+}
+
+function assertAnthropicStreamShape(events) {
+  const eventTypes = events.map(({ event }) => event);
+  assertEqual(eventTypes[0], 'message_start', 'anthropic first stream event');
+  assert(eventTypes.includes('content_block_delta'), 'anthropic stream missing content delta');
+  assert(eventTypes.includes('message_delta'), 'anthropic stream missing message_delta');
+  assertEqual(eventTypes.at(-1), 'message_stop', 'anthropic last stream event');
+  for (const { event, payload } of events) {
+    assertEqual(payload.type, event, `anthropic payload type for ${event}`);
+  }
+}
+
+function responseSummary(response) {
+  return {
+    totalMs: response.totalMs,
+    firstDataMs: response.firstDataMs,
+    firstTextMs: response.firstTextMs,
+    chunks: response.chunks,
+    eventTypes: response.events.map(({ event }) => event),
+    text: response.text,
   };
 }
 
@@ -324,6 +896,202 @@ function extractOpenAiFunctionCall(body) {
 
 function exactPrompt(token) {
   return `Reply with exactly this text and no extra characters: ${token}`;
+}
+
+function qualityPrompt() {
+  return [
+    'Write a concise English implementation review for a local OAuth CLI API proxy.',
+    'Facts to review: provider mappings lack schema versioning; provider auth headers are hardcoded; token exchange adds about 200ms; refresh caching and connection reuse are missing; localhost binding exists; state validation is missing; tokens may appear in debug logs; token storage is plaintext.',
+    'Treat these facts as current defects; do not soften them as acceptable tradeoffs or future recommendations.',
+    'Preserve qualifiers: say about 200ms, and say tokens may appear in debug logs.',
+    'Return only three bullet lines, with no heading, preface, caveat, or closing sentence.',
+    'Bullet 1 must assess API schema compatibility using the schema-versioning, provider-mapping, or auth-header facts.',
+    'Bullet 2 must assess latency using token exchange adding about 200ms plus missing refresh caching or connection reuse.',
+    'Bullet 3 must mention localhost binding exists, but missing state validation, plaintext storage, or possible debug-log token exposure keep OAuth risk high.',
+    'Keep each bullet under 24 words.',
+  ].join(' ');
+}
+
+function scoreQualityOutput(text) {
+  const lower = text.toLowerCase();
+  const required = ['schema', 'latency', 'risk'];
+  const keywordHits = required.filter((word) => lower.includes(word)).length;
+  const bulletCount = (text.match(/(^|\n)\s*(-|•|\d+[.)])/g) ?? []).length;
+  const words = text.trim().split(/\s+/).filter(Boolean).length;
+  const structureScore = Math.min(1, bulletCount / 3);
+  const keywordScore = keywordHits / required.length;
+  const lengthScore = words >= 18 && words <= 90 ? 1 : Math.max(0, 1 - Math.abs(words - 54) / 54);
+  return {
+    score: Math.round((keywordScore * 0.5 + structureScore * 0.3 + lengthScore * 0.2) * 100),
+    keywordHits,
+    bulletCount,
+    words,
+  };
+}
+
+async function semanticReference(kind, target, index, prompt) {
+  if (!semanticQualityReference || target.includes('-api:')) return null;
+  if (kind.startsWith('openai') && !process.env.OPENAI_API_KEY) return null;
+  if (kind.startsWith('anthropic') && !process.env.ANTHROPIC_API_KEY) return null;
+  const key = `${kind}:${index}`;
+  if (semanticReferenceCache.has(key)) return semanticReferenceCache.get(key);
+  const value = await fetchSemanticReference(kind, prompt);
+  semanticReferenceCache.set(key, value);
+  return value;
+}
+
+async function fetchSemanticReference(kind, prompt) {
+  if (kind === 'openai.chat') {
+    const response = await postJson('https://api.openai.com/v1/chat/completions', {
+      model: openAiModel,
+      messages: [{ role: 'user', content: prompt }],
+      max_completion_tokens: 640,
+    }, openAiHeaders(true));
+    assertOpenAiChatResponseShape(response.body, 'stop');
+    return {
+      target: `openai-api:${openAiModel}`,
+      totalMs: response.totalMs,
+      text: response.body.choices?.[0]?.message?.content ?? '',
+      usage: response.body.usage,
+    };
+  }
+  if (kind === 'openai.responses') {
+    const response = await postJson('https://api.openai.com/v1/responses', {
+      model: openAiModel,
+      input: prompt,
+      max_output_tokens: 640,
+    }, openAiHeaders(true));
+    assertOpenAiResponsesShape(response.body);
+    return {
+      target: `openai-api:${openAiModel}`,
+      totalMs: response.totalMs,
+      text: extractOpenAiResponseText(response.body) ?? '',
+      usage: response.body.usage,
+    };
+  }
+  if (kind === 'anthropic.messages') {
+    const response = await postJson('https://api.anthropic.com/v1/messages', {
+      model: anthropicModels.sonnet,
+      max_tokens: 640,
+      messages: [{ role: 'user', content: prompt }],
+    }, anthropicHeaders(true));
+    assertAnthropicMessageShape(response.body, 'end_turn');
+    return {
+      target: `anthropic-api:${anthropicModels.sonnet}`,
+      totalMs: response.totalMs,
+      text: response.body.content?.find((block) => block.type === 'text')?.text ?? '',
+      usage: response.body.usage,
+    };
+  }
+  throw new Error(`unsupported semantic reference kind: ${kind}`);
+}
+
+async function scoreSemanticQuality({ target, caseName, prompt, text, reference }) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY is required for semantic quality judge');
+  }
+  const response = await postJson('https://api.openai.com/v1/chat/completions', {
+    model: semanticQualityJudgeModel,
+    messages: [
+      {
+        role: 'system',
+        content: [
+          'You are a strict API benchmark judge.',
+          'Score semantic answer quality for provider API compatibility tests.',
+          'Return only JSON matching the requested schema.',
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: semanticJudgePrompt({ target, caseName, prompt, text, reference }),
+      },
+    ],
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'semantic_quality_score',
+        strict: true,
+        schema: semanticQualityScoreSchema(),
+      },
+    },
+    max_completion_tokens: 600,
+  }, openAiHeaders(true));
+  assertOpenAiChatResponseShape(response.body, 'stop');
+  const semanticQuality = parseJson(response.body.choices?.[0]?.message?.content, 'semantic judge content');
+  assertSemanticQualityShape(semanticQuality);
+  return {
+    semanticQuality,
+    judgeMs: response.totalMs,
+    judgeUsage: response.body.usage,
+    reference,
+  };
+}
+
+function semanticJudgePrompt({ target, caseName, prompt, text, reference }) {
+  return [
+    `Target: ${target}`,
+    `Case: ${caseName}`,
+    'Original user request:',
+    prompt,
+    reference
+      ? [
+          'Direct provider reference output for the same request:',
+          reference.text,
+        ].join('\n')
+      : 'No direct provider reference is available; judge against the request and typical provider API output quality.',
+    'Candidate output to score:',
+    text,
+    [
+      'Rubric:',
+      '- requirementFit: exact satisfaction of three bullets, required topics, and per-bullet length.',
+      '- semanticRelevance: usefulness and correctness for a local OAuth CLI API proxy implementation review.',
+      '- conciseness: dense, non-fluffy, no extra headings or unrelated caveats.',
+      '- providerSimilarity: if a reference is present, semantic similarity to the direct provider output; otherwise plausibility as a direct provider API answer.',
+      'Overall score should be a weighted quality score from 0 to 100.',
+      'List only concrete issues; use an empty array if none.',
+    ].join('\n'),
+  ].join('\n\n');
+}
+
+function semanticQualityScoreSchema() {
+  return {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      score: { type: 'integer' },
+      requirementFit: { type: 'integer' },
+      semanticRelevance: { type: 'integer' },
+      conciseness: { type: 'integer' },
+      providerSimilarity: { type: 'integer' },
+      rationale: { type: 'string' },
+      issues: {
+        type: 'array',
+        items: { type: 'string' },
+      },
+    },
+    required: [
+      'score',
+      'requirementFit',
+      'semanticRelevance',
+      'conciseness',
+      'providerSimilarity',
+      'rationale',
+      'issues',
+    ],
+  };
+}
+
+function assertSemanticQualityShape(value) {
+  assert(value && typeof value === 'object', 'semantic judge result must be object');
+  for (const key of ['score', 'requirementFit', 'semanticRelevance', 'conciseness', 'providerSimilarity']) {
+    assert(Number.isInteger(value[key]), `semantic judge ${key} must be integer`);
+    assert(value[key] >= 0 && value[key] <= 100, `semantic judge ${key} must be 0..100`);
+  }
+  assert(typeof value.rationale === 'string', 'semantic judge rationale must be string');
+  assert(Array.isArray(value.issues), 'semantic judge issues must be array');
+  for (const issue of value.issues) {
+    assert(typeof issue === 'string', 'semantic judge issue must be string');
+  }
 }
 
 function tokenFor(target, name, index) {
@@ -346,6 +1114,10 @@ function assertEqual(actual, expected, label) {
   }
 }
 
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
 function summarize(values) {
   if (values.length === 0) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -355,6 +1127,102 @@ function summarize(values) {
     max: sorted[sorted.length - 1],
     samples: values,
   };
+}
+
+function loadSummaryFile(path) {
+  const text = fs.readFileSync(path, 'utf8');
+  const marker = 'API_COMPARISON_SUMMARY ';
+  const markerIndex = text.lastIndexOf(marker);
+  return JSON.parse(markerIndex === -1 ? text : text.slice(markerIndex + marker.length));
+}
+
+function compareWithBaseline(baseline, current, options) {
+  const baselineRows = new Map(
+    (baseline.rows ?? [])
+      .filter((row) => row?.ok)
+      .map((row) => [rowKey(row), row]),
+  );
+  const regressions = [];
+  const improvements = [];
+  const compared = [];
+  const skipped = [];
+  for (const row of current.rows.filter((item) => item.ok)) {
+    if (!shouldCompareRegressionTarget(row.target, options.regressionTargets)) {
+      skipped.push({ target: row.target, case: row.case, reason: 'target-filter' });
+      continue;
+    }
+    const baselineRow = baselineRows.get(rowKey(row));
+    if (!baselineRow) {
+      skipped.push({ target: row.target, case: row.case, reason: 'missing-baseline' });
+      continue;
+    }
+    for (const metric of ['totalMs', 'firstDataMs', 'firstTextMs']) {
+      const before = medianOf(baselineRow[metric]);
+      const after = medianOf(row[metric]);
+      if (!Number.isFinite(before) || !Number.isFinite(after)) continue;
+      const delta = after - before;
+      const threshold = Math.max(options.latencyRegressionMs, Math.abs(before) * options.latencyRegressionPct / 100);
+      const entry = {
+        target: row.target,
+        case: row.case,
+        metric,
+        before,
+        after,
+        delta,
+        threshold: Math.round(threshold),
+      };
+      compared.push(entry);
+      if (delta > threshold) regressions.push(entry);
+      else if (delta < -threshold) improvements.push(entry);
+    }
+    for (const metric of ['quality', 'semanticQuality']) {
+      const qualityBefore = medianOf(baselineRow[metric]);
+      const qualityAfter = medianOf(row[metric]);
+      if (!Number.isFinite(qualityBefore) || !Number.isFinite(qualityAfter)) continue;
+      const delta = qualityAfter - qualityBefore;
+      const entry = {
+        target: row.target,
+        case: row.case,
+        metric,
+        before: qualityBefore,
+        after: qualityAfter,
+        delta,
+        threshold: options.qualityRegressionPoints,
+      };
+      compared.push(entry);
+      if (delta < -options.qualityRegressionPoints) regressions.push(entry);
+      else if (delta > options.qualityRegressionPoints) improvements.push(entry);
+    }
+  }
+  return {
+    baseline: baselinePath,
+    targets: options.regressionTargets,
+    latencyRegressionPct: options.latencyRegressionPct,
+    latencyRegressionMs: options.latencyRegressionMs,
+    qualityRegressionPoints: options.qualityRegressionPoints,
+    compared: compared.length,
+    skipped: skipped.length,
+    regressions,
+    improvements,
+  };
+}
+
+function rowKey(row) {
+  return `${row.target}\t${row.case}`;
+}
+
+function medianOf(summary) {
+  return typeof summary?.median === 'number' ? summary.median : Number.NaN;
+}
+
+function shouldCompareRegressionTarget(target, filter) {
+  if (filter === 'all') return true;
+  if (filter === 'proxy') return target.startsWith('proxy-');
+  return target.includes(filter);
+}
+
+function shouldRunSemanticQuality(target) {
+  return semanticQualityRepeats > 0 && shouldCompareRegressionTarget(target, semanticQualityTargets);
 }
 
 function stripUndefined(value) {
@@ -399,6 +1267,13 @@ function numberOption(value, fallback) {
   if (value === undefined) return fallback;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function booleanOption(value, fallback) {
+  if (value === undefined) return fallback;
+  if (value === true || value === 'true' || value === '1' || value === 'yes') return true;
+  if (value === false || value === 'false' || value === '0' || value === 'no') return false;
+  return fallback;
 }
 
 function reasoningEffort(value) {

@@ -1,0 +1,28 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { ToolCallDeltaExtractor } from '../dist/proxy/tool-call-stream.js';
+
+test('ToolCallDeltaExtractor waits for id and name before streaming arguments', () => {
+  const extractor = new ToolCallDeltaExtractor();
+
+  const early = extractor.push('{"status":"tool_calls","toolCalls":[{"arguments":"{\\"city\\"');
+  assert.deepEqual(early, []);
+
+  const events = extractor.push(':\\"Seoul\\"}","id":"call_1","name":"get_weather"}]}');
+  assert.deepEqual(events, [
+    {
+      type: 'tool_call_delta',
+      index: 0,
+      id: 'call_1',
+      name: 'get_weather',
+      argumentsDelta: '',
+    },
+    {
+      type: 'tool_call_delta',
+      index: 0,
+      id: 'call_1',
+      name: 'get_weather',
+      argumentsDelta: '{"city":"Seoul"}',
+    },
+  ]);
+});

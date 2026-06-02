@@ -11,11 +11,14 @@ import type {
   LocalCompletionResult,
   LocalStreamEvent,
   LocalToolCall,
+  LocalUsage,
   NormalizedRequest,
   ProxyServerOptions,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
+import { hasToolDecisionSchema } from './backend-contract.js';
+import { missingToolCallArgumentDelta } from './tool-call-stream.js';
 import {
   normalizeAnthropicMessagesRequest,
   normalizeOpenAiChatRequest,
@@ -97,7 +100,7 @@ async function handleRequest(
         await writeOpenAiResponsesStream(res, runStreamWithTimeout(backend, normalized, requestTimeoutMs), normalized);
       } else {
         const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
-        writeJson(res, 200, openAiResponsesResponse(result));
+        writeJson(res, 200, openAiResponsesResponse(result, normalized));
       }
       return;
     }
@@ -205,7 +208,7 @@ function openAiModelsResponse(backend: LocalCliBackend): unknown {
 function openAiChatResponse(result: LocalCompletionResult): unknown {
   const hasToolCalls = result.toolCalls.length > 0;
   return {
-    id: `chatcmpl_${result.id}`,
+    id: `chatcmpl-${result.id}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
     model: result.model,
@@ -216,54 +219,42 @@ function openAiChatResponse(result: LocalCompletionResult): unknown {
           role: 'assistant',
           content: null,
           tool_calls: result.toolCalls.map(openAiToolCall),
+          refusal: null,
+          annotations: [],
         } : {
           role: 'assistant',
           content: result.text,
+          refusal: null,
+          annotations: [],
         },
         finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
       },
     ],
-    usage: {
-      prompt_tokens: result.usage.inputTokens,
-      completion_tokens: result.usage.outputTokens,
-      total_tokens: result.usage.inputTokens + result.usage.outputTokens,
-    },
-    system_fingerprint: 'local-oauth-cli',
+    usage: openAiChatUsage(result.usage),
+    service_tier: 'default',
+    system_fingerprint: null,
   };
 }
 
-function openAiResponsesResponse(result: LocalCompletionResult): unknown {
+function openAiResponsesResponse(
+  result: LocalCompletionResult,
+  request: NormalizedRequest,
+): unknown {
   const output = result.toolCalls.length > 0
     ? result.toolCalls.map(openAiResponseToolCall)
     : [
-        {
-          id: `msg_${randomUUID()}`,
-          type: 'message',
-          status: 'completed',
-          role: 'assistant',
-          content: [
-            {
-              type: 'output_text',
-              text: result.text,
-              annotations: [],
-            },
-          ],
-        },
+        openAiResponseReasoningItem(),
+        openAiResponseMessageItem(`msg_${randomUUID()}`, result.text),
       ];
-  return {
+  return openAiResponseObject({
     id: `resp_${result.id}`,
-    object: 'response',
-    created_at: Math.floor(Date.now() / 1000),
-    status: 'completed',
     model: result.model,
+    request,
+    status: 'completed',
     output,
-    output_text: result.toolCalls.length > 0 ? '' : result.text,
-    usage: {
-      input_tokens: result.usage.inputTokens,
-      output_tokens: result.usage.outputTokens,
-      total_tokens: result.usage.inputTokens + result.usage.outputTokens,
-    },
-  };
+    usage: openAiResponsesUsage(result.usage),
+    completed: true,
+  });
 }
 
 function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
@@ -283,11 +274,177 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
         ],
     stop_reason: hasToolCalls ? 'tool_use' : 'end_turn',
     stop_sequence: null,
-    usage: {
-      input_tokens: result.usage.inputTokens,
-      output_tokens: result.usage.outputTokens,
+    usage: anthropicUsage(result.usage),
+  };
+}
+
+function openAiChatUsage(usage: LocalUsage): unknown {
+  const promptTokens = openAiInputTokens(usage);
+  const completionTokens = usage.outputTokens;
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: usage.totalTokens ?? promptTokens + completionTokens,
+    prompt_tokens_details: {
+      cached_tokens: cachedInputTokens(usage),
+      audio_tokens: 0,
+    },
+    completion_tokens_details: {
+      reasoning_tokens: usage.reasoningOutputTokens ?? 0,
+      audio_tokens: 0,
+      accepted_prediction_tokens: 0,
+      rejected_prediction_tokens: 0,
     },
   };
+}
+
+function openAiResponsesUsage(usage: LocalUsage): unknown {
+  const inputTokens = openAiInputTokens(usage);
+  const outputTokens = usage.outputTokens;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: usage.totalTokens ?? inputTokens + outputTokens,
+    input_tokens_details: {
+      cached_tokens: cachedInputTokens(usage),
+    },
+    output_tokens_details: {
+      reasoning_tokens: usage.reasoningOutputTokens ?? 0,
+    },
+  };
+}
+
+interface OpenAiResponseObjectOptions {
+  readonly id: string;
+  readonly model: string;
+  readonly request: NormalizedRequest;
+  readonly status: 'in_progress' | 'completed';
+  readonly output: readonly unknown[];
+  readonly usage: unknown;
+  readonly completed: boolean;
+  readonly includeBilling?: boolean;
+}
+
+function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
+  const now = Math.floor(Date.now() / 1000);
+  const raw = asRecordPayload(options.request.raw);
+  return {
+    id: options.id,
+    object: 'response',
+    created_at: now,
+    status: options.status,
+    background: false,
+    ...(options.includeBilling === false ? {} : { billing: { payer: 'developer' } }),
+    completed_at: options.completed ? now : null,
+    error: null,
+    frequency_penalty: numberOrDefault(raw.frequency_penalty, 0),
+    incomplete_details: null,
+    instructions: typeof raw.instructions === 'string' ? raw.instructions : null,
+    max_output_tokens: options.request.maxTokens ?? null,
+    max_tool_calls: null,
+    model: options.model,
+    moderation: null,
+    output: options.output,
+    parallel_tool_calls: true,
+    presence_penalty: numberOrDefault(raw.presence_penalty, 0),
+    previous_response_id: typeof raw.previous_response_id === 'string' ? raw.previous_response_id : null,
+    prompt_cache_key: typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : null,
+    prompt_cache_retention: '24h',
+    reasoning: responseReasoning(raw.reasoning),
+    safety_identifier: typeof raw.safety_identifier === 'string' ? raw.safety_identifier : null,
+    service_tier: 'default',
+    store: raw.store === false ? false : true,
+    temperature: options.request.temperature ?? 1,
+    text: responseTextConfig(raw.text),
+    tool_choice: responseToolChoice(raw.tool_choice),
+    tools: Array.isArray(raw.tools) ? raw.tools : [],
+    top_logprobs: numberOrDefault(raw.top_logprobs, 0),
+    top_p: numberOrDefault(raw.top_p, 0.98),
+    truncation: typeof raw.truncation === 'string' ? raw.truncation : 'disabled',
+    usage: options.usage,
+    user: typeof raw.user === 'string' ? raw.user : null,
+    metadata: asRecordPayload(raw.metadata),
+  };
+}
+
+function openAiResponseReasoningItem(): unknown {
+  return {
+    id: `rs_${randomUUID()}`,
+    type: 'reasoning',
+    summary: [],
+  };
+}
+
+function openAiResponseMessageItem(id: string, text: string): unknown {
+  return {
+    id,
+    type: 'message',
+    status: 'completed',
+    content: [
+      {
+        type: 'output_text',
+        annotations: [],
+        logprobs: [],
+        text,
+      },
+    ],
+    phase: 'final_answer',
+    role: 'assistant',
+  };
+}
+
+function responseReasoning(value: unknown): unknown {
+  const reasoning = asRecordPayload(value);
+  return {
+    context: typeof reasoning.context === 'string' ? reasoning.context : 'current_turn',
+    effort: typeof reasoning.effort === 'string' ? reasoning.effort : 'medium',
+    summary: reasoning.summary ?? null,
+  };
+}
+
+function responseTextConfig(value: unknown): unknown {
+  const text = asRecordPayload(value);
+  const format = asRecordPayload(text.format);
+  return {
+    format: Object.keys(format).length > 0 ? format : { type: 'text' },
+    verbosity: typeof text.verbosity === 'string' ? text.verbosity : 'medium',
+  };
+}
+
+function responseToolChoice(value: unknown): unknown {
+  if (typeof value === 'string') return value;
+  if (value && typeof value === 'object') return value;
+  return 'auto';
+}
+
+function numberOrDefault(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function anthropicUsage(usage: LocalUsage): Record<string, number> {
+  return {
+    input_tokens: usage.inputTokens,
+    output_tokens: usage.outputTokens,
+    ...(usage.cacheCreationInputTokens !== undefined
+      ? { cache_creation_input_tokens: usage.cacheCreationInputTokens }
+      : {}),
+    ...(usage.cacheReadInputTokens !== undefined
+      ? { cache_read_input_tokens: usage.cacheReadInputTokens }
+      : {}),
+  };
+}
+
+function openAiInputTokens(usage: LocalUsage): number {
+  const anthropicCacheTokens =
+    (usage.cacheCreationInputTokens ?? 0) + (usage.cacheReadInputTokens ?? 0);
+  return anthropicCacheTokens > 0
+    ? usage.inputTokens + anthropicCacheTokens
+    : usage.inputTokens;
+}
+
+function cachedInputTokens(usage: LocalUsage): number {
+  return usage.cachedInputTokens
+    ?? (usage.cacheCreationInputTokens ?? 0) + (usage.cacheReadInputTokens ?? 0);
 }
 
 async function writeOpenAiChatStream(
@@ -296,51 +453,87 @@ async function writeOpenAiChatStream(
   request: NormalizedRequest,
 ): Promise<void> {
   writeSseHeaders(res);
-  const id = `chatcmpl_stream_${randomUUID()}`;
+  const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
   let base = {
     id,
     object: 'chat.completion.chunk',
     created,
     model: request.model,
-    system_fingerprint: 'local-oauth-cli',
+    service_tier: 'default',
+    system_fingerprint: null,
   };
   let streamedText = '';
+  let assistantStarted = false;
+  const toolState = new OpenAiChatToolStreamState(
+    res,
+    request.streamOptions,
+    () => assistantStarted,
+    () => {
+      assistantStarted = true;
+    },
+  );
   try {
-    await writeSseData(res, {
-      ...base,
-      choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
-    });
+    const ensureTextStarted = async (): Promise<void> => {
+      if (assistantStarted) return;
+      assistantStarted = true;
+      await writeSseData(res, openAiChatStreamChunk(
+        base,
+        [{ index: 0, delta: { role: 'assistant', content: '', refusal: null }, finish_reason: null }],
+        request.streamOptions,
+      ));
+    };
+    if (!hasToolDecisionSchema(request)) {
+      await ensureTextStarted();
+    }
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
+        await ensureTextStarted();
         streamedText += event.delta;
-        await writeSseData(res, {
-          ...base,
-          choices: [{ index: 0, delta: { content: event.delta }, finish_reason: null }],
-        });
+        await writeSseData(res, openAiChatStreamChunk(
+          base,
+          [{ index: 0, delta: { content: event.delta }, finish_reason: null }],
+          request.streamOptions,
+        ));
+        continue;
+      }
+      if (event.type === 'tool_call_delta') {
+        await toolState.write(base, event);
         continue;
       }
       const result = event.result;
       base = { ...base, model: result.model };
       if (result.toolCalls.length > 0) {
-        await writeOpenAiChatToolCallChunks(res, base, result.toolCalls);
-        await writeSseData(res, {
-          ...base,
-          choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-        });
+        await toolState.finish(base, result.toolCalls);
+        await writeSseData(res, openAiChatStreamChunk(
+          base,
+          [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+          request.streamOptions,
+        ));
       } else {
+        await ensureTextStarted();
         if (!streamedText && result.text) {
           for (const chunk of chunkText(result.text)) {
-            await writeSseData(res, {
-              ...base,
-              choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-            });
+            await writeSseData(res, openAiChatStreamChunk(
+              base,
+              [{ index: 0, delta: { content: chunk }, finish_reason: null }],
+              request.streamOptions,
+            ));
           }
         }
+        await writeSseData(res, openAiChatStreamChunk(
+          base,
+          [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          request.streamOptions,
+        ));
+      }
+      if (request.streamOptions.includeUsage) {
         await writeSseData(res, {
           ...base,
-          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          choices: [],
+          usage: openAiChatUsage(result.usage),
+          ...(request.streamOptions.includeObfuscation ? { obfuscation: randomObfuscation() } : {}),
         });
       }
     }
@@ -353,26 +546,79 @@ async function writeOpenAiChatStream(
   }
 }
 
-async function writeOpenAiChatToolCallChunks(
-  res: ServerResponse,
+function openAiChatStreamChunk(
   base: Record<string, unknown>,
-  toolCalls: readonly LocalToolCall[],
-): Promise<void> {
-  for (const [index, call] of toolCalls.entries()) {
-    await writeSseData(res, {
-      ...base,
-      choices: [
+  choices: readonly unknown[],
+  streamOptions: NormalizedRequest['streamOptions'],
+): unknown {
+  return {
+    ...base,
+    choices,
+    ...(streamOptions.includeUsage ? { usage: null } : {}),
+    ...(streamOptions.includeObfuscation ? { obfuscation: randomObfuscation() } : {}),
+  };
+}
+
+class OpenAiChatToolStreamState {
+  private readonly streamedArguments = new Map<number, string>();
+  private readonly started = new Set<number>();
+
+  constructor(
+    private readonly res: ServerResponse,
+    private readonly streamOptions: NormalizedRequest['streamOptions'],
+    private readonly hasAssistantStarted: () => boolean,
+    private readonly markAssistantStarted: () => void,
+  ) {}
+
+  async write(
+    base: Record<string, unknown>,
+    event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>,
+  ): Promise<void> {
+    await this.ensureStarted(base, event.index, event.id, event.name);
+    if (event.argumentsDelta) {
+      await this.writeArgumentsChunk(base, event.index, event.argumentsDelta);
+    }
+  }
+
+  async finish(
+    base: Record<string, unknown>,
+    toolCalls: readonly LocalToolCall[],
+  ): Promise<void> {
+    for (const [index, call] of toolCalls.entries()) {
+      await this.ensureStarted(base, index, call.id, call.name);
+      const rest = missingToolCallArgumentDelta(
+        this.streamedArguments.get(index) ?? '',
+        call,
+      );
+      if (rest) await this.writeArgumentsChunk(base, index, rest);
+    }
+  }
+
+  private async ensureStarted(
+    base: Record<string, unknown>,
+    index: number,
+    id: string | undefined,
+    name: string | undefined,
+  ): Promise<void> {
+    if (this.started.has(index)) return;
+    const includeAssistantStart = !this.hasAssistantStarted();
+    if (includeAssistantStart) this.markAssistantStarted();
+    this.started.add(index);
+    await writeSseData(this.res, openAiChatStreamChunk(
+      base,
+      [
         {
           index: 0,
           delta: {
+            ...(includeAssistantStart ? { role: 'assistant', content: null, refusal: null } : {}),
             tool_calls: [
               {
                 index,
-                id: call.id,
+                id: id ?? `call_${index + 1}`,
                 type: 'function',
                 function: {
-                  name: call.name,
-                  arguments: call.arguments,
+                  name: name ?? 'tool',
+                  arguments: '',
                 },
               },
             ],
@@ -380,7 +626,39 @@ async function writeOpenAiChatToolCallChunks(
           finish_reason: null,
         },
       ],
-    });
+      this.streamOptions,
+    ));
+  }
+
+  private async writeArgumentsChunk(
+    base: Record<string, unknown>,
+    index: number,
+    argumentsDelta: string,
+  ): Promise<void> {
+    this.streamedArguments.set(
+      index,
+      `${this.streamedArguments.get(index) ?? ''}${argumentsDelta}`,
+    );
+    await writeSseData(this.res, openAiChatStreamChunk(
+      base,
+      [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index,
+                function: {
+                  arguments: argumentsDelta,
+                },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+      this.streamOptions,
+    ));
   }
 }
 
@@ -391,42 +669,74 @@ async function writeOpenAiResponsesStream(
 ): Promise<void> {
   writeSseHeaders(res);
   const responseId = `resp_stream_${randomUUID()}`;
+  const reasoningItem = openAiResponseReasoningItem();
   const itemId = `msg_${randomUUID()}`;
   let textStarted = false;
+  let reasoningEmitted = false;
   let streamedText = '';
   let finalOutput: unknown[] = [];
+  let sequenceNumber = -1;
+  const writeResponseEvent: OpenAiResponseEventWriter = async (event, payload) => {
+    sequenceNumber += 1;
+    await writeSseEvent(res, event, {
+      sequence_number: sequenceNumber,
+      ...payload,
+    });
+  };
+  const createdResponse = openAiResponseObject({
+    id: responseId,
+    model: request.model,
+    request,
+    status: 'in_progress',
+    output: [],
+    usage: null,
+    completed: false,
+    includeBilling: false,
+  });
+  const toolState = new OpenAiResponsesToolStreamState(writeResponseEvent);
 
   try {
-    await writeSseEvent(res, 'response.created', {
+    await writeResponseEvent('response.created', {
       type: 'response.created',
-      response: {
-        id: responseId,
-        object: 'response',
-        created_at: Math.floor(Date.now() / 1000),
-        status: 'in_progress',
-        model: request.model,
-        output: [],
-      },
+      response: createdResponse,
+    });
+    await writeResponseEvent('response.in_progress', {
+      type: 'response.in_progress',
+      response: createdResponse,
     });
 
     const ensureTextStarted = async (): Promise<void> => {
       if (textStarted) return;
+      if (!reasoningEmitted) {
+        reasoningEmitted = true;
+        await writeResponseEvent('response.output_item.added', {
+          type: 'response.output_item.added',
+          output_index: 0,
+          item: reasoningItem,
+        });
+        await writeResponseEvent('response.output_item.done', {
+          type: 'response.output_item.done',
+          output_index: 0,
+          item: reasoningItem,
+        });
+      }
       textStarted = true;
-      await writeSseEvent(res, 'response.output_item.added', {
+      await writeResponseEvent('response.output_item.added', {
         type: 'response.output_item.added',
-        output_index: 0,
+        output_index: 1,
         item: {
           id: itemId,
           type: 'message',
           status: 'in_progress',
-          role: 'assistant',
           content: [],
+          phase: 'final_answer',
+          role: 'assistant',
         },
       });
-      await writeSseEvent(res, 'response.content_part.added', {
+      await writeResponseEvent('response.content_part.added', {
         type: 'response.content_part.added',
         item_id: itemId,
-        output_index: 0,
+        output_index: 1,
         content_index: 0,
         part: { type: 'output_text', text: '', annotations: [] },
       });
@@ -437,131 +747,189 @@ async function writeOpenAiResponsesStream(
         if (!event.delta) continue;
         await ensureTextStarted();
         streamedText += event.delta;
-        await writeSseEvent(res, 'response.output_text.delta', {
+        await writeResponseEvent('response.output_text.delta', {
           type: 'response.output_text.delta',
           item_id: itemId,
-          output_index: 0,
+          output_index: 1,
           content_index: 0,
           delta: event.delta,
+          logprobs: [],
         });
+        continue;
+      }
+      if (event.type === 'tool_call_delta') {
+        await toolState.write(event);
         continue;
       }
 
       const result = event.result;
       if (result.toolCalls.length > 0) {
-        finalOutput = await writeOpenAiResponseToolCallChunks(res, result.toolCalls);
+        finalOutput = await toolState.finish(result.toolCalls);
       } else {
         await ensureTextStarted();
         if (!streamedText && result.text) {
           for (const chunk of chunkText(result.text)) {
             streamedText += chunk;
-            await writeSseEvent(res, 'response.output_text.delta', {
+            await writeResponseEvent('response.output_text.delta', {
               type: 'response.output_text.delta',
               item_id: itemId,
-              output_index: 0,
+              output_index: 1,
               content_index: 0,
               delta: chunk,
+              logprobs: [],
             });
           }
         }
-        await writeSseEvent(res, 'response.output_text.done', {
+        await writeResponseEvent('response.output_text.done', {
           type: 'response.output_text.done',
           item_id: itemId,
-          output_index: 0,
+          output_index: 1,
           content_index: 0,
+          logprobs: [],
           text: result.text,
         });
-        await writeSseEvent(res, 'response.content_part.done', {
+        await writeResponseEvent('response.content_part.done', {
           type: 'response.content_part.done',
           item_id: itemId,
-          output_index: 0,
+          output_index: 1,
           content_index: 0,
-          part: { type: 'output_text', text: result.text, annotations: [] },
+          part: { type: 'output_text', text: result.text, annotations: [], logprobs: [] },
         });
-        const item = {
-          id: itemId,
-          type: 'message',
-          status: 'completed',
-          role: 'assistant',
-          content: [{ type: 'output_text', text: result.text, annotations: [] }],
-        };
-        finalOutput = [item];
-        await writeSseEvent(res, 'response.output_item.done', {
+        const item = openAiResponseMessageItem(itemId, result.text);
+        finalOutput = [reasoningItem, item];
+        await writeResponseEvent('response.output_item.done', {
           type: 'response.output_item.done',
-          output_index: 0,
+          output_index: 1,
           item,
         });
       }
-      await writeSseEvent(res, 'response.completed', {
+      await writeResponseEvent('response.completed', {
         type: 'response.completed',
-        response: openAiResponsesCompletedResponse(responseId, result, finalOutput),
+        response: openAiResponsesCompletedResponse(responseId, result, request, finalOutput),
       });
     }
     res.write('data: [DONE]\n\n');
   } catch (err) {
-    await writeSseEvent(res, 'error', streamErrorPayload(err));
+    await writeResponseEvent('error', asRecordPayload(streamErrorPayload(err)));
     res.write('data: [DONE]\n\n');
   } finally {
     res.end();
   }
 }
 
-async function writeOpenAiResponseToolCallChunks(
-  res: ServerResponse,
-  toolCalls: readonly LocalToolCall[],
-): Promise<unknown[]> {
-  const output: unknown[] = [];
-  for (const [index, call] of toolCalls.entries()) {
-    const item = asObjectPayload(openAiResponseToolCall(call));
-    output.push(item);
-    await writeSseEvent(res, 'response.output_item.added', {
+interface OpenAiResponseToolItemState {
+  readonly itemId: string;
+  callId: string;
+  name: string;
+  arguments: string;
+}
+
+type OpenAiResponseEventWriter = (event: string, payload: Record<string, unknown>) => Promise<void>;
+
+class OpenAiResponsesToolStreamState {
+  private readonly items = new Map<number, OpenAiResponseToolItemState>();
+
+  constructor(private readonly writeResponseEvent: OpenAiResponseEventWriter) {}
+
+  async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
+    const state = await this.ensureStarted(
+      event.index,
+      event.id ?? `call_${event.index + 1}`,
+      event.name ?? 'tool',
+    );
+    if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
+  }
+
+  async finish(toolCalls: readonly LocalToolCall[]): Promise<unknown[]> {
+    const output: unknown[] = [];
+    for (const [index, call] of toolCalls.entries()) {
+      const state = await this.ensureStarted(index, call.id, call.name);
+      const rest = missingToolCallArgumentDelta(state.arguments, call);
+      if (rest) await this.writeArgumentsDelta(index, state, rest);
+      const item = {
+        id: state.itemId,
+        type: 'function_call',
+        status: 'completed',
+        call_id: state.callId,
+        name: state.name,
+        arguments: call.arguments,
+      };
+      output.push(item);
+      await this.writeResponseEvent('response.function_call_arguments.done', {
+        type: 'response.function_call_arguments.done',
+        output_index: index,
+        item_id: state.itemId,
+        arguments: call.arguments,
+      });
+      await this.writeResponseEvent('response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: index,
+        item,
+      });
+    }
+    return output;
+  }
+
+  private async ensureStarted(
+    index: number,
+    callId: string,
+    name: string,
+  ): Promise<OpenAiResponseToolItemState> {
+    const existing = this.items.get(index);
+    if (existing) return existing;
+    const state: OpenAiResponseToolItemState = {
+      itemId: `fc_${randomUUID()}`,
+      callId,
+      name,
+      arguments: '',
+    };
+    this.items.set(index, state);
+    await this.writeResponseEvent('response.output_item.added', {
       type: 'response.output_item.added',
       output_index: index,
       item: {
-        ...item,
+        id: state.itemId,
+        type: 'function_call',
+        status: 'in_progress',
+        call_id: state.callId,
+        name: state.name,
         arguments: '',
       },
     });
-    await writeSseEvent(res, 'response.function_call_arguments.delta', {
+    return state;
+  }
+
+  private async writeArgumentsDelta(
+    index: number,
+    state: OpenAiResponseToolItemState,
+    delta: string,
+  ): Promise<void> {
+    state.arguments += delta;
+    await this.writeResponseEvent('response.function_call_arguments.delta', {
       type: 'response.function_call_arguments.delta',
       output_index: index,
-      item_id: readObjectField(item, 'id'),
-      delta: call.arguments,
-    });
-    await writeSseEvent(res, 'response.function_call_arguments.done', {
-      type: 'response.function_call_arguments.done',
-      output_index: index,
-      item_id: readObjectField(item, 'id'),
-      arguments: call.arguments,
-    });
-    await writeSseEvent(res, 'response.output_item.done', {
-      type: 'response.output_item.done',
-      output_index: index,
-      item,
+      item_id: state.itemId,
+      delta,
     });
   }
-  return output;
 }
 
 function openAiResponsesCompletedResponse(
   responseId: string,
   result: LocalCompletionResult,
+  request: NormalizedRequest,
   output: unknown[],
 ): unknown {
-  return {
+  return openAiResponseObject({
     id: responseId,
-    object: 'response',
-    created_at: Math.floor(Date.now() / 1000),
-    status: 'completed',
     model: result.model,
+    request,
+    status: 'completed',
     output,
-    output_text: result.toolCalls.length > 0 ? '' : result.text,
-    usage: {
-      input_tokens: result.usage.inputTokens,
-      output_tokens: result.usage.outputTokens,
-      total_tokens: result.usage.inputTokens + result.usage.outputTokens,
-    },
-  };
+    usage: openAiResponsesUsage(result.usage),
+    completed: true,
+    includeBilling: false,
+  });
 }
 
 async function writeAnthropicMessagesStream(
@@ -572,6 +940,7 @@ async function writeAnthropicMessagesStream(
   writeSseHeaders(res);
   let textStarted = false;
   let streamedText = '';
+  const toolState = new AnthropicToolUseStreamState(res);
 
   try {
     await writeSseEvent(res, 'message_start', {
@@ -613,10 +982,14 @@ async function writeAnthropicMessagesStream(
         });
         continue;
       }
+      if (event.type === 'tool_call_delta') {
+        await toolState.write(event);
+        continue;
+      }
 
       const result = event.result;
       if (result.toolCalls.length > 0) {
-        await writeAnthropicToolUseChunks(res, result.toolCalls);
+        await toolState.finish(result.toolCalls);
       } else {
         await ensureTextStarted();
         if (!streamedText && result.text) {
@@ -662,32 +1035,73 @@ async function writeAnthropicMessagesStream(
   }
 }
 
-async function writeAnthropicToolUseChunks(
-  res: ServerResponse,
-  toolCalls: readonly LocalToolCall[],
-): Promise<void> {
-  for (const [index, call] of toolCalls.entries()) {
-    await writeSseEvent(res, 'content_block_start', {
+interface AnthropicToolUseState {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+class AnthropicToolUseStreamState {
+  private readonly states = new Map<number, AnthropicToolUseState>();
+
+  constructor(private readonly res: ServerResponse) {}
+
+  async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
+    const state = await this.ensureStarted(
+      event.index,
+      event.id ?? `call_${event.index + 1}`,
+      event.name ?? 'tool',
+    );
+    if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
+  }
+
+  async finish(toolCalls: readonly LocalToolCall[]): Promise<void> {
+    for (const [index, call] of toolCalls.entries()) {
+      const state = await this.ensureStarted(index, call.id, call.name);
+      const rest = missingToolCallArgumentDelta(state.arguments, call);
+      if (rest) await this.writeArgumentsDelta(index, state, rest);
+      await writeSseEvent(this.res, 'content_block_stop', {
+        type: 'content_block_stop',
+        index,
+      });
+    }
+  }
+
+  private async ensureStarted(
+    index: number,
+    id: string,
+    name: string,
+  ): Promise<AnthropicToolUseState> {
+    const existing = this.states.get(index);
+    if (existing) return existing;
+    const state = { id, name, arguments: '' };
+    this.states.set(index, state);
+    await writeSseEvent(this.res, 'content_block_start', {
       type: 'content_block_start',
       index,
       content_block: {
         type: 'tool_use',
-        id: call.id,
-        name: call.name,
+        id: state.id,
+        name: state.name,
         input: {},
       },
     });
-    await writeSseEvent(res, 'content_block_delta', {
+    return state;
+  }
+
+  private async writeArgumentsDelta(
+    index: number,
+    state: AnthropicToolUseState,
+    delta: string,
+  ): Promise<void> {
+    state.arguments += delta;
+    await writeSseEvent(this.res, 'content_block_delta', {
       type: 'content_block_delta',
       index,
       delta: {
         type: 'input_json_delta',
-        partial_json: call.arguments,
+        partial_json: delta,
       },
-    });
-    await writeSseEvent(res, 'content_block_stop', {
-      type: 'content_block_stop',
-      index,
     });
   }
 }
@@ -775,7 +1189,6 @@ async function writeSseData(res: ServerResponse, payload: unknown): Promise<void
   if (!res.write(line)) {
     await new Promise<void>((resolve) => res.once('drain', resolve));
   }
-  await new Promise<void>((resolve) => setTimeout(resolve, 1));
 }
 
 function chunkText(text: string): string[] {
@@ -787,13 +1200,11 @@ function chunkText(text: string): string[] {
   return chunks;
 }
 
-function readObjectField(value: unknown, key: string): string | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const field = (value as Record<string, unknown>)[key];
-  return typeof field === 'string' ? field : undefined;
+function randomObfuscation(): string {
+  return randomUUID().replace(/-/g, '').slice(0, 12);
 }
 
-function asObjectPayload(value: unknown): Record<string, unknown> {
+function asRecordPayload(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
 }

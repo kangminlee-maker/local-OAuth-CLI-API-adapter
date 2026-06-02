@@ -8,29 +8,20 @@ import type {
 import { estimateTokens } from './types.js';
 
 export function buildPrompt(request: NormalizedRequest): string {
-  const hasCallableTools = hasToolDecisionSchema(request);
-  const mode = hasCallableTools
-    ? toolModeInstructions(request)
-    : request.jsonMode
-    ? 'Return only valid JSON. Do not wrap it in Markdown.'
-    : 'Return only the assistant response text.';
   const messages = request.messages.map((message) => [
     `<${message.role}>`,
     renderMessageContent(message),
     `</${message.role}>`,
   ].join('\n')).join('\n\n');
   const maxTokens = request.maxTokens
-    ? `\nApproximate max output tokens: ${request.maxTokens}`
+    ? `Max output tokens: ${request.maxTokens}`
     : '';
   return [
-    'Handle this local API-compatible request.',
-    mode,
-    'Do not run commands, edit files, browse, or call host tools.',
-    'If image references appear in a message, inspect the attached native image inputs for the visual content.',
+    modeInstructions(request),
     maxTokens,
-    '',
+    imageInstructions(request),
     messages,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 export function outputSchemaFor(request: NormalizedRequest): unknown {
@@ -85,48 +76,62 @@ export function usageFor(
   return {
     inputTokens: estimateTokens([input, imageInput].filter(Boolean).join('\n')),
     outputTokens: estimateTokens(output),
+    source: 'estimated',
   };
 }
 
 export function baseInstructions(): string {
   return [
-    'You are a local API-compatible text generation backend.',
-    'Follow the current request only.',
-    'Do not retain or reuse prior request content.',
-    'Do not execute commands, edit files, browse, or call tools unless explicitly supported by this proxy.',
-  ].join('\n');
+    'Current proxy request only.',
+    'Treat it as a standalone provider API completion.',
+    'Do not use or mention host tools, commands, files, git status, browsing, memory, or inability to inspect them.',
+  ].join(' ');
 }
 
 export function developerInstructions(): string {
   return [
-    'The caller expects an API-shaped response from the wrapper.',
-    'Return exactly the content requested by the current turn.',
-    'For JSON mode, return valid JSON only.',
-  ].join('\n');
+    'Wrapper builds API shape only.',
+    'Follow only the tagged request messages.',
+    'Return requested content only.',
+    'No preface, caveat, file-status note, or extra heading unless requested.',
+    'Preserve exact counts, formats, and word limits.',
+    'JSON mode means JSON only.',
+  ].join(' ');
+}
+
+function modeInstructions(request: NormalizedRequest): string {
+  if (hasToolDecisionSchema(request)) return toolModeInstructions(request);
+  if (request.jsonMode) return 'Valid JSON only. No Markdown.';
+  return 'Return only the assistant response text.';
 }
 
 function toolModeInstructions(request: NormalizedRequest): string {
   const choice = request.toolChoice;
   const choiceText = choice.type === 'tool'
-    ? `You must request the tool named "${choice.name}" if a tool call is needed.`
+    ? `Use tool "${choice.name}" if calling.`
     : choice.type === 'required'
-    ? 'You must request at least one tool call unless the conversation already contains sufficient tool results.'
-    : 'Request tool calls only when needed. If tool results are already provided and sufficient, answer normally.';
+    ? 'Call a tool unless prior tool results answer.'
+    : 'Call tools only when needed; otherwise answer.';
   return [
-    'You may request client-provided tools, but you must not execute them yourself.',
+    'Schema JSON only.',
     choiceText,
-    'Return JSON matching the provided schema.',
-    'Use status "tool_calls" to ask the client to run tools.',
-    'Use status "message" to return a final assistant response.',
-    'For every tool call, set arguments to a JSON string, not an object.',
-    '',
-    'Available tools:',
+    'Tool: {"status":"tool_calls","text":"","toolCalls":[{"id":"call_1","name":"tool","arguments":"{}"}]}.',
+    'Answer: {"status":"message","text":"answer","toolCalls":[]}.',
+    'arguments is a JSON string.',
+    'Tools:',
     JSON.stringify(request.tools.map((tool) => ({
       name: tool.name,
       description: tool.description ?? '',
       input_schema: tool.inputSchema ?? {},
-    })), null, 2),
+    }))),
   ].join('\n');
+}
+
+function imageInstructions(request: NormalizedRequest): string {
+  const hasImages = request.messages.some((message) => (message.images ?? []).length > 0);
+  return hasImages
+    ? 'Use attached images.'
+    : '';
 }
 
 function toolDecisionSchema(): Record<string, unknown> {

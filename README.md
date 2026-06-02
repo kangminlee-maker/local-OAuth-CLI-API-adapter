@@ -54,11 +54,23 @@ Run a comparison benchmark against direct provider APIs:
 
 ```bash
 pnpm bench:api
+pnpm bench:api -- --repeats 3 --quality-repeats 3
+pnpm bench:api -- --semantic-quality-repeats 1 --semantic-quality-targets=proxy --min-semantic-quality=95
+pnpm bench:api -- --include-multimodal=true
+pnpm bench:api -- --output /tmp/api-bench.json
+pnpm bench:api -- --baseline /tmp/api-bench.json --regression-targets=proxy
 ```
 
 The benchmark loads `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment
-or `.env`, starts both local proxy backends, and compares exactness plus latency
-against direct API calls. Defaults:
+or `.env`, starts both local proxy backends, and compares schema exactness,
+response exactness, stream event shape, optional repeated quality samples, and
+latency against direct API calls. `--semantic-quality-repeats` additionally uses
+an OpenAI JSON-schema judge to score requirement fit, semantic relevance,
+conciseness, and direct-provider similarity; proxy targets also get cached direct
+provider reference outputs when the matching API key is available. Use
+`--min-semantic-quality=95` to make semantic quality a hard gate. With
+`--baseline`, proxy rows are compared against a previous summary by default and
+latency/quality regressions make the command fail. Defaults:
 
 - OpenAI API: `gpt-5.5`
 - Anthropic API Opus: `claude-opus-4-8`
@@ -82,7 +94,9 @@ Supported subset:
 - `POST /v1/messages`
 - non-stream text generation
 - live SSE text deltas from Codex `app-server` and Claude Code
-- synthetic SSE streaming for tool-call responses after the CLI decision completes
+- live SSE tool-call argument deltas when the backend streams structured output,
+  with synthetic completion of any remaining arguments after the CLI decision
+  completes
 - OpenAI JSON object/schema output where supported by the backend
 - OpenAI Chat tool calls and tool-result follow-up messages
 - OpenAI Responses function calls and function-call outputs
@@ -90,14 +104,15 @@ Supported subset:
 - image inputs for OpenAI Chat `image_url`, OpenAI Responses `input_image`, and
   Anthropic Messages `image` blocks
 - image sources as remote URLs, data URLs/base64, and local `file://` URLs
+- provider token usage details where the CLI exposes them, including cached and
+  reasoning-token breakdowns where available; estimated usage is used only as a
+  fallback
 
 Not yet supported:
 
-- partial tool-call argument streaming from the underlying CLI
 - provider `file_id` image sources, because the local CLI proxy cannot read the
   provider Files API storage for the caller
 - image/audio output generation
-- exact provider token usage
 - full API compatibility
 
 Example:

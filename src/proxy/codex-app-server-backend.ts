@@ -16,8 +16,10 @@ import type {
   LocalCliBackend,
   LocalCompletionResult,
   LocalStreamEvent,
+  LocalUsage,
   NormalizedRequest,
 } from './types.js';
+import { ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface CodexAppServerBackendOptions {
   readonly command?: string;
@@ -38,12 +40,20 @@ interface TurnWaiter {
   readonly threadId: string;
   readonly turnId: string;
   text: string;
+  usage?: LocalUsage;
   onTextDelta?: (delta: string) => void;
-  resolve: (value: string) => void;
+  resolve: (value: TurnResult) => void;
   reject: (err: Error) => void;
 }
 
 type JsonRpcMessage = Record<string, unknown>;
+
+interface TurnResult {
+  readonly text: string;
+  readonly usage?: LocalUsage;
+}
+
+const USAGE_NOTIFICATION_GRACE_MS = 100;
 
 export class CodexAppServerBackend implements LocalCliBackend {
   readonly name = 'codex-app-server';
@@ -83,13 +93,19 @@ export class CodexAppServerBackend implements LocalCliBackend {
     signal?: AbortSignal,
   ): AsyncIterable<LocalStreamEvent> {
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const shouldStreamText = !hasToolDecisionSchema(request);
+    const toolExtractor = hasToolDecisionSchema(request)
+      ? new ToolCallDeltaExtractor()
+      : null;
     const run = this.runTurn(
       request,
       signal,
-      shouldStreamText
-        ? (delta) => queue.push({ type: 'text_delta', delta })
-        : undefined,
+      (delta) => {
+        if (toolExtractor) {
+          for (const event of toolExtractor.push(delta)) queue.push(event);
+        } else {
+          queue.push({ type: 'text_delta', delta });
+        }
+      },
     )
       .then((result) => queue.push({ type: 'completed', result }))
       .catch((err: Error) => queue.fail(err))
@@ -110,23 +126,14 @@ export class CodexAppServerBackend implements LocalCliBackend {
   ): Promise<LocalCompletionResult> {
     const startedAt = Date.now();
     await this.ensureStarted();
-    const thread = await this.send('thread/start', {
-      cwd: this.cwd,
-      runtimeWorkspaceRoots: [this.cwd],
-      approvalPolicy: 'never',
-      sandbox: 'read-only',
-      ephemeral: true,
-      baseInstructions: baseInstructions(),
-      developerInstructions: developerInstructions(),
-      experimentalRawEvents: false,
-      persistExtendedHistory: false,
-      config: {
-        model_reasoning_effort: this.reasoningEffort,
-      },
+    const prompt = buildPrompt(request);
+    const threadPromise = this.startThread();
+    let threadId: string | null = null;
+    let preparedInput: Awaited<ReturnType<typeof prepareCodexInput>> | null = null;
+    const preparedInputPromise = prepareCodexInput(request, prompt).then((value) => {
+      preparedInput = value;
+      return value;
     });
-    const threadId = readPath<string>(thread, ['result', 'thread', 'id']);
-    if (!threadId) throw new Error('codex app-server did not return a thread id');
-
     let turnId: string | null = null;
     const abort = async (): Promise<void> => {
       if (!turnId) return;
@@ -141,34 +148,32 @@ export class CodexAppServerBackend implements LocalCliBackend {
     }
 
     try {
-      const preparedInput = await prepareCodexInput(request, buildPrompt(request));
-      try {
-        const turn = await this.send('turn/start', {
-          threadId,
-          input: preparedInput.input,
-          model: this.modelOverrideFor(request.model),
-          effort: this.reasoningEffort,
-          outputSchema: outputSchemaFor(request),
-        });
-        turnId = readPath<string>(turn, ['result', 'turn', 'id']);
-        if (!turnId) throw new Error('codex app-server did not return a turn id');
-        const text = await this.waitForTurn(threadId, turnId, signal, onTextDelta);
-        const parsed = parseBackendOutput(request, text);
-        const usage = usageFor(request, parsed.text, parsed.toolCalls);
-        return {
-          id: `local_${randomUUID()}`,
-          model: request.model,
-          text: parsed.text,
-          toolCalls: parsed.toolCalls,
-          usage,
-          latencyMs: Date.now() - startedAt,
-        };
-      } finally {
-        await preparedInput.cleanup();
-      }
+      [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
+      const turn = await this.send('turn/start', {
+        threadId,
+        input: preparedInput.input,
+        model: this.modelOverrideFor(request.model),
+        effort: this.reasoningEffort,
+        outputSchema: outputSchemaFor(request),
+      });
+      turnId = readPath<string>(turn, ['result', 'turn', 'id']);
+      if (!turnId) throw new Error('codex app-server did not return a turn id');
+      const turnResult = await this.waitForTurn(threadId, turnId, signal, onTextDelta);
+      const parsed = parseBackendOutput(request, turnResult.text);
+      const usage = turnResult.usage ?? usageFor(request, parsed.text, parsed.toolCalls);
+      return {
+        id: `local_${randomUUID()}`,
+        model: request.model,
+        text: parsed.text,
+        toolCalls: parsed.toolCalls,
+        usage,
+        latencyMs: Date.now() - startedAt,
+      };
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
-      await this.send('thread/archive', { threadId }).catch(() => undefined);
+      if (preparedInput) await preparedInput.cleanup();
+      else void preparedInputPromise.then((value) => value.cleanup()).catch(() => undefined);
+      if (threadId) this.archiveThread(threadId);
     }
   }
 
@@ -236,6 +241,30 @@ export class CodexAppServerBackend implements LocalCliBackend {
       },
     });
     this.notify('initialized', {});
+  }
+
+  private async startThread(): Promise<string> {
+    const thread = await this.send('thread/start', {
+      cwd: this.cwd,
+      runtimeWorkspaceRoots: [this.cwd],
+      approvalPolicy: 'never',
+      sandbox: 'read-only',
+      ephemeral: true,
+      baseInstructions: baseInstructions(),
+      developerInstructions: developerInstructions(),
+      experimentalRawEvents: false,
+      persistExtendedHistory: false,
+      config: {
+        model_reasoning_effort: this.reasoningEffort,
+      },
+    });
+    const threadId = readPath<string>(thread, ['result', 'thread', 'id']);
+    if (!threadId) throw new Error('codex app-server did not return a thread id');
+    return threadId;
+  }
+
+  private archiveThread(threadId: string): void {
+    void this.send('thread/archive', { threadId }).catch(() => undefined);
   }
 
   private send(method: string, params: unknown): Promise<JsonRpcMessage> {
@@ -322,6 +351,15 @@ export class CodexAppServerBackend implements LocalCliBackend {
       }
       return;
     }
+    if (method === 'thread/tokenUsage/updated') {
+      const threadId = typeof data.threadId === 'string' ? data.threadId : null;
+      const turnId = typeof data.turnId === 'string' ? data.turnId : null;
+      if (!threadId || !turnId) return;
+      const usage = usageFromCodexTokenUsage(data.tokenUsage);
+      const waiter = usage ? this.turnWaiters.get(`${threadId}:${turnId}`) : null;
+      if (waiter && usage) waiter.usage = usage;
+      return;
+    }
     if (method === 'turn/completed') {
       const threadId = typeof data.threadId === 'string' ? data.threadId : null;
       const turn = asRecord(data.turn);
@@ -330,11 +368,21 @@ export class CodexAppServerBackend implements LocalCliBackend {
       const key = `${threadId}:${turnId}`;
       const waiter = this.turnWaiters.get(key);
       if (!waiter) return;
-      this.turnWaiters.delete(key);
       if (turn?.status === 'failed') {
+        this.turnWaiters.delete(key);
         waiter.reject(new Error(JSON.stringify(turn.error ?? 'turn failed')));
       } else {
-        waiter.resolve(waiter.text.trim());
+        const resolveTurn = (): void => {
+          const current = this.turnWaiters.get(key);
+          if (!current) return;
+          this.turnWaiters.delete(key);
+          current.resolve({
+            text: current.text.trim(),
+            usage: current.usage,
+          });
+        };
+        if (waiter.usage) resolveTurn();
+        else setTimeout(resolveTurn, USAGE_NOTIFICATION_GRACE_MS);
       }
     }
   }
@@ -344,7 +392,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
     turnId: string,
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
-  ): Promise<string> {
+  ): Promise<TurnResult> {
     const key = `${threadId}:${turnId}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -413,7 +461,40 @@ function readPath<T>(value: unknown, path: readonly string[]): T | null {
   return current as T;
 }
 
+export function usageFromCodexTokenUsage(value: unknown): LocalUsage | null {
+  const usage = asRecord(value);
+  const last = asRecord(usage?.last);
+  if (!last) return null;
+  const totalTokens = readNumber(last.totalTokens);
+  const inputTokens = readNumber(last.inputTokens);
+  const outputTokens = readNumber(last.outputTokens);
+  const cachedInputTokens = readNumber(last.cachedInputTokens);
+  const reasoningOutputTokens = readNumber(last.reasoningOutputTokens);
+  if (
+    totalTokens === 0
+    && inputTokens === 0
+    && outputTokens === 0
+    && cachedInputTokens === 0
+    && reasoningOutputTokens === 0
+  ) {
+    return null;
+  }
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    cachedInputTokens,
+    reasoningOutputTokens,
+    source: 'provider',
+    raw: value,
+  };
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
+}
+
+function readNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }

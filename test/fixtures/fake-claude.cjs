@@ -4,6 +4,18 @@ const readline = require('node:readline');
 const args = process.argv.slice(2);
 const isPersistent = args.includes('--input-format') && args.includes('stream-json');
 const hasSchema = args.includes('--json-schema');
+const systemPromptIndex = args.indexOf('--system-prompt');
+
+if (
+  systemPromptIndex === -1
+  || !args[systemPromptIndex + 1]?.includes('API completion backend')
+  || !args.includes('--disable-slash-commands')
+  || !args.includes('--strict-mcp-config')
+  || args[args.indexOf('--mcp-config') + 1] !== '{"mcpServers":{}}'
+) {
+  process.stderr.write(`missing Claude context isolation args: ${args.join(' ')}\n`);
+  process.exit(2);
+}
 
 function write(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -48,8 +60,8 @@ function emitText(text) {
     session_id: 'fake_session',
     usage: {
       input_tokens: 3,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 2,
+      cache_read_input_tokens: 1,
       output_tokens: text.length,
     },
   });
@@ -67,7 +79,30 @@ function emitStructured() {
       },
     ],
   };
+  const streamed = JSON.stringify(structured_output);
   write({ type: 'system', subtype: 'init', session_id: 'fake_session' });
+  write({ type: 'stream_event', event: { type: 'message_start' }, session_id: 'fake_session' });
+  write({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    },
+    session_id: 'fake_session',
+  });
+  for (const delta of streamed.match(/.{1,12}/g) ?? []) {
+    write({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: delta },
+      },
+      session_id: 'fake_session',
+    });
+  }
+  write({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 }, session_id: 'fake_session' });
   write({
     type: 'result',
     subtype: 'success',

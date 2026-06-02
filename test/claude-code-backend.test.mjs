@@ -30,6 +30,12 @@ test('ClaudeCodeBackend streams persistent text deltas', async () => {
     );
     const completed = events.find((event) => event.type === 'completed');
     assert.equal(completed.result.text, 'OK');
+    assert.equal(completed.result.usage.inputTokens, 3);
+    assert.equal(completed.result.usage.outputTokens, 2);
+    assert.equal(completed.result.usage.cachedInputTokens, 3);
+    assert.equal(completed.result.usage.cacheCreationInputTokens, 2);
+    assert.equal(completed.result.usage.cacheReadInputTokens, 1);
+    assert.equal(completed.result.usage.totalTokens, 8);
   } finally {
     await backend.close();
   }
@@ -71,6 +77,30 @@ test('ClaudeCodeBackend parses structured tool decisions from one-shot schema ou
     assert.equal(result.toolCalls[0].id, 'call_1');
     assert.equal(result.toolCalls[0].name, 'get_weather');
     assert.equal(result.toolCalls[0].arguments, '{"city":"Seoul"}');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('ClaudeCodeBackend extracts live tool argument deltas from structured output', async () => {
+  const backend = new ClaudeCodeBackend({
+    command: fakeClaude,
+    cwd: process.cwd(),
+    timeoutMs: 10_000,
+  });
+  try {
+    const events = [];
+    for await (const event of backend.stream(toolRequest())) {
+      events.push(event);
+    }
+
+    const deltas = events
+      .filter((event) => event.type === 'tool_call_delta')
+      .map((event) => event.argumentsDelta ?? '')
+      .join('');
+    assert.equal(deltas, '{"city":"Seoul"}');
+    const completed = events.find((event) => event.type === 'completed');
+    assert.equal(completed.result.toolCalls[0].arguments, '{"city":"Seoul"}');
   } finally {
     await backend.close();
   }

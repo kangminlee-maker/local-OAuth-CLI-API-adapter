@@ -35,6 +35,10 @@ beforeEach(async () => {
           usage: {
             inputTokens: 7,
             outputTokens: toolCalls.length > 0 ? 8 : 1,
+            totalTokens: toolCalls.length > 0 ? 15 : 8,
+            cachedInputTokens: 2,
+            reasoningOutputTokens: toolCalls.length > 0 ? 3 : 0,
+            source: 'provider',
           },
           latencyMs: 1,
         };
@@ -67,8 +71,29 @@ test('POST /v1/chat/completions returns text in OpenAI chat shape', async () => 
 
   assert.equal(res.status, 200);
   assert.equal(body.choices[0].message.content, 'OK');
+  assert.match(body.id, /^chatcmpl-/);
+  assert.equal(body.choices[0].message.refusal, null);
+  assert.deepEqual(body.choices[0].message.annotations, []);
   assert.equal(body.choices[0].finish_reason, 'stop');
   assert.equal(seenRequests[0].shape, 'openai-chat');
+});
+
+test('OpenAI responses usage exposes provider token details', async () => {
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    input: 'Say OK',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal('output_text' in body, false);
+  assert.equal(body.output[0].type, 'reasoning');
+  assert.equal(body.output[1].type, 'message');
+  assert.equal(body.usage.input_tokens, 7);
+  assert.equal(body.usage.output_tokens, 1);
+  assert.equal(body.usage.total_tokens, 8);
+  assert.equal(body.usage.input_tokens_details.cached_tokens, 2);
+  assert.equal(body.usage.output_tokens_details.reasoning_tokens, 0);
 });
 
 test('POST /v1/chat/completions preserves OpenAI image_url input parts', async () => {
@@ -200,6 +225,20 @@ test('OpenAI chat stream emits completion chunks and DONE', async () => {
   assert.match(text, /data: \[DONE\]/);
 });
 
+test('OpenAI chat stream supports include_usage final chunk', async () => {
+  const res = await postJson('/v1/chat/completions', {
+    model: 'fake-local-model',
+    stream: true,
+    stream_options: { include_usage: true },
+    messages: [{ role: 'user', content: 'Say OK' }],
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 200);
+  assert.match(text, /"usage":null/);
+  assert.match(text, /"choices":\[\],"usage":\{"prompt_tokens":7,"completion_tokens":1,"total_tokens":8/);
+});
+
 test('OpenAI responses stream emits output_text deltas', async () => {
   const res = await postJson('/v1/responses', {
     model: 'fake-local-model',
@@ -210,7 +249,9 @@ test('OpenAI responses stream emits output_text deltas', async () => {
 
   assert.equal(res.status, 200);
   assert.match(text, /event: response\.created/);
+  assert.match(text, /event: response\.in_progress/);
   assert.match(text, /event: response\.output_text\.delta/);
+  assert.match(text, /"sequence_number":0/);
   assert.match(text, /"delta":"OK"/);
   assert.match(text, /event: response\.completed/);
 });
@@ -257,6 +298,48 @@ test('Anthropic messages returns tool_use for tool requests', async () => {
   assert.deepEqual(body.content[0].input, { city: 'Seoul' });
 });
 
+test('Anthropic messages usage preserves provider cache token fields', async () => {
+  const usageServer = await startProxyWithBackend({
+    name: 'usage-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_usage',
+        model: request.model,
+        text: 'OK',
+        toolCalls: [],
+        usage: {
+          inputTokens: 3,
+          outputTokens: 2,
+          totalTokens: 12,
+          cachedInputTokens: 7,
+          cacheCreationInputTokens: 4,
+          cacheReadInputTokens: 3,
+          source: 'provider',
+        },
+        latencyMs: 1,
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(usageServer.url, '/v1/messages', {
+      model: 'fake-local-model',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'Say OK' }],
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.usage.input_tokens, 3);
+    assert.equal(body.usage.output_tokens, 2);
+    assert.equal(body.usage.cache_creation_input_tokens, 4);
+    assert.equal(body.usage.cache_read_input_tokens, 3);
+  } finally {
+    await usageServer.close();
+  }
+});
+
 test('OpenAI chat stream forwards live backend text deltas', async () => {
   const live = await startProxyWithBackend(streamingBackend());
   try {
@@ -293,6 +376,82 @@ test('Anthropic stream forwards live backend text deltas', async () => {
     assert.match(text, /"text":"O"/);
     assert.match(text, /"text":"K"/);
     assert.doesNotMatch(text, /"text":"OK"/);
+  } finally {
+    await live.close();
+  }
+});
+
+test('OpenAI chat stream forwards live tool call argument deltas', async () => {
+  const live = await startProxyWithBackend(toolStreamingBackend());
+  try {
+    const res = await postJsonTo(live.url, '/v1/chat/completions', {
+      model: 'fake-local-model',
+      stream: true,
+      messages: [{ role: 'user', content: 'Use weather tool' }],
+      tools: [openAiWeatherTool()],
+      tool_choice: 'required',
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /"tool_calls"/);
+    assert.match(text, /"arguments":"\{\\?"city\\?""/);
+    assert.match(text, /"arguments":":\\?"Seoul\\?"\}"/);
+    assert.doesNotMatch(text, /"arguments":"\{\\?"city\\?":\\?"Seoul\\?"\}"/);
+    assert.match(text, /"finish_reason":"tool_calls"/);
+  } finally {
+    await live.close();
+  }
+});
+
+test('OpenAI responses stream forwards live function argument deltas', async () => {
+  const live = await startProxyWithBackend(toolStreamingBackend());
+  try {
+    const res = await postJsonTo(live.url, '/v1/responses', {
+      model: 'fake-local-model',
+      stream: true,
+      input: 'Use weather tool',
+      tools: [openAiWeatherTool()],
+      tool_choice: 'required',
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /event: response\.output_item\.added/);
+    assert.match(text, /event: response\.function_call_arguments\.delta/);
+    assert.match(text, /"delta":"\{\\?"city\\?""/);
+    assert.match(text, /"delta":":\\?"Seoul\\?"\}"/);
+    assert.doesNotMatch(text, /"delta":"\{\\?"city\\?":\\?"Seoul\\?"\}"/);
+    assert.match(text, /event: response\.function_call_arguments\.done/);
+    assert.match(text, /event: response\.output_item\.done/);
+    assert.match(text, /"name":"get_weather"/);
+  } finally {
+    await live.close();
+  }
+});
+
+test('Anthropic messages stream forwards live tool input deltas', async () => {
+  const live = await startProxyWithBackend(toolStreamingBackend());
+  try {
+    const res = await postJsonTo(live.url, '/v1/messages', {
+      model: 'fake-local-model',
+      stream: true,
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'Use weather tool' }],
+      tools: [{
+        name: 'get_weather',
+        input_schema: weatherSchema(),
+      }],
+      tool_choice: { type: 'any' },
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /event: content_block_start/);
+    assert.match(text, /"partial_json":"\{\\?"city\\?""/);
+    assert.match(text, /"partial_json":":\\?"Seoul\\?"\}"/);
+    assert.doesNotMatch(text, /"partial_json":"\{\\?"city\\?":\\?"Seoul\\?"\}"/);
+    assert.match(text, /event: content_block_stop/);
   } finally {
     await live.close();
   }
@@ -340,6 +499,32 @@ function streamingBackend() {
   };
 }
 
+function toolStreamingBackend() {
+  return {
+    name: 'tool-streaming-fake-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return toolCompletionResult(request.model);
+    },
+    async *stream(request) {
+      yield {
+        type: 'tool_call_delta',
+        index: 0,
+        id: 'call_1',
+        name: 'get_weather',
+        argumentsDelta: '{"city"',
+      };
+      yield {
+        type: 'tool_call_delta',
+        index: 0,
+        argumentsDelta: ':"Seoul"}',
+      };
+      yield { type: 'completed', result: toolCompletionResult(request.model) };
+    },
+    async close() {},
+  };
+}
+
 function completionResult() {
   return {
     id: 'local_test',
@@ -351,5 +536,50 @@ function completionResult() {
       outputTokens: 1,
     },
     latencyMs: 1,
+  };
+}
+
+function toolCompletionResult(model) {
+  return {
+    id: 'local_tool_test',
+    model,
+    text: '',
+    toolCalls: [
+      {
+        id: 'call_1',
+        name: 'get_weather',
+        arguments: '{"city":"Seoul"}',
+      },
+    ],
+    usage: {
+      inputTokens: 7,
+      outputTokens: 8,
+      totalTokens: 15,
+      cachedInputTokens: 2,
+      reasoningOutputTokens: 3,
+      source: 'provider',
+    },
+    latencyMs: 1,
+  };
+}
+
+function openAiWeatherTool() {
+  return {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Get current weather by city.',
+      parameters: weatherSchema(),
+    },
+  };
+}
+
+function weatherSchema() {
+  return {
+    type: 'object',
+    properties: {
+      city: { type: 'string' },
+    },
+    required: ['city'],
   };
 }
