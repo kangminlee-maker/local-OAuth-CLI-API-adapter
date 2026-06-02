@@ -73,21 +73,24 @@ async function handleRequest(
       const normalized = normalizeOpenAiChatRequest(body);
       rejectDeferredFeatures(normalized);
       const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
-      writeJson(res, 200, openAiChatResponse(result));
+      if (normalized.stream) await writeOpenAiChatStream(res, result);
+      else writeJson(res, 200, openAiChatResponse(result));
       return;
     }
     if (path === '/v1/responses') {
       const normalized = normalizeOpenAiResponsesRequest(body);
       rejectDeferredFeatures(normalized);
       const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
-      writeJson(res, 200, openAiResponsesResponse(result));
+      if (normalized.stream) await writeOpenAiResponsesStream(res, result);
+      else writeJson(res, 200, openAiResponsesResponse(result));
       return;
     }
     if (path === '/v1/messages') {
       const normalized = normalizeAnthropicMessagesRequest(body);
       rejectDeferredFeatures(normalized, 'anthropic');
       const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
-      writeJson(res, 200, anthropicMessagesResponse(result));
+      if (normalized.stream) await writeAnthropicMessagesStream(res, result);
+      else writeJson(res, 200, anthropicMessagesResponse(result));
       return;
     }
 
@@ -112,12 +115,9 @@ async function runWithTimeout(
 }
 
 function rejectDeferredFeatures(
-  request: NormalizedRequest,
-  provider: 'openai' | 'anthropic' = 'openai',
+  _request: NormalizedRequest,
+  _provider: 'openai' | 'anthropic' = 'openai',
 ): void {
-  if (request.stream) {
-    throw new ProxyRequestError('stream=true is not supported by this local proxy yet.', 501, provider);
-  }
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -242,6 +242,261 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
   };
 }
 
+async function writeOpenAiChatStream(
+  res: ServerResponse,
+  result: LocalCompletionResult,
+): Promise<void> {
+  writeSseHeaders(res);
+  const id = `chatcmpl_${result.id}`;
+  const created = Math.floor(Date.now() / 1000);
+  const base = {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model: result.model,
+    system_fingerprint: 'local-oauth-cli',
+  };
+  await writeSseData(res, {
+    ...base,
+    choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
+  });
+  if (result.toolCalls.length > 0) {
+    for (const [index, call] of result.toolCalls.entries()) {
+      await writeSseData(res, {
+        ...base,
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index,
+                  id: call.id,
+                  type: 'function',
+                  function: {
+                    name: call.name,
+                    arguments: call.arguments,
+                  },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      });
+    }
+    await writeSseData(res, {
+      ...base,
+      choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+    });
+  } else {
+    for (const chunk of chunkText(result.text)) {
+      await writeSseData(res, {
+        ...base,
+        choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
+      });
+    }
+    await writeSseData(res, {
+      ...base,
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    });
+  }
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+async function writeOpenAiResponsesStream(
+  res: ServerResponse,
+  result: LocalCompletionResult,
+): Promise<void> {
+  writeSseHeaders(res);
+  const response = openAiResponsesResponse(result);
+  const responseId = readObjectField(response, 'id') ?? `resp_${result.id}`;
+  await writeSseEvent(res, 'response.created', {
+    type: 'response.created',
+    response: {
+      id: responseId,
+      object: 'response',
+      created_at: Math.floor(Date.now() / 1000),
+      status: 'in_progress',
+      model: result.model,
+      output: [],
+    },
+  });
+
+  if (result.toolCalls.length > 0) {
+    for (const [index, call] of result.toolCalls.entries()) {
+      const item = asObjectPayload(openAiResponseToolCall(call));
+      await writeSseEvent(res, 'response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: index,
+        item: {
+          ...item,
+          arguments: '',
+        },
+      });
+      await writeSseEvent(res, 'response.function_call_arguments.delta', {
+        type: 'response.function_call_arguments.delta',
+        output_index: index,
+        item_id: readObjectField(item, 'id'),
+        delta: call.arguments,
+      });
+      await writeSseEvent(res, 'response.function_call_arguments.done', {
+        type: 'response.function_call_arguments.done',
+        output_index: index,
+        item_id: readObjectField(item, 'id'),
+        arguments: call.arguments,
+      });
+      await writeSseEvent(res, 'response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: index,
+        item,
+      });
+    }
+  } else {
+    const itemId = `msg_${randomUUID()}`;
+    await writeSseEvent(res, 'response.output_item.added', {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: {
+        id: itemId,
+        type: 'message',
+        status: 'in_progress',
+        role: 'assistant',
+        content: [],
+      },
+    });
+    await writeSseEvent(res, 'response.content_part.added', {
+      type: 'response.content_part.added',
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: '', annotations: [] },
+    });
+    for (const chunk of chunkText(result.text)) {
+      await writeSseEvent(res, 'response.output_text.delta', {
+        type: 'response.output_text.delta',
+        item_id: itemId,
+        output_index: 0,
+        content_index: 0,
+        delta: chunk,
+      });
+    }
+    await writeSseEvent(res, 'response.output_text.done', {
+      type: 'response.output_text.done',
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      text: result.text,
+    });
+    await writeSseEvent(res, 'response.content_part.done', {
+      type: 'response.content_part.done',
+      item_id: itemId,
+      output_index: 0,
+      content_index: 0,
+      part: { type: 'output_text', text: result.text, annotations: [] },
+    });
+    await writeSseEvent(res, 'response.output_item.done', {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: {
+        id: itemId,
+        type: 'message',
+        status: 'completed',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: result.text, annotations: [] }],
+      },
+    });
+  }
+
+  await writeSseEvent(res, 'response.completed', {
+    type: 'response.completed',
+    response,
+  });
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+async function writeAnthropicMessagesStream(
+  res: ServerResponse,
+  result: LocalCompletionResult,
+): Promise<void> {
+  writeSseHeaders(res);
+  const message = asObjectPayload(anthropicMessagesResponse(result));
+  const messageStart = {
+    ...message,
+    content: [],
+    stop_reason: null,
+    usage: {
+      input_tokens: result.usage.inputTokens,
+      output_tokens: 0,
+    },
+  };
+  await writeSseEvent(res, 'message_start', {
+    type: 'message_start',
+    message: messageStart,
+  });
+
+  if (result.toolCalls.length > 0) {
+    for (const [index, call] of result.toolCalls.entries()) {
+      await writeSseEvent(res, 'content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'tool_use',
+          id: call.id,
+          name: call.name,
+          input: {},
+        },
+      });
+      await writeSseEvent(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: call.arguments,
+        },
+      });
+      await writeSseEvent(res, 'content_block_stop', {
+        type: 'content_block_stop',
+        index,
+      });
+    }
+  } else {
+    await writeSseEvent(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    });
+    for (const chunk of chunkText(result.text)) {
+      await writeSseEvent(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: chunk },
+      });
+    }
+    await writeSseEvent(res, 'content_block_stop', {
+      type: 'content_block_stop',
+      index: 0,
+    });
+  }
+
+  await writeSseEvent(res, 'message_delta', {
+    type: 'message_delta',
+    delta: {
+      stop_reason: result.toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+      stop_sequence: null,
+    },
+    usage: {
+      output_tokens: result.usage.outputTokens,
+    },
+  });
+  await writeSseEvent(res, 'message_stop', {
+    type: 'message_stop',
+  });
+  res.end();
+}
+
 function openAiToolCall(call: LocalToolCall): unknown {
   return {
     id: call.id,
@@ -286,6 +541,51 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
     'content-type': 'application/json; charset=utf-8',
   });
   res.end(`${JSON.stringify(payload)}\n`);
+}
+
+function writeSseHeaders(res: ServerResponse): void {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
+}
+
+async function writeSseEvent(
+  res: ServerResponse,
+  event: string,
+  payload: unknown,
+): Promise<void> {
+  res.write(`event: ${event}\n`);
+  await writeSseData(res, payload);
+}
+
+async function writeSseData(res: ServerResponse, payload: unknown): Promise<void> {
+  const line = `data: ${JSON.stringify(payload)}\n\n`;
+  if (!res.write(line)) {
+    await new Promise<void>((resolve) => res.once('drain', resolve));
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 1));
+}
+
+function chunkText(text: string): string[] {
+  if (!text) return [];
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += 48) {
+    chunks.push(text.slice(i, i + 48));
+  }
+  return chunks;
+}
+
+function readObjectField(value: unknown, key: string): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const field = (value as Record<string, unknown>)[key];
+  return typeof field === 'string' ? field : undefined;
+}
+
+function asObjectPayload(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
 }
 
 function writeError(res: ServerResponse, err: unknown): void {

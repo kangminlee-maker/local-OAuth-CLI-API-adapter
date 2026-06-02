@@ -32,6 +32,7 @@ Supported subset:
 - `POST /v1/responses`
 - `POST /v1/messages`
 - non-stream text generation
+- synthetic SSE streaming for text and tool-call responses
 - OpenAI JSON object/schema output where supported by the backend
 - OpenAI Chat tool calls and tool-result follow-up messages
 - OpenAI Responses function calls and function-call outputs
@@ -39,7 +40,7 @@ Supported subset:
 
 Not yet supported:
 
-- streaming/SSE
+- true token-level streaming from the underlying CLI
 - multimodal inputs
 - exact provider token usage
 - full API compatibility
