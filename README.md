@@ -27,6 +27,22 @@ Run the local compatibility tests:
 pnpm test
 ```
 
+Run real CLI smoke tests with exact return checks:
+
+```bash
+pnpm smoke:real:codex
+pnpm smoke:real:claude
+```
+
+These commands use the actual logged-in CLI sessions and may consume plan
+credits/rate limits. They verify exact text assembly, JSON values, tool names and
+arguments, provider finish reasons, and optional latency samples:
+
+```bash
+pnpm smoke:real:codex -- --speed-repeats 3
+pnpm smoke:real:claude -- --speed-repeats 3
+```
+
 The default base URLs are:
 
 ```text

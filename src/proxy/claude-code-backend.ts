@@ -159,12 +159,23 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       ...this.extraArgs,
       buildPrompt(request),
     ];
-    const turn = await runClaudeProcess(this.command, argv, {
-      cwd: this.cwd,
-      timeoutMs: this.timeoutMs,
-      signal,
-      onTextDelta,
-    });
+    let turn: ClaudeTurnResult | null = null;
+    let lastError: Error | null = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        turn = await runClaudeProcess(this.command, argv, {
+          cwd: this.cwd,
+          timeoutMs: this.timeoutMs,
+          signal,
+          onTextDelta,
+        });
+        break;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (!isRetryableClaudeStructuredOutputError(lastError) || signal?.aborted) throw lastError;
+      }
+    }
+    if (!turn) throw lastError ?? new Error('claude did not return a result');
     return this.resultFromTurn(request, turn, startedAt);
   }
 
@@ -448,6 +459,11 @@ function readErrorMessage(message: JsonObject): string {
   if (typeof message.result === 'string' && message.result.trim()) return message.result;
   if (typeof message.error === 'string' && message.error.trim()) return message.error;
   return JSON.stringify(message);
+}
+
+function isRetryableClaudeStructuredOutputError(err: Error): boolean {
+  return err.message.includes('error_during_execution')
+    || err.message.includes('[ede_diagnostic]');
 }
 
 function parseJsonObject(line: string): JsonObject | null {
