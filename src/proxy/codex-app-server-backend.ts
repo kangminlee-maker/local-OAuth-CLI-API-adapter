@@ -4,6 +4,7 @@ import readline from 'node:readline';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
+  LocalStreamEvent,
   LocalToolCall,
   LocalUsage,
   NormalizedRequest,
@@ -29,6 +30,7 @@ interface TurnWaiter {
   readonly threadId: string;
   readonly turnId: string;
   text: string;
+  onTextDelta?: (delta: string) => void;
   resolve: (value: string) => void;
   reject: (err: Error) => void;
 }
@@ -64,6 +66,39 @@ export class CodexAppServerBackend implements LocalCliBackend {
   async generate(
     request: NormalizedRequest,
     signal?: AbortSignal,
+  ): Promise<LocalCompletionResult> {
+    return this.runTurn(request, signal);
+  }
+
+  async *stream(
+    request: NormalizedRequest,
+    signal?: AbortSignal,
+  ): AsyncIterable<LocalStreamEvent> {
+    const queue = new AsyncQueue<LocalStreamEvent>();
+    const shouldStreamText = request.tools.length === 0 || request.toolChoice.type === 'none';
+    const run = this.runTurn(
+      request,
+      signal,
+      shouldStreamText
+        ? (delta) => queue.push({ type: 'text_delta', delta })
+        : undefined,
+    )
+      .then((result) => queue.push({ type: 'completed', result }))
+      .catch((err: Error) => queue.fail(err))
+      .finally(() => queue.close());
+
+    try {
+      for await (const event of queue) yield event;
+      await run;
+    } finally {
+      await run.catch(() => undefined);
+    }
+  }
+
+  private async runTurn(
+    request: NormalizedRequest,
+    signal?: AbortSignal,
+    onTextDelta?: (delta: string) => void,
   ): Promise<LocalCompletionResult> {
     const startedAt = Date.now();
     await this.ensureStarted();
@@ -113,7 +148,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
       });
       turnId = readPath<string>(turn, ['result', 'turn', 'id']);
       if (!turnId) throw new Error('codex app-server did not return a turn id');
-      const text = await this.waitForTurn(threadId, turnId, signal);
+      const text = await this.waitForTurn(threadId, turnId, signal, onTextDelta);
       const parsed = parseBackendOutput(request, text);
       const usage = usageFor(request, parsed.text, parsed.toolCalls);
       return {
@@ -266,7 +301,10 @@ export class CodexAppServerBackend implements LocalCliBackend {
     if (!data) return;
     if (method === 'item/agentMessage/delta') {
       const waiter = this.turnWaiters.get(`${data.threadId}:${data.turnId}`);
-      if (waiter && typeof data.delta === 'string') waiter.text += data.delta;
+      if (waiter && typeof data.delta === 'string') {
+        waiter.text += data.delta;
+        waiter.onTextDelta?.(data.delta);
+      }
       return;
     }
     if (method === 'item/completed') {
@@ -298,6 +336,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
     threadId: string,
     turnId: string,
     signal?: AbortSignal,
+    onTextDelta?: (delta: string) => void,
   ): Promise<string> {
     const key = `${threadId}:${turnId}`;
     return new Promise((resolve, reject) => {
@@ -318,6 +357,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
         threadId,
         turnId,
         text: '',
+        onTextDelta,
         resolve: (value) => {
           cleanup();
           resolve(value);
@@ -353,6 +393,58 @@ export class CodexAppServerBackend implements LocalCliBackend {
       return undefined;
     }
     return requestModel;
+  }
+}
+
+class AsyncQueue<T> implements AsyncIterable<T> {
+  private readonly values: T[] = [];
+  private readonly resolvers: Array<(value: IteratorResult<T>) => void> = [];
+  private error: Error | null = null;
+  private closed = false;
+
+  push(value: T): void {
+    if (this.closed) return;
+    const resolve = this.resolvers.shift();
+    if (resolve) resolve({ done: false, value });
+    else this.values.push(value);
+  }
+
+  fail(err: Error): void {
+    if (this.closed) return;
+    this.error = err;
+    this.closed = true;
+    while (this.resolvers.length > 0) {
+      const resolve = this.resolvers.shift();
+      resolve?.({ done: true, value: undefined });
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    while (this.resolvers.length > 0) {
+      const resolve = this.resolvers.shift();
+      resolve?.({ done: true, value: undefined });
+    }
+  }
+
+  async *[Symbol.asyncIterator](): AsyncIterator<T> {
+    while (true) {
+      if (this.values.length > 0) {
+        yield this.values.shift() as T;
+        continue;
+      }
+      if (this.error) throw this.error;
+      if (this.closed) return;
+      const next = await new Promise<IteratorResult<T>>((resolve) => {
+        this.resolvers.push(resolve);
+      });
+      if (next.done) {
+        if (this.error) throw this.error;
+        return;
+      }
+      yield next.value;
+    }
   }
 }
 

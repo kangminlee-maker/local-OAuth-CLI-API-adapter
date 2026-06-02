@@ -52,10 +52,18 @@ export interface LocalCompletionResult {
   readonly latencyMs: number;
 }
 
+export type LocalStreamEvent =
+  | { readonly type: 'text_delta'; readonly delta: string }
+  | { readonly type: 'completed'; readonly result: LocalCompletionResult };
+
 export interface LocalCliBackend {
   readonly name: string;
   readonly model: string;
   generate(request: NormalizedRequest, signal?: AbortSignal): Promise<LocalCompletionResult>;
+  stream?(
+    request: NormalizedRequest,
+    signal?: AbortSignal,
+  ): AsyncIterable<LocalStreamEvent>;
   close(): Promise<void>;
 }
 

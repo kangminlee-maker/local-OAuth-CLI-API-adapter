@@ -38,7 +38,8 @@ Supported subset:
 - `POST /v1/responses`
 - `POST /v1/messages`
 - non-stream text generation
-- synthetic SSE streaming for text and tool-call responses
+- live SSE text deltas from Codex `app-server`
+- synthetic SSE streaming for tool-call responses after the CLI decision completes
 - OpenAI JSON object/schema output where supported by the backend
 - OpenAI Chat tool calls and tool-result follow-up messages
 - OpenAI Responses function calls and function-call outputs
@@ -46,7 +47,7 @@ Supported subset:
 
 Not yet supported:
 
-- true token-level streaming from the underlying CLI
+- partial tool-call argument streaming from the underlying CLI
 - multimodal inputs
 - exact provider token usage
 - full API compatibility
@@ -117,3 +118,7 @@ http://127.0.0.1:6781/mcp
 - The generated TSX is compiled to browser ESM before ggui commits it.
 - This avoids provider API keys, but it still consumes the selected CLI's plan,
   credits, rate limits, and applicable usage policy.
+- Codex text streaming maps `item/agentMessage/delta` notifications to the
+  local API stream. Claude Code can expose comparable text deltas through
+  `claude -p --output-format stream-json --include-partial-messages`, where
+  `stream_event.event.content_block_delta` carries `text_delta` chunks.

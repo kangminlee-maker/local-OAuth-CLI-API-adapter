@@ -169,8 +169,53 @@ test('Anthropic messages returns tool_use for tool requests', async () => {
   assert.deepEqual(body.content[0].input, { city: 'Seoul' });
 });
 
+test('OpenAI chat stream forwards live backend text deltas', async () => {
+  const live = await startProxyWithBackend(streamingBackend());
+  try {
+    const res = await postJsonTo(live.url, '/v1/chat/completions', {
+      model: 'fake-local-model',
+      stream: true,
+      messages: [{ role: 'user', content: 'Say OK' }],
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /"content":"O"/);
+    assert.match(text, /"content":"K"/);
+    assert.doesNotMatch(text, /"content":"OK"/);
+    assert.match(text, /data: \[DONE\]/);
+  } finally {
+    await live.close();
+  }
+});
+
+test('Anthropic stream forwards live backend text deltas', async () => {
+  const live = await startProxyWithBackend(streamingBackend());
+  try {
+    const res = await postJsonTo(live.url, '/v1/messages', {
+      model: 'fake-local-model',
+      stream: true,
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'Say OK' }],
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /event: content_block_delta/);
+    assert.match(text, /"text":"O"/);
+    assert.match(text, /"text":"K"/);
+    assert.doesNotMatch(text, /"text":"OK"/);
+  } finally {
+    await live.close();
+  }
+});
+
 async function postJson(path, body) {
-  return fetch(`${started.url}${path}`, {
+  return postJsonTo(started.url, path, body);
+}
+
+async function postJsonTo(url, path, body) {
+  return fetch(`${url}${path}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -180,4 +225,43 @@ async function postJson(path, body) {
     },
     body: JSON.stringify(body),
   });
+}
+
+async function startProxyWithBackend(backend) {
+  return startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 10_000,
+    backend,
+  });
+}
+
+function streamingBackend() {
+  return {
+    name: 'streaming-fake-backend',
+    model: 'fake-local-model',
+    async generate() {
+      return completionResult();
+    },
+    async *stream() {
+      yield { type: 'text_delta', delta: 'O' };
+      yield { type: 'text_delta', delta: 'K' };
+      yield { type: 'completed', result: completionResult() };
+    },
+    async close() {},
+  };
+}
+
+function completionResult() {
+  return {
+    id: 'local_test',
+    model: 'fake-local-model',
+    text: 'OK',
+    toolCalls: [],
+    usage: {
+      inputTokens: 7,
+      outputTokens: 1,
+    },
+    latencyMs: 1,
+  };
 }

@@ -9,6 +9,7 @@ export type {
   ApiShape,
   LocalCliBackend,
   LocalCompletionResult,
+  LocalStreamEvent,
   LocalToolCall,
   NormalizedMessage,
   NormalizedRequest,
