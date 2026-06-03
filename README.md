@@ -56,6 +56,10 @@ Run a comparison benchmark against direct provider APIs:
 pnpm bench:api
 pnpm bench:api -- --repeats 3 --quality-repeats 3
 pnpm bench:api -- --semantic-quality-repeats 1 --semantic-quality-targets=proxy --min-semantic-quality=95
+pnpm bench:api -- --cases=semantic_quality --semantic-quality-suite=realistic --semantic-quality-repeats 1 --min-semantic-quality=95
+pnpm bench:api -- --targets=proxy-codex --cases=tool_call_stream,tool_use,tool_result --repeats 3
+pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=request_reasoning_effort --request-reasoning-effort=none --repeats 3
+pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=request_reasoning_effort --request-reasoning-effort=minimal --expect-provider-errors=true
 pnpm bench:api -- --include-multimodal=true
 pnpm bench:api -- --output /tmp/api-bench.json
 pnpm bench:api -- --baseline /tmp/api-bench.json --regression-targets=proxy
@@ -64,15 +68,42 @@ pnpm bench:api -- --baseline /tmp/api-bench.json --regression-targets=proxy
 The benchmark loads `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment
 or `.env`, starts both local proxy backends, and compares schema exactness,
 response exactness, stream event shape, optional repeated quality samples, and
-latency against direct API calls. `--semantic-quality-repeats` additionally uses
+latency against direct API calls. `--targets` and `--cases` narrow the run to
+comma-separated target or case filters; exact, substring, and `*` wildcard
+matches are supported, so targeted repeated medians can be collected without
+rerunning every provider/API shape. `--semantic-quality-repeats` additionally uses
 an OpenAI JSON-schema judge to score requirement fit, semantic relevance,
 conciseness, and direct-provider similarity; proxy targets also get cached direct
-provider reference outputs when the matching API key is available. Use
-`--min-semantic-quality=95` to make semantic quality a hard gate. With
+provider reference outputs when the matching API key is available. Semantic
+references are paired by proxy backend provider, not by request API surface:
+`proxy-codex` is compared with direct OpenAI API output, and `proxy-claude` is
+compared with direct Anthropic API output. Use
+`--min-semantic-quality=95` to make semantic quality a hard gate. Proxy-Codex
+benchmark rows also include summary-only `backendTiming` diagnostics for local
+phase breakdowns such as `threadStartMs`, `turnWaitMs`, and `usageWaitMs`; these
+diagnostics are not added to API responses. Streaming benchmark rows record
+`firstDataMs`, `firstTextMs`, and `firstToolArgumentMs` so text-token and tool
+argument latency can be compared separately. Outlier rows include the dominant
+backend phase when proxy-codex timing is available. With
 `--baseline`, proxy rows are compared against a previous summary by default and
-latency/quality regressions make the command fail. Defaults:
+latency/quality regressions make the command fail. Proxy-Codex follows
+request-level OpenAI reasoning effort settings first: Chat Completions
+`reasoning_effort` and Responses `reasoning.effort`. The CLI
+`--reasoning-effort` value is only the fallback when the request omits effort;
+when it is also omitted, `settings.json` supplies
+`codexProxy.fallbackReasoningEffort`, currently `medium` because the repeated
+matrix benchmark showed the best speed/quality stability there.
+Use `--request-reasoning-effort` in benchmarks to send those request fields to
+both proxy and direct OpenAI targets. Current direct `gpt-5.5` rejects
+`minimal`, so that value is useful as an unsupported-value parity probe rather
+than a successful quality/latency case; add `--expect-provider-errors=true` to
+assert matching provider error shapes. Multimodal image benchmarks use a
+deterministic generated 64x64 red PNG fixture that direct OpenAI and Anthropic
+APIs accept, so proxy image paths are compared against real provider behavior.
+Defaults:
 
 - OpenAI API: `gpt-5.5`
+- Codex proxy fallback effort: `settings.json` `codexProxy.fallbackReasoningEffort`
 - Anthropic API Opus: `claude-opus-4-8`
 - Anthropic API Sonnet: `claude-sonnet-4-6`
 - Anthropic API Haiku: `claude-haiku-4-5-20251001`

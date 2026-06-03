@@ -64,7 +64,7 @@ test('ClaudeCodeBackend streams one-shot image text deltas', async () => {
   }
 });
 
-test('ClaudeCodeBackend parses structured tool decisions from one-shot schema output', async () => {
+test('ClaudeCodeBackend parses structured tool decisions from persistent schema prompt output', async () => {
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
@@ -77,6 +77,22 @@ test('ClaudeCodeBackend parses structured tool decisions from one-shot schema ou
     assert.equal(result.toolCalls[0].id, 'call_1');
     assert.equal(result.toolCalls[0].name, 'get_weather');
     assert.equal(result.toolCalls[0].arguments, '{"city":"Seoul"}');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('ClaudeCodeBackend uses persistent JSON mode without losing exact JSON output', async () => {
+  const backend = new ClaudeCodeBackend({
+    command: fakeClaude,
+    cwd: process.cwd(),
+    timeoutMs: 10_000,
+  });
+  try {
+    const result = await backend.generate(jsonSchemaRequest());
+
+    assert.equal(result.text, '{"adapter":"local-oauth-cli","ok":true}');
+    assert.deepEqual(result.toolCalls, []);
   } finally {
     await backend.close();
   }
@@ -137,6 +153,29 @@ function imageTextRequest() {
     }],
     stream: true,
     jsonMode: false,
+    tools: [],
+    toolChoice: { type: 'auto' },
+    raw: {},
+  };
+}
+
+function jsonSchemaRequest() {
+  return {
+    shape: 'openai-chat',
+    model: 'claude-code-cli',
+    messages: [{ role: 'user', content: 'Return adapter JSON' }],
+    stream: false,
+    streamOptions: { includeUsage: false, includeObfuscation: false },
+    jsonMode: true,
+    jsonSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        adapter: { type: 'string' },
+        ok: { type: 'boolean' },
+      },
+      required: ['adapter', 'ok'],
+    },
     tools: [],
     toolChoice: { type: 'auto' },
     raw: {},

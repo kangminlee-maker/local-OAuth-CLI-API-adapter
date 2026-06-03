@@ -7,9 +7,14 @@ import { startLocalApiProxy } from './proxy/http-server.js';
 import { createRuntime } from './runtimes/index.js';
 import { startAddonServer } from './server.js';
 import {
+  codexProxyFallbackReasoningEffort,
+  isReasoningEffort,
+} from './settings.js';
+import {
   sentinelSelectionForRuntime,
   type RuntimeName,
 } from './types.js';
+import type { NormalizedReasoningEffort } from './proxy/types.js';
 import { InMemoryBlueprintProvider } from '@ggui-ai/mcp-server-core/in-memory';
 
 async function main(argv: readonly string[]): Promise<number> {
@@ -238,18 +243,10 @@ function parseIntOption(value: string | undefined, fallback: number): number {
 
 function parseReasoningEffort(
   value: string | undefined,
-): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' {
-  if (
-    value === 'none'
-    || value === 'minimal'
-    || value === 'low'
-    || value === 'medium'
-    || value === 'high'
-    || value === 'xhigh'
-  ) {
-    return value;
-  }
-  return 'low';
+): NormalizedReasoningEffort | undefined {
+  if (value === undefined) return undefined;
+  if (isReasoningEffort(value)) return value;
+  throw new Error('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.');
 }
 
 function helpText(): string {
@@ -270,7 +267,7 @@ Options:
   --public-base-url <url>            Public URL used in ggui metadata.
   --timeout-ms <number>              Runtime timeout. Default: 180000.
   --cwd <dir>                        Working directory for proxy app-server. Default: current cwd.
-  --reasoning-effort <effort>        Codex proxy effort. Default: low.
+  --reasoning-effort <effort>        Codex proxy fallback effort. Default: settings.json (${codexProxyFallbackReasoningEffort()}).
   --max-attempts <number>            Compile feedback attempts. Default: 2.
   --keep-workspace                   Keep temp workspaces after generation.
   --workspace-root <dir>             Parent directory for temp workspaces.

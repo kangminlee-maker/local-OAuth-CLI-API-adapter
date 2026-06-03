@@ -1,6 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
 import readline from 'node:readline';
+import { codexProxyFallbackReasoningEffort } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
 import {
   baseInstructions,
@@ -18,6 +22,7 @@ import type {
   LocalStreamEvent,
   LocalUsage,
   NormalizedRequest,
+  NormalizedReasoningEffort,
 } from './types.js';
 import { ToolCallDeltaExtractor } from './tool-call-stream.js';
 
@@ -26,7 +31,8 @@ interface CodexAppServerBackendOptions {
   readonly cwd: string;
   readonly model?: string;
   readonly timeoutMs: number;
-  readonly reasoningEffort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  readonly reasoningEffort?: CodexReasoningEffort;
+  readonly onTiming?: (timing: CodexTurnTiming) => void;
 }
 
 interface PendingRequest {
@@ -41,6 +47,10 @@ interface TurnWaiter {
   readonly turnId: string;
   text: string;
   usage?: LocalUsage;
+  completed: boolean;
+  completedAt?: number;
+  usageUpdatedAt?: number;
+  usageGraceTimer?: NodeJS.Timeout;
   onTextDelta?: (delta: string) => void;
   resolve: (value: TurnResult) => void;
   reject: (err: Error) => void;
@@ -51,9 +61,43 @@ type JsonRpcMessage = Record<string, unknown>;
 interface TurnResult {
   readonly text: string;
   readonly usage?: LocalUsage;
+  readonly usageWaitMs?: number;
+}
+
+type CodexReasoningEffort = NormalizedReasoningEffort;
+
+export interface CodexIsolation {
+  readonly rootDir: string;
+  readonly homeDir: string;
+  readonly workDir: string;
+  readonly defaultModel?: string;
+}
+
+interface CodexTurnTiming {
+  readonly ensureStartedMs: number;
+  readonly promptBuildMs: number;
+  readonly threadStartMs: number;
+  readonly inputPrepareMs: number;
+  readonly turnStartMs: number;
+  readonly turnWaitMs: number;
+  readonly usageWaitMs: number;
+  readonly totalMs: number;
 }
 
 const USAGE_NOTIFICATION_GRACE_MS = 100;
+const FALLBACK_CODEX_MODEL = 'gpt-5.5';
+const DISABLED_CODEX_CONTEXT_FEATURES = [
+  'apps',
+  'browser_use',
+  'computer_use',
+  'goals',
+  'hooks',
+  'image_generation',
+  'multi_agent',
+  'plugins',
+  'shell_tool',
+  'workspace_dependencies',
+] as const;
 
 export class CodexAppServerBackend implements LocalCliBackend {
   readonly name = 'codex-app-server';
@@ -63,7 +107,8 @@ export class CodexAppServerBackend implements LocalCliBackend {
   private readonly cwd: string;
   private readonly configuredModel?: string;
   private readonly timeoutMs: number;
-  private readonly reasoningEffort: NonNullable<CodexAppServerBackendOptions['reasoningEffort']>;
+  private readonly reasoningEffort: CodexReasoningEffort;
+  private readonly onTiming?: (timing: CodexTurnTiming) => void;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
   private nextId = 1;
@@ -71,6 +116,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
   private stderr = '';
   private readonly pending = new Map<number, PendingRequest>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
+  private isolation: CodexIsolation | null = null;
 
   constructor(options: CodexAppServerBackendOptions) {
     this.command = options.command ?? 'codex';
@@ -78,7 +124,8 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.model = options.model ?? 'codex-app-server';
     this.configuredModel = options.model;
     this.timeoutMs = options.timeoutMs;
-    this.reasoningEffort = options.reasoningEffort ?? 'low';
+    this.reasoningEffort = options.reasoningEffort ?? codexProxyFallbackReasoningEffort();
+    this.onTiming = options.onTiming;
   }
 
   async generate(
@@ -125,13 +172,33 @@ export class CodexAppServerBackend implements LocalCliBackend {
     onTextDelta?: (delta: string) => void,
   ): Promise<LocalCompletionResult> {
     const startedAt = Date.now();
+    const timing = {
+      ensureStartedMs: 0,
+      promptBuildMs: 0,
+      threadStartMs: 0,
+      inputPrepareMs: 0,
+      turnStartMs: 0,
+      turnWaitMs: 0,
+      usageWaitMs: 0,
+    };
+    let phaseStartedAt = Date.now();
     await this.ensureStarted();
+    timing.ensureStartedMs = Date.now() - phaseStartedAt;
+    phaseStartedAt = Date.now();
+    const reasoningEffort = request.reasoningEffort ?? this.reasoningEffort;
     const prompt = buildPrompt(request);
-    const threadPromise = this.startThread();
+    timing.promptBuildMs = Date.now() - phaseStartedAt;
+    const threadStartedAt = Date.now();
+    const threadPromise = this.startThread(reasoningEffort).then((value) => {
+      timing.threadStartMs = Date.now() - threadStartedAt;
+      return value;
+    });
     let threadId: string | null = null;
     let preparedInput: Awaited<ReturnType<typeof prepareCodexInput>> | null = null;
+    const inputStartedAt = Date.now();
     const preparedInputPromise = prepareCodexInput(request, prompt).then((value) => {
       preparedInput = value;
+      timing.inputPrepareMs = Date.now() - inputStartedAt;
       return value;
     });
     let turnId: string | null = null;
@@ -149,25 +216,41 @@ export class CodexAppServerBackend implements LocalCliBackend {
 
     try {
       [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
+      const cwd = this.isolation?.workDir ?? this.cwd;
+      phaseStartedAt = Date.now();
       const turn = await this.send('turn/start', {
         threadId,
+        cwd,
+        runtimeWorkspaceRoots: [cwd],
+        environments: [],
         input: preparedInput.input,
         model: this.modelOverrideFor(request.model),
-        effort: this.reasoningEffort,
+        effort: reasoningEffort,
+        summary: 'none',
+        personality: 'none',
         outputSchema: outputSchemaFor(request),
       });
+      timing.turnStartMs = Date.now() - phaseStartedAt;
       turnId = readPath<string>(turn, ['result', 'turn', 'id']);
       if (!turnId) throw new Error('codex app-server did not return a turn id');
+      phaseStartedAt = Date.now();
       const turnResult = await this.waitForTurn(threadId, turnId, signal, onTextDelta);
+      timing.turnWaitMs = Date.now() - phaseStartedAt;
+      timing.usageWaitMs = turnResult.usageWaitMs ?? 0;
       const parsed = parseBackendOutput(request, turnResult.text);
       const usage = turnResult.usage ?? usageFor(request, parsed.text, parsed.toolCalls);
+      const totalMs = Date.now() - startedAt;
+      this.onTiming?.({
+        ...timing,
+        totalMs,
+      });
       return {
         id: `local_${randomUUID()}`,
         model: request.model,
         text: parsed.text,
         toolCalls: parsed.toolCalls,
         usage,
-        latencyMs: Date.now() - startedAt,
+        latencyMs: totalMs,
       };
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
@@ -192,6 +275,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.child = null;
     this.lineReader = null;
     this.initialized = null;
+    await this.cleanupIsolation();
   }
 
   private async ensureStarted(): Promise<void> {
@@ -201,11 +285,26 @@ export class CodexAppServerBackend implements LocalCliBackend {
   }
 
   private async start(): Promise<void> {
-    this.child = spawn(this.command, ['app-server', '--listen', 'stdio://'], {
-      cwd: this.cwd,
+    const isolation = await createCodexIsolation({
+      configuredModel: this.configuredModel,
+      reasoningEffort: this.reasoningEffort,
+    });
+    this.isolation = isolation;
+    const appServerArgs = [
+      'app-server',
+      ...codexContextIsolationArgs({
+        model: this.configuredModel ?? isolation.defaultModel ?? FALLBACK_CODEX_MODEL,
+        reasoningEffort: this.reasoningEffort,
+      }),
+      '--listen',
+      'stdio://',
+    ];
+    this.child = spawn(this.command, appServerArgs, {
+      cwd: isolation.workDir,
       shell: false,
       env: {
         ...process.env,
+        CODEX_HOME: isolation.homeDir,
         TERM: process.env.TERM && process.env.TERM !== 'dumb'
           ? process.env.TERM
           : 'xterm-256color',
@@ -223,6 +322,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
       this.child = null;
       this.lineReader = null;
       this.initialized = null;
+      void this.cleanupIsolation();
     });
 
     this.lineReader = readline.createInterface({ input: this.child.stdout });
@@ -243,19 +343,25 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.notify('initialized', {});
   }
 
-  private async startThread(): Promise<string> {
+  private async startThread(reasoningEffort: CodexReasoningEffort): Promise<string> {
+    const cwd = this.isolation?.workDir ?? this.cwd;
     const thread = await this.send('thread/start', {
-      cwd: this.cwd,
-      runtimeWorkspaceRoots: [this.cwd],
+      cwd,
+      runtimeWorkspaceRoots: [cwd],
       approvalPolicy: 'never',
       sandbox: 'read-only',
+      environments: [],
+      dynamicTools: [],
       ephemeral: true,
       baseInstructions: baseInstructions(),
       developerInstructions: developerInstructions(),
+      personality: 'none',
       experimentalRawEvents: false,
       persistExtendedHistory: false,
       config: {
-        model_reasoning_effort: this.reasoningEffort,
+        model_reasoning_effort: reasoningEffort,
+        model_reasoning_summary: 'none',
+        web_search: 'disabled',
       },
     });
     const threadId = readPath<string>(thread, ['result', 'thread', 'id']);
@@ -265,6 +371,19 @@ export class CodexAppServerBackend implements LocalCliBackend {
 
   private archiveThread(threadId: string): void {
     void this.send('thread/archive', { threadId }).catch(() => undefined);
+  }
+
+  private async cleanupIsolation(): Promise<void> {
+    const isolation = this.isolation;
+    this.isolation = null;
+    if (isolation) {
+      await rm(isolation.rootDir, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 100,
+      });
+    }
   }
 
   private send(method: string, params: unknown): Promise<JsonRpcMessage> {
@@ -357,7 +476,11 @@ export class CodexAppServerBackend implements LocalCliBackend {
       if (!threadId || !turnId) return;
       const usage = usageFromCodexTokenUsage(data.tokenUsage);
       const waiter = usage ? this.turnWaiters.get(`${threadId}:${turnId}`) : null;
-      if (waiter && usage) waiter.usage = usage;
+      if (waiter && usage) {
+        waiter.usage = usage;
+        waiter.usageUpdatedAt = Date.now();
+        if (waiter.completed) this.resolveTurnWaiter(threadId, turnId);
+      }
       return;
     }
     if (method === 'turn/completed') {
@@ -372,19 +495,35 @@ export class CodexAppServerBackend implements LocalCliBackend {
         this.turnWaiters.delete(key);
         waiter.reject(new Error(JSON.stringify(turn.error ?? 'turn failed')));
       } else {
-        const resolveTurn = (): void => {
-          const current = this.turnWaiters.get(key);
-          if (!current) return;
-          this.turnWaiters.delete(key);
-          current.resolve({
-            text: current.text.trim(),
-            usage: current.usage,
-          });
-        };
-        if (waiter.usage) resolveTurn();
-        else setTimeout(resolveTurn, USAGE_NOTIFICATION_GRACE_MS);
+        waiter.completed = true;
+        waiter.completedAt = Date.now();
+        if (waiter.usage) this.resolveTurnWaiter(threadId, turnId);
+        else {
+          waiter.usageGraceTimer = setTimeout(
+            () => this.resolveTurnWaiter(threadId, turnId),
+            USAGE_NOTIFICATION_GRACE_MS,
+          );
+        }
       }
     }
+  }
+
+  private resolveTurnWaiter(threadId: string, turnId: string): void {
+    const key = `${threadId}:${turnId}`;
+    const waiter = this.turnWaiters.get(key);
+    if (!waiter) return;
+    this.turnWaiters.delete(key);
+    if (waiter.usageGraceTimer) {
+      clearTimeout(waiter.usageGraceTimer);
+      waiter.usageGraceTimer = undefined;
+    }
+    waiter.resolve({
+      text: waiter.text.trim(),
+      usage: waiter.usage,
+      usageWaitMs: waiter.completedAt
+        ? Math.max(0, (waiter.usageUpdatedAt ?? Date.now()) - waiter.completedAt)
+        : 0,
+    });
   }
 
   private waitForTurn(
@@ -395,12 +534,18 @@ export class CodexAppServerBackend implements LocalCliBackend {
   ): Promise<TurnResult> {
     const key = `${threadId}:${turnId}`;
     return new Promise((resolve, reject) => {
+      let waiter: TurnWaiter | undefined;
       const timer = setTimeout(() => {
         this.turnWaiters.delete(key);
+        cleanup();
         reject(new Error(`turn timed out after ${this.timeoutMs}ms`));
       }, this.timeoutMs);
       const cleanup = (): void => {
         clearTimeout(timer);
+        if (waiter?.usageGraceTimer) {
+          clearTimeout(waiter.usageGraceTimer);
+          waiter.usageGraceTimer = undefined;
+        }
         if (signal) signal.removeEventListener('abort', abortFromSignal);
       };
       const abortFromSignal = (): void => {
@@ -408,10 +553,11 @@ export class CodexAppServerBackend implements LocalCliBackend {
         cleanup();
         reject(new Error('request aborted'));
       };
-      const waiter: TurnWaiter = {
+      waiter = {
         threadId,
         turnId,
         text: '',
+        completed: false,
         onTextDelta,
         resolve: (value) => {
           cleanup();
@@ -488,6 +634,126 @@ export function usageFromCodexTokenUsage(value: unknown): LocalUsage | null {
     source: 'provider',
     raw: value,
   };
+}
+
+export function codexContextIsolationArgs(options: {
+  readonly model: string;
+  readonly reasoningEffort: CodexReasoningEffort;
+}): string[] {
+  return [
+    '-c',
+    `model=${tomlString(options.model)}`,
+    '-c',
+    `model_reasoning_effort=${tomlString(options.reasoningEffort)}`,
+    '-c',
+    'model_reasoning_summary="none"',
+    '-c',
+    'web_search="disabled"',
+    '-c',
+    'approval_policy="never"',
+    '-c',
+    'sandbox_mode="read-only"',
+    '-c',
+    'shell_environment_policy.inherit="none"',
+    ...DISABLED_CODEX_CONTEXT_FEATURES.flatMap((feature) => [
+      '-c',
+      `features.${feature}=false`,
+    ]),
+    '-c',
+    'notify=[]',
+    '-c',
+    'analytics.enabled=false',
+  ];
+}
+
+export async function createCodexIsolation(options: {
+  readonly configuredModel?: string;
+  readonly reasoningEffort: CodexReasoningEffort;
+}): Promise<CodexIsolation> {
+  const rootDir = await mkdtemp(join(tmpdir(), 'ggui-codex-proxy-'));
+  const homeDir = join(rootDir, 'codex-home');
+  const workDir = join(rootDir, 'workspace');
+  await Promise.all([
+    mkdir(homeDir, { recursive: true }),
+    mkdir(workDir, { recursive: true }),
+  ]);
+
+  const sourceHome = sourceCodexHome();
+  const defaultModel = options.configuredModel ?? await readTopLevelStringConfig(sourceHome, 'model');
+  await copyCodexAuth(sourceHome, homeDir);
+  await writeFile(
+    join(homeDir, 'config.toml'),
+    minimalCodexConfigToml({
+      model: defaultModel ?? FALLBACK_CODEX_MODEL,
+      reasoningEffort: options.reasoningEffort,
+    }),
+    { mode: 0o600 },
+  );
+
+  return {
+    rootDir,
+    homeDir,
+    workDir,
+    defaultModel,
+  };
+}
+
+export function minimalCodexConfigToml(options: {
+  readonly model: string;
+  readonly reasoningEffort: CodexReasoningEffort;
+}): string {
+  return [
+    `model = ${tomlString(options.model)}`,
+    `model_reasoning_effort = ${tomlString(options.reasoningEffort)}`,
+    'model_reasoning_summary = "none"',
+    'web_search = "disabled"',
+    'approval_policy = "never"',
+    'sandbox_mode = "read-only"',
+    '',
+    '[analytics]',
+    'enabled = false',
+    '',
+    '[features]',
+    ...DISABLED_CODEX_CONTEXT_FEATURES.map((feature) => `${feature} = false`),
+    '',
+    '[shell_environment_policy]',
+    'inherit = "none"',
+    '',
+  ].join('\n');
+}
+
+function sourceCodexHome(): string {
+  return process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
+    ? process.env.CODEX_HOME
+    : join(homedir(), '.codex');
+}
+
+async function copyCodexAuth(sourceHome: string, targetHome: string): Promise<void> {
+  try {
+    await copyFile(join(sourceHome, 'auth.json'), join(targetHome, 'auth.json'));
+  } catch {
+    // Let Codex surface its normal auth error if the user has no local auth state.
+  }
+}
+
+async function readTopLevelStringConfig(sourceHome: string, key: string): Promise<string | undefined> {
+  let text: string;
+  try {
+    text = await readFile(join(sourceHome, 'config.toml'), 'utf8');
+  } catch {
+    return undefined;
+  }
+  const match = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"\\s*$`, 'm').exec(text);
+  if (!match?.[1]) return undefined;
+  return match[1].replace(/\\(["\\])/g, '$1');
+}
+
+function tomlString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

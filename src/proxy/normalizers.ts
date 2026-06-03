@@ -4,6 +4,7 @@ import type {
   NormalizedImageDetail,
   NormalizedMessage,
   NormalizedRequest,
+  NormalizedReasoningEffort,
   NormalizedTool,
   NormalizedToolChoice,
 } from './types.js';
@@ -24,6 +25,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     messages,
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
     temperature: readOptionalNumber(input.temperature),
+    reasoningEffort: readOpenAiReasoningEffort(input.reasoning_effort ?? asRecord(input.reasoning)?.effort),
     stream: input.stream === true,
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: isOpenAiJsonMode(input.response_format),
@@ -43,12 +45,14 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   messages.push(...readResponsesInput(input.input));
   const text = asRecord(input.text);
   const format = asRecord(text?.format);
+  const reasoning = asRecord(input.reasoning);
   return {
     shape: 'openai-responses',
     model: readString(input.model, 'codex-app-server'),
     messages,
     maxTokens: readOptionalNumber(input.max_output_tokens),
     temperature: readOptionalNumber(input.temperature),
+    reasoningEffort: readOpenAiReasoningEffort(reasoning?.effort),
     stream: input.stream === true,
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: format?.type === 'json_object' || format?.type === 'json_schema',
@@ -57,6 +61,21 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
   };
+}
+
+function readOpenAiReasoningEffort(value: unknown): NormalizedReasoningEffort | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    value === 'none'
+    || value === 'minimal'
+    || value === 'low'
+    || value === 'medium'
+    || value === 'high'
+    || value === 'xhigh'
+  ) {
+    return value;
+  }
+  throw new ProxyRequestError('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.', 400);
 }
 
 export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequest {

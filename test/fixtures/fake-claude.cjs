@@ -118,6 +118,53 @@ function emitStructured() {
   });
 }
 
+function emitJsonObject() {
+  const text = '{"adapter":"local-oauth-cli","ok":true}';
+  write({ type: 'system', subtype: 'init', session_id: 'fake_session' });
+  write({ type: 'stream_event', event: { type: 'message_start' }, session_id: 'fake_session' });
+  write({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    },
+    session_id: 'fake_session',
+  });
+  for (const delta of text.match(/.{1,12}/g) ?? []) {
+    write({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: delta },
+      },
+      session_id: 'fake_session',
+    });
+  }
+  write({
+    type: 'assistant',
+    message: {
+      role: 'assistant',
+      content: [{ type: 'text', text }],
+    },
+    session_id: 'fake_session',
+  });
+  write({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 }, session_id: 'fake_session' });
+  write({
+    type: 'result',
+    subtype: 'success',
+    result: text,
+    session_id: 'fake_session',
+    usage: {
+      input_tokens: 4,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: 4,
+    },
+  });
+}
+
 if (isPersistent) {
   const rl = readline.createInterface({ input: process.stdin });
   rl.on('line', (line) => {
@@ -132,7 +179,8 @@ if (isPersistent) {
       ? content.map((part) => part?.text ?? '').join('')
       : String(content ?? '');
     if (text.trim() === '/clear') emitText('');
-    else if (hasSchema) emitStructured();
+    else if (hasSchema || text.includes('Schema JSON only.')) emitStructured();
+    else if (text.includes('Valid JSON only.')) emitJsonObject();
     else emitText('OK');
   });
   rl.on('close', () => process.exit(0));

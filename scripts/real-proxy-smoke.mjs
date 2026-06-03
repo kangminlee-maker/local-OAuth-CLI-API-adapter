@@ -3,6 +3,7 @@ import { deflateSync } from 'node:zlib';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from '../dist/proxy/codex-app-server-backend.js';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { isReasoningEffort } from '../dist/settings.js';
 
 const options = parseArgs(process.argv.slice(2));
 const runtime = options.runtime ?? 'codex';
@@ -634,8 +635,9 @@ function numberOption(value, fallback) {
 }
 
 function reasoningEffort(value) {
-  if (['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)) return value;
-  return 'low';
+  if (value === undefined) return undefined;
+  if (isReasoningEffort(value)) return value;
+  throw new Error(`Unsupported reasoning effort: ${value}`);
 }
 
 function errorMessage(err) {

@@ -123,7 +123,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
   ): Promise<LocalCompletionResult> {
-    if (this.canUsePersistentText(request)) {
+    if (this.canUsePersistentTurn(request)) {
       return this.withLock(() => this.runPersistentTurn(request, signal, onTextDelta));
     }
     return this.runOneShotTurn(request, signal, onTextDelta);
@@ -133,8 +133,8 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     return !hasToolDecisionSchema(request) && !request.jsonSchema;
   }
 
-  private canUsePersistentText(request: NormalizedRequest): boolean {
-    return this.canStreamTextDeltas(request) && !hasImageInputs(request);
+  private canUsePersistentTurn(request: NormalizedRequest): boolean {
+    return !hasImageInputs(request);
   }
 
   private async runPersistentTurn(
@@ -387,6 +387,8 @@ function claudeContextIsolationArgs(): string[] {
       'Do not use or mention repository files, git status, host tools, commands, browsing, memory, or inability to inspect them unless the user explicitly asks.',
       'Do not add prefaces, caveats, file-status notes, or extra headings unless requested.',
       'Preserve exact requested output counts, formats, and word limits.',
+      'Preserve numbers, thresholds, labels, and technical identifiers exactly.',
+      'Do not invent product consequences, metrics, policies, or operational claims.',
     ].join(' '),
     '--disable-slash-commands',
     '--strict-mcp-config',

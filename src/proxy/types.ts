@@ -1,5 +1,7 @@
 export type ApiShape = 'openai-chat' | 'openai-responses' | 'anthropic-messages';
 
+export type NormalizedReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
 export interface NormalizedMessage {
   readonly role: 'system' | 'user' | 'assistant' | 'tool';
   readonly content: string;
@@ -44,6 +46,7 @@ export interface NormalizedRequest {
   readonly messages: readonly NormalizedMessage[];
   readonly maxTokens?: number;
   readonly temperature?: number;
+  readonly reasoningEffort?: NormalizedReasoningEffort;
   readonly stream: boolean;
   readonly streamOptions: NormalizedStreamOptions;
   readonly jsonMode: boolean;

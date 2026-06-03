@@ -30,7 +30,9 @@ export function outputSchemaFor(request: NormalizedRequest): unknown {
 }
 
 export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
-  return request.tools.length > 0 && request.toolChoice.type !== 'none';
+  return request.tools.length > 0
+    && request.toolChoice.type !== 'none'
+    && !isAutoToolResultContinuation(request);
 }
 
 export function parseBackendOutput(
@@ -81,21 +83,18 @@ export function usageFor(
 }
 
 export function baseInstructions(): string {
-  return [
-    'Current proxy request only.',
-    'Treat it as a standalone provider API completion.',
-    'Do not use or mention host tools, commands, files, git status, browsing, memory, or inability to inspect them.',
-  ].join(' ');
+  return 'API proxy completion only. Ignore host context, files, tools, memory, browsing, and git.';
 }
 
 export function developerInstructions(): string {
   return [
-    'Wrapper builds API shape only.',
-    'Follow only the tagged request messages.',
-    'Return requested content only.',
-    'No preface, caveat, file-status note, or extra heading unless requested.',
-    'Preserve exact counts, formats, and word limits.',
-    'JSON mode means JSON only.',
+    'Follow tagged messages only.',
+    'Return requested content exactly.',
+    'No preface or caveat unless requested.',
+    'Preserve counts, formats, and word limits.',
+    'Preserve numbers, thresholds, labels, and technical identifiers exactly.',
+    'Do not invent product consequences, metrics, policies, or operational claims.',
+    'JSON mode: JSON only.',
   ].join(' ');
 }
 
@@ -103,6 +102,20 @@ function modeInstructions(request: NormalizedRequest): string {
   if (hasToolDecisionSchema(request)) return toolModeInstructions(request);
   if (request.jsonMode) return 'Valid JSON only. No Markdown.';
   return 'Return only the assistant response text.';
+}
+
+function isAutoToolResultContinuation(request: NormalizedRequest): boolean {
+  if (request.toolChoice.type !== 'auto') return false;
+  const lastMessage = request.messages.at(-1);
+  if (!lastMessage) return false;
+  if (lastMessage.role === 'tool') return true;
+  return containsNormalizedToolResult(lastMessage.content);
+}
+
+function containsNormalizedToolResult(content: string): boolean {
+  const trimmed = content.trimStart();
+  return trimmed.startsWith('[tool result]')
+    || trimmed.includes('\n[tool result]');
 }
 
 function toolModeInstructions(request: NormalizedRequest): string {

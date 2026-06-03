@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import { deflateSync } from 'node:zlib';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from '../dist/proxy/codex-app-server-backend.js';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { isReasoningEffort } from '../dist/settings.js';
 
 loadEnvFile('.env');
 
@@ -28,49 +30,78 @@ const qualityRegressionPoints = numberOption(options.qualityRegressionPoints, 5)
 const semanticQualityTargets = options.semanticQualityTargets ?? 'proxy';
 const semanticQualityJudgeModel = options.semanticQualityJudgeModel ?? openAiModel;
 const semanticQualityReference = booleanOption(options.semanticQualityReference, true);
+const semanticQualitySuite = options.semanticQualitySuite ?? 'realistic';
 const minSemanticQuality = numberOption(options.minSemanticQuality, 0);
+const expectProviderErrors = booleanOption(options.expectProviderErrors, false);
+const requestReasoningEffort = optionalReasoningEffort(options.requestReasoningEffort);
+const targetFilters = readFilters(options.targets ?? options.target);
+const caseFilters = readFilters(options.cases ?? options.case);
 
 const rows = [];
 const servers = [];
 const semanticReferenceCache = new Map();
+let redVisionDataUrl;
+const backendTimingQueues = new Map();
 
 try {
-  const proxyCodex = await startProxy(new CodexAppServerBackend({
-    command: options.codexCommand,
-    cwd,
-    model: options.codexModel,
-    timeoutMs,
-    reasoningEffort: reasoningEffort(options.reasoningEffort),
-  }));
-  const proxyClaude = await startProxy(new ClaudeCodeBackend({
-    command: options.claudeCommand,
-    cwd,
-    model: options.claudeCliModel ?? 'sonnet',
-    timeoutMs,
-  }));
-
-  await benchmarkOpenAiChatCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
-  await benchmarkOpenAiChatCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
-  await benchmarkOpenAiCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
-  await benchmarkOpenAiCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
-  if (process.env.OPENAI_API_KEY) {
-    await benchmarkOpenAiChatCompatible('openai-api:gpt-5.5', 'https://api.openai.com', openAiModel, true);
-    await benchmarkOpenAiCompatible('openai-api:gpt-5.5', 'https://api.openai.com', openAiModel, true);
-  } else {
-    rows.push({ target: 'openai-api:gpt-5.5', ok: false, skipped: true, error: 'OPENAI_API_KEY missing' });
+  let proxyCodex = null;
+  let proxyClaude = null;
+  if (shouldRunTarget('proxy-codex')) {
+    proxyCodex = await startProxy(new CodexAppServerBackend({
+      command: options.codexCommand,
+      cwd,
+      model: options.codexModel,
+      timeoutMs,
+      reasoningEffort: reasoningEffort(options.reasoningEffort),
+      onTiming: (timing) => pushBackendTiming('proxy-codex', timing),
+    }));
+  }
+  if (shouldRunTarget('proxy-claude')) {
+    proxyClaude = await startProxy(new ClaudeCodeBackend({
+      command: options.claudeCommand,
+      cwd,
+      model: options.claudeCliModel ?? 'sonnet',
+      timeoutMs,
+    }));
   }
 
-  await benchmarkAnthropicCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
-  await benchmarkAnthropicCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
+  if (proxyCodex) await benchmarkOpenAiChatCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
+  if (proxyClaude) await benchmarkOpenAiChatCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
+  if (proxyCodex) await benchmarkOpenAiCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
+  if (proxyClaude) await benchmarkOpenAiCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
+  const openAiApiTarget = 'openai-api:gpt-5.5';
+  if (shouldRunTarget(openAiApiTarget)) {
+    if (process.env.OPENAI_API_KEY) {
+      await benchmarkOpenAiChatCompatible(openAiApiTarget, 'https://api.openai.com', openAiModel, true);
+      await benchmarkOpenAiCompatible(openAiApiTarget, 'https://api.openai.com', openAiModel, true);
+    } else {
+      rows.push({ target: openAiApiTarget, ok: false, skipped: true, error: 'OPENAI_API_KEY missing' });
+    }
+  }
+
+  if (proxyCodex) await benchmarkAnthropicCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
+  if (proxyClaude) await benchmarkAnthropicCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   if (process.env.ANTHROPIC_API_KEY) {
     for (const [family, model] of Object.entries(anthropicModels)) {
-      await benchmarkAnthropicCompatible(`anthropic-api:${family}`, 'https://api.anthropic.com', model, true);
+      const target = `anthropic-api:${family}`;
+      if (shouldRunTarget(target)) {
+        await benchmarkAnthropicCompatible(target, 'https://api.anthropic.com', model, true);
+      }
     }
-  } else {
+  } else if (Object.keys(anthropicModels).some((family) => shouldRunTarget(`anthropic-api:${family}`))) {
     rows.push({ target: 'anthropic-api', ok: false, skipped: true, error: 'ANTHROPIC_API_KEY missing' });
   }
 } finally {
   for (const server of servers.reverse()) await server.close().catch(() => undefined);
+}
+
+if (rows.length === 0) {
+  rows.push({
+    target: 'benchmark',
+    case: 'selection',
+    ok: false,
+    error: `No benchmark rows selected. targets=${filterLabel(targetFilters)} cases=${filterLabel(caseFilters)}`,
+  });
 }
 
 const failed = rows.filter((row) => !row.ok && !row.skipped);
@@ -81,7 +112,13 @@ const summaryBase = {
   semanticQualityTargets,
   semanticQualityJudgeModel,
   semanticQualityReference,
+  semanticQualityReferenceMode: 'proxy-provider',
+  semanticQualitySuite,
   minSemanticQuality,
+  expectProviderErrors,
+  requestReasoningEffort,
+  targetFilters: filterLabel(targetFilters),
+  caseFilters: filterLabel(caseFilters),
   includeMultimodal,
   openAiModel,
   anthropicModels,
@@ -131,6 +168,33 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
     assertEqual(text, token, 'chat content');
     return { totalMs: response.totalMs, text, usage: response.body.usage };
   });
+
+  if (requestReasoningEffort) {
+    await benchmarkCase(target, 'openai.chat.request_reasoning_effort.schema_exact', repeats, async (index) => {
+      const token = tokenFor(target, `CHAT_REASONING_${requestReasoningEffort.toUpperCase()}`, index);
+      const body = {
+        model,
+        reasoning_effort: requestReasoningEffort,
+        messages: [{ role: 'user', content: exactPrompt(token) }],
+        max_completion_tokens: 64,
+      };
+      if (expectProviderErrors) {
+        return await postJsonExpectOpenAiError(`${baseUrl}/v1/chat/completions`, body, openAiHeaders(isApi), {
+          status: 400,
+          type: 'invalid_request_error',
+          param: 'reasoning_effort',
+          code: 'unsupported_value',
+        });
+      }
+      const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+        ...body,
+      }, openAiHeaders(isApi));
+      assertOpenAiChatResponseShape(response.body, 'stop');
+      const text = response.body.choices?.[0]?.message?.content;
+      assertEqual(text, token, 'chat reasoning effort content');
+      return { totalMs: response.totalMs, text, requestReasoningEffort, usage: response.body.usage };
+    });
+  }
 
   await benchmarkCase(target, 'openai.chat.stream.schema_exact', repeats, async (index) => {
     const token = tokenFor(target, 'CHAT_STREAM', index);
@@ -203,8 +267,27 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
     return { totalMs: response.totalMs, toolName: toolCall.function.name, args, usage: response.body.usage };
   });
 
+  await benchmarkCase(target, 'openai.chat.tool_call_stream.schema_exact', repeats, async () => {
+    const response = await postSse(`${baseUrl}/v1/chat/completions`, {
+      model,
+      stream: true,
+      messages: [{ role: 'user', content: 'Use get_weather for Seoul. Return a tool call only.' }],
+      tools: [openAiChatWeatherTool()],
+      tool_choice: 'required',
+      max_completion_tokens: 128,
+    }, openAiHeaders(isApi), () => '', (_event, payload) => {
+      const calls = payload?.choices?.[0]?.delta?.tool_calls;
+      if (!Array.isArray(calls)) return '';
+      return calls.map((call) => call?.function?.arguments ?? '').join('');
+    });
+    const args = parseJson(response.toolArguments, 'chat streamed tool arguments');
+    assertEqual(args.city, 'Seoul', 'chat streamed tool city');
+    assertOpenAiChatToolStreamShape(response.events);
+    return responseSummary(response);
+  });
+
   await benchmarkCase(target, 'openai.chat.tool_result.schema_exact', repeats, async () => {
-    if (!toolCall) throw new Error('chat tool_call prerequisite did not run');
+    toolCall ??= benchmarkChatToolCall();
     const expected = 'WEATHER_RESULT_CITY=Seoul;TEMP_C=23;CONDITION=clear';
     const response = await postJson(`${baseUrl}/v1/chat/completions`, {
       model,
@@ -259,24 +342,58 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
   }
 
   if (shouldRunSemanticQuality(target)) {
-    await benchmarkQualityCase(target, 'openai.chat.semantic_quality', semanticQualityRepeats, async (index) => {
-      const prompt = qualityPrompt();
+    for (const task of semanticQualityTasks()) {
+      await benchmarkQualityCase(target, `openai.chat.semantic_quality.${task.id}`, semanticQualityRepeats, async (index) => {
+        const prompt = task.prompt;
+        const response = await postJson(`${baseUrl}/v1/chat/completions`, {
+          model,
+          messages: [{ role: 'user', content: prompt }],
+          max_completion_tokens: 640,
+        }, openAiHeaders(isApi));
+        const text = response.body.choices?.[0]?.message?.content ?? '';
+        assertOpenAiChatResponseShape(response.body, 'stop');
+        const reference = await semanticReference('openai.chat', target, `${task.id}:${index}`, prompt);
+        const judged = await scoreSemanticQuality({
+          target,
+          caseName: `openai.chat.semantic_quality.${task.id}`,
+          prompt,
+          text,
+          reference,
+        });
+        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged };
+      });
+    }
+  }
+
+  if (requestReasoningEffort && !expectProviderErrors && shouldRunSemanticQuality(target)) {
+    await benchmarkQualityCase(target, 'openai.chat.request_reasoning_effort.semantic_quality', semanticQualityRepeats, async (index) => {
+      const task = semanticQualityTasks()[0];
+      const prompt = task.prompt;
       const response = await postJson(`${baseUrl}/v1/chat/completions`, {
         model,
+        reasoning_effort: requestReasoningEffort,
         messages: [{ role: 'user', content: prompt }],
         max_completion_tokens: 640,
       }, openAiHeaders(isApi));
       const text = response.body.choices?.[0]?.message?.content ?? '';
       assertOpenAiChatResponseShape(response.body, 'stop');
-      const reference = await semanticReference('openai.chat', target, index, prompt);
+      const reference = await semanticReference('openai.chat', target, `request_reasoning:${requestReasoningEffort}:${index}`, prompt, {
+        openAiReasoningEffort: requestReasoningEffort,
+      });
       const judged = await scoreSemanticQuality({
         target,
-        caseName: 'openai.chat.semantic_quality',
+        caseName: 'openai.chat.request_reasoning_effort.semantic_quality',
         prompt,
         text,
         reference,
       });
-      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text), ...judged };
+      return {
+        totalMs: response.totalMs,
+        text,
+        requestReasoningEffort,
+        quality: scoreQualityOutput(text, task),
+        ...judged,
+      };
     });
   }
 }
@@ -294,6 +411,31 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
     assertEqual(text, token, 'responses text');
     return { totalMs: response.totalMs, text };
   });
+
+  if (requestReasoningEffort) {
+    await benchmarkCase(target, 'openai.responses.request_reasoning_effort.schema_exact', repeats, async (index) => {
+      const token = tokenFor(target, `RESPONSES_REASONING_${requestReasoningEffort.toUpperCase()}`, index);
+      const body = {
+        model,
+        reasoning: { effort: requestReasoningEffort },
+        input: exactPrompt(token),
+        max_output_tokens: 64,
+      };
+      if (expectProviderErrors) {
+        return await postJsonExpectOpenAiError(`${baseUrl}/v1/responses`, body, openAiHeaders(isApi), {
+          status: 400,
+          type: 'invalid_request_error',
+          param: 'reasoning.effort',
+          code: 'unsupported_value',
+        });
+      }
+      const response = await postJson(`${baseUrl}/v1/responses`, body, openAiHeaders(isApi));
+      const text = extractOpenAiResponseText(response.body);
+      assertOpenAiResponsesShape(response.body);
+      assertEqual(text, token, 'responses reasoning effort text');
+      return { totalMs: response.totalMs, text, requestReasoningEffort, usage: response.body.usage };
+    });
+  }
 
   await benchmarkCase(target, 'openai.responses.stream', repeats, async (index) => {
     const token = tokenFor(target, 'OPENAI_STREAM', index);
@@ -338,11 +480,11 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
       stream_options: isApi ? { include_obfuscation: false } : undefined,
       tools: [openAiWeatherTool()],
       tool_choice: 'required',
-    }, openAiHeaders(isApi), (event, payload) => {
+    }, openAiHeaders(isApi), () => '', (event, payload) => {
       if (event === 'response.function_call_arguments.delta') return payload.delta ?? '';
       return '';
     });
-    const args = parseJson(response.text, 'responses streamed tool arguments');
+    const args = parseJson(response.toolArguments, 'responses streamed tool arguments');
     assertEqual(args.city, 'Seoul', 'responses streamed tool city');
     assertOpenAiResponsesStreamShape(response.events, [
       'response.created',
@@ -389,25 +531,27 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
   }
 
   if (shouldRunSemanticQuality(target)) {
-    await benchmarkQualityCase(target, 'openai.responses.semantic_quality', semanticQualityRepeats, async (index) => {
-      const prompt = qualityPrompt();
-      const response = await postJson(`${baseUrl}/v1/responses`, {
-        model,
-        input: prompt,
-        max_output_tokens: 640,
-      }, openAiHeaders(isApi));
-      assertOpenAiResponsesShape(response.body);
-      const text = extractOpenAiResponseText(response.body) ?? '';
-      const reference = await semanticReference('openai.responses', target, index, prompt);
-      const judged = await scoreSemanticQuality({
-        target,
-        caseName: 'openai.responses.semantic_quality',
-        prompt,
-        text,
-        reference,
+    for (const task of semanticQualityTasks()) {
+      await benchmarkQualityCase(target, `openai.responses.semantic_quality.${task.id}`, semanticQualityRepeats, async (index) => {
+        const prompt = task.prompt;
+        const response = await postJson(`${baseUrl}/v1/responses`, {
+          model,
+          input: prompt,
+          max_output_tokens: 640,
+        }, openAiHeaders(isApi));
+        assertOpenAiResponsesShape(response.body);
+        const text = extractOpenAiResponseText(response.body) ?? '';
+        const reference = await semanticReference('openai.responses', target, `${task.id}:${index}`, prompt);
+        const judged = await scoreSemanticQuality({
+          target,
+          caseName: `openai.responses.semantic_quality.${task.id}`,
+          prompt,
+          text,
+          reference,
+        });
+        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged };
       });
-      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text), ...judged };
-    });
+    }
   }
 }
 
@@ -459,6 +603,28 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
     assertEqual(call?.name, 'get_weather', 'tool name');
     assertEqual(call?.input?.city, 'Seoul', 'tool city');
     return { totalMs: response.totalMs, toolName: call.name, args: call.input };
+  });
+
+  await benchmarkCase(target, 'anthropic.messages.tool_use_stream.schema_exact', repeats, async () => {
+    const response = await postSse(`${baseUrl}/v1/messages`, {
+      model,
+      max_tokens: 128,
+      stream: true,
+      messages: [{ role: 'user', content: 'Use get_weather for Seoul. Return a tool call only.' }],
+      tools: [{
+        name: 'get_weather',
+        description: 'Get current weather by city.',
+        input_schema: weatherSchema(),
+      }],
+      tool_choice: { type: 'any' },
+    }, anthropicHeaders(isApi), () => '', (event, payload) => {
+      if (event !== 'content_block_delta' && payload?.type !== 'content_block_delta') return '';
+      return payload?.delta?.type === 'input_json_delta' ? payload.delta.partial_json ?? '' : '';
+    });
+    const args = parseJson(response.toolArguments, 'anthropic streamed tool arguments');
+    assertEqual(args.city, 'Seoul', 'anthropic streamed tool city');
+    assertAnthropicStreamShape(response.events);
+    return responseSummary(response);
   });
 
   await benchmarkCase(target, 'anthropic.messages.tool_result.schema_exact', repeats, async () => {
@@ -534,33 +700,37 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
   }
 
   if (shouldRunSemanticQuality(target)) {
-    await benchmarkQualityCase(target, 'anthropic.messages.semantic_quality', semanticQualityRepeats, async (index) => {
-      const prompt = qualityPrompt();
-      const response = await postJson(`${baseUrl}/v1/messages`, {
-        model,
-        max_tokens: 640,
-        messages: [{ role: 'user', content: prompt }],
-      }, anthropicHeaders(isApi));
-      assertAnthropicMessageShape(response.body, 'end_turn');
-      const text = response.body.content?.find((block) => block.type === 'text')?.text ?? '';
-      const reference = await semanticReference('anthropic.messages', target, index, prompt);
-      const judged = await scoreSemanticQuality({
-        target,
-        caseName: 'anthropic.messages.semantic_quality',
-        prompt,
-        text,
-        reference,
+    for (const task of semanticQualityTasks()) {
+      await benchmarkQualityCase(target, `anthropic.messages.semantic_quality.${task.id}`, semanticQualityRepeats, async (index) => {
+        const prompt = task.prompt;
+        const response = await postJson(`${baseUrl}/v1/messages`, {
+          model,
+          max_tokens: 640,
+          messages: [{ role: 'user', content: prompt }],
+        }, anthropicHeaders(isApi));
+        assertAnthropicMessageShape(response.body, 'end_turn');
+        const text = response.body.content?.find((block) => block.type === 'text')?.text ?? '';
+        const reference = await semanticReference('anthropic.messages', target, `${task.id}:${index}`, prompt);
+        const judged = await scoreSemanticQuality({
+          target,
+          caseName: `anthropic.messages.semantic_quality.${task.id}`,
+          prompt,
+          text,
+          reference,
+        });
+        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged };
       });
-      return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text), ...judged };
-    });
+    }
   }
 }
 
 async function benchmarkCase(target, caseName, count, fn) {
+  if (!shouldRunCase(caseName)) return;
   const samples = [];
   for (let i = 0; i < count; i += 1) {
     try {
       const sample = await fn(i + 1);
+      attachBackendTiming(target, sample);
       samples.push(sample);
       console.log(`PASS ${target} ${caseName} #${i + 1}: ${JSON.stringify(sample)}`);
     } catch (err) {
@@ -575,29 +745,38 @@ async function benchmarkCase(target, caseName, count, fn) {
       return;
     }
   }
-  rows.push({
+  const row = {
     target,
     case: caseName,
     ok: true,
     totalMs: summarize(samples.map((sample) => sample.totalMs)),
     firstDataMs: summarize(samples.map((sample) => sample.firstDataMs).filter(Number.isFinite)),
     firstTextMs: summarize(samples.map((sample) => sample.firstTextMs).filter(Number.isFinite)),
+    firstToolArgumentMs: summarize(samples.map((sample) => sample.firstToolArgumentMs).filter(Number.isFinite)),
     chunks: samples.map((sample) => sample.chunks).filter(Number.isFinite),
     sample: samples.at(-1),
-  });
+  };
+  const backendTiming = summarizeBackendTimings(samples);
+  if (backendTiming) row.backendTiming = backendTiming;
+  const outliers = sampleOutliers(samples);
+  if (outliers.length > 0) row.outliers = outliers;
+  rows.push(row);
 }
 
 async function benchmarkQualityCase(target, caseName, count, fn) {
+  if (!shouldRunCase(caseName)) return;
   const samples = [];
   for (let i = 0; i < count; i += 1) {
     try {
       const sample = await fn(i + 1);
+      attachBackendTiming(target, sample);
       samples.push(sample);
       console.log(`PASS ${target} ${caseName} #${i + 1}: ${JSON.stringify({
         totalMs: sample.totalMs,
         quality: sample.quality,
         semanticQuality: sample.semanticQuality,
         judgeMs: sample.judgeMs,
+        backendTiming: sample.backendTiming,
       })}`);
     } catch (err) {
       const row = {
@@ -623,6 +802,10 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
   if (semanticScores.length > 0) row.semanticQuality = summarize(semanticScores);
   const judgeMs = samples.map((sample) => sample.judgeMs).filter(Number.isFinite);
   if (judgeMs.length > 0) row.judgeMs = summarize(judgeMs);
+  const backendTiming = summarizeBackendTimings(samples);
+  if (backendTiming) row.backendTiming = backendTiming;
+  const outliers = sampleOutliers(samples);
+  if (outliers.length > 0) row.outliers = outliers;
   const lowestSemanticScore = Math.min(...semanticScores);
   if (semanticScores.length > 0 && minSemanticQuality > 0 && lowestSemanticScore < minSemanticQuality) {
     row.ok = false;
@@ -650,7 +833,41 @@ async function postJson(url, body, headers) {
   return { body: parsed, totalMs: elapsed(startedAt) };
 }
 
-async function postSse(url, body, headers, collectText) {
+async function postJsonExpectOpenAiError(url, body, headers, expected) {
+  const startedAt = performance.now();
+  const res = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(stripUndefined(body)),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await res.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = { raw: text };
+  }
+  assertEqual(res.status, expected.status, 'expected provider error status');
+  const error = parsed.error;
+  assert(error && typeof error === 'object', 'expected OpenAI error object');
+  assertEqual(error.type, expected.type, 'provider error type');
+  assertEqual(error.param, expected.param, 'provider error param');
+  assertEqual(error.code, expected.code, 'provider error code');
+  assert(typeof error.message === 'string' && error.message.length > 0, 'provider error message');
+  return {
+    totalMs: elapsed(startedAt),
+    statusCode: res.status,
+    error: {
+      type: error.type,
+      param: error.param,
+      code: error.code,
+      message: error.message,
+    },
+  };
+}
+
+async function postSse(url, body, headers, collectText, collectToolArgument = () => '') {
   const startedAt = performance.now();
   const res = await fetch(url, {
     method: 'POST',
@@ -665,8 +882,10 @@ async function postSse(url, body, headers, collectText) {
   let buffer = '';
   let firstDataMs = null;
   let firstTextMs = null;
+  let firstToolArgumentMs = null;
   let chunks = 0;
   let text = '';
+  let toolArguments = '';
   let done = false;
   const events = [];
 
@@ -700,9 +919,15 @@ async function postSse(url, body, headers, collectText) {
         chunks += 1;
         text += delta;
       }
+      const toolArgumentDelta = collectToolArgument(event, payload);
+      if (toolArgumentDelta) {
+        if (firstToolArgumentMs === null) firstToolArgumentMs = elapsed(startedAt);
+        chunks += 1;
+        toolArguments += toolArgumentDelta;
+      }
     }
   }
-  return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, chunks, text, done, events };
+  return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, firstToolArgumentMs, chunks, text, toolArguments, done, events };
 }
 
 function openAiHeaders(isApi) {
@@ -745,6 +970,17 @@ function openAiChatWeatherTool() {
   };
 }
 
+function benchmarkChatToolCall() {
+  return {
+    id: 'call_bench_weather',
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      arguments: '{"city":"Seoul"}',
+    },
+  };
+}
+
 function adapterSchema() {
   return {
     type: 'object',
@@ -769,8 +1005,61 @@ function weatherSchema() {
 }
 
 function visionDataUrl() {
-  // 8x8 red PNG.
-  return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAFElEQVR4nGP8z4AdMDEQqgsA0ZIBCfL8IFwAAAAASUVORK5CYII=';
+  redVisionDataUrl ??= solidPngDataUrl(64, 64, { r: 255, g: 0, b: 0, a: 255 });
+  return redVisionDataUrl;
+}
+
+function solidPngDataUrl(width, height, rgba) {
+  const stride = 1 + width * 4;
+  const pixels = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * stride;
+    pixels[row] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const offset = row + 1 + x * 4;
+      pixels[offset] = rgba.r;
+      pixels[offset + 1] = rgba.g;
+      pixels[offset + 2] = rgba.b;
+      pixels[offset + 3] = rgba.a;
+    }
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(pixels)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
+
+function pngChunk(type, data) {
+  const name = Buffer.from(type, 'ascii');
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length, 0);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([name, data])), 0);
+  return Buffer.concat([length, name, data, crc]);
+}
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function assertOpenAiChatResponseShape(body, finishReason) {
@@ -805,6 +1094,17 @@ function assertOpenAiChatStreamShape(events, { includeUsage }) {
     assert(usageChunk, 'chat stream final usage chunk missing');
     assertUsageShape(usageChunk.payload.usage, 'openai-chat');
   }
+}
+
+function assertOpenAiChatToolStreamShape(events) {
+  assertOpenAiChatStreamShape(events, { includeUsage: false });
+  const toolDelta = events.find(({ payload }) => {
+    const calls = payload?.choices?.[0]?.delta?.tool_calls;
+    return Array.isArray(calls) && calls.some((call) => call?.function?.arguments);
+  });
+  assert(toolDelta, 'chat tool stream missing argument delta');
+  const finish = events.find(({ payload }) => payload?.choices?.[0]?.finish_reason === 'tool_calls');
+  assert(finish, 'chat tool stream missing tool_calls finish reason');
 }
 
 function assertOpenAiResponsesShape(body) {
@@ -877,10 +1177,44 @@ function responseSummary(response) {
     totalMs: response.totalMs,
     firstDataMs: response.firstDataMs,
     firstTextMs: response.firstTextMs,
+    firstToolArgumentMs: response.firstToolArgumentMs,
     chunks: response.chunks,
     eventTypes: response.events.map(({ event }) => event),
     text: response.text,
+    toolArguments: response.toolArguments,
   };
+}
+
+function pushBackendTiming(target, timing) {
+  const queue = backendTimingQueues.get(target) ?? [];
+  queue.push(timing);
+  backendTimingQueues.set(target, queue);
+}
+
+function attachBackendTiming(target, sample) {
+  const queue = backendTimingQueues.get(target);
+  if (!queue?.length) return;
+  sample.backendTiming = queue.shift();
+}
+
+function summarizeBackendTimings(samples) {
+  const timings = samples.map((sample) => sample.backendTiming).filter(Boolean);
+  if (timings.length === 0) return null;
+  const summary = {};
+  for (const key of [
+    'ensureStartedMs',
+    'promptBuildMs',
+    'threadStartMs',
+    'inputPrepareMs',
+    'turnStartMs',
+    'turnWaitMs',
+    'usageWaitMs',
+    'totalMs',
+  ]) {
+    const values = timings.map((timing) => timing[key]).filter(Number.isFinite);
+    if (values.length > 0) summary[key] = summarize(values);
+  }
+  return summary;
 }
 
 function extractOpenAiResponseText(body) {
@@ -899,62 +1233,148 @@ function exactPrompt(token) {
 }
 
 function qualityPrompt() {
-  return [
-    'Write a concise English implementation review for a local OAuth CLI API proxy.',
-    'Facts to review: provider mappings lack schema versioning; provider auth headers are hardcoded; token exchange adds about 200ms; refresh caching and connection reuse are missing; localhost binding exists; state validation is missing; tokens may appear in debug logs; token storage is plaintext.',
-    'Treat these facts as current defects; do not soften them as acceptable tradeoffs or future recommendations.',
-    'Preserve qualifiers: say about 200ms, and say tokens may appear in debug logs.',
-    'Return only three bullet lines, with no heading, preface, caveat, or closing sentence.',
-    'Bullet 1 must assess API schema compatibility using the schema-versioning, provider-mapping, or auth-header facts.',
-    'Bullet 2 must assess latency using token exchange adding about 200ms plus missing refresh caching or connection reuse.',
-    'Bullet 3 must mention localhost binding exists, but missing state validation, plaintext storage, or possible debug-log token exposure keep OAuth risk high.',
-    'Keep each bullet under 24 words.',
-  ].join(' ');
+  return semanticQualityTasks()[0].prompt;
 }
 
-function scoreQualityOutput(text) {
+function semanticQualityTasks() {
+  if (semanticQualitySuite === 'legacy') return [qualityTasks()[0]];
+  if (semanticQualitySuite !== 'realistic') {
+    throw new Error(`unsupported semantic quality suite: ${semanticQualitySuite}`);
+  }
+  return qualityTasks();
+}
+
+function qualityTasks() {
+  return [
+    {
+      id: 'implementation_review',
+      requiredTerms: ['schema', 'latency', 'risk'],
+      format: 'bullets',
+      prompt: [
+        'Write a concise English implementation review for a local OAuth CLI API proxy.',
+        'Facts to review: provider mappings lack schema versioning; provider auth headers are hardcoded; token exchange adds about 200ms; refresh caching and connection reuse are missing; localhost binding exists; state validation is missing; tokens may appear in debug logs; token storage is plaintext.',
+        'Treat these facts as current defects; do not soften them as acceptable tradeoffs or future recommendations.',
+        'Preserve qualifiers: say about 200ms, and say tokens may appear in debug logs.',
+        'Return only three bullet lines, with no heading, preface, caveat, or closing sentence.',
+        'Bullet 1 must assess API schema compatibility using the schema-versioning, provider-mapping, or auth-header facts.',
+        'Bullet 2 must assess latency using token exchange adding about 200ms plus missing refresh caching or connection reuse.',
+        'Bullet 3 must mention localhost binding exists, but missing state validation, plaintext storage, or possible debug-log token exposure keep OAuth risk high.',
+        'Keep each bullet under 24 words.',
+      ].join(' '),
+    },
+    {
+      id: 'korean_optimization_axes',
+      requiredTerms: ['속도', '품질', '영향', '개선'],
+      format: 'table',
+      prompt: [
+        '다음 최적화 후보를 한국어로 평가해줘.',
+        '후보: Codex wrapper 축소, tool argument streaming, Claude persistent session, negative provider error parity.',
+        '판단 근거: Codex wrapper 축소는 proxy-added token/context를 줄여 속도에는 중간 정도 도움이 되지만 guardrail 약화 회귀 위험이 있어 품질 영향도 중간이다.',
+        '판단 근거: tool argument streaming은 첫 tool argument latency를 크게 줄일 수 있어 속도 영향은 크지만 JSON argument 파싱 안정성을 보존해야 하므로 품질 영향은 중간이다.',
+        '판단 근거: Claude persistent session은 프로세스 재시작 비용을 줄여 속도 영향은 크고, 세션 상태 오염을 막으면 품질은 대체로 중립이다.',
+        '판단 근거: negative provider error parity는 정상 경로 속도 개선은 거의 없고, unsupported-value 400 shape 일치로 contract 품질을 중간 정도 개선한다.',
+        '속도 영향 크기는 각각 정확히 "중간", "큼", "큼", "거의 없음"으로 써.',
+        '품질 영향 크기는 각각 정확히 "중간", "중간", "낮음", "중간"으로 써.',
+        '품질 개선 방향에는 각각 "악화 위험", "보존 필요", "대체로 중립", "개선"을 포함해.',
+        '반드시 "영향 크기"와 "개선 방향"을 분리해서 판단해.',
+        '출력은 Markdown 표 하나만 사용하고, 열은 작업, 속도 영향 크기, 속도 개선 방향, 품질 영향 크기, 품질 개선 방향으로 해.',
+        '각 셀은 짧게 쓰고, 위 판단 근거와 반대되는 영향 크기를 만들지 마.',
+        '영향이 크다는 말과 좋아진다는 말을 같은 뜻으로 쓰지 마.',
+      ].join(' '),
+    },
+    {
+      id: 'benchmark_failure_triage',
+      requiredTerms: ['fixture', 'provider', 'proxy', 'benchmark'],
+      format: 'bullets',
+      prompt: [
+        'A benchmark for multimodal parity failed.',
+        'Observed facts: direct OpenAI returns image_parse_error for the fixture; direct Anthropic says it could not process the image; both proxies sometimes answer BLUE when the expected label is RED.',
+        'Write an English triage note with exactly four bullets.',
+        'Identify the most likely first thing to validate, explain why proxy quality cannot be judged until direct providers accept the same fixture, and include one benchmark change plus one implementation check.',
+        'Name both direct-provider errors: image_parse_error and could not process the image.',
+        'Name the proxy label mismatch as BLUE vs expected RED.',
+        'The implementation check must include forwarding fidelity and synthetic fallback labels or swallowed upstream errors.',
+        'Do not claim the model is color blind and do not blame OAuth.',
+      ].join(' '),
+    },
+    {
+      id: 'handoff_summary',
+      requiredTerms: ['usage', 'stream', 'quality', 'turnWaitMs'],
+      format: 'bullets',
+      prompt: [
+        'Write a concise engineering handoff in English for the next maintainer of a local OAuth CLI API proxy.',
+        'Current facts: provider token usage is preserved in public usage fields; stream rows track firstDataMs, firstTextMs, and firstToolArgumentMs; semantic quality must stay at least 95; proxy-codex latency outliers are dominated by turnWaitMs; request-level effort overrides backend fallback settings.',
+        'Return exactly five bullets.',
+        'Each bullet must name the product consequence first, then the technical authority.',
+        'Preserve exact identifiers and numeric thresholds: write "at least 95" as a score, not 95%, and state that outliers are dominated by turnWaitMs.',
+        'Include these exact authority phrases once each: "stream rows track firstDataMs, firstTextMs, and firstToolArgumentMs"; "proxy-codex latency outliers are dominated by turnWaitMs"; "request-level effort overrides backend fallback settings".',
+        'Keep each bullet under 18 words.',
+        'Avoid historical narration and avoid asking follow-up questions.',
+      ].join(' '),
+    },
+  ];
+}
+
+function scoreQualityOutput(text, task = { requiredTerms: ['schema', 'latency', 'risk'], format: 'bullets' }) {
   const lower = text.toLowerCase();
-  const required = ['schema', 'latency', 'risk'];
-  const keywordHits = required.filter((word) => lower.includes(word)).length;
+  const required = task.requiredTerms ?? ['schema', 'latency', 'risk'];
+  const keywordHits = required.filter((word) => lower.includes(word.toLowerCase())).length;
   const bulletCount = (text.match(/(^|\n)\s*(-|•|\d+[.)])/g) ?? []).length;
-  const words = text.trim().split(/\s+/).filter(Boolean).length;
-  const structureScore = Math.min(1, bulletCount / 3);
+  const tableRows = text.split('\n').filter((line) => /^\s*\|.*\|\s*$/.test(line)).length;
+  const characters = text.trim().length;
+  const structureScore = task.format === 'table'
+    ? Math.min(1, tableRows / 6)
+    : Math.min(1, bulletCount / (task.id === 'handoff_summary' ? 5 : task.id === 'benchmark_failure_triage' ? 4 : 3));
   const keywordScore = keywordHits / required.length;
-  const lengthScore = words >= 18 && words <= 90 ? 1 : Math.max(0, 1 - Math.abs(words - 54) / 54);
+  const lengthScore = characters >= 120 && characters <= 1200 ? 1 : Math.max(0, 1 - Math.abs(characters - 480) / 480);
   return {
     score: Math.round((keywordScore * 0.5 + structureScore * 0.3 + lengthScore * 0.2) * 100),
     keywordHits,
     bulletCount,
-    words,
+    tableRows,
+    characters,
   };
 }
 
-async function semanticReference(kind, target, index, prompt) {
+async function semanticReference(kind, target, index, prompt, options = {}) {
   if (!semanticQualityReference || target.includes('-api:')) return null;
-  if (kind.startsWith('openai') && !process.env.OPENAI_API_KEY) return null;
-  if (kind.startsWith('anthropic') && !process.env.ANTHROPIC_API_KEY) return null;
-  const key = `${kind}:${index}`;
+  const provider = semanticReferenceProvider(target);
+  if (!provider) return null;
+  if (provider === 'openai' && !process.env.OPENAI_API_KEY) return null;
+  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) return null;
+  const key = `${provider}:${kind}:${index}:${hashString(prompt)}:${options.openAiReasoningEffort ?? ''}`;
   if (semanticReferenceCache.has(key)) return semanticReferenceCache.get(key);
-  const value = await fetchSemanticReference(kind, prompt);
+  const value = await fetchSemanticReference(provider, kind, prompt, options);
   semanticReferenceCache.set(key, value);
   return value;
 }
 
-async function fetchSemanticReference(kind, prompt) {
-  if (kind === 'openai.chat') {
-    const response = await postJson('https://api.openai.com/v1/chat/completions', {
-      model: openAiModel,
-      messages: [{ role: 'user', content: prompt }],
-      max_completion_tokens: 640,
-    }, openAiHeaders(true));
-    assertOpenAiChatResponseShape(response.body, 'stop');
-    return {
-      target: `openai-api:${openAiModel}`,
-      totalMs: response.totalMs,
-      text: response.body.choices?.[0]?.message?.content ?? '',
-      usage: response.body.usage,
-    };
+function semanticReferenceProvider(target) {
+  if (target === 'proxy-codex') return 'openai';
+  if (target === 'proxy-claude') return 'anthropic';
+  return null;
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
   }
+  return (hash >>> 0).toString(16);
+}
+
+async function fetchSemanticReference(provider, kind, prompt, options = {}) {
+  if (provider === 'openai') {
+    return await fetchOpenAiSemanticReference(kind, prompt, options);
+  }
+  if (provider === 'anthropic') {
+    return await fetchAnthropicSemanticReference(prompt);
+  }
+  throw new Error(`unsupported semantic reference provider: ${provider}`);
+}
+
+async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
   if (kind === 'openai.responses') {
     const response = await postJson('https://api.openai.com/v1/responses', {
       model: openAiModel,
@@ -963,27 +1383,42 @@ async function fetchSemanticReference(kind, prompt) {
     }, openAiHeaders(true));
     assertOpenAiResponsesShape(response.body);
     return {
-      target: `openai-api:${openAiModel}`,
+      target: `openai-api:${openAiModel}:responses`,
       totalMs: response.totalMs,
       text: extractOpenAiResponseText(response.body) ?? '',
       usage: response.body.usage,
     };
   }
-  if (kind === 'anthropic.messages') {
-    const response = await postJson('https://api.anthropic.com/v1/messages', {
-      model: anthropicModels.sonnet,
-      max_tokens: 640,
-      messages: [{ role: 'user', content: prompt }],
-    }, anthropicHeaders(true));
-    assertAnthropicMessageShape(response.body, 'end_turn');
-    return {
-      target: `anthropic-api:${anthropicModels.sonnet}`,
-      totalMs: response.totalMs,
-      text: response.body.content?.find((block) => block.type === 'text')?.text ?? '',
-      usage: response.body.usage,
-    };
-  }
-  throw new Error(`unsupported semantic reference kind: ${kind}`);
+
+  const body = {
+    model: openAiModel,
+    messages: [{ role: 'user', content: prompt }],
+    max_completion_tokens: 640,
+  };
+  if (options.openAiReasoningEffort) body.reasoning_effort = options.openAiReasoningEffort;
+  const response = await postJson('https://api.openai.com/v1/chat/completions', body, openAiHeaders(true));
+  assertOpenAiChatResponseShape(response.body, 'stop');
+  return {
+    target: `openai-api:${openAiModel}:chat`,
+    totalMs: response.totalMs,
+    text: response.body.choices?.[0]?.message?.content ?? '',
+    usage: response.body.usage,
+  };
+}
+
+async function fetchAnthropicSemanticReference(prompt) {
+  const response = await postJson('https://api.anthropic.com/v1/messages', {
+    model: anthropicModels.sonnet,
+    max_tokens: 640,
+    messages: [{ role: 'user', content: prompt }],
+  }, anthropicHeaders(true));
+  assertAnthropicMessageShape(response.body, 'end_turn');
+  return {
+    target: `anthropic-api:${anthropicModels.sonnet}`,
+    totalMs: response.totalMs,
+    text: response.body.content?.find((block) => block.type === 'text')?.text ?? '',
+    usage: response.body.usage,
+  };
 }
 
 async function scoreSemanticQuality({ target, caseName, prompt, text, reference }) {
@@ -1014,7 +1449,7 @@ async function scoreSemanticQuality({ target, caseName, prompt, text, reference 
         schema: semanticQualityScoreSchema(),
       },
     },
-    max_completion_tokens: 600,
+    max_completion_tokens: 1600,
   }, openAiHeaders(true));
   assertOpenAiChatResponseShape(response.body, 'stop');
   const semanticQuality = parseJson(response.body.choices?.[0]?.message?.content, 'semantic judge content');
@@ -1043,10 +1478,11 @@ function semanticJudgePrompt({ target, caseName, prompt, text, reference }) {
     text,
     [
       'Rubric:',
-      '- requirementFit: exact satisfaction of three bullets, required topics, and per-bullet length.',
-      '- semanticRelevance: usefulness and correctness for a local OAuth CLI API proxy implementation review.',
-      '- conciseness: dense, non-fluffy, no extra headings or unrelated caveats.',
+      '- requirementFit: exact satisfaction of the original request, including language, format, count, ordering, forbidden claims, and required facts.',
+      '- semanticRelevance: usefulness, correctness, and operational value for the requested local OAuth CLI API proxy scenario.',
+      '- conciseness: dense, non-fluffy, and no extra headings, caveats, or follow-up questions unless the request asks for them.',
       '- providerSimilarity: if a reference is present, semantic similarity to the direct provider output; otherwise plausibility as a direct provider API answer.',
+      'Do not reward reference similarity when both the reference and candidate violate the explicit original request.',
       'Overall score should be a weighted quality score from 0 to 100.',
       'List only concrete issues; use an empty array if none.',
     ].join('\n'),
@@ -1129,6 +1565,51 @@ function summarize(values) {
   };
 }
 
+function sampleOutliers(samples) {
+  const totals = samples.map((sample) => sample.totalMs).filter(Number.isFinite);
+  if (totals.length < 2) return [];
+  const median = medianNumber(totals);
+  const threshold = Math.max(750, Math.abs(median) * 0.3);
+  return samples
+    .map((sample, index) => {
+      if (!Number.isFinite(sample.totalMs) || sample.totalMs <= median + threshold) return null;
+      return {
+        sample: index + 1,
+        totalMs: sample.totalMs,
+        medianMs: median,
+        overMedianMs: Math.round(sample.totalMs - median),
+        thresholdMs: Math.round(threshold),
+        ...(sample.backendTiming ? { backendTiming: outlierBackendTiming(sample.backendTiming) } : {}),
+      };
+    })
+    .filter(Boolean);
+}
+
+function outlierBackendTiming(timing) {
+  const phases = [
+    'ensureStartedMs',
+    'promptBuildMs',
+    'threadStartMs',
+    'inputPrepareMs',
+    'turnStartMs',
+    'turnWaitMs',
+    'usageWaitMs',
+  ].map((key) => ({ key, value: Number.isFinite(timing[key]) ? timing[key] : 0 }));
+  const dominant = phases.reduce((best, item) => item.value > best.value ? item : best, phases[0]);
+  const total = Number.isFinite(timing.totalMs) && timing.totalMs > 0 ? timing.totalMs : 0;
+  return {
+    dominantPhase: dominant.key,
+    dominantMs: dominant.value,
+    turnWaitMs: timing.turnWaitMs ?? 0,
+    turnWaitShare: total > 0 ? Math.round((timing.turnWaitMs ?? 0) / total * 100) / 100 : null,
+  };
+}
+
+function medianNumber(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor((sorted.length - 1) / 2)];
+}
+
 function loadSummaryFile(path) {
   const text = fs.readFileSync(path, 'utf8');
   const marker = 'API_COMPARISON_SUMMARY ';
@@ -1156,7 +1637,7 @@ function compareWithBaseline(baseline, current, options) {
       skipped.push({ target: row.target, case: row.case, reason: 'missing-baseline' });
       continue;
     }
-    for (const metric of ['totalMs', 'firstDataMs', 'firstTextMs']) {
+    for (const metric of ['totalMs', 'firstDataMs', 'firstTextMs', 'firstToolArgumentMs']) {
       const before = medianOf(baselineRow[metric]);
       const after = medianOf(row[metric]);
       if (!Number.isFinite(before) || !Number.isFinite(after)) continue;
@@ -1221,6 +1702,44 @@ function shouldCompareRegressionTarget(target, filter) {
   return target.includes(filter);
 }
 
+function shouldRunTarget(target) {
+  return matchesFilters(target, targetFilters);
+}
+
+function shouldRunCase(caseName) {
+  return matchesFilters(caseName, caseFilters);
+}
+
+function matchesFilters(value, filters) {
+  if (!filters) return true;
+  return filters.some((filter) => matchesFilter(value, filter));
+}
+
+function matchesFilter(value, filter) {
+  if (filter === 'all') return true;
+  if (filter.includes('*')) {
+    const pattern = filter
+      .split('*')
+      .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, '\\$&'))
+      .join('.*');
+    return new RegExp(`^${pattern}$`).test(value);
+  }
+  return value === filter || value.includes(filter);
+}
+
+function readFilters(value) {
+  if (value === undefined || value === null || value === '' || value === 'all') return null;
+  const filters = String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  return filters.length > 0 ? filters : null;
+}
+
+function filterLabel(filters) {
+  return filters?.join(',') ?? 'all';
+}
+
 function shouldRunSemanticQuality(target) {
   return semanticQualityRepeats > 0 && shouldCompareRegressionTarget(target, semanticQualityTargets);
 }
@@ -1277,8 +1796,15 @@ function booleanOption(value, fallback) {
 }
 
 function reasoningEffort(value) {
-  if (['none', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)) return value;
-  return 'low';
+  if (value === undefined) return undefined;
+  if (isReasoningEffort(value)) return value;
+  throw new Error(`Unsupported reasoning effort: ${value}`);
+}
+
+function optionalReasoningEffort(value) {
+  if (value === undefined) return undefined;
+  if (isReasoningEffort(value)) return value;
+  throw new Error(`Unsupported request reasoning effort: ${value}`);
 }
 
 function errorMessage(err) {

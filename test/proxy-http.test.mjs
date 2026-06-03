@@ -17,6 +17,19 @@ beforeEach(async () => {
       model: 'fake-local-model',
       async generate(request) {
         seenRequests.push(request);
+        if (request.messages.some((message) => message.content.includes('FAIL_PROVIDER'))) {
+          throw new Error(JSON.stringify({
+            message: JSON.stringify({
+              status: 400,
+              error: {
+                type: 'invalid_request_error',
+                message: 'Unsupported value: requested effort is not supported with this model.',
+                param: 'reasoning.effort',
+                code: 'unsupported_value',
+              },
+            }),
+          }));
+        }
         const tool = request.tools[0];
         const toolCalls = tool && request.toolChoice.type !== 'none'
           ? [
@@ -46,6 +59,41 @@ beforeEach(async () => {
       async close() {},
     },
   });
+});
+
+test('OpenAI request reasoning effort reaches the backend', async () => {
+  const chat = await postJson('/v1/chat/completions', {
+    model: 'fake-local-model',
+    reasoning_effort: 'high',
+    messages: [{ role: 'user', content: 'Say OK' }],
+  });
+  await chat.json();
+
+  const responses = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    reasoning: { effort: 'low' },
+    input: 'Say OK',
+  });
+  await responses.json();
+
+  assert.equal(chat.status, 200);
+  assert.equal(responses.status, 200);
+  assert.equal(seenRequests[0].reasoningEffort, 'high');
+  assert.equal(seenRequests[1].reasoningEffort, 'low');
+});
+
+test('provider invalid request errors preserve OpenAI 4xx shape', async () => {
+  const res = await postJson('/v1/chat/completions', {
+    model: 'fake-local-model',
+    messages: [{ role: 'user', content: 'FAIL_PROVIDER' }],
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.equal(body.error.param, 'reasoning_effort');
+  assert.equal(body.error.code, 'unsupported_value');
+  assert.match(body.error.message, /requested effort/);
 });
 
 afterEach(async () => {
@@ -395,10 +443,15 @@ test('OpenAI chat stream forwards live tool call argument deltas', async () => {
 
     assert.equal(res.status, 200);
     assert.match(text, /"tool_calls"/);
+    assert.match(text, /"name":"get_weather","arguments":""/);
     assert.match(text, /"arguments":"\{\\?"city\\?""/);
     assert.match(text, /"arguments":":\\?"Seoul\\?"\}"/);
     assert.doesNotMatch(text, /"arguments":"\{\\?"city\\?":\\?"Seoul\\?"\}"/);
     assert.match(text, /"finish_reason":"tool_calls"/);
+    assert.ok(
+      text.indexOf('"name":"get_weather","arguments":""') < text.indexOf('"arguments":"{\\\"city\\\""'),
+      'tool start chunk should precede argument deltas',
+    );
   } finally {
     await live.close();
   }

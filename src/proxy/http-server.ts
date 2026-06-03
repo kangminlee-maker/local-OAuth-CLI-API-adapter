@@ -31,6 +31,8 @@ export interface StartedProxyServer {
   close(): Promise<void>;
 }
 
+type ErrorResponseShape = 'openai' | 'openai-chat' | 'openai-responses' | 'anthropic';
+
 export async function startLocalApiProxy(
   options: ProxyServerOptions,
 ): Promise<StartedProxyServer> {
@@ -67,6 +69,7 @@ async function handleRequest(
   requestTimeoutMs: number,
 ): Promise<void> {
   setCorsHeaders(res);
+  let errorShape: ErrorResponseShape = 'openai';
   if (req.method === 'OPTIONS') {
     res.writeHead(204).end();
     return;
@@ -83,6 +86,7 @@ async function handleRequest(
 
     const body = await readJsonBody(req);
     if (path === '/v1/chat/completions') {
+      errorShape = 'openai-chat';
       const normalized = normalizeOpenAiChatRequest(body);
       rejectDeferredFeatures(normalized);
       if (normalized.stream) {
@@ -94,6 +98,7 @@ async function handleRequest(
       return;
     }
     if (path === '/v1/responses') {
+      errorShape = 'openai-responses';
       const normalized = normalizeOpenAiResponsesRequest(body);
       rejectDeferredFeatures(normalized);
       if (normalized.stream) {
@@ -105,6 +110,7 @@ async function handleRequest(
       return;
     }
     if (path === '/v1/messages') {
+      errorShape = 'anthropic';
       const normalized = normalizeAnthropicMessagesRequest(body);
       rejectDeferredFeatures(normalized, 'anthropic');
       if (normalized.stream) {
@@ -118,7 +124,7 @@ async function handleRequest(
 
     throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
   } catch (err) {
-    writeError(res, err);
+    writeError(res, err, errorShape);
   }
 }
 
@@ -485,6 +491,8 @@ async function writeOpenAiChatStream(
     };
     if (!hasToolDecisionSchema(request)) {
       await ensureTextStarted();
+    } else {
+      await toolState.prestart(base, predictableOpenAiChatToolStart(request));
     }
     for await (const event of events) {
       if (event.type === 'text_delta') {
@@ -569,6 +577,11 @@ class OpenAiChatToolStreamState {
     private readonly hasAssistantStarted: () => boolean,
     private readonly markAssistantStarted: () => void,
   ) {}
+
+  async prestart(base: Record<string, unknown>, tool: PredictableToolStart | null): Promise<void> {
+    if (!tool) return;
+    await this.ensureStarted(base, tool.index, tool.id, tool.name);
+  }
 
   async write(
     base: Record<string, unknown>,
@@ -914,6 +927,31 @@ class OpenAiResponsesToolStreamState {
   }
 }
 
+interface PredictableToolStart {
+  readonly index: number;
+  readonly id: string;
+  readonly name: string;
+}
+
+function predictableOpenAiChatToolStart(request: NormalizedRequest): PredictableToolStart | null {
+  if (request.shape !== 'openai-chat') return null;
+  if (request.toolChoice.type === 'tool') {
+    return {
+      index: 0,
+      id: 'call_1',
+      name: request.toolChoice.name,
+    };
+  }
+  if (request.toolChoice.type === 'required' && request.tools.length === 1) {
+    return {
+      index: 0,
+      id: 'call_1',
+      name: request.tools[0]?.name ?? 'tool',
+    };
+  }
+  return null;
+}
+
 function openAiResponsesCompletedResponse(
   responseId: string,
   result: LocalCompletionResult,
@@ -1213,7 +1251,11 @@ function isAddressInfo(value: string | AddressInfo | null): value is AddressInfo
   return Boolean(value) && typeof value === 'object';
 }
 
-function writeError(res: ServerResponse, err: unknown): void {
+function writeError(
+  res: ServerResponse,
+  err: unknown,
+  shape: ErrorResponseShape = 'openai',
+): void {
   if (err instanceof ProxyRequestError) {
     if (err.provider === 'anthropic') {
       writeJson(res, err.statusCode, {
@@ -1235,6 +1277,28 @@ function writeError(res: ServerResponse, err: unknown): void {
     });
     return;
   }
+  const providerError = providerErrorFromBackendError(err);
+  if (providerError) {
+    if (shape === 'anthropic') {
+      writeJson(res, providerError.statusCode, {
+        type: 'error',
+        error: {
+          type: providerError.type,
+          message: providerError.message,
+        },
+      });
+      return;
+    }
+    writeJson(res, providerError.statusCode, {
+      error: {
+        message: providerError.message,
+        type: providerError.type,
+        param: providerErrorParamForShape(providerError.param, shape),
+        code: providerError.code,
+      },
+    });
+    return;
+  }
   writeJson(res, 500, {
     error: {
       message: err instanceof Error ? err.message : String(err),
@@ -1243,6 +1307,46 @@ function writeError(res: ServerResponse, err: unknown): void {
       code: null,
     },
   });
+}
+
+function providerErrorFromBackendError(err: unknown): {
+  readonly statusCode: number;
+  readonly type: string;
+  readonly message: string;
+  readonly param: string | null;
+  readonly code: string | null;
+} | null {
+  const outer = parseObject(errorMessage(err));
+  const inner = parseObject(typeof outer?.message === 'string' ? outer.message : undefined) ?? outer;
+  const error = asRecordPayload(inner?.error);
+  const statusCode = typeof inner?.status === 'number' ? inner.status : undefined;
+  const message = typeof error.message === 'string' ? error.message : undefined;
+  if (!statusCode || statusCode < 400 || statusCode >= 500 || !message) return null;
+  return {
+    statusCode,
+    type: typeof error.type === 'string' ? error.type : 'invalid_request_error',
+    message,
+    param: typeof error.param === 'string' ? error.param : null,
+    code: typeof error.code === 'string' ? error.code : null,
+  };
+}
+
+function providerErrorParamForShape(
+  param: string | null,
+  shape: ErrorResponseShape,
+): string | null {
+  if (shape === 'openai-chat' && param === 'reasoning.effort') return 'reasoning_effort';
+  return param;
+}
+
+function parseObject(value: string | undefined): Record<string, unknown> | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return asRecordPayload(parsed);
+  } catch {
+    return null;
+  }
 }
 
 function setCorsHeaders(res: ServerResponse): void {

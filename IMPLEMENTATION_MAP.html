@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ggui OAuth CLI Add-on Implementation Map</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #202124;
+      --muted: #5f6368;
+      --line: #dadce0;
+      --surface: #f8f9fa;
+      --accent: #0b57d0;
+      --ok: #137333;
+      --warn: #b06000;
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: white;
+      line-height: 1.5;
+    }
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1, h2 {
+      line-height: 1.2;
+      margin: 0;
+    }
+    h1 {
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+    h2 {
+      font-size: 18px;
+      margin-top: 28px;
+      margin-bottom: 12px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: var(--muted);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      background: white;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: var(--surface);
+      font-size: 13px;
+      color: var(--muted);
+    }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.95em;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .step {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--surface);
+    }
+    .step strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+    .ok {
+      color: var(--ok);
+      font-weight: 600;
+    }
+    .warn {
+      color: var(--warn);
+      font-weight: 600;
+    }
+    @media (max-width: 760px) {
+      .flow {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ggui OAuth CLI Add-on Implementation Map</h1>
+    <p>Current map for the local OAuth CLI API adapter, focused on runtime proxy behavior and benchmark-sensitive contracts.</p>
+
+    <h2>Runtime Flow</h2>
+    <section class="flow" aria-label="Runtime flow">
+      <div class="step">
+        <strong>1. HTTP API</strong>
+        <code>startLocalApiProxy</code> accepts OpenAI Chat, OpenAI Responses, and Anthropic Messages compatible requests.
+      </div>
+      <div class="step">
+        <strong>2. Normalize</strong>
+        Provider-shaped input is normalized into internal messages, tools, image references, schema mode, and stream mode.
+      </div>
+      <div class="step">
+        <strong>3. Local CLI Backend</strong>
+        Requests route to <code>CodexAppServerBackend</code> or <code>ClaudeCodeBackend</code> using local OAuth CLI auth.
+      </div>
+      <div class="step">
+        <strong>4. Provider Shape</strong>
+        Text, tool calls, streaming deltas, and provider token usage are mapped back to exact API-compatible responses.
+      </div>
+    </section>
+
+    <h2>Codex Proxy Context Isolation</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Concern</th>
+          <th>Current Authority</th>
+          <th>Reason</th>
+          <th>Verification</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>User prompt preservation</td>
+          <td><code>buildPrompt(request)</code> remains the request payload authority.</td>
+          <td>The optimization removes ambient CLI context only; it does not summarize, rewrite, or shrink API input.</td>
+          <td class="ok">Schema/output parity tests and live benchmark completions pass.</td>
+        </tr>
+        <tr>
+          <td>Codex auth</td>
+          <td><code>createCodexIsolation()</code> copies only <code>auth.json</code> into an ephemeral <code>CODEX_HOME</code>.</td>
+          <td>Local OAuth auth is preserved while user MCP, plugins, hooks, projects, memory, and history stay out of the proxy run.</td>
+          <td class="ok">Unit test asserts auth copy and config exclusion.</td>
+        </tr>
+        <tr>
+          <td>Ambient tool context</td>
+          <td><code>DISABLED_CODEX_CONTEXT_FEATURES</code> disables apps, plugins, browser/computer tools, shell tool, multi-agent, hooks, goals, workspace dependencies, and Codex web search.</td>
+          <td>These features are useful in Codex sessions but inflate model-visible API proxy context.</td>
+          <td class="ok">Input tokens dropped from about 14k to about 1.9-2.0k in proxy-codex text/tool cases.</td>
+        </tr>
+        <tr>
+          <td>Workspace context</td>
+          <td>Each Codex thread and turn uses an ephemeral temp workspace as <code>cwd</code> and <code>runtimeWorkspaceRoots</code>.</td>
+          <td>API completion requests should not read repository files or project instructions unless the API payload includes them.</td>
+          <td class="ok">AGENTS/project context no longer drives the proxy-codex token count.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Benchmark Snapshot</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Case</th>
+          <th>Before</th>
+          <th>After</th>
+          <th>Impact</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>proxy-codex openai.chat.text</code></td>
+          <td>5242ms, 13984 prompt tokens</td>
+          <td>1713ms, 1884 prompt tokens</td>
+          <td class="ok">67.3% lower latency, 86.5% lower input tokens</td>
+        </tr>
+        <tr>
+          <td><code>proxy-codex openai.chat.tool_call</code></td>
+          <td>5154ms, 14147 prompt tokens</td>
+          <td>3294ms, 2047 prompt tokens</td>
+          <td class="ok">36.1% lower latency, 85.5% lower input tokens</td>
+        </tr>
+        <tr>
+          <td><code>proxy-codex anthropic.messages.tool_result</code></td>
+          <td>4164ms, 14056 input tokens</td>
+          <td>1871ms, 1956 input tokens</td>
+          <td class="ok">55.1% lower latency, 86.1% lower input tokens</td>
+        </tr>
+        <tr>
+          <td><code>proxy-codex openai.chat.json_schema</code></td>
+          <td>4800ms, 14010 prompt tokens</td>
+          <td>3064ms, 1910 prompt tokens</td>
+          <td class="ok">36.2% lower latency, 86.4% lower input tokens</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Claude Structured Fast Path</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Concern</th>
+          <th>Current Authority</th>
+          <th>Reason</th>
+          <th>Verification</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Structured non-image requests</td>
+          <td><code>ClaudeCodeBackend</code> now routes non-image JSON/tool requests through the persistent stream-json session.</td>
+          <td>This avoids per-request Claude process startup and expensive <code>--json-schema</code> structured-output validation for hot proxy paths.</td>
+          <td class="ok">OpenAI Chat tool_call dropped from 8174ms to 1955ms in the latest quality-gated benchmark.</td>
+        </tr>
+        <tr>
+          <td>Image requests</td>
+          <td>Image-bearing requests stay on the one-shot stream-json path.</td>
+          <td>Image payload setup and file cleanup remain isolated from the long-lived text session.</td>
+          <td class="ok">Real multimodal benchmark passed 9/9 after switching the benchmark fixture to a provider-accepted generated 64x64 red PNG.</td>
+        </tr>
+        <tr>
+          <td>Quality gate</td>
+          <td>Semantic quality benchmark uses provider-paired direct API references: proxy-codex compares with OpenAI API, proxy-claude with Anthropic API.</td>
+          <td>Context or schema enforcement changes can improve speed while subtly changing answer quality, and API-surface matching is not the same as backend-provider quality matching.</td>
+          <td class="ok">Latest realistic semantic suite passed 24/24 with proxy semantic scores from 95 to 99 at a 95-point gate; latest non-multimodal schema run passed 54/54.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Tool Result Continuation</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Concern</th>
+          <th>Current Authority</th>
+          <th>Reason</th>
+          <th>Verification</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Auto tool result turns</td>
+          <td><code>backend-contract</code> disables the proxy tool-decision schema only when <code>tool_choice</code> is <code>auto</code> and the latest normalized message is a provider tool result.</td>
+          <td>This matches the next step of the provider tool loop: after a tool result, the assistant normally produces a final message instead of another tool-decision envelope.</td>
+          <td class="ok">OpenAI Chat tool_result improved from 2465ms to 2003ms on proxy-codex and from 3496ms to 1514ms on proxy-claude.</td>
+        </tr>
+        <tr>
+          <td>Forced tool calls</td>
+          <td><code>required</code> and named tool choices still use the tool-decision schema.</td>
+          <td>Those requests explicitly ask the provider to choose or call tools, so the proxy still needs structured tool-call extraction.</td>
+          <td class="ok">Contract tests cover auto-before-tool, required-after-result, final-answer mode, and JSON-schema preservation.</td>
+        </tr>
+        <tr>
+          <td>Benchmark variance</td>
+          <td><code>api-comparison-benchmark</code> supports <code>--targets</code> and <code>--cases</code> filters with exact, substring, and wildcard matching.</td>
+          <td>Single-sample latency gates can fail on Codex provider outliers unrelated to a changed branch, so outlier cases need targeted repeated medians.</td>
+          <td class="ok">Rows now include outlier tags; proxy-codex outliers also identify the dominant backend phase when timing is available.</td>
+        </tr>
+        <tr>
+          <td>Codex JSON schema latency</td>
+          <td>No prompt-only schema or idle-thread prewarm fast path is active.</td>
+          <td>Both probes preserved schema exactness and semantic quality, but neither improved median latency over the structured-output baseline.</td>
+          <td class="warn">Baseline median 2088ms; prompt-only schema 2465ms; idle-thread prewarm 2605ms. Keep the structured schema path.</td>
+        </tr>
+        <tr>
+          <td>Compact Codex proxy context</td>
+          <td>Codex proxy threads and turns force <code>personality: none</code>, <code>model_reasoning_summary: none</code>, <code>web_search: disabled</code>, and shorter API-wrapper instructions.</td>
+          <td>This preserves the user prompt while removing proxy-added conversational context that direct provider APIs do not need.</td>
+          <td class="ok">Representative benchmark passed 14/14; semantic quality stayed 98-99; representative Codex input is now about 1.9-2.0k tokens.</td>
+        </tr>
+        <tr>
+          <td>Codex context floor probe</td>
+          <td>Direct app-server probes compared the product payload, no wrapper, base-only wrapper, and shorter wrapper variants.</td>
+          <td>The current wrapper is needed to suppress default Codex instructions; omitting it increased input from about 4.6k to 8.7k tokens.</td>
+          <td class="warn">A more aggressive shorter wrapper saved only about 33 tokens and weakens response guardrails, so it is not active.</td>
+        </tr>
+        <tr>
+          <td>Codex usage-tail timing</td>
+          <td>The Codex waiter now resolves immediately when provider token usage arrives after <code>turn/completed</code>, while keeping the 100ms fallback only for missing usage.</td>
+          <td>This preserves exact provider usage and removes a deterministic tail in reversed notification order without changing API response schemas.</td>
+          <td class="warn">Fake app-server test proves the tail removal. Real Codex timing probes show <code>usageWaitMs=0</code>; current latency is dominated by provider <code>turnWaitMs</code>.</td>
+        </tr>
+        <tr>
+          <td>Benchmark phase diagnostics</td>
+          <td><code>api-comparison-benchmark</code> records proxy-codex-only <code>backendTiming</code> summaries outside the public API response.</td>
+          <td>Contract exactness stays intact while benchmarks can separate local overhead from provider turn latency.</td>
+          <td class="ok">Six-case streaming probe passed 6/6; outliers were dominated by <code>turnWaitMs</code>, usually with 0.89-1.00 turn-wait share.</td>
+        </tr>
+        <tr>
+          <td>Codex reasoning effort</td>
+          <td>Proxy-Codex reads request-level effort from OpenAI Chat <code>reasoning_effort</code> and Responses <code>reasoning.effort</code>.</td>
+          <td>The API request is the authority; CLI <code>--reasoning-effort</code> is an explicit override, and <code>settings.json</code> <code>codexProxy.fallbackReasoningEffort</code> is the fallback when both are omitted.</td>
+          <td class="ok">Supported efforts <code>none</code>, <code>low</code>, <code>medium</code>, <code>high</code>, and <code>xhigh</code> each passed 20/20 across four runs. <code>settings.json</code> currently selects <code>medium</code>. Current direct <code>gpt-5.5</code> rejects <code>minimal</code>; negative parity benchmark passed 4/4 with matching 400 invalid-request shapes.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Reasoning Effort Matrix</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Request Effort</th>
+          <th>Proxy Chat</th>
+          <th>Proxy Responses</th>
+          <th>Semantic Gate</th>
+          <th>Direct API Chat</th>
+          <th>Conclusion</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>none</code></td>
+          <td>1850ms median, 4219ms p95</td>
+          <td>1817ms median, 4516ms p95</td>
+          <td class="ok">99 score; 4855ms semantic median</td>
+          <td>1160ms median</td>
+          <td class="warn">Good quality, but schema p95 is noisy.</td>
+        </tr>
+        <tr>
+          <td><code>low</code></td>
+          <td>1812ms median, 7308ms p95</td>
+          <td>1728ms median, 3089ms p95</td>
+          <td class="ok">99 score; 3196ms semantic median</td>
+          <td>1265ms median</td>
+          <td class="warn">Fast median, but Chat p95 has the worst low-effort outlier.</td>
+        </tr>
+        <tr>
+          <td><code>medium</code></td>
+          <td>1911ms median, 3130ms p95</td>
+          <td>1781ms median, 2487ms p95</td>
+          <td class="ok">99 score; 2973ms semantic median</td>
+          <td>1397ms median</td>
+          <td class="ok">Best balanced effort after four runs: stable p95, high quality, and reasonable semantic latency.</td>
+        </tr>
+        <tr>
+          <td><code>high</code></td>
+          <td>2345ms median, 4614ms p95</td>
+          <td>2009ms median, 3388ms p95</td>
+          <td class="ok">99 score; 7454ms semantic median</td>
+          <td>1463ms median</td>
+          <td class="warn">Quality stays high, but semantic latency is consistently much slower.</td>
+        </tr>
+        <tr>
+          <td><code>xhigh</code></td>
+          <td>2956ms median, 5716ms p95</td>
+          <td>2408ms median, 3223ms p95</td>
+          <td class="ok">98 score; 10536ms semantic median</td>
+          <td>1593ms median</td>
+          <td class="warn">Not just a spike: higher effort creates a persistent latency tail without quality gain.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Next Optimization Queue</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Priority</th>
+          <th>Work</th>
+          <th>Expected Speed Impact</th>
+          <th>Expected Quality Impact</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>1</td>
+          <td>Investigate whether Codex app-server exposes partial text/tool deltas before <code>turn/completed</code>.</td>
+          <td class="ok">High if available; proxy-codex first text/tool argument is still gated by 1.6-3.8s <code>turnWaitMs</code>.</td>
+          <td class="warn">High risk; partial-event semantics must not break exact schema or tool-call JSON.</td>
+        </tr>
+        <tr>
+          <td>2</td>
+          <td>Reduce the proxy-codex token floor beyond the current wrapper without changing user prompts.</td>
+          <td class="ok">Medium to high for cost and latency; current image/text requests still report about 1.9k Codex input tokens versus tens of direct API tokens.</td>
+          <td class="warn">Medium risk; the wrapper also suppresses ambient Codex behavior, so semantic quality must stay above 95.</td>
+        </tr>
+        <tr>
+          <td>3</td>
+          <td>Stabilize proxy-claude latency outliers, especially image and OpenAI-shaped stream rows.</td>
+          <td>Medium; medians are close to direct API, but isolated samples still jump by 0.75-2.9s.</td>
+          <td>Low to medium; mostly runtime/session management, but image routing must preserve provider behavior.</td>
+        </tr>
+        <tr>
+          <td>4</td>
+          <td>Run repeated provider-paired realistic semantic suite and add more real task shapes.</td>
+          <td>Low direct speed impact; it makes optimization decisions safer.</td>
+          <td class="ok">High; one-sample realistic suite passed 24/24 at 95+, but repeats are needed to measure variance.</td>
+        </tr>
+        <tr>
+          <td>5</td>
+          <td>Extend usage-token parity reporting to compare proxy backend usage, public response usage, and direct provider usage side by side.</td>
+          <td>Low speed impact.</td>
+          <td class="ok">High contract value; it clarifies exact provider-usage authority while exposing token-floor regressions.</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h2>Streaming Latency Snapshot</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Stream Case</th>
+          <th>Proxy-Codex</th>
+          <th>Proxy-Claude</th>
+          <th>Direct API</th>
+          <th>Interpretation</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>OpenAI Chat first text</td>
+          <td>2333ms</td>
+          <td>1404ms</td>
+          <td>885ms</td>
+          <td class="warn">Proxy-Codex sends first stream data in about 1ms, but first text still waits on Codex turn progress.</td>
+        </tr>
+        <tr>
+          <td>OpenAI Responses first text</td>
+          <td>3228ms</td>
+          <td>1284ms</td>
+          <td>1136ms</td>
+          <td class="warn">Responses stream shape is immediate, but proxy-codex text arrival is still turn-wait dominated.</td>
+        </tr>
+        <tr>
+          <td>OpenAI Chat first tool argument</td>
+          <td>2744ms</td>
+          <td>1786ms</td>
+          <td>689ms</td>
+          <td class="warn">Chat tool pre-start reduces first stream data to about 1ms, but actual arguments remain backend-gated.</td>
+        </tr>
+        <tr>
+          <td>OpenAI Responses first tool argument</td>
+          <td>3550ms</td>
+          <td>1743ms</td>
+          <td>985ms</td>
+          <td class="warn">Argument delta streaming works, but proxy-codex remains tied to provider turn completion.</td>
+        </tr>
+        <tr>
+          <td>Anthropic Messages first text</td>
+          <td>1598ms</td>
+          <td>1201ms</td>
+          <td>1088ms</td>
+          <td class="ok">Anthropic text streaming is now closer to direct API in this 3-repeat run.</td>
+        </tr>
+        <tr>
+          <td>Anthropic Messages first tool argument</td>
+          <td>2391ms</td>
+          <td>1526ms</td>
+          <td>1296ms</td>
+          <td class="ok">Proxy-Claude remains close to direct Sonnet; proxy-codex is slower but improved versus the previous 3.0s run.</td>
+        </tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>
