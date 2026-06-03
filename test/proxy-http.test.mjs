@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
-import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { openAiImageQualityReasoningEffort, startLocalApiProxy } from '../dist/proxy/http-server.js';
 
 let started;
 let seenRequests;
+let seenImageGenerationRequests;
 const pngDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
 
 beforeEach(async () => {
   seenRequests = [];
+  seenImageGenerationRequests = [];
   started = await startLocalApiProxy({
     host: '127.0.0.1',
     port: 0,
@@ -58,6 +60,63 @@ beforeEach(async () => {
       },
       async close() {},
     },
+    imageGenerationClient: {
+      async generate(request) {
+        seenImageGenerationRequests.push(request);
+        return {
+          created: 123,
+          images: Array.from({ length: request.n }, (_, index) => ({
+            b64Json: Buffer.from(`fake-image-${index + 1}:${request.prompt}`).toString('base64'),
+            revisedPrompt: `revised ${index + 1}: ${request.prompt}`,
+          })),
+          background: request.background,
+          outputFormat: request.outputFormat,
+          quality: request.quality,
+          size: request.size,
+          latencyMs: 1,
+        };
+      },
+      async *stream(request) {
+        seenImageGenerationRequests.push(request);
+        if (request.prompt.includes('FAIL_IMAGE_STREAM_PROVIDER')) {
+          throw new Error(JSON.stringify({
+            message: JSON.stringify({
+              status: 429,
+              error: {
+                type: 'insufficient_quota',
+                message: 'Image quota exceeded.',
+                param: null,
+                code: 'insufficient_quota',
+              },
+            }),
+          }));
+        }
+        yield {
+          type: 'partial_image',
+          created: 122,
+          partialImageIndex: 0,
+          image: {
+            b64Json: Buffer.from(`partial:${request.prompt}`).toString('base64'),
+          },
+          background: request.background,
+          outputFormat: request.outputFormat,
+          quality: request.quality,
+          size: request.size,
+        };
+        yield {
+          type: 'completed',
+          created: 123,
+          image: {
+            b64Json: Buffer.from(`final:${request.prompt}`).toString('base64'),
+            revisedPrompt: `stream revised: ${request.prompt}`,
+          },
+          background: request.background,
+          outputFormat: request.outputFormat,
+          quality: request.quality,
+          size: request.size,
+        };
+      },
+    },
   });
 });
 
@@ -99,6 +158,14 @@ test('provider invalid request errors preserve OpenAI 4xx shape', async () => {
 afterEach(async () => {
   await started?.close();
   started = undefined;
+});
+
+test('image-2 quality maps to gpt-5.5 reasoning effort', () => {
+  assert.equal(openAiImageQualityReasoningEffort(undefined), 'xhigh');
+  assert.equal(openAiImageQualityReasoningEffort('high'), 'xhigh');
+  assert.equal(openAiImageQualityReasoningEffort('medium'), 'high');
+  assert.equal(openAiImageQualityReasoningEffort('low'), 'medium');
+  assert.equal(openAiImageQualityReasoningEffort('auto'), 'xhigh');
 });
 
 test('GET /v1/models returns an OpenAI-compatible model list', async () => {
@@ -183,6 +250,208 @@ test('POST /v1/responses preserves input_image URL parts', async () => {
   assert.equal(seenRequests[0].messages[0].images[0].source.type, 'url');
   assert.equal(seenRequests[0].messages[0].images[0].source.url, 'https://example.com/image.png');
   assert.equal(seenRequests[0].messages[0].images[0].detail, 'low');
+});
+
+test('POST /v1/images/generations maps image-2 requests to the image generation client', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'A small red square.',
+    n: 2,
+    size: '1024x1024',
+    quality: 'low',
+    output_format: 'webp',
+    output_compression: 80,
+    background: 'opaque',
+    moderation: 'low',
+    user: 'end-user-123',
+    response_format: 'b64_json',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenRequests.length, 0);
+  assert.equal(seenImageGenerationRequests.length, 1);
+  assert.equal(seenImageGenerationRequests[0].model, 'image-2');
+  assert.equal(seenImageGenerationRequests[0].prompt, 'A small red square.');
+  assert.equal(seenImageGenerationRequests[0].n, 2);
+  assert.equal(seenImageGenerationRequests[0].size, '1024x1024');
+  assert.equal(seenImageGenerationRequests[0].quality, 'low');
+  assert.equal(seenImageGenerationRequests[0].outputFormat, 'webp');
+  assert.equal(seenImageGenerationRequests[0].outputCompression, 80);
+  assert.equal(seenImageGenerationRequests[0].background, 'opaque');
+  assert.equal(seenImageGenerationRequests[0].moderation, 'low');
+  assert.equal(seenImageGenerationRequests[0].user, 'end-user-123');
+  assert.equal(body.created, 123);
+  assert.equal(body.size, '1024x1024');
+  assert.equal(body.quality, 'low');
+  assert.equal(body.output_format, 'webp');
+  assert.equal(body.background, 'opaque');
+  assert.equal(body.data.length, 2);
+  assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:A small red square.').toString('base64'));
+  assert.equal(body.data[0].revised_prompt, 'revised 1: A small red square.');
+});
+
+test('POST /v1/images/generations supports URL response format with local image URLs', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'A small red square.',
+    response_format: 'url',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].responseFormat, 'url');
+  assert.equal(body.output_format, undefined);
+  assert.equal(body.quality, undefined);
+  assert.equal(body.size, undefined);
+  assert.equal(body.background, undefined);
+  assert.equal(body.data[0].b64_json, undefined);
+  assert.match(body.data[0].url, /^http:\/\/127\.0\.0\.1:\d+\/v1\/images\/generated\//);
+
+  const imageRes = await fetch(body.data[0].url);
+  assert.equal(imageRes.status, 200);
+  assert.equal(imageRes.headers.get('content-type'), 'image/png');
+  assert.equal(
+    Buffer.from(await imageRes.arrayBuffer()).toString('utf8'),
+    'fake-image-1:A small red square.',
+  );
+});
+
+test('POST /v1/images/generations streams partial and completed image events', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'A streaming red square.',
+    stream: true,
+    partial_images: 1,
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') ?? '', /text\/event-stream/);
+  assert.equal(seenImageGenerationRequests[0].stream, true);
+  assert.equal(seenImageGenerationRequests[0].partialImages, 1);
+  assert.match(text, /event: image_generation\.partial_image/);
+  assert.match(text, /"type":"image_generation\.partial_image"/);
+  assert.match(text, /"partial_image_index":0/);
+  assert.match(text, /event: image_generation\.completed/);
+  assert.match(text, /"type":"image_generation\.completed"/);
+  assert.equal((text.match(/event: image_generation\.completed/g) ?? []).length, 1);
+  assert.match(text, /"b64_json"/);
+});
+
+test('POST /v1/images/generations stream preserves provider error fields', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'FAIL_IMAGE_STREAM_PROVIDER',
+    stream: true,
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 200);
+  assert.match(text, /event: error/);
+  assert.match(text, /"type":"insufficient_quota"/);
+  assert.match(text, /"code":"insufficient_quota"/);
+  assert.match(text, /"message":"Image quota exceeded\."/);
+});
+
+test('POST /v1/images/edits accepts JSON image references', async () => {
+  const res = await postJson('/v1/images/edits', {
+    model: 'image-2',
+    prompt: 'Make the square green.',
+    images: [{ image_url: pngDataUrl }],
+    mask: { image_url: pngDataUrl },
+    input_fidelity: 'high',
+    output_format: 'jpeg',
+    output_compression: 55,
+    moderation: 'auto',
+    response_format: 'b64_json',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].operation, 'edit');
+  assert.equal(seenImageGenerationRequests[0].images.length, 1);
+  assert.equal(seenImageGenerationRequests[0].images[0].source.type, 'base64');
+  assert.equal(seenImageGenerationRequests[0].mask.source.type, 'base64');
+  assert.equal(seenImageGenerationRequests[0].inputFidelity, 'high');
+  assert.equal(seenImageGenerationRequests[0].outputFormat, 'jpeg');
+  assert.equal(seenImageGenerationRequests[0].outputCompression, 55);
+  assert.equal(seenImageGenerationRequests[0].moderation, 'auto');
+  assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Make the square green.').toString('base64'));
+});
+
+test('POST /v1/images/edits accepts multipart image array fields and string options', async () => {
+  const form = new FormData();
+  form.set('model', 'image-2');
+  form.append('image[]', new Blob([Buffer.from('fake-png-1')], { type: 'image/png' }), 'source-1.png');
+  form.append('image[]', new Blob([Buffer.from('fake-png-2')], { type: 'image/png' }), 'source-2.png');
+  form.set('prompt', 'Combine these images.');
+  form.set('n', '2');
+  form.set('stream', 'true');
+  form.set('partial_images', '1');
+  const res = await fetch(`${started.url}/v1/images/edits`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer local' },
+    body: form,
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].operation, 'edit');
+  assert.equal(seenImageGenerationRequests[0].images.length, 2);
+  assert.equal(seenImageGenerationRequests[0].n, 2);
+  assert.equal(seenImageGenerationRequests[0].stream, true);
+  assert.equal(seenImageGenerationRequests[0].partialImages, 1);
+  assert.match(text, /event: image_edit\.partial_image/);
+  assert.match(text, /event: image_edit\.completed/);
+});
+
+test('POST /v1/images/variations accepts multipart image uploads', async () => {
+  const form = new FormData();
+  form.set('model', 'image-2');
+  form.set('image', new Blob([Buffer.from('fake-png')], { type: 'image/png' }), 'source.png');
+  form.set('response_format', 'b64_json');
+  const res = await fetch(`${started.url}/v1/images/variations`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer local' },
+    body: form,
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].operation, 'variation');
+  assert.equal(seenImageGenerationRequests[0].prompt, 'Create a variation of the provided image.');
+  assert.equal(seenImageGenerationRequests[0].images.length, 1);
+  assert.equal(seenImageGenerationRequests[0].images[0].source.type, 'base64');
+  assert.equal(seenImageGenerationRequests[0].images[0].source.mediaType, 'image/png');
+  assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Create a variation of the provided image.').toString('base64'));
+});
+
+test('POST /v1/images/variations rejects JSON image input to match the Images API form-data shape', async () => {
+  const res = await postJson('/v1/images/variations', {
+    model: 'image-2',
+    image: pngDataUrl,
+    response_format: 'b64_json',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.match(body.error.message, /multipart\/form-data/);
+});
+
+test('POST /v1/images/generations rejects output compression without jpeg or webp output', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'A small red square.',
+    output_format: 'png',
+    output_compression: 80,
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.match(body.error.message, /output_compression/);
 });
 
 test('POST /v1/messages preserves Anthropic image blocks', async () => {

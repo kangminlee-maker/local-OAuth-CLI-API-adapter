@@ -12,7 +12,14 @@ import type {
   LocalStreamEvent,
   LocalToolCall,
   LocalUsage,
+  NormalizedImage,
   NormalizedRequest,
+  NormalizedReasoningEffort,
+  OpenAiGeneratedImage,
+  OpenAiImageGenerationClient,
+  OpenAiImageGenerationRequest,
+  OpenAiImageGenerationResult,
+  OpenAiImageGenerationStreamEvent,
   ProxyServerOptions,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
@@ -32,12 +39,31 @@ export interface StartedProxyServer {
 }
 
 type ErrorResponseShape = 'openai' | 'openai-chat' | 'openai-responses' | 'anthropic';
+type OpenAiImageOperation = OpenAiImageGenerationRequest['operation'];
+
+const OPENAI_IMAGE_GENERATION_TARGET_MODEL = 'gpt-5.5';
+const DEFAULT_IMAGE_GENERATION_SIZE = 'auto';
+const DEFAULT_IMAGE_GENERATION_QUALITY = 'auto';
+const DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT = 'png';
+const DEFAULT_IMAGE_GENERATION_BACKGROUND = 'auto';
+const GENERATED_IMAGE_TTL_MS = 60 * 60 * 1000;
+
+interface ParsedImageRequestBody {
+  readonly body: unknown;
+  readonly isMultipart: boolean;
+}
+
+interface OpenAiImageResponsesResult {
+  readonly image: OpenAiGeneratedImage;
+  readonly usage?: unknown;
+}
 
 export async function startLocalApiProxy(
   options: ProxyServerOptions,
 ): Promise<StartedProxyServer> {
+  const generatedImages = new GeneratedImageStore();
   const server = createServer((req, res) => {
-    void handleRequest(req, res, options.backend, options.requestTimeoutMs);
+    void handleRequest(req, res, options, generatedImages);
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -58,6 +84,7 @@ export async function startLocalApiProxy(
         }),
         options.backend.close(),
       ]);
+      generatedImages.clear();
     },
   };
 }
@@ -65,9 +92,10 @@ export async function startLocalApiProxy(
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  backend: LocalCliBackend,
-  requestTimeoutMs: number,
+  options: ProxyServerOptions,
+  generatedImages: GeneratedImageStore,
 ): Promise<void> {
+  const { backend, requestTimeoutMs } = options;
   setCorsHeaders(res);
   let errorShape: ErrorResponseShape = 'openai';
   if (req.method === 'OPTIONS') {
@@ -80,10 +108,32 @@ async function handleRequest(
       writeJson(res, 200, openAiModelsResponse(backend));
       return;
     }
+    if (req.method === 'GET' && path.startsWith('/v1/images/generated/')) {
+      writeGeneratedImage(res, generatedImages, path);
+      return;
+    }
     if (req.method !== 'POST') {
       throw new ProxyRequestError('Unsupported method.', 405);
     }
 
+    if (path === '/v1/images/generations') {
+      const { body, isMultipart } = await readImageRequestBody(req);
+      const normalized = normalizeOpenAiImageRequest(body, 'generation', isMultipart);
+      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
+      return;
+    }
+    if (path === '/v1/images/edits') {
+      const { body, isMultipart } = await readImageRequestBody(req);
+      const normalized = normalizeOpenAiImageRequest(body, 'edit', isMultipart);
+      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
+      return;
+    }
+    if (path === '/v1/images/variations') {
+      const { body, isMultipart } = await readImageRequestBody(req);
+      const normalized = normalizeOpenAiImageRequest(body, 'variation', isMultipart);
+      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
+      return;
+    }
     const body = await readJsonBody(req);
     if (path === '/v1/chat/completions') {
       errorShape = 'openai-chat';
@@ -126,6 +176,701 @@ async function handleRequest(
   } catch (err) {
     writeError(res, err, errorShape);
   }
+}
+
+async function handleOpenAiImageRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: ProxyServerOptions,
+  generatedImages: GeneratedImageStore,
+  request: OpenAiImageGenerationRequest,
+): Promise<void> {
+  const client = options.imageGenerationClient ?? defaultOpenAiImageGenerationClient();
+  if (request.stream) {
+    await writeOpenAiImageStream(
+      req,
+      res,
+      runImageGenerationStreamWithTimeout(client, request, options.requestTimeoutMs),
+      generatedImages,
+      request,
+    );
+    return;
+  }
+  const result = await runImageGenerationWithTimeout(
+    client,
+    request,
+    options.requestTimeoutMs,
+  );
+  writeJson(res, 200, openAiImagesGenerationResponse(req, generatedImages, result, request));
+}
+
+function normalizeOpenAiImageRequest(
+  body: unknown,
+  operation: OpenAiImageOperation,
+  isMultipart: boolean,
+): OpenAiImageGenerationRequest {
+  const input = asRecordPayload(body);
+  const prompt = imagePrompt(input.prompt, operation);
+  if (!prompt.trim()) {
+    throw new ProxyRequestError('prompt must be a non-empty string.', 400);
+  }
+  if (prompt.length > 32_000) {
+    throw new ProxyRequestError('prompt must be 32000 characters or fewer.', 400);
+  }
+  const responseFormat = typeof input.response_format === 'string'
+    ? input.response_format
+    : 'b64_json';
+  if (responseFormat !== 'b64_json' && responseFormat !== 'url') {
+    throw new ProxyRequestError('response_format must be one of url or b64_json.', 400);
+  }
+  const images = imageInputsForOperation(input, operation, isMultipart);
+  if ((operation === 'edit' || operation === 'variation') && images.length === 0) {
+    throw new ProxyRequestError('image input is required for image edits and variations.', 400);
+  }
+  if (operation === 'variation' && !isMultipart) {
+    throw new ProxyRequestError('image variations require multipart/form-data with an image file.', 400);
+  }
+  const request: OpenAiImageGenerationRequest = {
+    operation,
+    model: typeof input.model === 'string' && input.model.trim()
+      ? input.model
+      : 'image-2',
+    prompt,
+    n: imageGenerationCount(input.n),
+    images,
+    mask: optionalImageInput(input.mask),
+    size: optionalImageSize(input.size),
+    quality: optionalEnum(input.quality, 'quality', ['standard', 'hd', 'low', 'medium', 'high', 'auto']),
+    background: optionalEnum(input.background, 'background', ['transparent', 'opaque', 'auto']),
+    outputFormat: optionalEnum(input.output_format, 'output_format', ['png', 'jpeg', 'webp']),
+    outputCompression: optionalInteger(input.output_compression, 'output_compression', 0, 100),
+    moderation: optionalEnum(input.moderation, 'moderation', ['low', 'auto']),
+    inputFidelity: optionalEnum(input.input_fidelity, 'input_fidelity', ['high', 'low']),
+    style: optionalEnum(input.style, 'style', ['vivid', 'natural']),
+    user: optionalString(input.user),
+    responseFormat,
+    stream: optionalBoolean(input.stream, 'stream') ?? false,
+    partialImages: partialImageCount(input.partial_images),
+    raw: body,
+  };
+  validateOpenAiImageRequest(request);
+  return request;
+}
+
+function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void {
+  if (
+    request.outputCompression !== undefined
+    && request.outputFormat !== 'jpeg'
+    && request.outputFormat !== 'webp'
+  ) {
+    throw new ProxyRequestError('output_compression requires output_format to be jpeg or webp.', 400);
+  }
+  if (request.background === 'transparent' && request.outputFormat === 'jpeg') {
+    throw new ProxyRequestError('background transparent requires output_format to be png or webp.', 400);
+  }
+  if (request.inputFidelity && request.operation !== 'edit') {
+    throw new ProxyRequestError('input_fidelity is only supported for image edits.', 400);
+  }
+  if (request.style && request.operation !== 'generation') {
+    throw new ProxyRequestError('style is only supported for image generations.', 400);
+  }
+}
+
+function imagePrompt(value: unknown, operation: OpenAiImageOperation): string {
+  if (operation === 'variation') return 'Create a variation of the provided image.';
+  if (typeof value === 'string' && value.trim()) return value;
+  return '';
+}
+
+function imageInputsForOperation(
+  input: Record<string, unknown>,
+  operation: OpenAiImageOperation,
+  isMultipart: boolean,
+): readonly NormalizedImage[] {
+  if (operation === 'generation') return [];
+  const value = operation === 'edit' && !isMultipart
+    ? input.images
+    : input.image ?? input['image[]'] ?? input.images;
+  return imageInputArray(value);
+}
+
+function imageInputArray(value: unknown): readonly NormalizedImage[] {
+  if (Array.isArray(value)) return value.map(optionalImageInput).filter(isNormalizedImage);
+  const image = optionalImageInput(value);
+  return image ? [image] : [];
+}
+
+function optionalImageInput(value: unknown): NormalizedImage | undefined {
+  const multipart = asMultipartFile(value);
+  if (multipart) {
+    return {
+      source: {
+        type: 'base64',
+        mediaType: multipart.mediaType,
+        data: multipart.data,
+      },
+      raw: value,
+    };
+  }
+  if (typeof value === 'string') {
+    const image = imageSourceFromUrlLike(value);
+    return image ? { ...image, raw: value } : undefined;
+  }
+  const obj = asRecordPayload(value);
+  const fileId = typeof obj.file_id === 'string' && obj.file_id.trim()
+    ? obj.file_id.trim()
+    : '';
+  const imageUrl = typeof obj.image_url === 'string'
+    ? obj.image_url
+    : typeof asRecordPayload(obj.image_url).url === 'string'
+    ? String(asRecordPayload(obj.image_url).url)
+    : typeof obj.url === 'string'
+    ? obj.url
+    : '';
+  if (fileId && imageUrl.trim()) {
+    throw new ProxyRequestError('image references must provide exactly one of file_id or image_url.', 400);
+  }
+  if (fileId) {
+    return {
+      source: { type: 'file_id', fileId },
+      raw: value,
+    };
+  }
+  const fromUrl = imageSourceFromUrlLike(imageUrl);
+  if (fromUrl) return { ...fromUrl, raw: value };
+  if (typeof obj.b64_json === 'string' && obj.b64_json.trim()) {
+    return {
+      source: {
+        type: 'base64',
+        mediaType: typeof obj.media_type === 'string' ? obj.media_type : 'image/png',
+        data: obj.b64_json.replace(/\s/g, ''),
+      },
+      raw: value,
+    };
+  }
+  return undefined;
+}
+
+function imageSourceFromUrlLike(
+  value: string,
+): Omit<NormalizedImage, 'raw'> | null {
+  const url = value.trim();
+  if (!url) return null;
+  const dataUrl = /^data:([^;,]+);base64,(.*)$/s.exec(url);
+  if (dataUrl) {
+    const mediaType = dataUrl[1]?.trim() || 'image/png';
+    const data = dataUrl[2]?.replace(/\s/g, '') ?? '';
+    if (!mediaType.startsWith('image/') || !data) return null;
+    return {
+      source: { type: 'base64', mediaType, data },
+    };
+  }
+  return { source: { type: 'url', url } };
+}
+
+function isNormalizedImage(value: NormalizedImage | undefined): value is NormalizedImage {
+  return Boolean(value);
+}
+
+function imageGenerationCount(value: unknown): number {
+  if (value === undefined || value === null) return 1;
+  const parsed = optionalInteger(value, 'n', 1, 10);
+  if (parsed === undefined) {
+    throw new ProxyRequestError('n must be an integer between 1 and 10.', 400);
+  }
+  return parsed;
+}
+
+function partialImageCount(value: unknown): number {
+  if (value === undefined || value === null) return 0;
+  const parsed = optionalInteger(value, 'partial_images', 0, 3);
+  if (parsed === undefined) {
+    throw new ProxyRequestError('partial_images must be an integer between 0 and 3.', 400);
+  }
+  return parsed;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function optionalEnum<T extends string>(
+  value: unknown,
+  field: string,
+  allowed: readonly T[],
+): T | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string' || !allowed.includes(value as T)) {
+    throw new ProxyRequestError(`${field} must be one of ${allowed.join(', ')}.`, 400);
+  }
+  return value as T;
+}
+
+function optionalInteger(
+  value: unknown,
+  field: string,
+  min: number,
+  max: number,
+): number | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const parsed = typeof value === 'number'
+    ? value
+    : typeof value === 'string' && /^\d+$/.test(value.trim())
+    ? Number(value.trim())
+    : NaN;
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new ProxyRequestError(`${field} must be an integer between ${min} and ${max}.`, 400);
+  }
+  return parsed;
+}
+
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (value === true || value === 'true') return true;
+  if (value === false || value === 'false') return false;
+  throw new ProxyRequestError(`${field} must be a boolean.`, 400);
+}
+
+function optionalImageSize(value: unknown): string | undefined {
+  const size = optionalString(value);
+  if (!size) return undefined;
+  if (size === 'auto') return size;
+  const match = /^(\d+)x(\d+)$/.exec(size);
+  if (!match) {
+    throw new ProxyRequestError('size must be auto or a WIDTHxHEIGHT string.', 400);
+  }
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (width <= 0 || height <= 0) {
+    throw new ProxyRequestError('size width and height must be positive.', 400);
+  }
+  return size;
+}
+
+async function runImageGenerationWithTimeout(
+  client: OpenAiImageGenerationClient,
+  request: OpenAiImageGenerationRequest,
+  requestTimeoutMs: number,
+): Promise<OpenAiImageGenerationResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  try {
+    return await client.generate(request, controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function* runImageGenerationStreamWithTimeout(
+  client: OpenAiImageGenerationClient,
+  request: OpenAiImageGenerationRequest,
+  requestTimeoutMs: number,
+): AsyncIterable<OpenAiImageGenerationStreamEvent> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  try {
+    if (client.stream) {
+      for await (const event of client.stream(request, controller.signal)) {
+        yield event;
+      }
+      return;
+    }
+    const result = await client.generate(request, controller.signal);
+    for (const [index, image] of result.images.entries()) {
+      yield {
+        type: 'completed',
+        created: result.created,
+        image,
+        partialImageIndex: index,
+        background: result.background,
+        outputFormat: result.outputFormat,
+        quality: result.quality,
+        size: result.size,
+        usage: result.usage,
+      };
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function defaultOpenAiImageGenerationClient(): OpenAiImageGenerationClient {
+  return {
+    async generate(
+      request: OpenAiImageGenerationRequest,
+      signal?: AbortSignal,
+    ): Promise<OpenAiImageGenerationResult> {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) {
+        throw new Error('OPENAI_API_KEY is required to translate image-2 image generation through gpt-5.5.');
+      }
+      const startedAt = Date.now();
+      const responses = await Promise.all(
+        Array.from({ length: request.n }, () => generateOpenAiImageViaResponses(request, apiKey, signal)),
+      );
+      return {
+        created: Math.floor(Date.now() / 1000),
+        images: responses.map((response) => response.image),
+        background: request.background,
+        outputFormat: request.outputFormat,
+        quality: request.quality,
+        size: request.size,
+        usage: mergeOpenAiImageUsage(responses.map((response) => response.usage)),
+        latencyMs: Date.now() - startedAt,
+      };
+    },
+    async *stream(
+      request: OpenAiImageGenerationRequest,
+      signal?: AbortSignal,
+    ): AsyncIterable<OpenAiImageGenerationStreamEvent> {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) {
+        throw new Error('OPENAI_API_KEY is required to translate image-2 image generation through gpt-5.5.');
+      }
+      yield* streamOpenAiImageViaResponses(request, apiKey, signal);
+    },
+  };
+}
+
+async function generateOpenAiImageViaResponses(
+  request: OpenAiImageGenerationRequest,
+  apiKey: string,
+  signal: AbortSignal | undefined,
+): Promise<OpenAiImageResponsesResult> {
+  const body = openAiResponsesImageRequestBody(request, false);
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  const text = await response.text();
+  const parsed = parseObject(text) ?? { raw: text };
+  if (!response.ok) {
+    throw new Error(JSON.stringify({
+      message: JSON.stringify({
+        status: response.status,
+        error: asRecordPayload(parsed.error).message
+          ? parsed.error
+          : {
+              type: 'server_error',
+              message: text || `OpenAI image generation failed with status ${response.status}.`,
+              param: null,
+              code: null,
+            },
+      }),
+    }));
+  }
+  const output = Array.isArray(parsed.output) ? parsed.output : [];
+  const imageCall = output
+    .map(asRecordPayload)
+    .find((item) => item.type === 'image_generation_call' && typeof item.result === 'string');
+  const b64Json = typeof imageCall?.result === 'string' ? imageCall.result : '';
+  if (!b64Json) {
+    throw new Error('OpenAI Responses image_generation did not return an image result.');
+  }
+  return {
+    image: {
+      b64Json,
+      revisedPrompt: typeof imageCall?.revised_prompt === 'string'
+        ? imageCall.revised_prompt
+        : undefined,
+    },
+    usage: parsed.usage,
+  };
+}
+
+async function* streamOpenAiImageViaResponses(
+  request: OpenAiImageGenerationRequest,
+  apiKey: string,
+  signal: AbortSignal | undefined,
+): AsyncIterable<OpenAiImageGenerationStreamEvent> {
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(openAiResponsesImageRequestBody(request, true)),
+    signal,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    const parsed = parseObject(text) ?? { raw: text };
+    throw new Error(JSON.stringify({
+      message: JSON.stringify({
+        status: response.status,
+        error: asRecordPayload(parsed.error).message
+          ? parsed.error
+          : {
+              type: 'server_error',
+              message: text || `OpenAI image generation failed with status ${response.status}.`,
+              param: null,
+              code: null,
+            },
+      }),
+    }));
+  }
+  if (!response.body) throw new Error('OpenAI image generation stream did not return a readable body.');
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let emittedAny = false;
+  let emittedCompleted = false;
+  while (true) {
+    const read = await reader.read();
+    if (read.done) break;
+    buffer += decoder.decode(read.value, { stream: true });
+    let index;
+    while ((index = buffer.indexOf('\n\n')) !== -1) {
+      const frame = buffer.slice(0, index);
+      buffer = buffer.slice(index + 2);
+      const event = openAiImageStreamEventFromFrame(frame, request);
+      if (!event) continue;
+      if (event.type === 'completed') {
+        if (emittedCompleted) continue;
+        emittedCompleted = true;
+      }
+      emittedAny = true;
+      yield event;
+    }
+  }
+  buffer += decoder.decode();
+  const finalFrame = buffer.trim();
+  if (finalFrame) {
+    const event = openAiImageStreamEventFromFrame(finalFrame, request);
+    if (event && (event.type !== 'completed' || !emittedCompleted)) {
+      emittedAny = true;
+      yield event;
+    }
+  }
+  if (!emittedAny) {
+    throw new Error('OpenAI image generation stream ended without image events.');
+  }
+}
+
+function mergeOpenAiImageUsage(usages: readonly unknown[]): unknown | undefined {
+  const usageObjects = usages.map(asRecordPayload).filter((usage) => Object.keys(usage).length > 0);
+  if (usageObjects.length === 0) return undefined;
+  const inputDetails = mergeImageTokenDetails(usageObjects, 'input_tokens_details');
+  if (!inputDetails) return undefined;
+  const outputDetails = mergeImageTokenDetails(usageObjects, 'output_tokens_details');
+  return {
+    input_tokens: sumUsageField(usageObjects, 'input_tokens'),
+    input_tokens_details: inputDetails,
+    output_tokens: sumUsageField(usageObjects, 'output_tokens'),
+    total_tokens: sumUsageField(usageObjects, 'total_tokens'),
+    ...(outputDetails ? { output_tokens_details: outputDetails } : {}),
+  };
+}
+
+function sumUsageField(usages: readonly Record<string, unknown>[], field: string): number {
+  return usages.reduce((sum, usage) => sum + (typeof usage[field] === 'number' ? usage[field] : 0), 0);
+}
+
+function mergeImageTokenDetails(
+  usages: readonly Record<string, unknown>[],
+  field: string,
+): Record<string, number> | undefined {
+  const detailObjects = usages
+    .map((usage) => asRecordPayload(usage[field]))
+    .filter((details) => Object.keys(details).length > 0);
+  if (detailObjects.length === 0) return undefined;
+  if (!detailObjects.some((details) => 'image_tokens' in details || 'text_tokens' in details)) {
+    return undefined;
+  }
+  return {
+    image_tokens: detailObjects.reduce(
+      (sum, details) => sum + (typeof details.image_tokens === 'number' ? details.image_tokens : 0),
+      0,
+    ),
+    text_tokens: detailObjects.reduce(
+      (sum, details) => sum + (typeof details.text_tokens === 'number' ? details.text_tokens : 0),
+      0,
+    ),
+  };
+}
+
+function openAiResponsesImageRequestBody(
+  request: OpenAiImageGenerationRequest,
+  stream: boolean,
+): unknown {
+  return {
+    model: OPENAI_IMAGE_GENERATION_TARGET_MODEL,
+    input: responsesImageInput(request),
+    reasoning: { effort: openAiImageQualityReasoningEffort(request.quality) },
+    stream,
+    tools: [{
+      type: 'image_generation',
+      action: imageGenerationAction(request),
+      ...(request.size ? { size: request.size } : {}),
+      ...(request.quality ? { quality: request.quality } : {}),
+      ...(request.outputFormat ? { output_format: request.outputFormat } : {}),
+      ...(request.outputCompression !== undefined ? { output_compression: request.outputCompression } : {}),
+      ...(request.background ? { background: request.background } : {}),
+      ...(request.moderation ? { moderation: request.moderation } : {}),
+      ...(request.inputFidelity ? { input_fidelity: request.inputFidelity } : {}),
+      ...(request.style ? { style: request.style } : {}),
+      ...(stream ? { partial_images: request.partialImages } : {}),
+    }],
+    ...(request.user ? { user: request.user } : {}),
+  };
+}
+
+export function openAiImageQualityReasoningEffort(
+  quality: string | undefined,
+): NormalizedReasoningEffort {
+  if (quality === 'low') return 'medium';
+  if (quality === 'medium') return 'high';
+  return 'xhigh';
+}
+
+function responsesImageInput(request: OpenAiImageGenerationRequest): unknown {
+  if (request.images.length === 0 && !request.mask) return request.prompt;
+  const content: unknown[] = [
+    { type: 'input_text', text: request.prompt },
+    ...request.images.map((image) => responsesInputImage(image)),
+  ];
+  if (request.mask) {
+    content.push({ type: 'input_text', text: 'Use the next image as the edit mask when applicable.' });
+    content.push(responsesInputImage(request.mask));
+  }
+  return [{ role: 'user', content }];
+}
+
+function responsesInputImage(image: NormalizedImage): unknown {
+  if (image.source.type === 'url') {
+    return { type: 'input_image', image_url: image.source.url };
+  }
+  if (image.source.type === 'base64') {
+    return {
+      type: 'input_image',
+      image_url: `data:${image.source.mediaType};base64,${image.source.data}`,
+    };
+  }
+  if (image.source.type === 'file_id') {
+    return { type: 'input_image', file_id: image.source.fileId };
+  }
+  return { type: 'input_image', image_url: image.source.path };
+}
+
+function imageGenerationAction(request: OpenAiImageGenerationRequest): 'generate' | 'edit' {
+  return request.operation === 'generation' ? 'generate' : 'edit';
+}
+
+function openAiImageStreamEventFromFrame(
+  frame: string,
+  request: OpenAiImageGenerationRequest,
+): OpenAiImageGenerationStreamEvent | null {
+  const data = frame
+    .split(/\n/)
+    .map((line) => line.trimEnd())
+    .find((line) => line.startsWith('data: '))
+    ?.slice(6);
+  if (!data || data === '[DONE]') return null;
+  const payload = parseObject(data);
+  if (!payload) return null;
+  if (
+    payload.type === 'response.failed'
+    || payload.type === 'response.incomplete'
+    || payload.type === 'error'
+  ) {
+    throw openAiImageStreamFailureError(payload);
+  }
+  if (
+    payload.type === 'response.image_generation_call.partial_image'
+    && typeof payload.partial_image_b64 === 'string'
+  ) {
+    return {
+      type: 'partial_image',
+      created: Math.floor(Date.now() / 1000),
+      image: { b64Json: payload.partial_image_b64 },
+      partialImageIndex: typeof payload.partial_image_index === 'number'
+        ? payload.partial_image_index
+        : undefined,
+      background: request.background ?? DEFAULT_IMAGE_GENERATION_BACKGROUND,
+      outputFormat: request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+      quality: request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
+      size: request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
+    };
+  }
+  const item = asRecordPayload(payload.item);
+  if (
+    payload.type === 'response.output_item.done'
+    && item.type === 'image_generation_call'
+    && typeof item.result === 'string'
+  ) {
+    return imageCompletedStreamEventFromCall(item, request, payload.response);
+  }
+  const response = asRecordPayload(payload.response);
+  if (payload.type === 'response.completed') {
+    const output = Array.isArray(response.output) ? response.output : [];
+    const imageCall = output
+      .map(asRecordPayload)
+      .find((candidate) => candidate.type === 'image_generation_call' && typeof candidate.result === 'string');
+    if (imageCall) return imageCompletedStreamEventFromCall(imageCall, request, response);
+  }
+  return null;
+}
+
+function openAiImageStreamFailureError(payload: Record<string, unknown>): Error {
+  const response = asRecordPayload(payload.response);
+  const error = asRecordPayload(payload.error ?? response.error ?? response.incomplete_details);
+  const message = typeof error.message === 'string'
+    ? error.message
+    : `OpenAI image generation stream ended with ${String(payload.type ?? 'an error')}.`;
+  const status = typeof payload.status === 'number'
+    ? payload.status
+    : typeof response.status === 'number'
+      ? response.status
+      : providerStatusCodeFromError(error);
+  return new Error(JSON.stringify({
+    message: JSON.stringify({
+      status,
+      error: {
+        type: typeof error.type === 'string' ? error.type : providerErrorTypeFromStatus(status),
+        message,
+        param: typeof error.param === 'string' ? error.param : null,
+        code: typeof error.code === 'string' ? error.code : null,
+      },
+    }),
+  }));
+}
+
+function providerStatusCodeFromError(error: Record<string, unknown>): number {
+  const code = typeof error.code === 'string' ? error.code : '';
+  const type = typeof error.type === 'string' ? error.type : '';
+  if (code === 'insufficient_quota' || type === 'insufficient_quota') return 429;
+  if (code === 'rate_limit_exceeded' || type === 'rate_limit_exceeded') return 429;
+  if (type === 'invalid_request_error' || type === 'image_generation_user_error') return 400;
+  return 500;
+}
+
+function providerErrorTypeFromStatus(status: number): string {
+  return status >= 500 ? 'server_error' : 'invalid_request_error';
+}
+
+function imageCompletedStreamEventFromCall(
+  item: Record<string, unknown>,
+  request: OpenAiImageGenerationRequest,
+  response: unknown,
+): OpenAiImageGenerationStreamEvent {
+  return {
+    type: 'completed',
+    created: Math.floor(Date.now() / 1000),
+    image: {
+      b64Json: String(item.result),
+      revisedPrompt: typeof item.revised_prompt === 'string' ? item.revised_prompt : undefined,
+    },
+    background: request.background ?? DEFAULT_IMAGE_GENERATION_BACKGROUND,
+    outputFormat: request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+    quality: request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
+    size: request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
+    usage: mergeOpenAiImageUsage([asRecordPayload(response).usage]),
+  };
 }
 
 async function runWithTimeout(
@@ -177,7 +922,114 @@ function rejectDeferredFeatures(
   }
 }
 
+interface MultipartFilePart {
+  readonly filename: string;
+  readonly mediaType: string;
+  readonly data: string;
+}
+
+class GeneratedImageStore {
+  private readonly images = new Map<string, {
+    readonly bytes: Buffer;
+    readonly contentType: string;
+    readonly expiresAt: number;
+  }>();
+
+  put(b64Json: string, outputFormat: string): string {
+    this.cleanupExpired();
+    const id = randomUUID();
+    this.images.set(id, {
+      bytes: Buffer.from(b64Json, 'base64'),
+      contentType: imageContentType(outputFormat),
+      expiresAt: Date.now() + GENERATED_IMAGE_TTL_MS,
+    });
+    return id;
+  }
+
+  get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null {
+    const image = this.images.get(id);
+    if (!image) return null;
+    if (image.expiresAt <= Date.now()) {
+      this.images.delete(id);
+      return null;
+    }
+    return image;
+  }
+
+  clear(): void {
+    this.images.clear();
+  }
+
+  private cleanupExpired(): void {
+    const now = Date.now();
+    for (const [id, image] of this.images.entries()) {
+      if (image.expiresAt <= now) this.images.delete(id);
+    }
+  }
+}
+
+function writeGeneratedImage(
+  res: ServerResponse,
+  generatedImages: GeneratedImageStore,
+  path: string,
+): void {
+  const id = decodeURIComponent(path.slice('/v1/images/generated/'.length));
+  const image = generatedImages.get(id);
+  if (!image) {
+    writeJson(res, 404, {
+      error: {
+        message: 'Generated image URL has expired or does not exist.',
+        type: 'invalid_request_error',
+        param: null,
+        code: null,
+      },
+    });
+    return;
+  }
+  res.writeHead(200, {
+    'content-type': image.contentType,
+    'cache-control': 'private, max-age=3600',
+  });
+  res.end(image.bytes);
+}
+
+function generatedImageUrl(req: IncomingMessage, id: string): string {
+  const host = headerValue(req.headers.host) || '127.0.0.1';
+  return `http://${host}/v1/images/generated/${encodeURIComponent(id)}`;
+}
+
+function imageContentType(outputFormat: string): string {
+  if (outputFormat === 'jpeg' || outputFormat === 'jpg') return 'image/jpeg';
+  if (outputFormat === 'webp') return 'image/webp';
+  return 'image/png';
+}
+
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const text = (await readBodyBuffer(req)).toString('utf8');
+  if (!text.trim()) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ProxyRequestError('Request body must be valid JSON.', 400);
+  }
+}
+
+async function readImageRequestBody(req: IncomingMessage): Promise<ParsedImageRequestBody> {
+  const body = await readBodyBuffer(req);
+  const contentType = headerValue(req.headers['content-type']);
+  if (contentType.toLowerCase().includes('multipart/form-data')) {
+    return { body: parseMultipartFormData(body, contentType), isMultipart: true };
+  }
+  const text = body.toString('utf8');
+  if (!text.trim()) return { body: {}, isMultipart: false };
+  try {
+    return { body: JSON.parse(text), isMultipart: false };
+  } catch {
+    throw new ProxyRequestError('Request body must be valid JSON or multipart/form-data.', 400);
+  }
+}
+
+async function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -188,13 +1040,115 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
     }
     chunks.push(buf);
   }
-  const text = Buffer.concat(chunks).toString('utf8');
-  if (!text.trim()) return {};
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new ProxyRequestError('Request body must be valid JSON.', 400);
+  return Buffer.concat(chunks);
+}
+
+function parseMultipartFormData(
+  body: Buffer,
+  contentType: string,
+): Record<string, unknown> {
+  const boundary = multipartBoundary(contentType);
+  if (!boundary) throw new ProxyRequestError('multipart/form-data boundary is required.', 400);
+  const output: Record<string, unknown> = {};
+  const binary = body.toString('latin1');
+  const parts = binary.split(`--${boundary}`);
+  for (const rawPart of parts) {
+    if (!rawPart || rawPart === '--\r\n' || rawPart === '--') continue;
+    const part = rawPart.startsWith('\r\n') ? rawPart.slice(2) : rawPart;
+    if (part.startsWith('--')) continue;
+    const headerEnd = part.indexOf('\r\n\r\n');
+    if (headerEnd === -1) continue;
+    const rawHeaders = part.slice(0, headerEnd);
+    let rawContent = part.slice(headerEnd + 4);
+    if (rawContent.endsWith('\r\n')) rawContent = rawContent.slice(0, -2);
+    const headers = multipartHeaders(rawHeaders);
+    const disposition = parseContentDisposition(headers['content-disposition']);
+    if (!disposition.name) continue;
+    const content = Buffer.from(rawContent, 'latin1');
+    const value = disposition.filename
+      ? {
+          filename: disposition.filename,
+          mediaType: headers['content-type'] || mediaTypeForFilename(disposition.filename),
+          data: content.toString('base64'),
+        } satisfies MultipartFilePart
+      : content.toString('utf8');
+    assignMultipartValue(output, disposition.name, value);
   }
+  return output;
+}
+
+function multipartBoundary(contentType: string): string | null {
+  const match = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType);
+  return match?.[1] ?? match?.[2]?.trim() ?? null;
+}
+
+function multipartHeaders(raw: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const line of raw.split('\r\n')) {
+    const index = line.indexOf(':');
+    if (index === -1) continue;
+    out[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
+  }
+  return out;
+}
+
+function parseContentDisposition(value: string | undefined): {
+  readonly name?: string;
+  readonly filename?: string;
+} {
+  if (!value) return {};
+  const out: Record<string, string> = {};
+  for (const part of value.split(';').slice(1)) {
+    const index = part.indexOf('=');
+    if (index === -1) continue;
+    const key = part.slice(0, index).trim();
+    let val = part.slice(index + 1).trim();
+    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+    out[key] = val;
+  }
+  return { name: out.name, filename: out.filename };
+}
+
+function assignMultipartValue(
+  output: Record<string, unknown>,
+  name: string,
+  value: unknown,
+): void {
+  const existing = output[name];
+  if (existing === undefined) {
+    output[name] = value;
+  } else if (Array.isArray(existing)) {
+    existing.push(value);
+  } else {
+    output[name] = [existing, value];
+  }
+}
+
+function asMultipartFile(value: unknown): MultipartFilePart | null {
+  const obj = asRecordPayload(value);
+  if (
+    typeof obj.filename === 'string'
+    && typeof obj.mediaType === 'string'
+    && typeof obj.data === 'string'
+  ) {
+    return {
+      filename: obj.filename,
+      mediaType: obj.mediaType,
+      data: obj.data,
+    };
+  }
+  return null;
+}
+
+function mediaTypeForFilename(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  return 'image/png';
+}
+
+function headerValue(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] ?? '' : value ?? '';
 }
 
 function openAiModelsResponse(backend: LocalCliBackend): unknown {
@@ -209,6 +1163,117 @@ function openAiModelsResponse(backend: LocalCliBackend): unknown {
       },
     ],
   };
+}
+
+function openAiImagesGenerationResponse(
+  req: IncomingMessage,
+  generatedImages: GeneratedImageStore,
+  result: OpenAiImageGenerationResult,
+  request: OpenAiImageGenerationRequest,
+): unknown {
+  return {
+    created: result.created,
+    data: result.images.map((image) => openAiImageObject(req, generatedImages, image, request)),
+    ...openAiImageResponseMetadata(result, request),
+    ...(result.usage ? { usage: result.usage } : {}),
+  };
+}
+
+function openAiImageResponseMetadata(
+  result: OpenAiImageGenerationResult,
+  request: OpenAiImageGenerationRequest,
+): Record<string, string> {
+  const background = responseBackground(result.background ?? request.background);
+  const outputFormat = result.outputFormat ?? request.outputFormat;
+  const quality = responseQuality(result.quality ?? request.quality);
+  const size = responseSize(result.size ?? request.size);
+  return {
+    ...(background ? { background } : {}),
+    ...(outputFormat ? { output_format: outputFormat } : {}),
+    ...(quality ? { quality } : {}),
+    ...(size ? { size } : {}),
+  };
+}
+
+function responseBackground(value: string | undefined): string | undefined {
+  return value === 'transparent' || value === 'opaque' ? value : undefined;
+}
+
+function responseQuality(value: string | undefined): string | undefined {
+  return value === 'low' || value === 'medium' || value === 'high' ? value : undefined;
+}
+
+function responseSize(value: string | undefined): string | undefined {
+  return value && value !== 'auto' ? value : undefined;
+}
+
+function openAiImageObject(
+  req: IncomingMessage,
+  generatedImages: GeneratedImageStore,
+  image: OpenAiGeneratedImage,
+  request: OpenAiImageGenerationRequest,
+): unknown {
+  if (request.responseFormat === 'url') {
+    const id = generatedImages.put(
+      image.b64Json,
+      request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+    );
+    return {
+      url: generatedImageUrl(req, id),
+      ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
+    };
+  }
+  return {
+    b64_json: image.b64Json,
+    ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
+  };
+}
+
+async function writeOpenAiImageStream(
+  req: IncomingMessage,
+  res: ServerResponse,
+  events: AsyncIterable<OpenAiImageGenerationStreamEvent>,
+  generatedImages: GeneratedImageStore,
+  request: OpenAiImageGenerationRequest,
+): Promise<void> {
+  writeSseHeaders(res);
+  try {
+    for await (const event of events) {
+      const type = imageStreamEventType(request.operation, event.type);
+      const payload = {
+        type,
+        created_at: event.created,
+        background: event.background ?? request.background ?? DEFAULT_IMAGE_GENERATION_BACKGROUND,
+        output_format: event.outputFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+        quality: event.quality ?? request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
+        size: event.size ?? request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
+        ...(event.type === 'partial_image'
+          ? { partial_image_index: event.partialImageIndex ?? 0 }
+          : {}),
+        ...(request.responseFormat === 'url' && event.type === 'completed'
+          ? { url: generatedImageUrl(req, generatedImages.put(event.image.b64Json, request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT)) }
+          : { b64_json: event.image.b64Json }),
+        ...(event.type === 'completed' && event.usage ? { usage: event.usage } : {}),
+      };
+      await writeSseEvent(res, type, payload);
+    }
+  } catch (err) {
+    await writeSseEvent(res, 'error', streamErrorPayload(err));
+  } finally {
+    res.end();
+  }
+}
+
+function imageStreamEventType(
+  operation: OpenAiImageOperation,
+  eventType: OpenAiImageGenerationStreamEvent['type'],
+): string {
+  const prefix = operation === 'edit' || operation === 'variation'
+    ? 'image_edit'
+    : 'image_generation';
+  return eventType === 'partial_image'
+    ? `${prefix}.partial_image`
+    : `${prefix}.completed`;
 }
 
 function openAiChatResponse(result: LocalCompletionResult): unknown {
@@ -1184,6 +2249,17 @@ function parseToolArguments(value: string): unknown {
 }
 
 function streamErrorPayload(err: unknown): unknown {
+  const providerError = providerErrorFromBackendError(err);
+  if (providerError) {
+    return {
+      error: {
+        message: providerError.message,
+        type: providerError.type,
+        param: providerError.param,
+        code: providerError.code,
+      },
+    };
+  }
   return {
     error: {
       message: errorMessage(err),
@@ -1321,7 +2397,7 @@ function providerErrorFromBackendError(err: unknown): {
   const error = asRecordPayload(inner?.error);
   const statusCode = typeof inner?.status === 'number' ? inner.status : undefined;
   const message = typeof error.message === 'string' ? error.message : undefined;
-  if (!statusCode || statusCode < 400 || statusCode >= 500 || !message) return null;
+  if (!statusCode || statusCode < 400 || statusCode >= 600 || !message) return null;
   return {
     statusCode,
     type: typeof error.type === 'string' ? error.type : 'invalid_request_error',

@@ -83,6 +83,68 @@ export interface LocalCompletionResult {
   readonly latencyMs: number;
 }
 
+export interface OpenAiImageGenerationRequest {
+  readonly operation: 'generation' | 'edit' | 'variation';
+  readonly model: string;
+  readonly prompt: string;
+  readonly n: number;
+  readonly images: readonly NormalizedImage[];
+  readonly mask?: NormalizedImage;
+  readonly size?: string;
+  readonly quality?: string;
+  readonly background?: string;
+  readonly outputFormat?: string;
+  readonly outputCompression?: number;
+  readonly moderation?: string;
+  readonly inputFidelity?: string;
+  readonly style?: string;
+  readonly user?: string;
+  readonly responseFormat: 'b64_json' | 'url';
+  readonly stream: boolean;
+  readonly partialImages: number;
+  readonly raw: unknown;
+}
+
+export interface OpenAiGeneratedImage {
+  readonly b64Json: string;
+  readonly revisedPrompt?: string;
+}
+
+export interface OpenAiImageGenerationResult {
+  readonly created: number;
+  readonly images: readonly OpenAiGeneratedImage[];
+  readonly background?: string;
+  readonly outputFormat?: string;
+  readonly quality?: string;
+  readonly size?: string;
+  readonly usage?: unknown;
+  readonly latencyMs: number;
+  readonly raw?: unknown;
+}
+
+export interface OpenAiImageGenerationStreamEvent {
+  readonly type: 'partial_image' | 'completed';
+  readonly created: number;
+  readonly image: OpenAiGeneratedImage;
+  readonly partialImageIndex?: number;
+  readonly background?: string;
+  readonly outputFormat?: string;
+  readonly quality?: string;
+  readonly size?: string;
+  readonly usage?: unknown;
+}
+
+export interface OpenAiImageGenerationClient {
+  generate(
+    request: OpenAiImageGenerationRequest,
+    signal?: AbortSignal,
+  ): Promise<OpenAiImageGenerationResult>;
+  stream?(
+    request: OpenAiImageGenerationRequest,
+    signal?: AbortSignal,
+  ): AsyncIterable<OpenAiImageGenerationStreamEvent>;
+}
+
 export type LocalStreamEvent =
   | { readonly type: 'text_delta'; readonly delta: string }
   | {
@@ -107,6 +169,7 @@ export interface LocalCliBackend {
 
 export interface ProxyServerOptions {
   readonly backend: LocalCliBackend;
+  readonly imageGenerationClient?: OpenAiImageGenerationClient;
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;
