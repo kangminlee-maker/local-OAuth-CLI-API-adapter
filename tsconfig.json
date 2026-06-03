@@ -13,5 +13,9 @@
     "rootDir": "src",
     "types": ["node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": [
+    "src/proxy-cli.ts",
+    "src/settings.ts",
+    "src/proxy/**/*.ts"
+  ]
 }

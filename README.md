@@ -3,15 +3,42 @@
 Experimental local adapter that makes an already-authenticated OAuth CLI look
 like a small API server.
 
-The first backends are Codex CLI via a long-lived `codex app-server` process and
+The supported backends are Codex CLI via a long-lived `codex app-server` process and
 Claude Code via its local OAuth CLI session. The adapter exposes a local
 OpenAI/Anthropic-compatible subset so local tools can use OAuth CLI login instead
 of provider API keys.
 
-It also includes a ggui MCP add-on mode that swaps ggui's UI generator for a CLI
-runtime without patching the upstream `ggui` repository.
-
 ## Local API Proxy
+
+Install the built proxy bin globally from this repository:
+
+```bash
+pnpm pack
+pnpm add -g ./local-oauth-cli-api-adapter-0.1.0.tgz
+```
+
+Then start it from any repository:
+
+```bash
+ggui-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
+# or
+ggui-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
+```
+
+Point API clients in the target repository at the local proxy:
+
+```bash
+OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+OPENAI_API_KEY=local
+ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+ANTHROPIC_API_KEY=local
+```
+
+The installable proxy bin contains only the proxy runtime files and
+`settings.json`; it does not install or load sibling-repository packages and does
+not depend on this source repository after installation.
+
+For local development in this repository:
 
 ```bash
 pnpm install
@@ -238,56 +265,10 @@ requests use a one-shot Claude process so `--json-schema` can be set per request
 Image requests also use a one-shot `stream-json` input process to avoid carrying
 image attachment state across persistent turns.
 
-## ggui Add-on
-
-The add-on does not patch the upstream `ggui` repository. It imports the local
-ggui packages via `link:` dependencies and supplies its own `UiGenerator`
-implementation through `createGguiServer({ generation })`.
-
-The runtime boundary is intentionally thin: `CliGenerationApi.generate(input)`
-behaves like a single API request, while CLI-specific file setup, structured
-output parsing, compile feedback, and cleanup stay hidden inside the facade.
-
-### Install
-
-```bash
-pnpm install
-pnpm build
-```
-
-This package expects the sibling `../ggui` repository to be built already:
-
-```bash
-cd ../ggui
-PATH=/opt/homebrew/opt/node@22/bin:$PATH pnpm build
-```
-
-### Dry Run
-
-```bash
-pnpm generate:mock
-```
-
-### Serve
-
-```bash
-pnpm serve:mock
-pnpm serve:codex
-pnpm serve:claude
-```
-
-The default endpoint is:
-
-```text
-http://127.0.0.1:6781/mcp
-```
-
 ## Notes
 
-- `mock` proves the ggui seam and compile path without calling a model.
-- `codex` uses `codex exec` and the local Codex CLI auth state.
+- `codex` uses `codex app-server` and the local Codex CLI auth state.
 - `claude` uses `claude -p` and the local Claude Code auth state.
-- The generated TSX is compiled to browser ESM before ggui commits it.
 - This avoids provider API keys, but it still consumes the selected CLI's plan,
   credits, rate limits, and applicable usage policy.
 - Codex text streaming maps `item/agentMessage/delta` notifications to the
