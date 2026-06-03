@@ -77,14 +77,18 @@ conciseness, and direct-provider similarity; proxy targets also get cached direc
 provider reference outputs when the matching API key is available. Semantic
 references are paired by proxy backend provider, not by request API surface:
 `proxy-codex` is compared with direct OpenAI API output, and `proxy-claude` is
-compared with direct Anthropic API output. Use
+compared with direct Anthropic API output. The semantic judge treats the direct
+provider output as a reference rather than a style template, so equivalent
+answers can still pass when they better satisfy the original request. Use
 `--min-semantic-quality=95` to make semantic quality a hard gate. Proxy-Codex
 benchmark rows also include summary-only `backendTiming` diagnostics for local
 phase breakdowns such as `threadStartMs`, `turnWaitMs`, and `usageWaitMs`; these
 diagnostics are not added to API responses. Streaming benchmark rows record
 `firstDataMs`, `firstTextMs`, and `firstToolArgumentMs` so text-token and tool
 argument latency can be compared separately. Outlier rows include the dominant
-backend phase when proxy-codex timing is available. With
+backend phase when proxy-codex timing is available. Codex app-server text deltas
+are buffered if they arrive before the `turn/start` response, preventing an
+early-notification race from delaying public SSE streams. With
 `--baseline`, proxy rows are compared against a previous summary by default and
 latency/quality regressions make the command fail. Proxy-Codex follows
 request-level OpenAI reasoning effort settings first: Chat Completions

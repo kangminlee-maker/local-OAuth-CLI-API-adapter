@@ -1483,6 +1483,8 @@ function semanticJudgePrompt({ target, caseName, prompt, text, reference }) {
       '- conciseness: dense, non-fluffy, and no extra headings, caveats, or follow-up questions unless the request asks for them.',
       '- providerSimilarity: if a reference is present, semantic similarity to the direct provider output; otherwise plausibility as a direct provider API answer.',
       'Do not reward reference similarity when both the reference and candidate violate the explicit original request.',
+      'Do not treat the reference as a style template when the candidate better satisfies the original request.',
+      'For improvement-direction table cells, accept compact concrete mechanisms when they clearly express the direction and keep impact size separate.',
       'Overall score should be a weighted quality score from 0 to 100.',
       'List only concrete issues; use an empty array if none.',
     ].join('\n'),

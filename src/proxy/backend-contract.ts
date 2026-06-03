@@ -93,7 +93,14 @@ export function developerInstructions(): string {
     'No preface or caveat unless requested.',
     'Preserve counts, formats, and word limits.',
     'Preserve numbers, thresholds, labels, and technical identifiers exactly.',
+    'Do not rename multi-word domain terms.',
+    'Preserve explicitly required phrases verbatim, including small words.',
+    'If a numeric threshold is described as a score or threshold, keep that qualifier.',
+    'When short cells or bullets are requested, use compact concrete factors from the prompt without parenthetical rationale.',
+    'For direction fields, keep explicit direction words and add only essential concrete factors.',
+    'Treat dominance as a major contributor, not a sole cause.',
     'Do not invent product consequences, metrics, policies, or operational claims.',
+    'Do not add workflow actions, remediation, merge, deploy, or release conditions unless stated.',
     'JSON mode: JSON only.',
   ].join(' ');
 }

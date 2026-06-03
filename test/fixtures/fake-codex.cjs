@@ -44,6 +44,40 @@ function emitTurn(threadId, turnId, text = 'OK') {
   }, 0);
 }
 
+function emitEarlyTurn(threadId, turnId) {
+  write({
+    method: 'item/agentMessage/delta',
+    params: { threadId, turnId, delta: 'EARLY_OK' },
+  });
+  write({
+    method: 'thread/tokenUsage/updated',
+    params: {
+      threadId,
+      turnId,
+      tokenUsage: {
+        last: {
+          totalTokens: 11,
+          inputTokens: 7,
+          cachedInputTokens: 3,
+          outputTokens: 2,
+          reasoningOutputTokens: 1,
+        },
+      },
+    },
+  });
+  write({
+    method: 'turn/completed',
+    params: {
+      threadId,
+      turn: { id: turnId, status: 'completed' },
+    },
+  });
+}
+
+function inputText(payload) {
+  return JSON.stringify(payload.params?.input ?? []);
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   let payload;
@@ -67,6 +101,11 @@ rl.on('line', (line) => {
     turnSeq += 1;
     const threadId = payload.params?.threadId ?? `thread_${threadSeq}`;
     const turnId = `turn_${turnSeq}`;
+    if (inputText(payload).includes('EARLY_DELTA')) {
+      emitEarlyTurn(threadId, turnId);
+      result(payload.id, { turn: { id: turnId } });
+      return;
+    }
     const effort = payload.params?.effort;
     const text = effort === 'minimal'
       ? 'MINIMAL_OK'

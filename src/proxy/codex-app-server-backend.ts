@@ -56,6 +56,17 @@ interface TurnWaiter {
   reject: (err: Error) => void;
 }
 
+interface BufferedTurnState {
+  textDeltas: string[];
+  finalText?: string;
+  usage?: LocalUsage;
+  usageUpdatedAt?: number;
+  completed: boolean;
+  completedAt?: number;
+  error?: Error;
+  cleanupTimer?: NodeJS.Timeout;
+}
+
 type JsonRpcMessage = Record<string, unknown>;
 
 interface TurnResult {
@@ -85,6 +96,7 @@ interface CodexTurnTiming {
 }
 
 const USAGE_NOTIFICATION_GRACE_MS = 100;
+const BUFFERED_TURN_STATE_TTL_MS = 30_000;
 const FALLBACK_CODEX_MODEL = 'gpt-5.5';
 const DISABLED_CODEX_CONTEXT_FEATURES = [
   'apps',
@@ -116,6 +128,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
   private stderr = '';
   private readonly pending = new Map<number, PendingRequest>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
+  private readonly bufferedTurnStates = new Map<string, BufferedTurnState>();
   private isolation: CodexIsolation | null = null;
 
   constructor(options: CodexAppServerBackendOptions) {
@@ -270,6 +283,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
       waiter.reject(new Error('codex app-server backend closed'));
     }
     this.turnWaiters.clear();
+    this.clearBufferedTurnStates();
     this.lineReader?.close();
     this.child?.kill('SIGTERM');
     this.child = null;
@@ -455,18 +469,25 @@ export class CodexAppServerBackend implements LocalCliBackend {
     const data = asRecord(params);
     if (!data) return;
     if (method === 'item/agentMessage/delta') {
-      const waiter = this.turnWaiters.get(`${data.threadId}:${data.turnId}`);
-      if (waiter && typeof data.delta === 'string') {
-        waiter.text += data.delta;
-        waiter.onTextDelta?.(data.delta);
-      }
+      const key = turnStateKey(data.threadId, data.turnId);
+      if (!key || typeof data.delta !== 'string') return;
+      const delta = data.delta;
+      const waiter = this.turnWaiters.get(key);
+      if (waiter) this.appendTextDelta(waiter, delta);
+      else this.bufferTurnState(key, (state) => state.textDeltas.push(delta));
       return;
     }
     if (method === 'item/completed') {
-      const waiter = this.turnWaiters.get(`${data.threadId}:${data.turnId}`);
+      const key = turnStateKey(data.threadId, data.turnId);
+      if (!key) return;
+      const waiter = this.turnWaiters.get(key);
       const item = asRecord(data.item);
       if (waiter && item?.type === 'agentMessage' && typeof item.text === 'string') {
         waiter.text = item.text;
+      } else if (item?.type === 'agentMessage' && typeof item.text === 'string') {
+        this.bufferTurnState(key, (state) => {
+          state.finalText = item.text as string;
+        });
       }
       return;
     }
@@ -475,11 +496,17 @@ export class CodexAppServerBackend implements LocalCliBackend {
       const turnId = typeof data.turnId === 'string' ? data.turnId : null;
       if (!threadId || !turnId) return;
       const usage = usageFromCodexTokenUsage(data.tokenUsage);
-      const waiter = usage ? this.turnWaiters.get(`${threadId}:${turnId}`) : null;
+      const key = `${threadId}:${turnId}`;
+      const waiter = usage ? this.turnWaiters.get(key) : null;
       if (waiter && usage) {
         waiter.usage = usage;
         waiter.usageUpdatedAt = Date.now();
         if (waiter.completed) this.resolveTurnWaiter(threadId, turnId);
+      } else if (usage) {
+        this.bufferTurnState(key, (state) => {
+          state.usage = usage;
+          state.usageUpdatedAt = Date.now();
+        });
       }
       return;
     }
@@ -490,21 +517,45 @@ export class CodexAppServerBackend implements LocalCliBackend {
       if (!threadId || !turnId) return;
       const key = `${threadId}:${turnId}`;
       const waiter = this.turnWaiters.get(key);
-      if (!waiter) return;
+      if (!waiter) {
+        this.bufferTurnState(key, (state) => {
+          if (turn?.status === 'failed') {
+            state.error = new Error(JSON.stringify(turn.error ?? 'turn failed'));
+          } else {
+            state.completed = true;
+            state.completedAt = Date.now();
+          }
+        });
+        return;
+      }
       if (turn?.status === 'failed') {
         this.turnWaiters.delete(key);
         waiter.reject(new Error(JSON.stringify(turn.error ?? 'turn failed')));
       } else {
-        waiter.completed = true;
-        waiter.completedAt = Date.now();
-        if (waiter.usage) this.resolveTurnWaiter(threadId, turnId);
-        else {
-          waiter.usageGraceTimer = setTimeout(
-            () => this.resolveTurnWaiter(threadId, turnId),
-            USAGE_NOTIFICATION_GRACE_MS,
-          );
-        }
+        this.markWaiterCompleted(threadId, turnId, waiter, Date.now());
       }
+    }
+  }
+
+  private appendTextDelta(waiter: TurnWaiter, delta: string): void {
+    waiter.text += delta;
+    waiter.onTextDelta?.(delta);
+  }
+
+  private markWaiterCompleted(
+    threadId: string,
+    turnId: string,
+    waiter: TurnWaiter,
+    completedAt: number,
+  ): void {
+    waiter.completed = true;
+    waiter.completedAt = completedAt;
+    if (waiter.usage) this.resolveTurnWaiter(threadId, turnId);
+    else {
+      waiter.usageGraceTimer = setTimeout(
+        () => this.resolveTurnWaiter(threadId, turnId),
+        USAGE_NOTIFICATION_GRACE_MS,
+      );
     }
   }
 
@@ -570,8 +621,37 @@ export class CodexAppServerBackend implements LocalCliBackend {
       };
       this.turnWaiters.set(key, waiter);
       if (signal) {
-        if (signal.aborted) abortFromSignal();
-        else signal.addEventListener('abort', abortFromSignal, { once: true });
+        if (signal.aborted) {
+          abortFromSignal();
+          return;
+        }
+        signal.addEventListener('abort', abortFromSignal, { once: true });
+      }
+      const buffered = this.takeBufferedTurnState(key);
+      if (buffered) {
+        const bufferedText = buffered.finalText ?? buffered.textDeltas.join('');
+        waiter.text = bufferedText;
+        waiter.usage = buffered.usage;
+        waiter.usageUpdatedAt = buffered.usageUpdatedAt;
+        if (buffered.textDeltas.length > 0) {
+          for (const delta of buffered.textDeltas) waiter.onTextDelta?.(delta);
+        } else if (buffered.finalText) {
+          waiter.onTextDelta?.(buffered.finalText);
+        }
+        if (buffered.error) {
+          this.turnWaiters.delete(key);
+          cleanup();
+          reject(buffered.error);
+          return;
+        }
+        if (buffered.completed) {
+          this.markWaiterCompleted(
+            threadId,
+            turnId,
+            waiter,
+            buffered.completedAt ?? Date.now(),
+          );
+        }
       }
     });
   }
@@ -586,6 +666,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.pending.clear();
     for (const waiter of this.turnWaiters.values()) waiter.reject(wrapped);
     this.turnWaiters.clear();
+    this.clearBufferedTurnStates();
   }
 
   private modelOverrideFor(requestModel: string): string | undefined {
@@ -595,6 +676,43 @@ export class CodexAppServerBackend implements LocalCliBackend {
     }
     return requestModel;
   }
+
+  private bufferTurnState(key: string, apply: (state: BufferedTurnState) => void): void {
+    const state = this.bufferedTurnStates.get(key) ?? {
+      textDeltas: [],
+      completed: false,
+    };
+    if (state.cleanupTimer) clearTimeout(state.cleanupTimer);
+    apply(state);
+    state.cleanupTimer = setTimeout(() => {
+      this.bufferedTurnStates.delete(key);
+    }, BUFFERED_TURN_STATE_TTL_MS);
+    this.bufferedTurnStates.set(key, state);
+  }
+
+  private takeBufferedTurnState(key: string): BufferedTurnState | undefined {
+    const state = this.bufferedTurnStates.get(key);
+    if (!state) return undefined;
+    this.bufferedTurnStates.delete(key);
+    if (state.cleanupTimer) {
+      clearTimeout(state.cleanupTimer);
+      state.cleanupTimer = undefined;
+    }
+    return state;
+  }
+
+  private clearBufferedTurnStates(): void {
+    for (const state of this.bufferedTurnStates.values()) {
+      if (state.cleanupTimer) clearTimeout(state.cleanupTimer);
+    }
+    this.bufferedTurnStates.clear();
+  }
+}
+
+function turnStateKey(threadId: unknown, turnId: unknown): string | null {
+  return typeof threadId === 'string' && typeof turnId === 'string'
+    ? `${threadId}:${turnId}`
+    : null;
 }
 
 function readPath<T>(value: unknown, path: readonly string[]): T | null {

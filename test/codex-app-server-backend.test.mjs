@@ -73,6 +73,52 @@ test('CodexAppServerBackend follows per-request reasoning effort over backend fa
   }
 });
 
+test('CodexAppServerBackend buffers notifications that arrive before turn/start response', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 10_000,
+  });
+
+  try {
+    const result = await backend.generate(earlyDeltaRequest());
+
+    assert.equal(result.text, 'EARLY_OK');
+    assert.equal(result.usage.source, 'provider');
+    assert.equal(result.usage.inputTokens, 7);
+    assert.equal(result.usage.outputTokens, 2);
+    assert.equal(result.usage.cachedInputTokens, 3);
+    assert.equal(result.usage.reasoningOutputTokens, 1);
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexAppServerBackend streams buffered text deltas', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 10_000,
+  });
+
+  try {
+    const events = [];
+    for await (const event of backend.stream(earlyDeltaRequest())) {
+      events.push(event);
+    }
+
+    assert.equal(events[0].type, 'text_delta');
+    assert.equal(events[0].delta, 'EARLY_OK');
+    assert.equal(events.at(-1).type, 'completed');
+    assert.equal(events.at(-1).result.text, 'EARLY_OK');
+    assert.equal(events.at(-1).result.usage.source, 'provider');
+  } finally {
+    await backend.close();
+  }
+});
+
 async function createCodexHome() {
   const dir = await mkdtemp(join(tmpdir(), 'codex-test-home-'));
   tempDirs.push(dir);
@@ -92,5 +138,12 @@ function textRequest() {
     tools: [],
     toolChoice: { type: 'auto' },
     raw: {},
+  };
+}
+
+function earlyDeltaRequest() {
+  return {
+    ...textRequest(),
+    messages: [{ role: 'user', content: 'EARLY_DELTA' }],
   };
 }
