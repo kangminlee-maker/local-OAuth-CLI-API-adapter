@@ -120,6 +120,38 @@
       </div>
     </section>
 
+    <h2>Installable Package Boundary</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Boundary</th>
+          <th>Current Authority</th>
+          <th>Reason</th>
+          <th>Verification</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>CLI entry point</td>
+          <td><code>src/proxy-cli.ts</code> builds to <code>dist/proxy-cli.js</code> and is the only package bin.</td>
+          <td>The installable adapter should expose the proxy runtime without loading generator, add-on, or sibling-repository code.</td>
+          <td class="ok"><code>pnpm pack:adapter</code> installs the tarball into a temp consumer project and checks the bin help.</td>
+        </tr>
+        <tr>
+          <td>Artifact contents</td>
+          <td><code>package.json files</code> plus <code>scripts/package-adapter.mjs</code> define and validate the distributable file set.</td>
+          <td>The package contains compiled proxy files, settings, README, and benchmark design docs only.</td>
+          <td class="ok">The package check rejects source, tests, repo-local paths, sibling package links, and <code>@ggui-ai/*</code> references.</td>
+        </tr>
+        <tr>
+          <td>Consumer install</td>
+          <td>Other repositories install the verified <code>artifacts/*.tgz</code>, release asset, or registry package.</td>
+          <td>This avoids <code>file:../source-checkout</code> links and keeps the target repository independent from this working tree.</td>
+          <td class="ok"><code>pnpm test:e2e:adapter</code> also starts the installed bin in a temp consumer project and verifies HTTP chat and SSE streaming responses.</td>
+        </tr>
+      </tbody>
+    </table>
+
     <h2>Codex Proxy Context Isolation</h2>
     <table>
       <thead>

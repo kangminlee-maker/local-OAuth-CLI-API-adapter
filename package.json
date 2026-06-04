@@ -19,6 +19,8 @@
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "prepack": "pnpm build",
+    "pack:adapter": "node scripts/package-adapter.mjs",
+    "test:e2e:adapter": "node scripts/e2e-installed-adapter.mjs",
     "test": "pnpm build && node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "proxy:codex": "tsx src/proxy-cli.ts proxy --runtime codex --port 8787",

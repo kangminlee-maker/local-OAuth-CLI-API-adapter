@@ -10,19 +10,34 @@ of provider API keys.
 
 ## Local API Proxy
 
-Install the built proxy bin globally from this repository:
+Build a distributable adapter package from this repository:
 
 ```bash
-pnpm pack
-pnpm add -g ./local-oauth-cli-api-adapter-0.1.0.tgz
+pnpm install
+pnpm pack:adapter
+```
+
+The command writes and verifies a standalone tarball such as:
+
+```text
+artifacts/local-oauth-cli-api-adapter-0.1.0.tgz
+```
+
+Install that tarball from any other repository without linking back to this
+source checkout:
+
+```bash
+pnpm add -D /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
+# or
+pnpm add -g /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
 ```
 
 Then start it from any repository:
 
 ```bash
-ggui-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
+pnpm exec ggui-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
 # or
-ggui-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
+pnpm exec ggui-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
 ```
 
 Point API clients in the target repository at the local proxy:
@@ -36,7 +51,10 @@ ANTHROPIC_API_KEY=local
 
 The installable proxy bin contains only the proxy runtime files and
 `settings.json`; it does not install or load sibling-repository packages and does
-not depend on this source repository after installation.
+not depend on this source repository after installation. For independence, avoid
+`file:../path-to-adapter-source`-style installs; use the verified tarball, a
+release asset containing that tarball, or a registry package built from the same
+artifact flow.
 
 For local development in this repository:
 
@@ -53,6 +71,17 @@ Run the local compatibility tests:
 ```bash
 pnpm test
 ```
+
+Run the installed-package E2E test:
+
+```bash
+pnpm test:e2e:adapter
+```
+
+This E2E test packs the adapter, installs the tarball into a temporary consumer
+project, starts the installed `ggui-oauth-cli` bin with a deterministic fake
+Codex app-server backend, and verifies OpenAI-compatible model, chat completion,
+and SSE streaming responses over HTTP.
 
 Run real CLI smoke tests with exact return checks:
 
