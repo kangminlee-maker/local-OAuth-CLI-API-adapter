@@ -139,7 +139,7 @@ function parseReasoningEffort(
 }
 
 function helpText(): string {
-  return `ggui-oauth-cli
+  return `local-oauth-cli
 
 Commands:
   proxy      Start an OpenAI/Anthropic-compatible local API subset proxy.
@@ -157,8 +157,8 @@ Options:
   --image-model <model>              Codex model for image-2 via gpt-5.5 route. Default: settings.json (${codexProxyImageModel()}).
 
 Examples:
-  ggui-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/project
-  ggui-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/project
+  local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/project
+  local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/project
 `;
 }
 

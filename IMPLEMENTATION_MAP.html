@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ggui OAuth CLI 애드온 구현 지도</title>
+  <title>Local OAuth CLI 애드온 구현 지도</title>
   <style>
     :root {
       color-scheme: light;
@@ -193,7 +193,7 @@
 </head>
 <body>
   <main>
-    <h1>ggui OAuth CLI 애드온 구현 지도</h1>
+    <h1>Local OAuth CLI 애드온 구현 지도</h1>
     <p class="lead">이 문서는 로컬 OAuth CLI를 OpenAI·Anthropic 호환 API 표면으로 노출하는 설치형 프록시의 현재 구현 경계, 검증 기준, 남은 최적화 지점을 한눈에 정리합니다.</p>
 
     <h2>현재 목표</h2>
@@ -236,7 +236,7 @@
         <tr>
           <td>설치형 실행 파일</td>
           <td><code>src/proxy-cli.ts</code>가 <code>dist/proxy-cli.js</code>로 빌드되어 패키지의 단일 bin이 됩니다.</td>
-          <td>다른 레포에서 이 저장소나 <code>@ggui-ai/*</code>에 의존하지 않고 독립 실행되도록 합니다.</td>
+          <td>다른 레포에서 이 저장소나 repo-local sibling package에 의존하지 않고 독립 실행되도록 합니다.</td>
           <td class="ok"><code>pnpm pack:adapter</code>, <code>pnpm test:e2e:adapter</code></td>
         </tr>
         <tr>

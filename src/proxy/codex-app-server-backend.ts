@@ -621,8 +621,8 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
 
     await this.send('initialize', {
       clientInfo: {
-        name: 'ggui_oauth_cli_proxy',
-        title: 'ggui OAuth CLI Proxy',
+        name: 'local_oauth_cli_proxy',
+        title: 'Local OAuth CLI Proxy',
         version: '0.1.0',
       },
       capabilities: {
@@ -1411,7 +1411,7 @@ export async function createCodexIsolation(options: {
   readonly verbosity: CodexVerbosity;
   readonly imageGeneration?: boolean;
 }): Promise<CodexIsolation> {
-  const rootDir = await mkdtemp(join(tmpdir(), 'ggui-codex-proxy-'));
+  const rootDir = await mkdtemp(join(tmpdir(), 'local-oauth-cli-codex-proxy-'));
   const homeDir = join(rootDir, 'codex-home');
   const workDir = join(rootDir, 'workspace');
   await Promise.all([

@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "bin": {
-    "ggui-oauth-cli": "./dist/proxy-cli.js"
+    "local-oauth-cli": "./dist/proxy-cli.js"
   },
   "files": [
     "dist/proxy-cli.js",
@@ -14,7 +14,8 @@
     "dist/proxy/",
     "settings.json",
     "README.md",
-    "docs/api-benchmark-design.md"
+    "docs/api-benchmark-design.md",
+    "docs/optimization-learnings.md"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",

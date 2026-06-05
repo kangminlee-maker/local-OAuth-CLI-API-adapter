@@ -35,9 +35,9 @@ pnpm add -g /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
 Then start it from any repository:
 
 ```bash
-pnpm exec ggui-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
+pnpm exec local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
 # or
-pnpm exec ggui-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
+pnpm exec local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
 ```
 
 Point API clients in the target repository at the local proxy:
@@ -84,7 +84,7 @@ pnpm test:e2e:adapter
 ```
 
 This E2E test packs the adapter, installs the tarball into a temporary consumer
-project, starts the installed `ggui-oauth-cli` bin with a deterministic fake
+project, starts the installed `local-oauth-cli` bin with a deterministic fake
 Codex app-server backend, and verifies OpenAI-compatible model, chat completion,
 and SSE streaming responses over HTTP.
 
@@ -136,6 +136,9 @@ The benchmark design and release-gate matrix live in
 [`docs/api-benchmark-design.md`](docs/api-benchmark-design.md). Use that document
 as the source of truth for which provider authority, quality gate, latency
 metric, and real-use fixture each suite must cover.
+The optimization lessons that informed the current context isolation, benchmark
+authority, image proxy, and packaging boundaries are summarized in
+[`docs/optimization-learnings.md`](docs/optimization-learnings.md).
 
 The benchmark loads `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment
 or `.env`, starts both local proxy backends, and compares schema exactness,

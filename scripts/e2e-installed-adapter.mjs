@@ -27,7 +27,7 @@ const artifactPath = join(outDir, packageArtifactName(pkg.name, pkg.version));
 
 run(process.execPath, [join(repoRoot, 'scripts/package-adapter.mjs'), '--out-dir', outDir]);
 
-const consumerDir = await mkdtemp(join(tmpdir(), 'ggui-oauth-cli-e2e-consumer-'));
+const consumerDir = await mkdtemp(join(tmpdir(), 'local-oauth-cli-e2e-consumer-'));
 const codexHome = join(consumerDir, '.codex-home');
 const fakeCodexPath = join(consumerDir, 'fake-codex.cjs');
 let proxyProcess;
@@ -100,7 +100,7 @@ function packageArtifactName(name, version) {
 function startProxy(consumerDir, codexHome, fakeCodexPath, port) {
   const child = spawn(pnpm, [
     'exec',
-    'ggui-oauth-cli',
+    'local-oauth-cli',
     'proxy',
     '--runtime',
     'codex',

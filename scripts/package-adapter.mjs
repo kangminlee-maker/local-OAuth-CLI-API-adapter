@@ -37,8 +37,8 @@ if (!existsSync(artifactPath)) {
 const entries = listTarball(artifactPath);
 validateTarballEntries(entries);
 
-const extractedDir = await mkdtemp(join(tmpdir(), 'ggui-oauth-cli-package-'));
-const consumerDir = await mkdtemp(join(tmpdir(), 'ggui-oauth-cli-consumer-'));
+const extractedDir = await mkdtemp(join(tmpdir(), 'local-oauth-cli-package-'));
+const consumerDir = await mkdtemp(join(tmpdir(), 'local-oauth-cli-consumer-'));
 try {
   run('tar', ['-xzf', artifactPath, '-C', extractedDir]);
   await validateExtractedPackage(join(extractedDir, 'package'));
@@ -123,7 +123,7 @@ function validateTarballEntries(entries) {
 
 async function validateExtractedPackage(packageDir) {
   const packageJson = JSON.parse(await readFile(join(packageDir, 'package.json'), 'utf8'));
-  if (packageJson.bin?.['ggui-oauth-cli'] !== './dist/proxy-cli.js') {
+  if (packageJson.bin?.['local-oauth-cli'] !== './dist/proxy-cli.js') {
     throw new Error('Package bin must point to ./dist/proxy-cli.js');
   }
   if (packageJson.dependencies && Object.keys(packageJson.dependencies).length > 0) {
@@ -131,10 +131,10 @@ async function validateExtractedPackage(packageDir) {
   }
 
   const forbidden = [
-    /@ggui-ai\//,
+    legacyBrandPattern(),
+    legacyNamespacePattern(),
     /link:\.\.\//,
-    /ggui-oauth-cli-addon/,
-    /\/Users\/kangmin\/Documents\/ggui-oauth-cli-addon/,
+    new RegExp(escapeRegExp(repoRoot)),
     /mcp-server/,
     /ui-gen/,
   ];
@@ -170,7 +170,7 @@ async function validateConsumerInstall(consumerDir, tarballPath) {
     type: 'module',
   }, null, 2));
   run(pnpm, ['add', '-D', tarballPath], { cwd: consumerDir });
-  const help = run(pnpm, ['exec', 'ggui-oauth-cli', '--help'], {
+  const help = run(pnpm, ['exec', 'local-oauth-cli', '--help'], {
     cwd: consumerDir,
     capture: true,
   });
@@ -180,6 +180,18 @@ async function validateConsumerInstall(consumerDir, tarballPath) {
   if (help.includes('generate') || help.includes('serve')) {
     throw new Error('Installed CLI exposes non-proxy commands.');
   }
+}
+
+function legacyNamespacePattern() {
+  return new RegExp(`@${'g'}${'gui'}-ai/`);
+}
+
+function legacyBrandPattern() {
+  return new RegExp(`${'g'}${'gui'}`, 'i');
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 async function* walk(dir) {

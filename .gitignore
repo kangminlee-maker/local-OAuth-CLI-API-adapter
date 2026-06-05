@@ -2,5 +2,5 @@ node_modules/
 dist/
 artifacts/
 .DS_Store
-.ggui-oauth-cli/
+.local-oauth-cli/
 .env
