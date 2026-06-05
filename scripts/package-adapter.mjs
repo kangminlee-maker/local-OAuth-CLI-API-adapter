@@ -102,6 +102,10 @@ function validateTarballEntries(entries) {
     'package/dist/settings.js',
     'package/dist/proxy/http-server.js',
     'package/docs/api-benchmark-design.md',
+    'package/docs/api-interface-contract.md',
+    'package/docs/local-cli-chat-api-design.md',
+    'package/docs/runtime-capability-catalog.md',
+    'package/docs/runtime-capability-update-playbook.md',
   ];
   for (const item of required) {
     if (!entries.includes(item)) throw new Error(`Package is missing required file: ${item}`);

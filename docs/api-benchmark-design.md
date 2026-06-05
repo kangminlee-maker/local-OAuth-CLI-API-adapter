@@ -11,6 +11,8 @@
 
 Proxy runtime은 local OAuth CLI auth를 쓰는 것이 제품 목적이다. 따라서 proxy target이 benchmark 중 direct provider API(`api.openai.com`, `api.anthropic.com`)를 호출하면 해당 row는 실패로 기록하고 quality를 0점 처리한다. Direct provider API 호출은 `openai-api:*`, `anthropic-api:*` 같은 direct target에서만 허용한다.
 
+Input/output interface contract의 단일 문서는 `docs/api-interface-contract.md`이다. 이 벤치마크 문서는 그 contract가 실제 provider 대비 schema, event, usage, error, semantic/image quality 기준을 만족하는지 검증하는 방법을 정의한다.
+
 이 경계는 benchmark만의 사후 판정이 아니라 런타임 구조 검증으로도 고정한다. `pnpm verify:runtime-boundary`는 `src`/`dist` proxy runtime에서 direct provider host, provider credential env, outbound HTTP client, ambient `process.env` pass-through를 금지하고, child CLI env sanitization만 별도 authority로 허용한다. 이 검증은 `pnpm test`와 `pnpm pack`의 `prepack` 단계에서 실행된다.
 
 같은 verifier는 benchmark fixture 또는 문제 문항 리터럴이 runtime에 들어오는 것도 금지한다. Benchmark prompt, fixture 이름, expected tool/result token은 `scripts/`, `test/`, docs에만 존재해야 하며, `src`/`dist` runtime은 API field translation, provider-surface validation, context isolation, streaming forwarding 같은 일반 규칙만 가져야 한다.

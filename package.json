@@ -15,10 +15,17 @@
     "settings.json",
     "README.md",
     "docs/api-benchmark-design.md",
-    "docs/optimization-learnings.md"
+    "docs/api-interface-contract.md",
+    "docs/direct-api-transport-handoff.md",
+    "docs/local-cli-chat-api-design.md",
+    "docs/optimization-learnings.md",
+    "docs/runtime-capability-catalog.md",
+    "docs/runtime-capability-update-playbook.md"
   ],
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
+    "catalog:runtime": "node scripts/update-runtime-capability-catalog.mjs",
+    "smoke:runtime-capabilities": "node scripts/smoke-runtime-capabilities.mjs",
     "verify:runtime-boundary": "node scripts/verify-runtime-boundary.mjs",
     "prepack": "pnpm build && pnpm verify:runtime-boundary",
     "pack:adapter": "node scripts/package-adapter.mjs",

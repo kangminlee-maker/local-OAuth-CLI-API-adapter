@@ -1,30 +1,30 @@
 # Local OAuth CLI API Adapter
 
-Experimental local adapter that makes an already-authenticated OAuth CLI look
-like a small API server.
+Local OAuth CLI API Adapter turns an already-authenticated Codex or Claude Code
+CLI session into a small local HTTP API server. It exposes an
+OpenAI/Anthropic-compatible subset so tools that expect provider APIs can use a
+local OAuth CLI login instead of provider API keys.
 
-The supported backends are Codex CLI via a long-lived `codex app-server` process and
-Claude Code via its local OAuth CLI session. The adapter exposes a local
-OpenAI/Anthropic-compatible subset so local tools can use OAuth CLI login instead
-of provider API keys.
+The package is meant for local development and automation flows where a consumer
+tool can point `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` at a loopback proxy.
+The proxy runtime does not fall back to direct OpenAI or Anthropic API calls.
 
-## Local API Proxy
+## Quick Start
 
-Build a distributable adapter package from this repository:
+Build a verified installable tarball from this repository:
 
 ```bash
 pnpm install
 pnpm pack:adapter
 ```
 
-The command writes and verifies a standalone tarball such as:
+The command writes and verifies a standalone package:
 
 ```text
 artifacts/local-oauth-cli-api-adapter-0.1.0.tgz
 ```
 
-Install that tarball from any other repository without linking back to this
-source checkout:
+Install that tarball from any other repository:
 
 ```bash
 pnpm add -D /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
@@ -32,49 +32,203 @@ pnpm add -D /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
 pnpm add -g /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
 ```
 
-Then start it from any repository:
+Start the proxy from the consumer repository:
 
 ```bash
 pnpm exec local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
-# or
-pnpm exec local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
 ```
 
-Point API clients in the target repository at the local proxy:
+Then point OpenAI-compatible clients at the local proxy:
 
 ```bash
 OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 OPENAI_API_KEY=local
+```
+
+For Anthropic-compatible clients, start a Claude runtime proxy:
+
+```bash
+pnpm exec local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
+```
+
+Then configure:
+
+```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8788
 ANTHROPIC_API_KEY=local
 ```
 
-The installable proxy bin contains only the proxy runtime files and
-`settings.json`; it does not install or load sibling-repository packages and does
-not depend on this source repository after installation. For independence, avoid
-`file:../path-to-adapter-source`-style installs; use the verified tarball, a
-release asset containing that tarball, or a registry package built from the same
-artifact flow.
+## Requirements
+
+- Node.js 22 or newer
+- `pnpm`
+- A logged-in Codex CLI session for `--runtime codex`
+- A logged-in Claude Code CLI session for `--runtime claude`
+
+The proxy uses the selected local CLI's OAuth session. It avoids provider API
+keys in the proxy path, but it can still consume the selected CLI plan, credits,
+rate limits, and applicable usage policy.
+
+## Supported API Surface
+
+The implemented input/output contract follows the simulated OpenAI and Anthropic
+API-compatible shapes for the subset below. The detailed field-by-field contract
+lives in [`docs/api-interface-contract.md`](docs/api-interface-contract.md).
+
+| Surface | Endpoint | Status |
+| --- | --- | --- |
+| OpenAI Models | `GET /v1/models` | Supported local model list |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Text, tools, JSON mode/schema, streaming, image inputs |
+| OpenAI Responses | `POST /v1/responses` | Text, function calls, function outputs, streaming, image inputs |
+| OpenAI Images | `POST /v1/images/generations` | `image-2` via local Codex image generation |
+| OpenAI Images | `POST /v1/images/edits` | JSON image references and multipart edits |
+| OpenAI Images | `POST /v1/images/variations` | Multipart variations |
+| Anthropic Messages | `POST /v1/messages` | Text, tools, images, streaming |
+
+Planned local CLI chat sessions are intentionally separate from the
+provider-compatible API surface. That design lives in
+[`docs/local-cli-chat-api-design.md`](docs/local-cli-chat-api-design.md).
+
+Common supported features:
+
+- SSE text deltas
+- SSE tool/function argument deltas
+- OpenAI Chat tool calls and tool-result follow-up messages
+- OpenAI Responses function calls and function-call outputs
+- Anthropic `tool_use` and `tool_result`
+- OpenAI Chat `image_url` inputs
+- OpenAI Responses `input_image` inputs
+- Anthropic Messages image blocks
+- image sources as remote URLs, data URLs/base64, local `file://` URLs, and
+  multipart files where the endpoint supports multipart
+- provider token usage details when the CLI exposes them, with estimated usage
+  only as a fallback
+
+## Important Differences From Full Provider APIs
+
+This adapter is compatible with a focused subset, not a full clone of the
+OpenAI or Anthropic APIs.
+
+| Area | Difference |
+| --- | --- |
+| Runtime authority | Local proxy requests never call direct OpenAI or Anthropic APIs. |
+| Model list | `GET /v1/models` returns the configured local backend model, not the full provider catalog. |
+| Model execution | The request `model` is accepted, but execution is constrained by the selected local CLI backend. |
+| Context | Codex proxy runs with isolated home/workspace settings so ambient project context does not leak into API requests. |
+| Images `image-2` | Implemented through the local Codex `gpt-5.5` image-generation route. |
+| Images partial streaming | `partial_images > 0` is rejected; streams emit completed images only. |
+| Images `input_fidelity` | Treated as disabled for `image-2`. |
+| Provider `file_id` images | Rejected because the local CLI proxy cannot read provider Files API storage. |
+| Token usage | Provider CLI usage is preferred; estimated usage is fallback only. |
+| Audio / embeddings | Not implemented. |
+
+For the complete list of input/output rules and implementation differences, see
+[`docs/api-interface-contract.md`](docs/api-interface-contract.md).
+
+## Examples
+
+OpenAI Chat Completions:
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{
+    "model": "codex-app-server",
+    "messages": [
+      { "role": "user", "content": "Reply with exactly: OK" }
+    ]
+  }'
+```
+
+OpenAI Responses:
+
+```bash
+curl http://127.0.0.1:8787/v1/responses \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{
+    "model": "codex-app-server",
+    "input": "Reply with exactly: OK"
+  }'
+```
+
+OpenAI Images through the local `image-2` route:
+
+```bash
+curl http://127.0.0.1:8787/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{
+    "model": "image-2",
+    "prompt": "A simple flat red square on a pure white background.",
+    "size": "1024x1024",
+    "quality": "medium",
+    "response_format": "b64_json"
+  }'
+```
+
+Anthropic Messages:
+
+```bash
+curl http://127.0.0.1:8788/v1/messages \
+  -H 'Content-Type: application/json' \
+  -H 'x-api-key: local' \
+  -H 'anthropic-version: 2023-06-01' \
+  -d '{
+    "model": "claude-code",
+    "max_tokens": 64,
+    "messages": [
+      { "role": "user", "content": "Reply with exactly: OK" }
+    ]
+  }'
+```
+
+## Package Independence
+
+The installable proxy bin contains only the proxy runtime files,
+`settings.json`, README, and contract/design docs. It does not install or load
+sibling-repository packages and does not depend on this source checkout after
+installation.
+
+For independence, avoid `file:../path-to-adapter-source` installs. Use the
+verified tarball, a release asset containing that tarball, or a registry package
+built from the same artifact flow.
 
 The proxy also strips direct provider credential/routing environment variables
 from spawned local CLI backends, including OpenAI/Anthropic API keys and base
 URLs. The target backend should authenticate through its local OAuth CLI session,
 not inherited provider API key settings.
 
-For local development in this repository:
+## Local Development
+
+Install and build:
 
 ```bash
 pnpm install
 pnpm build
+```
+
+Start a development proxy:
+
+```bash
 pnpm proxy:codex
 # or
 pnpm proxy:claude
 ```
 
-Run the local compatibility tests:
+Run the main verification suite:
 
 ```bash
 pnpm test
+```
+
+Run runtime capability catalog and smoke checks:
+
+```bash
+pnpm catalog:runtime
+pnpm smoke:runtime-capabilities
+pnpm smoke:runtime-capabilities -- --include-live-model
 ```
 
 Run the installed-package E2E test:
@@ -86,7 +240,9 @@ pnpm test:e2e:adapter
 This E2E test packs the adapter, installs the tarball into a temporary consumer
 project, starts the installed `local-oauth-cli` bin with a deterministic fake
 Codex app-server backend, and verifies OpenAI-compatible model, chat completion,
-and SSE streaming responses over HTTP.
+image, and SSE streaming responses over HTTP.
+
+## Real CLI Checks
 
 Run real CLI smoke tests with exact return checks:
 
@@ -102,233 +258,60 @@ pnpm smoke:real:codex:multimodal
 pnpm smoke:real:claude:multimodal
 ```
 
-These commands use the actual logged-in CLI sessions and may consume plan
-credits/rate limits. They verify exact text assembly, JSON values, tool names and
-arguments, provider finish reasons, and optional latency samples:
+These commands use actual logged-in CLI sessions and may consume plan credits or
+rate limits.
 
-```bash
-pnpm smoke:real:codex -- --speed-repeats 3
-pnpm smoke:real:claude -- --speed-repeats 3
-```
+## Benchmarks
 
 Run a comparison benchmark against direct provider APIs:
 
 ```bash
 pnpm bench:api
-pnpm bench:api -- --repeats 3 --quality-repeats 3
-pnpm bench:api -- --semantic-quality-repeats 1 --semantic-quality-targets=proxy --min-semantic-quality=95
-pnpm bench:api -- --cases=semantic_quality --semantic-quality-suite=realistic --semantic-quality-repeats 1 --min-semantic-quality=95
-pnpm bench:api -- --targets=proxy-codex --cases=tool_call_stream,tool_use,tool_result --repeats 3
-pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=request_reasoning_effort --request-reasoning-effort=none --repeats 3
-pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=request_reasoning_effort --request-reasoning-effort=minimal --expect-provider-errors=true
 pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex,proxy-claude --repeats 1
 pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --repeats 3
 pnpm bench:api -- --suite=quality-realistic --targets=proxy-codex,proxy-claude --min-semantic-quality=95
 pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api:gpt-5.5 --image-quality-repeats=1 --min-image-quality=90 --repeats 1
-pnpm bench:api -- --include-multimodal=true
-pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=openai.images.generation_api_fields.image2_via_gpt55,openai.images.edit.image2_via_gpt55 --include-image-generation=true --image-quality-repeats=1 --min-image-quality=90
-pnpm bench:api -- --targets=proxy-codex-vs-openai-api:gpt-5.5 --cases=openai.images.generation_stream_paired.image2_via_gpt55 --include-image-generation=true
-pnpm bench:api -- --output /tmp/api-bench.json
-pnpm bench:api -- --baseline /tmp/api-bench.json --regression-targets=proxy
 ```
 
-The benchmark design and release-gate matrix live in
-[`docs/api-benchmark-design.md`](docs/api-benchmark-design.md). Use that document
-as the source of truth for which provider authority, quality gate, latency
-metric, and real-use fixture each suite must cover.
-The optimization lessons that informed the current context isolation, benchmark
-authority, image proxy, and packaging boundaries are summarized in
-[`docs/optimization-learnings.md`](docs/optimization-learnings.md).
+Benchmarks load `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment or
+`.env` for direct provider targets. Direct provider rows can consume paid
+credits and rate limits.
 
-The benchmark loads `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment
-or `.env`, starts both local proxy backends, and compares schema exactness,
-response exactness, stream event shape, optional repeated quality samples, and
-latency against direct API calls. `--suite` expands named benchmark presets such
-as `contract-smoke`, `provider-parity`, `quality-realistic`, `image-realistic`,
-and `release-gate`; explicit `--cases` are unioned with suite cases.
-`--targets` and `--cases` narrow the run to comma-separated target or case
-filters; exact, substring, and `*` wildcard matches are supported, so targeted
-repeated medians can be collected without rerunning every provider/API shape.
-`--semantic-quality-repeats` additionally uses
-an OpenAI JSON-schema judge to score requirement fit, semantic relevance,
-conciseness, and direct-provider similarity; proxy targets also get cached direct
-provider reference outputs when the matching API key is available. Semantic
-references are paired by proxy backend provider, not by request API surface:
-`proxy-codex` is compared with direct OpenAI API output, and `proxy-claude` is
-compared with direct Anthropic API output. The semantic judge treats the direct
-provider output as a reference rather than a style template, so equivalent
-answers can still pass when they better satisfy the original request. Use
-`--min-semantic-quality=95` to make semantic quality a hard gate. The realistic
-semantic suite covers 10 prompt shapes across implementation review, Korean
-optimization tables, multimodal triage, handoff notes, Korean incident reports,
-strict JSON summaries, latency decisions, error policy, image benchmark planning,
-and release-gate decisions. Proxy-Codex
-benchmark rows also include summary-only `backendTiming` diagnostics for local
-phase breakdowns such as `threadStartMs`, `turnWaitMs`, and `usageWaitMs`; these
-diagnostics are not added to API responses. Streaming benchmark rows record
-`firstDataMs`, `firstTextMs`, and `firstToolArgumentMs` so text-token and tool
-argument latency can be compared separately; image stream rows also expose
-`firstImageMs` as the image-specific alias for `firstToolArgumentMs`, because
-direct Responses API lifecycle events can arrive before the first image payload.
-For image stream latency investigations, use the targeted
-`openai.images.generation_stream_paired` diagnostic; it alternates proxy/direct
-request order inside each repeat and reports paired `firstImageMs` deltas. This
-diagnostic keeps per-sample failures in `sampleFailures` so transient provider
-quota or rate-limit errors do not erase earlier successful samples from the
-summary.
-Outlier rows include the dominant backend phase when proxy-codex timing is
-available. Codex app-server text deltas are buffered if they arrive before the
-`turn/start` response, preventing an early-notification race from delaying public
-SSE streams. With
-`--baseline`, proxy rows are compared against a previous summary by default and
-latency/quality regressions make the command fail. Proxy-Codex follows
-request-level OpenAI reasoning effort settings first: Chat Completions
-`reasoning_effort` and Responses `reasoning.effort`. The CLI
-`--reasoning-effort` value is only the fallback when the request omits effort;
-when it is also omitted, `settings.json` supplies
-`codexProxy.fallbackReasoningEffort`, currently `medium` because the repeated
-matrix benchmark showed the best speed/quality stability there.
-Proxy-Codex also preserves OpenAI verbosity structurally: Chat Completions
-`verbosity` and Responses `text.verbosity` are mapped to Codex
-`model_verbosity`, with `settings.json` `codexProxy.fallbackVerbosity`
-currently set to the OpenAI default `medium` when the request omits it.
-For role fidelity, OpenAI Chat `system`/`developer` messages and Responses
-`instructions` are lifted into Codex thread instructions, while user,
-assistant, and tool messages remain in the tagged conversation input. This keeps
-the user message text intact while avoiding a flat one-message transcript for
-API-level instructions.
-Use `--request-reasoning-effort` in benchmarks to send those request fields to
-both proxy and direct OpenAI targets. Current direct `gpt-5.5` rejects
-`minimal`, so that value is useful as an unsupported-value parity probe rather
-than a successful quality/latency case; add `--expect-provider-errors=true` to
-assert matching provider error shapes. Multimodal image benchmarks use a
-deterministic generated PNG fixture family that direct OpenAI and Anthropic APIs
-accept, including single red-square and red/blue multi-image order cases, so
-proxy image paths are compared against real provider behavior.
-Image generation benchmarks are opt-in because direct provider image rows create
-billable images. For the Codex runtime, `model: "image-2"` is the formal local
-proxy image route: the proxy translates the OpenAI Images API request into a
-Codex OAuth `gpt-5.5` image-generation turn and never falls back to direct
-OpenAI API calls. Direct Images API positive/negative rows remain separate
-baselines, including official GPT image model rows and direct `image-2`
-rejection behavior.
-Semantic quality reference failures are reported as `referenceErrors`, separate
-from proxy output quality. For proxy-claude, the direct Anthropic comparison
-authority is Opus (`claude-opus-4-8`); `max_tokens` failures mean the request's
-output cap was reached, not that subscription usage was exhausted.
-The `image-realistic` suite intentionally covers more than the red-square
-contract fixture: it includes photoreal product generation, asset-icon
-generation, text-poster generation, composition-preservation edits, and
-disabled-field rows such as `background: transparent` for `image-2` so prompt
-translation improvements must generalize across visual task types without
-silently accepting unsupported API fields.
-Benchmark proxy requests are guarded: if a proxy target makes
-a direct `api.openai.com` or `api.anthropic.com` call during a local proxy
-request, that benchmark row is failed and quality is forced to 0. Direct OpenAI
-image generation quality/latency rows still run only under explicit direct API
-targets.
-The same runtime boundary is enforced before tests and packaging with
-`pnpm verify:runtime-boundary`: proxy runtime code must not embed direct
-provider hosts, read direct provider credential env names outside the child-env
-sanitizer, call outbound HTTP clients, or pass ambient `process.env` wholesale
-to local CLI children. The verifier also rejects benchmark fixture/task literals
-inside `src` or packaged `dist`, so benchmark gains must come from general API
-translation and runtime behavior rather than hardcoded benchmark prompts.
-Defaults:
+Benchmark design and release gates are documented in
+[`docs/api-benchmark-design.md`](docs/api-benchmark-design.md). The benchmark
+runner compares schema exactness, response shape, streaming event shape, usage,
+latency, semantic quality, image quality, and provider error parity.
 
-- OpenAI API: `gpt-5.5`
-- Codex proxy fallback effort: `settings.json` `codexProxy.fallbackReasoningEffort`
-- Codex proxy fallback verbosity: `settings.json` `codexProxy.fallbackVerbosity`
-- Codex proxy image model: `settings.json` `codexProxy.imageModel`
-- Anthropic API Opus: `claude-opus-4-8`
-- Anthropic API Haiku: `claude-haiku-4-5-20251001`
+Proxy benchmark rows are guarded: if a local proxy target makes a direct
+provider API call during a proxy request, the row fails and quality is forced to
+0. Direct OpenAI/Anthropic calls are allowed only under explicit direct provider
+benchmark targets.
 
-It performs real provider calls and may consume paid credits/rate limits.
+## Reference Docs
 
-The default base URLs are:
+- [`docs/api-interface-contract.md`](docs/api-interface-contract.md): public
+  input/output contract and implementation differences
+- [`docs/api-benchmark-design.md`](docs/api-benchmark-design.md): benchmark
+  suites, provider authorities, quality gates, and latency metrics
+- [`docs/direct-api-transport-handoff.md`](docs/direct-api-transport-handoff.md):
+  design handoff for adding a separate direct provider transport surface
+- [`docs/local-cli-chat-api-design.md`](docs/local-cli-chat-api-design.md):
+  native local CLI chat session API design
+- [`docs/runtime-capability-catalog.md`](docs/runtime-capability-catalog.md):
+  Codex and Claude Code non-interactive runtime capability map
+- [`docs/runtime-capability-update-playbook.md`](docs/runtime-capability-update-playbook.md):
+  periodic validity check and LLM-assisted update process for the runtime map
+- [`docs/optimization-learnings.md`](docs/optimization-learnings.md): lessons
+  from proxy optimization work
 
-```text
-OpenAI-compatible:    http://127.0.0.1:8787/v1
-Anthropic-compatible: http://127.0.0.1:8787
-```
-
-Supported subset:
-
-- `GET /v1/models`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `POST /v1/images/generations`
-- `POST /v1/images/edits`
-- `POST /v1/images/variations`
-- `POST /v1/messages`
-- non-stream text generation
-- live SSE text deltas from Codex `app-server` and Claude Code
-- live SSE tool-call argument deltas when the backend streams structured output,
-  with synthetic completion of any remaining arguments after the CLI decision
-  completes
-- OpenAI JSON object/schema output where supported by the backend
-- OpenAI Chat tool calls and tool-result follow-up messages
-- OpenAI Responses function calls and function-call outputs
-- Anthropic `tool_use` and `tool_result`
-- image inputs for OpenAI Chat `image_url`, OpenAI Responses `input_image`, and
-  Anthropic Messages `image` blocks
-- image sources as remote URLs, data URLs/base64, and local `file://` URLs
-- OpenAI Images generation, edit, and variation through the Codex
-  `image2_via_gpt55` route for `model: "image-2"`, including URL responses,
-  streaming image generation, multipart edits, and multipart variations.
-  Direct OpenAI fallback is disabled structurally.
-  Generation/edit options such as `background`, `quality`, `size`,
-  `output_format`, `output_compression`,
-  `moderation`, `input_fidelity`, `style`, `user`, `stream`, and
-  `partial_images` are validated where the Images API surface requires them;
-  `input_fidelity` is treated as a disabled image-2 API field rather than a
-  quality failure
-- provider token usage details where the CLI exposes them, including cached and
-  reasoning-token breakdowns where available; estimated usage is used only as a
-  fallback
-
-Not yet supported:
-
-- provider `file_id` image sources for non-image-generation chat/messages paths,
-  because the local CLI proxy cannot read the provider Files API storage for the
-  caller
-- audio output generation
-- full API compatibility
-
-Example:
-
-```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer local' \
-  -d '{
-    "model": "codex-app-server",
-    "messages": [
-      { "role": "user", "content": "Reply with exactly: OK" }
-    ]
-  }'
-```
-
-Claude proxy:
-
-```bash
-pnpm proxy:claude
-```
-
-Plain text Claude requests use one long-lived
-`claude -p --input-format stream-json --output-format stream-json` process and
-clear context with `/clear` after each request. Tool-call and JSON-schema
-requests use a one-shot Claude process so `--json-schema` can be set per request.
-Image requests also use a one-shot `stream-json` input process to avoid carrying
-image attachment state across persistent turns.
-
-## Notes
+## Runtime Notes
 
 - `codex` uses `codex app-server` and the local Codex CLI auth state.
 - `claude` uses `claude -p` and the local Claude Code auth state.
-- This avoids provider API keys, but it still consumes the selected CLI's plan,
-  credits, rate limits, and applicable usage policy.
-- Codex text streaming maps `item/agentMessage/delta` notifications to the
-  local API stream. Claude Code text streaming maps
-  `stream_event.event.content_block_delta` `text_delta` chunks to the same local
+- Codex text streaming maps app-server agent-message deltas to the local API
+  stream.
+- Claude Code text streaming maps Claude stream-json text deltas to the local
   API stream.
+- Plain text Claude requests use one long-lived process and clear context after
+  each request. Tool-call, JSON-schema, and image requests use one-shot Claude
+  processes where needed for per-request schema or attachment isolation.

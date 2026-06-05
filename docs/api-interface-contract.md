@@ -1,0 +1,418 @@
+# API interface contract
+
+이 문서는 local OAuth CLI API adapter가 외부에 제공하는 input/output interface 규약이다. 원칙은 명확하다.
+
+- 구현된 surface의 input spec과 output spec은 OpenAI 또는 Anthropic API-compatible shape를 기준으로 한다.
+- provider와 동일하게 보이도록 simulate한 subset만 public contract로 본다.
+- 구현상 provider와 다르게 처리하는 영역은 "구현 차이와 제약"에 별도 명시한다.
+- 런타임 proxy는 direct provider API를 호출하지 않는다. direct provider API는 benchmark, reference 생성, 별도 direct transport 설계에서만 다룬다.
+
+## Supported surfaces
+
+| Provider-compatible surface | Endpoint | Runtime backend |
+| --- | --- | --- |
+| OpenAI Models | `GET /v1/models` | local backend metadata |
+| OpenAI Chat Completions | `POST /v1/chat/completions` | Codex-compatible local backend |
+| OpenAI Responses | `POST /v1/responses` | Codex-compatible local backend |
+| OpenAI Images | `POST /v1/images/generations`, `/v1/images/edits`, `/v1/images/variations` | Codex image-generation backend for `image-2` route |
+| Anthropic Messages | `POST /v1/messages` | Claude-compatible local backend |
+
+## OpenAI Chat Completions
+
+### Input spec
+
+The request body is a JSON object compatible with Chat Completions for the implemented subset.
+
+| Field | Supported shape | Handling |
+| --- | --- | --- |
+| `model` | string | Accepted. Defaults to `codex-app-server` when omitted. The backend may return its actual model in output. |
+| `messages` | array | Required. Each item must be an object. |
+| `messages[].role` | `system`, `developer`, `user`, `assistant`, `tool` | Preserved in normalized conversation. Unknown roles are normalized to `user`. |
+| `messages[].content` | string or content-part array | Text is flattened. `image_url` parts are preserved as image inputs. |
+| `messages[].tool_calls` | assistant tool call array | Flattened into conversation context for tool-result continuation. |
+| `messages[].tool_call_id` | string | Preserved for `tool` role messages. |
+| `tools` | OpenAI function tool array | `function.name`, `function.description`, and `function.parameters` are preserved. |
+| `tool_choice` | `none`, `required`, or `{ type: "function", function: { name } }` | Mapped to internal tool-choice modes. Other values default to `auto`. |
+| `stream` | boolean | `true` enables SSE chunks. |
+| `stream_options.include_usage` | boolean | Emits final usage chunk when true. |
+| `stream_options.include_obfuscation` | boolean | Defaults to true unless explicitly false. |
+| `response_format` | `{ type: "json_object" }` or `{ type: "json_schema", json_schema: { schema } }` | Enables JSON mode/schema steering where backend supports it. |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` | Request value takes priority over fallback settings. Invalid values return 400. |
+| `reasoning.effort` | same enum | Accepted as an alternate source. |
+| `verbosity` | `low`, `medium`, `high` | Request value takes priority over fallback settings. |
+| `text.verbosity` | same enum | Accepted as an alternate source. |
+| `max_tokens`, `max_completion_tokens` | number | Passed to backend as max token hint. |
+| `temperature` | number | Passed to backend as temperature hint. |
+
+### Output spec
+
+Non-streaming response uses OpenAI Chat Completions shape:
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "created": 0,
+  "model": "...",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "...",
+        "refusal": null,
+        "annotations": []
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0,
+    "prompt_tokens_details": {
+      "cached_tokens": 0,
+      "audio_tokens": 0
+    },
+    "completion_tokens_details": {
+      "reasoning_tokens": 0,
+      "audio_tokens": 0,
+      "accepted_prediction_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "service_tier": "default",
+  "system_fingerprint": null
+}
+```
+
+When the backend returns tool calls, `message.content` is `null`, `message.tool_calls` is populated, and `finish_reason` is `tool_calls`.
+
+### Streaming output spec
+
+SSE stream uses `data: ...` Chat Completions chunks and ends with `data: [DONE]`.
+
+- First assistant chunk includes `delta.role`.
+- Text chunks include `delta.content`.
+- Tool chunks include `delta.tool_calls[].function.arguments` deltas.
+- Final choice chunk has `finish_reason: "stop"` or `"tool_calls"`.
+- If `stream_options.include_usage` is true, an extra chunk with `choices: []` and `usage` is emitted before `[DONE]`.
+- Chunk `usage` is `null` when `include_usage` is true and the chunk is not the final usage chunk.
+
+## OpenAI Responses
+
+### Input spec
+
+The request body is a JSON object compatible with Responses for the implemented subset.
+
+| Field | Supported shape | Handling |
+| --- | --- | --- |
+| `model` | string | Accepted. Defaults to `codex-app-server` when omitted. |
+| `instructions` | string | Added as system-level instruction input. |
+| `input` | string or array | String becomes a user message. Array items support message-like objects, `function_call`, and `function_call_output`. |
+| `input[].role` | OpenAI-style role | Unknown or missing roles normalize to `user`. |
+| `input[].content` | string, object, or content-part array | Text is flattened. `input_image` parts are preserved as image inputs. |
+| `tools` | function tools | Same tool parser as Chat Completions. |
+| `tool_choice` | string or object | Preserved in output response config and mapped to internal tool-choice mode. |
+| `stream` | boolean | `true` enables Responses SSE events. |
+| `stream_options.include_usage` | boolean | Parsed for shared stream options. |
+| `text.format` | `{ type: "text" }`, `{ type: "json_object" }`, `{ type: "json_schema", schema }` | JSON modes enable backend schema steering. |
+| `text.verbosity` | `low`, `medium`, `high` | Request value takes priority over fallback settings. |
+| `reasoning.effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` | Request value takes priority over fallback settings. |
+| `max_output_tokens` | number | Passed to backend as max token hint. |
+| `temperature` | number | Passed to backend as temperature hint. |
+| `previous_response_id`, `prompt_cache_key`, `safety_identifier`, `metadata`, `user`, `store`, `truncation` | provider-style fields | Reflected in the response object where implemented. |
+
+### Output spec
+
+Non-streaming response uses Responses object shape:
+
+```json
+{
+  "id": "resp_...",
+  "object": "response",
+  "created_at": 0,
+  "status": "completed",
+  "background": false,
+  "billing": { "payer": "developer" },
+  "completed_at": 0,
+  "error": null,
+  "instructions": null,
+  "max_output_tokens": null,
+  "model": "...",
+  "output": [],
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "context": "current_turn",
+    "effort": "medium",
+    "summary": null
+  },
+  "service_tier": "default",
+  "store": true,
+  "temperature": 1,
+  "text": {
+    "format": { "type": "text" },
+    "verbosity": "medium"
+  },
+  "tool_choice": "auto",
+  "tools": [],
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "input_tokens_details": { "cached_tokens": 0 },
+    "output_tokens_details": { "reasoning_tokens": 0 }
+  }
+}
+```
+
+Text output is represented as a reasoning item plus an assistant message item with `content[].type: "output_text"`. Tool output is represented as `function_call` items with `call_id`, `name`, and `arguments`.
+
+### Streaming output spec
+
+Responses streaming uses named SSE events:
+
+- `response.created`
+- `response.in_progress`
+- `response.output_item.added`
+- `response.output_item.done`
+- `response.content_part.added`
+- `response.output_text.delta`
+- `response.output_text.done`
+- `response.content_part.done`
+- `response.function_call_arguments.delta`
+- `response.function_call_arguments.done`
+- `response.completed`
+- `error`
+
+Each event payload includes a monotonically increasing `sequence_number`. The stream ends with `data: [DONE]`.
+
+## OpenAI Images
+
+### Input spec
+
+Images requests accept JSON bodies, and edit/variation endpoints also accept `multipart/form-data` where applicable.
+
+| Field | Generation | Edit | Variation | Handling |
+| --- | --- | --- | --- | --- |
+| `model` | optional | optional | optional | Defaults to `dall-e-2`. `image-2` is the local Codex image route. |
+| `prompt` | required | required | ignored | Variation uses `Create a variation of the provided image.` internally. |
+| `image`, `image[]`, `images` | ignored | required | required | JSON image references are accepted for edits. Variations require multipart. |
+| `mask` | ignored | optional | ignored | Accepted as image input. |
+| `n` | optional | optional | optional | Integer 1-10, default 1. |
+| `size` | optional | optional | optional | `auto` or `WIDTHxHEIGHT`. |
+| `quality` | optional | optional | optional | `standard`, `hd`, `low`, `medium`, `high`, `auto`. |
+| `background` | optional | optional | optional | `transparent`, `opaque`, `auto`. |
+| `output_format` | optional | optional | optional | `png`, `jpeg`, `webp`. |
+| `output_compression` | optional | optional | optional | Integer 0-100; valid only for `jpeg` or `webp`. |
+| `moderation` | optional | optional | optional | `low`, `auto`. |
+| `input_fidelity` | invalid | optional | invalid | `high`, `low`; disabled for `image-2`. |
+| `style` | optional | invalid | invalid | `vivid`, `natural`. |
+| `user` | optional | optional | optional | Accepted. |
+| `response_format` | optional | optional | optional | `b64_json` or `url`, default `b64_json`. Rejected for `gpt-image-*` models. |
+| `stream` | optional | optional | optional | Boolean. |
+| `partial_images` | optional | optional | optional | Only `0` or omitted is supported. Values above 0 return 400. |
+
+Image references support:
+
+- URL string
+- data URL
+- `{ "image_url": "..." }`
+- `{ "image_url": { "url": "..." } }`
+- `{ "url": "..." }`
+- `{ "b64_json": "...", "media_type": "image/png" }`
+- multipart file parts
+- `{ "file_id": "..." }` is parsed but rejected before backend execution for local proxy paths.
+
+### Output spec
+
+Non-streaming output follows Images response shape:
+
+```json
+{
+  "created": 0,
+  "data": [
+    {
+      "b64_json": "...",
+      "revised_prompt": "..."
+    }
+  ],
+  "background": "opaque",
+  "output_format": "png",
+  "quality": "high",
+  "size": "1024x1024",
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "input_tokens_details": { "cached_tokens": 0 },
+    "output_tokens_details": { "reasoning_tokens": 0 }
+  }
+}
+```
+
+When `response_format: "url"` is requested, each image object contains `url` instead of `b64_json`. The URL points to the local proxy under `/v1/images/generated/{id}` and is fetchable for approximately one hour.
+
+### Streaming output spec
+
+Images streaming uses named SSE events and does not expose partial image payloads.
+
+- generation emits `image_generation.completed`
+- edits and variations emit `image_edit.completed`
+- error emits `error`
+
+Completed event payload includes:
+
+```json
+{
+  "type": "image_generation.completed",
+  "created_at": 0,
+  "background": "auto",
+  "output_format": "png",
+  "quality": "auto",
+  "size": "auto",
+  "b64_json": "..."
+}
+```
+
+If `response_format: "url"` is requested, the completed event contains `url` instead of `b64_json`.
+
+## Anthropic Messages
+
+### Input spec
+
+The request body is a JSON object compatible with Anthropic Messages for the implemented subset.
+
+| Field | Supported shape | Handling |
+| --- | --- | --- |
+| `model` | string | Accepted. Defaults to `codex-app-server` when omitted. |
+| `system` | string or content block array | Flattened into system-level text. |
+| `messages` | array | Required. Each item must be an object. |
+| `messages[].role` | `user`, `assistant` | `assistant` is preserved; other values normalize to `user`. |
+| `messages[].content` | string or content block array | Text and image blocks are preserved. Tool blocks are flattened into conversation context. |
+| `content[].type: "text"` | `{ text }` | Text is preserved. |
+| `content[].type: "image"` | base64, URL, or file source | Base64 and URL are supported. File IDs are rejected before backend execution. |
+| `content[].type: "tool_use"` | `{ id, name, input }` | Flattened into assistant tool-call context. |
+| `content[].type: "tool_result"` | `{ tool_use_id, content }` | Flattened into tool-result context. |
+| `tools` | array with `name`, `description`, `input_schema` | Preserved. |
+| `tool_choice` | `{ type: "none" }`, `{ type: "any" }`, `{ type: "tool", name }` | Mapped to internal tool-choice modes. |
+| `stream` | boolean | `true` enables Anthropic SSE events. |
+| `max_tokens` | number | Passed to backend as max token hint. |
+| `temperature` | number | Passed to backend as temperature hint. |
+
+### Output spec
+
+Non-streaming output follows Anthropic Messages shape:
+
+```json
+{
+  "id": "msg_...",
+  "type": "message",
+  "role": "assistant",
+  "model": "...",
+  "content": [
+    {
+      "type": "text",
+      "text": "..."
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0
+  }
+}
+```
+
+When tool calls are returned, `content` contains `tool_use` blocks and `stop_reason` is `tool_use`. Tool arguments are parsed as JSON when possible; invalid JSON becomes `{ "input": "..." }`.
+
+### Streaming output spec
+
+Anthropic streaming uses named SSE events:
+
+- `message_start`
+- `content_block_start`
+- `content_block_delta`
+- `content_block_stop`
+- `message_delta`
+- `message_stop`
+- `error`
+
+Text deltas use `delta: { "type": "text_delta", "text": "..." }`. Tool input deltas use `delta: { "type": "input_json_delta", "partial_json": "..." }`.
+
+## Usage contract
+
+Usage fields prefer provider-reported CLI usage when available. Estimated usage is fallback only.
+
+| Surface | Usage shape |
+| --- | --- |
+| OpenAI Chat | `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens` |
+| OpenAI Responses | `input_tokens`, `output_tokens`, `total_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens` |
+| OpenAI Images | Same as OpenAI Responses when local usage is available; otherwise provider/raw image usage is passed through. |
+| Anthropic Messages | `input_tokens`, `output_tokens`, optional `cache_creation_input_tokens`, optional `cache_read_input_tokens` |
+
+Anthropic cache creation/read tokens are folded into OpenAI `input_tokens` when an Anthropic-style backend usage object is rendered through an OpenAI-compatible surface.
+
+## Error contract
+
+OpenAI-compatible errors use:
+
+```json
+{
+  "error": {
+    "message": "...",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}
+```
+
+Anthropic-compatible errors use:
+
+```json
+{
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "..."
+  }
+}
+```
+
+Backend provider-style JSON errors are parsed and forwarded with their status, type, message, param, and code where possible. For OpenAI Chat shape, backend param `reasoning.effort` is normalized to `reasoning_effort`.
+
+## 구현 차이와 제약
+
+This section is the explicit list of areas where implementation intentionally differs from a full direct OpenAI or Anthropic API.
+
+| Area | Difference | Reason / expected behavior |
+| --- | --- | --- |
+| Runtime authority | Proxy runtime never calls direct provider APIs. | Local OAuth CLI auth is the product boundary. Direct provider calls belong only to benchmark/reference/direct-transport surfaces. |
+| Model catalog | `GET /v1/models` returns the single configured local backend model. | The proxy exposes local backend availability, not the full provider model list. |
+| Model execution | Request `model` is accepted, but actual execution depends on local CLI backend configuration. | The output `model` may reflect backend model resolution. |
+| Ambient context | Codex proxy runs in an isolated temp home/workspace with project context sources disabled. | User request text is preserved; hidden local project context is intentionally removed. |
+| Instruction handling | OpenAI Chat `system`/`developer` and Responses `instructions` can be lifted into backend thread instructions. | This preserves API roles while fitting CLI backend mechanics. |
+| Unknown roles | Some unknown roles normalize to `user` instead of provider-style validation failure. | Current normalizer is permissive for compatibility with local tools. |
+| `file_id` images | Parsed but rejected before backend execution. | Local CLI proxy cannot fetch provider file storage. Use URL, data URL, base64, or multipart image input. |
+| Images `image-2` | `image-2` is implemented through local Codex `gpt-5.5` image generation. | This is the formal local proxy route, not direct OpenAI `image-2` execution. |
+| Images quality mapping | `quality: low -> effort low`, `medium -> medium`, `high/auto/omitted -> high`. | Maps Images API quality intent to local Codex image-generation effort. |
+| Images `input_fidelity` | Disabled for `image-2`. | Treated as current `image-2` field capability, not as quality failure. |
+| Images partial streaming | `partial_images > 0` is rejected. Partial backend events are not forwarded. | Public proxy stream exposes completed images only. |
+| Images variations | JSON image input is rejected; multipart image upload is required. | Matches the implemented Images API form-data contract. |
+| GPT image `response_format` | `response_format` is rejected for `gpt-image-*` models. | Mirrors provider-style parameter compatibility for GPT image models. |
+| URL images | `response_format: "url"` returns local ephemeral URLs under the proxy. | Generated image bytes are stored in-memory for about one hour. |
+| Token accounting | Provider CLI usage is preferred; estimated usage is fallback. | Local CLIs do not always provide complete provider token details. |
+| Audio and embeddings | Not implemented. | Outside current compatible subset. |
+
+## Verification authority
+
+| Contract area | Tests / benchmark authority |
+| --- | --- |
+| OpenAI/Anthropic HTTP shapes | `test/proxy-http.test.mjs` |
+| Input normalization | `test/normalizers.test.mjs` |
+| Image route translation | `test/image2-via-gpt55.test.mjs`, image rows in `scripts/api-comparison-benchmark.mjs` |
+| Tool streaming deltas | `test/tool-call-stream.test.mjs`, stream tests in `test/proxy-http.test.mjs` |
+| Runtime boundary | `scripts/verify-runtime-boundary.mjs` |
+| Provider parity and quality | `docs/api-benchmark-design.md` and `scripts/api-comparison-benchmark.mjs` |
