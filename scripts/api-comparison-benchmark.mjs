@@ -2,28 +2,42 @@
 import fs from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
-import { CodexAppServerBackend } from '../dist/proxy/codex-app-server-backend.js';
+import {
+  CodexAppServerBackend,
+  isCodexAppServerProxyMode,
+} from '../dist/proxy/codex-app-server-backend.js';
 import { openAiImageQualityReasoningEffort, startLocalApiProxy } from '../dist/proxy/http-server.js';
-import { isReasoningEffort } from '../dist/settings.js';
+import { image2ViaGpt55Prompt } from '../dist/proxy/image2-via-gpt55.js';
+import { codexProxyImageModel, isReasoningEffort } from '../dist/settings.js';
 
 loadEnvFile('.env');
 
 const imageGenerationCaseNames = {
   generationB64: 'openai.images.generation.image2_via_gpt55.b64_json.schema_exact',
+  generationB64N3Parallel: 'openai.images.generation.image2_via_gpt55.b64_json_n3_parallel.schema_exact',
   generationApiFields: 'openai.images.generation_api_fields.image2_via_gpt55.schema_exact',
   generationUrl: 'openai.images.generation_url.image2_via_gpt55.schema_exact',
   generationStream: 'openai.images.generation_stream.image2_via_gpt55.schema_exact',
   generationStreamPaired: 'openai.images.generation_stream_paired.image2_via_gpt55.latency_compare',
+  generationPhotorealProduct: 'openai.images.generation_photoreal_product.image2_via_gpt55.schema_exact',
+  generationAssetIcon: 'openai.images.generation_asset_icon.image2_via_gpt55.schema_exact',
+  generationTextPoster: 'openai.images.generation_text_poster.image2_via_gpt55.schema_exact',
+  referenceStyleGeneration: 'openai.images.reference_style_generation.image2_via_gpt55.schema_exact',
+  referenceProductGeneration: 'openai.images.reference_product_generation.image2_via_gpt55.schema_exact',
+  referenceMultiGeneration: 'openai.images.reference_multi_generation.image2_via_gpt55.schema_exact',
   edit: 'openai.images.edit.image2_via_gpt55.schema_exact',
+  editPreserveComposition: 'openai.images.edit_preserve_composition.image2_via_gpt55.schema_exact',
   editMultiImage: 'openai.images.edit_multi_image.image2_via_gpt55.schema_exact',
   editMultipartStream: 'openai.images.edit_multipart_stream.image2_via_gpt55.schema_exact',
   variation: 'openai.images.variation.image2_via_gpt55.schema_exact',
+  proxyGptImageResponseFormatUnsupported: 'openai.images.proxy_gpt_image_response_format_unsupported.schema_exact',
   directImagesGeneration: 'openai.images.direct_generation.gpt_image.schema_exact',
   directImagesEdit: 'openai.images.direct_edit.gpt_image.schema_exact',
   directImagesImage2Unsupported: 'openai.images.direct_image2_unsupported.schema_exact',
   errorMissingPrompt: 'openai.images.error_missing_prompt.schema_exact',
   errorInvalidOutputCompression: 'openai.images.error_invalid_output_compression.schema_exact',
-  errorUnsupportedInputFidelity: 'openai.images.error_unsupported_input_fidelity.schema_exact',
+  backgroundTransparentUnsupported: 'openai.images.background_transparent_unsupported.image2_via_gpt55.schema_exact',
+  inputFidelityDisabled: 'openai.images.input_fidelity_disabled.image2_via_gpt55.schema_exact',
   errorVariationJson: 'openai.images.error_variation_json.schema_exact',
 };
 
@@ -31,6 +45,95 @@ const imageGenerationSuiteCaseNames = Object.values(imageGenerationCaseNames)
   .filter((caseName) => caseName !== imageGenerationCaseNames.generationStreamPaired);
 const openAiApiTarget = 'openai-api:gpt-5.5';
 const imageGenerationPairTarget = 'proxy-codex-vs-openai-api:gpt-5.5';
+const originalFetch = globalThis.fetch.bind(globalThis);
+let currentBenchmarkContext = null;
+let activeProxyProviderEgressGuard = null;
+
+globalThis.fetch = async (input, init) => {
+  const url = fetchUrl(input);
+  if (activeProxyProviderEgressGuard && isProviderApiUrl(url)) {
+    const call = {
+      url,
+      target: currentBenchmarkContext?.target ?? null,
+      case: currentBenchmarkContext?.caseName ?? null,
+    };
+    activeProxyProviderEgressGuard.calls.push(call);
+    throw new ProxyProviderEgressError(activeProxyProviderEgressGuard.calls);
+  }
+  return originalFetch(input, init);
+};
+
+class ProxyProviderEgressError extends Error {
+  constructor(calls, cause) {
+    super(`proxy target made direct provider API call: ${calls.map((call) => call.url).join(', ')}`);
+    this.name = 'ProxyProviderEgressError';
+    this.calls = calls;
+    this.cause = cause;
+  }
+}
+
+function failedBenchmarkRow(target, caseName, err) {
+  const row = {
+    target,
+    case: caseName,
+    ok: false,
+    error: errorMessage(err),
+  };
+  if (err instanceof ProxyProviderEgressError) {
+    row.error = 'proxy target made direct provider API call; quality forced to 0';
+    row.providerEgress = err.calls;
+    row.quality = summarize([0]);
+    row.semanticQuality = summarize([0]);
+    row.imageQuality = summarize([0]);
+    if (err.cause) row.providerEgressCause = errorMessage(err.cause);
+  }
+  return row;
+}
+
+async function guardedProxyFetch(url, fn) {
+  if (!isLocalProxyUrl(url)) return await fn();
+  const previous = activeProxyProviderEgressGuard;
+  const guard = { calls: [] };
+  activeProxyProviderEgressGuard = guard;
+  try {
+    const result = await fn();
+    if (guard.calls.length > 0) throw new ProxyProviderEgressError(guard.calls);
+    return result;
+  } catch (err) {
+    if (guard.calls.length > 0) throw new ProxyProviderEgressError(guard.calls, err);
+    throw err;
+  } finally {
+    activeProxyProviderEgressGuard = previous;
+  }
+}
+
+function fetchUrl(input) {
+  if (typeof input === 'string') return input;
+  if (input instanceof URL) return input.href;
+  if (input && typeof input === 'object' && typeof input.url === 'string') return input.url;
+  return String(input ?? '');
+}
+
+function isLocalProxyUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === '127.0.0.1'
+      || parsed.hostname === 'localhost'
+      || parsed.hostname === '::1';
+  } catch {
+    return false;
+  }
+}
+
+function isProviderApiUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === 'api.openai.com'
+      || parsed.hostname === 'api.anthropic.com';
+  } catch {
+    return false;
+  }
+}
 
 const benchmarkSuiteDefinitions = {
   'contract-smoke': [
@@ -94,7 +197,6 @@ const openAiModel = options.openaiModel ?? 'gpt-5.5';
 const openAiImageApiModel = options.openaiImageApiModel ?? 'gpt-image-1.5';
 const anthropicModels = {
   opus: options.anthropicOpusModel ?? 'claude-opus-4-8',
-  sonnet: options.anthropicSonnetModel ?? 'claude-sonnet-4-6',
   haiku: options.anthropicHaikuModel ?? 'claude-haiku-4-5-20251001',
 };
 const outputPath = options.output;
@@ -112,6 +214,7 @@ const minSemanticQuality = nonNegativeNumberOption(options.minSemanticQuality, 0
 const minImageQuality = nonNegativeNumberOption(options.minImageQuality, suiteDefaults.minImageQuality);
 const expectProviderErrors = booleanOption(options.expectProviderErrors, false);
 const requestReasoningEffort = optionalReasoningEffort(options.requestReasoningEffort);
+const codexProxyMode = codexAppServerProxyMode(options.codexProxyMode ?? options.codexProbeMode);
 const targetFilters = readFilters(options.targets ?? options.target);
 const caseFilters = mergeFilters(readFilters(options.cases ?? options.case), suiteCaseFilters);
 
@@ -125,30 +228,40 @@ try {
   let proxyCodex = null;
   let proxyClaude = null;
   if (shouldRunTarget('proxy-codex') || shouldRunImageGenerationPairBenchmark()) {
-    proxyCodex = await startProxy(new CodexAppServerBackend({
+    const proxyCodexBackend = new CodexAppServerBackend({
       command: options.codexCommand,
       cwd,
       model: options.codexModel,
       timeoutMs,
       reasoningEffort: reasoningEffort(options.reasoningEffort),
+      proxyMode: codexProxyMode,
       onTiming: (timing) => pushBackendTiming('proxy-codex', timing),
-    }));
+    });
+    const proxyCodexImageBackend = new CodexAppServerBackend({
+      command: options.codexCommand,
+      cwd,
+      model: options.codexImageModel ?? codexProxyImageModel(),
+      timeoutMs,
+      imageGeneration: true,
+      proxyMode: codexProxyMode,
+      onTiming: (timing) => pushBackendTiming('proxy-codex', timing),
+    });
+    proxyCodex = await startProxy(proxyCodexBackend, {
+      imageGenerationClient: proxyCodexImageBackend,
+    });
   }
   if (shouldRunTarget('proxy-claude')) {
     proxyClaude = await startProxy(new ClaudeCodeBackend({
       command: options.claudeCommand,
       cwd,
-      model: options.claudeCliModel ?? 'sonnet',
+      model: options.claudeCliModel ?? 'opus',
       timeoutMs,
     }));
   }
 
   if (proxyCodex) await benchmarkOpenAiChatCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
-  if (proxyClaude) await benchmarkOpenAiChatCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   if (proxyCodex) await benchmarkOpenAiCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
-  if (proxyClaude) await benchmarkOpenAiCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   if (shouldRunImageGenerationBenchmarks() && proxyCodex) await benchmarkOpenAiImageGenerationCompatible('proxy-codex', proxyCodex.url, false);
-  if (shouldRunImageGenerationBenchmarks() && proxyClaude) await benchmarkOpenAiImageGenerationCompatible('proxy-claude', proxyClaude.url, false);
   if (shouldRunTarget(openAiApiTarget)) {
     if (process.env.OPENAI_API_KEY) {
       await benchmarkOpenAiChatCompatible(openAiApiTarget, 'https://api.openai.com', openAiModel, true);
@@ -171,7 +284,6 @@ try {
     }
   }
 
-  if (proxyCodex) await benchmarkAnthropicCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
   if (proxyClaude) await benchmarkAnthropicCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   if (process.env.ANTHROPIC_API_KEY) {
     for (const [family, model] of Object.entries(anthropicModels)) {
@@ -212,6 +324,7 @@ const summaryBase = {
   minImageQuality,
   expectProviderErrors,
   requestReasoningEffort,
+  codexProxyMode: codexProxyMode ?? 'api-isolated',
   suites: filterLabel(selectedSuites),
   targetFilters: filterLabel(targetFilters),
   caseFilters: filterLabel(caseFilters),
@@ -242,9 +355,10 @@ if (outputPath) {
 console.log(`\nAPI_COMPARISON_SUMMARY ${JSON.stringify(summary, null, 2)}`);
 process.exit(failed.length > 0 || (regressionGate?.regressions.length ?? 0) > 0 ? 1 : 0);
 
-async function startProxy(backend) {
+async function startProxy(backend, options = {}) {
   const server = await startLocalApiProxy({
     backend,
+    imageGenerationClient: options.imageGenerationClient,
     host: '127.0.0.1',
     port: 0,
     requestTimeoutMs: timeoutMs,
@@ -469,7 +583,7 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
         }, openAiHeaders(isApi));
         const text = response.body.choices?.[0]?.message?.content ?? '';
         assertOpenAiChatResponseShape(response.body, 'stop');
-        const reference = await semanticReference('openai.chat', target, `${task.id}:${index}`, prompt);
+        const { reference, referenceError } = await safeSemanticReference('openai.chat', target, `${task.id}:${index}`, prompt);
         const judged = await scoreSemanticQuality({
           target,
           caseName: `openai.chat.semantic_quality.${task.id}`,
@@ -477,7 +591,7 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
           text,
           reference,
         });
-        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged };
+        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged, referenceError };
       });
     }
   }
@@ -494,7 +608,7 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
       }, openAiHeaders(isApi));
       const text = response.body.choices?.[0]?.message?.content ?? '';
       assertOpenAiChatResponseShape(response.body, 'stop');
-      const reference = await semanticReference('openai.chat', target, `request_reasoning:${requestReasoningEffort}:${index}`, prompt, {
+      const { reference, referenceError } = await safeSemanticReference('openai.chat', target, `request_reasoning:${requestReasoningEffort}:${index}`, prompt, {
         openAiReasoningEffort: requestReasoningEffort,
       });
       const judged = await scoreSemanticQuality({
@@ -510,6 +624,7 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
         requestReasoningEffort,
         quality: scoreQualityOutput(text, task),
         ...judged,
+        referenceError,
       };
     });
   }
@@ -677,7 +792,7 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
         }, openAiHeaders(isApi));
         assertOpenAiResponsesShape(response.body);
         const text = extractOpenAiResponseText(response.body) ?? '';
-        const reference = await semanticReference('openai.responses', target, `${task.id}:${index}`, prompt);
+        const { reference, referenceError } = await safeSemanticReference('openai.responses', target, `${task.id}:${index}`, prompt);
         const judged = await scoreSemanticQuality({
           target,
           caseName: `openai.responses.semantic_quality.${task.id}`,
@@ -685,7 +800,7 @@ async function benchmarkOpenAiCompatible(target, baseUrl, model, isApi) {
           text,
           reference,
         });
-        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged };
+        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged, referenceError };
       });
     }
   }
@@ -698,7 +813,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       return await directImagesSample(`${baseUrl}/v1/images/generations`, {
         model: openAiImageApiModel,
         prompt,
-        response_format: 'b64_json',
         size: '1024x1024',
         quality: 'low',
         output_format: 'png',
@@ -714,7 +828,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       return await directImagesMultipartSample(`${baseUrl}/v1/images/edits`, {
         model: openAiImageApiModel,
         prompt,
-        response_format: 'b64_json',
         size: '1024x1024',
         quality: 'low',
       }, [{
@@ -740,6 +853,21 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     });
   }
 
+  if (!isApi) {
+    await benchmarkCase(target, imageGenerationCaseNames.proxyGptImageResponseFormatUnsupported, repeats, async () => {
+      return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
+        model: openAiImageApiModel,
+        prompt: 'A simple flat red square centered on a white background. No text.',
+        response_format: 'b64_json',
+      }, openAiHeaders(false), {
+        status: 400,
+        type: 'invalid_request_error',
+        param: 'response_format',
+        code: 'unknown_parameter',
+      });
+    });
+  }
+
   await benchmarkCase(target, imageGenerationCaseNames.generationB64, repeats, async () => {
     const prompt = 'A simple flat red square centered on a white background. No text.';
     return isApi
@@ -759,6 +887,26 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
           requirements: ['solid red square', 'white background', 'no text'],
           kind: 'generation',
         });
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.generationB64N3Parallel, repeats, async () => {
+    const prompt = 'A simple flat red square centered on a white background. No text.';
+    const judge = {
+      prompt,
+      requirements: ['solid red square', 'white background', 'no text'],
+      kind: 'generation',
+    };
+    return isApi
+      ? await directResponsesImageSamplesParallel(baseUrl, prompt, {
+          count: 3,
+          action: 'generate',
+          judge,
+        })
+      : await proxyImagesMultiSample(`${baseUrl}/v1/images/generations`, {
+          prompt,
+          n: 3,
+          response_format: 'b64_json',
+        }, judge);
   });
 
   await benchmarkCase(target, imageGenerationCaseNames.generationApiFields, repeats, async () => {
@@ -811,6 +959,211 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     return await openAiImageGenerationStreamSample(baseUrl, isApi);
   });
 
+  await benchmarkCase(target, imageGenerationCaseNames.generationPhotorealProduct, repeats, async () => {
+    const prompt = 'A photorealistic studio product photo of a matte teal ceramic coffee mug on a light gray tabletop, soft natural window light, shallow realistic shadow, no text.';
+    const imageOptions = {
+      size: '1024x1024',
+      quality: 'medium',
+      output_format: 'png',
+    };
+    const judge = {
+      prompt,
+      requirements: ['photorealistic product photo', 'matte teal ceramic mug', 'light gray tabletop', 'soft natural light', 'no text'],
+      kind: 'photorealistic generation',
+    };
+    return isApi
+      ? await directResponsesImageSample(baseUrl, prompt, {
+          action: 'generate',
+          imageOptions,
+          judge,
+        })
+      : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
+          prompt,
+          response_format: 'b64_json',
+          ...imageOptions,
+        }, judge);
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.generationAssetIcon, repeats, async () => {
+    const prompt = 'A clean app icon style illustration of a yellow rain boot with a small blue puddle, centered on a plain white background, no text.';
+    const imageOptions = {
+      size: '1024x1024',
+      quality: 'medium',
+      output_format: 'png',
+      background: 'opaque',
+    };
+    const judge = {
+      prompt,
+      requirements: ['yellow rain boot', 'small blue puddle', 'centered icon illustration', 'plain white background', 'no text'],
+      kind: 'asset icon generation',
+    };
+    return isApi
+      ? await directResponsesImageSample(baseUrl, prompt, {
+          action: 'generate',
+          imageOptions,
+          judge,
+        })
+      : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
+          prompt,
+          response_format: 'b64_json',
+          ...imageOptions,
+        }, judge);
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.generationTextPoster, repeats, async () => {
+    const prompt = 'A clean square launch poster with exactly the words "LAUNCH DAY" in large bold white sans-serif letters centered above a small silver rocket icon, dark navy background. No other text.';
+    const imageOptions = {
+      size: '1024x1024',
+      quality: 'medium',
+      output_format: 'png',
+    };
+    const judge = {
+      prompt,
+      requirements: ['exact text LAUNCH DAY', 'large bold white sans-serif lettering', 'small silver rocket icon', 'dark navy background', 'no other text'],
+      kind: 'text poster generation',
+    };
+    return isApi
+      ? await directResponsesImageSample(baseUrl, prompt, {
+          action: 'generate',
+          imageOptions,
+          judge,
+        })
+      : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
+          prompt,
+          response_format: 'b64_json',
+          ...imageOptions,
+        }, judge);
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.referenceStyleGeneration, repeats, async () => {
+    const prompt = [
+      'Use the attached style reference image to create a new flat vector icon of a yellow rain boot beside a small blue puddle.',
+      'Match the reference style: thick navy outline, coral accent stripe, simple geometric shapes, and a soft cream background.',
+      'Do not copy the reference subject. No text.',
+    ].join(' ');
+    const referenceImages = [fixtureDataUrl('style_reference_card')];
+    const imageOptions = {
+      size: '1024x1024',
+      quality: 'medium',
+      output_format: 'png',
+    };
+    const judge = {
+      prompt,
+      requirements: [
+        'yellow rain boot',
+        'small blue puddle',
+        'flat vector icon',
+        'thick navy outline from reference',
+        'coral accent stripe from reference',
+        'soft cream background from reference',
+        'does not copy the reference subject',
+        'no text',
+      ],
+      referenceImages,
+      kind: 'reference-guided style generation',
+    };
+    return isApi
+      ? await directResponsesImageSample(baseUrl, prompt, {
+          action: 'edit',
+          images: referenceImages,
+          imageOptions,
+          judge,
+        })
+      : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
+          prompt,
+          images: referenceImages.map((image_url) => ({ image_url })),
+          response_format: 'b64_json',
+          ...imageOptions,
+        }, judge);
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.referenceProductGeneration, repeats, async () => {
+    const prompt = [
+      'Use the attached product reference image as the product identity reference.',
+      'Generate a photorealistic studio product image of the same matte teal mug, keeping the rounded mug body, right-side handle, dark rim, and teal color family.',
+      'Place it on a light gray tabletop with soft window light. No text.',
+    ].join(' ');
+    const referenceImages = [fixtureDataUrl('teal_mug_reference')];
+    const imageOptions = {
+      size: '1024x1024',
+      quality: 'medium',
+      output_format: 'png',
+    };
+    const judge = {
+      prompt,
+      requirements: [
+        'photorealistic studio product image',
+        'same matte teal mug identity from reference',
+        'rounded mug body',
+        'right-side handle',
+        'dark rim',
+        'light gray tabletop',
+        'soft window light',
+        'no text',
+      ],
+      referenceImages,
+      kind: 'reference-guided product generation',
+    };
+    return isApi
+      ? await directResponsesImageSample(baseUrl, prompt, {
+          action: 'edit',
+          images: referenceImages,
+          imageOptions,
+          judge,
+        })
+      : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
+          prompt,
+          images: referenceImages.map((image_url) => ({ image_url })),
+          response_format: 'b64_json',
+          ...imageOptions,
+        }, judge);
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.referenceMultiGeneration, repeats, async () => {
+    const prompt = [
+      'Use the first attached image as the product reference and the second attached image as the color/style palette reference.',
+      'Generate a clean ecommerce hero image of the same teal mug on a warm sand background with navy and coral geometric accent shapes inspired by the palette reference.',
+      'Keep the mug recognizable with a right-side handle and dark rim. No text.',
+    ].join(' ');
+    const referenceImages = [
+      fixtureDataUrl('teal_mug_reference'),
+      fixtureDataUrl('warm_palette_reference'),
+    ];
+    const imageOptions = {
+      size: '1024x1024',
+      quality: 'medium',
+      output_format: 'png',
+    };
+    const judge = {
+      prompt,
+      requirements: [
+        'clean ecommerce hero image',
+        'same teal mug identity from first reference',
+        'right-side handle',
+        'dark rim',
+        'warm sand background from second reference',
+        'navy geometric accents from second reference',
+        'coral geometric accents from second reference',
+        'no text',
+      ],
+      referenceImages,
+      kind: 'multi-reference guided generation',
+    };
+    return isApi
+      ? await directResponsesImageSample(baseUrl, prompt, {
+          action: 'edit',
+          images: referenceImages,
+          imageOptions,
+          judge,
+        })
+      : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
+          prompt,
+          images: referenceImages.map((image_url) => ({ image_url })),
+          response_format: 'b64_json',
+          ...imageOptions,
+        }, judge);
+  });
+
   await benchmarkCase(target, imageGenerationCaseNames.edit, repeats, async () => {
     const prompt = 'Edit this image so the red square becomes green. No text.';
     return isApi
@@ -837,6 +1190,33 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
           requirements: ['green square', 'same simple square composition', 'no text'],
           kind: 'edit',
         });
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.editPreserveComposition, repeats, async () => {
+    const prompt = 'Edit this image by changing only the white background to pale blue. Keep the red square unchanged, centered, and the same size. No text.';
+    const imageOptions = {
+      size: '1024x1024',
+      quality: 'low',
+      output_format: 'png',
+    };
+    const judge = {
+      prompt,
+      requirements: ['pale blue background', 'red square unchanged', 'same centered composition', 'same square size', 'no text'],
+      kind: 'preservation edit',
+    };
+    return isApi
+      ? await directResponsesImageSample(baseUrl, prompt, {
+          action: 'edit',
+          images: [fixtureDataUrl('red_square_on_white')],
+          imageOptions,
+          judge,
+        })
+      : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
+          prompt,
+          images: [{ image_url: fixtureDataUrl('red_square_on_white') }],
+          response_format: 'b64_json',
+          ...imageOptions,
+        }, judge);
   });
 
   await benchmarkCase(target, imageGenerationCaseNames.editMultiImage, repeats, async () => {
@@ -875,7 +1255,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
         model: 'image-2',
         prompt,
         stream: 'true',
-        partial_images: '1',
         size: '1024x1024',
         quality: 'low',
         output_format: 'png',
@@ -936,11 +1315,56 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       output_compression: 80,
     }, openAiHeaders(isApi), {
       status: 400,
-      type: isApi ? 'image_generation_user_error' : 'invalid_request_error',
+      type: 'image_generation_user_error',
+      param: null,
+      code: 'invalid_png_output_compression',
     });
   });
 
-  await benchmarkCase(target, imageGenerationCaseNames.errorUnsupportedInputFidelity, repeats, async () => {
+  await benchmarkCase(target, imageGenerationCaseNames.backgroundTransparentUnsupported, repeats, async () => {
+    const prompt = 'A clean app icon style illustration of a yellow rain boot with a small blue puddle, centered, transparent background, no text.';
+    if (isApi) {
+      return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/responses`, {
+        model: openAiModel,
+        input: image2ViaGpt55Prompt({
+          action: 'generate',
+          prompt,
+          size: '1024x1024',
+          quality: 'medium',
+          outputFormat: 'png',
+          background: 'transparent',
+        }),
+        reasoning: { effort: openAiImageQualityReasoningEffort('medium') },
+        tools: [{
+          type: 'image_generation',
+          action: 'generate',
+          size: '1024x1024',
+          quality: 'medium',
+          output_format: 'png',
+          background: 'transparent',
+        }],
+      }, openAiHeaders(true), {
+        status: 400,
+        type: 'image_generation_user_error',
+        param: 'tools',
+        code: 'invalid_value',
+      });
+    }
+    return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
+      model: 'image-2',
+      prompt,
+      background: 'transparent',
+      output_format: 'png',
+      response_format: 'b64_json',
+    }, openAiHeaders(false), {
+      status: 400,
+      type: 'image_generation_user_error',
+      param: 'tools',
+      code: 'invalid_value',
+    });
+  });
+
+  await benchmarkCase(target, imageGenerationCaseNames.inputFidelityDisabled, repeats, async () => {
     const prompt = 'Edit this image so the red square becomes green. No text.';
     if (isApi) {
       return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/responses`, {
@@ -1002,6 +1426,22 @@ async function proxyImagesSample(url, body, judgeSpec) {
   return await imagesApiSampleSummary(response, 'images', response.body.data[0], judgeSpec);
 }
 
+async function proxyImagesMultiSample(url, body, judgeSpec) {
+  const response = await postJson(url, {
+    model: 'image-2',
+    n: 1,
+    size: '1024x1024',
+    quality: 'low',
+    output_format: 'png',
+    ...body,
+  }, openAiHeaders(false));
+  assertOpenAiImagesGenerationShape(response.body);
+  if (Number.isInteger(body.n)) {
+    assert(response.body.data.length === body.n, `images generation data length must match n=${body.n}`);
+  }
+  return await imagesApiMultiSampleSummary(response, 'images', judgeSpec);
+}
+
 async function proxyImagesMultipartSample(url, fields, files, judgeSpec) {
   const response = await postMultipart(url, fields, files, openAiMultipartHeaders(false));
   assertOpenAiImagesGenerationShape(response.body);
@@ -1044,11 +1484,52 @@ async function imagesApiSampleSummary(response, responseApi, image, judgeSpec) {
   };
 }
 
+async function imagesApiMultiSampleSummary(response, responseApi, judgeSpec) {
+  const images = response.body.data;
+  const b64Jsons = await Promise.all(images.map((image) => imageB64Json(image)));
+  const imageQualities = await Promise.all(b64Jsons.map((b64Json) => b64Json
+    ? maybeScoreImageQuality({
+        ...judgeSpec,
+        b64Json,
+        mediaType: mediaTypeForOutputFormat(response.body.output_format),
+      })
+    : null));
+  const resultBytesApprox = b64Jsons
+    .filter((b64Json) => typeof b64Json === 'string')
+    .reduce((sum, b64Json) => sum + Math.floor(b64Json.length * 3 / 4), 0);
+  return {
+    totalMs: response.totalMs,
+    responseApi,
+    imageCount: images.length,
+    resultBytesApprox,
+    hasUrl: images.some((image) => typeof image.url === 'string'),
+    revisedPrompt: truncate(images.map((image) => image.revised_prompt).filter(Boolean).join(' | ')),
+    size: response.body.size,
+    quality: response.body.quality,
+    outputFormat: response.body.output_format,
+    background: response.body.background,
+    ...(response.body.usage ? { usage: response.body.usage } : {}),
+    ...aggregateImageQualityResult(imageQualities),
+  };
+}
+
 async function directResponsesImageSample(baseUrl, prompt, options) {
   const imageOptions = options.imageOptions ?? {};
+  const translatedPrompt = image2ViaGpt55Prompt({
+    action: options.action,
+    prompt,
+    size: imageOptions.size ?? '1024x1024',
+    quality: imageOptions.quality ?? 'low',
+    outputFormat: imageOptions.output_format ?? 'png',
+    outputCompression: imageOptions.output_compression,
+    background: imageOptions.background,
+    moderation: imageOptions.moderation,
+    inputFidelity: imageOptions.input_fidelity,
+    imageCount: options.images?.length ?? 0,
+  });
   const response = await postJson(`${baseUrl}/v1/responses`, {
     model: openAiModel,
-    input: responsesImageInput(prompt, options.images ?? []),
+    input: responsesImageInput(translatedPrompt, options.images ?? []),
     reasoning: { effort: openAiImageQualityReasoningEffort(imageOptions.quality) },
     tools: [{
       type: 'image_generation',
@@ -1080,6 +1561,67 @@ async function directResponsesImageSample(baseUrl, prompt, options) {
   };
 }
 
+async function directResponsesImageSamplesParallel(baseUrl, prompt, options) {
+  const count = options.count ?? 1;
+  const results = await Promise.all(Array.from({ length: count }, () => directResponsesImageSample(baseUrl, prompt, options)));
+  return {
+    totalMs: Math.max(...results.map((result) => result.totalMs)),
+    responseApi: 'responses-parallel',
+    imageCount: results.length,
+    resultBytesApprox: results.reduce((sum, result) => sum + (result.resultBytesApprox ?? 0), 0),
+    revisedPrompt: truncate(results.map((result) => result.revisedPrompt).filter(Boolean).join(' | ')),
+    ...aggregateOpenAiUsageResult(results.map((result) => result.usage)),
+    ...aggregateImageQualityResult(results.map((result) => result.imageQuality)),
+  };
+}
+
+function aggregateImageQualityResult(qualities) {
+  const present = qualities.filter(Boolean);
+  if (present.length === 0) return {};
+  const scores = present.map((quality) => quality.score).filter(Number.isFinite);
+  const judgeMs = present
+    .map((quality) => quality.judgeMs?.median ?? quality.judgeMs)
+    .filter(Number.isFinite);
+  return {
+    imageQuality: {
+      score: Math.min(...scores),
+      scoreSummary: summarize(scores),
+      requirementFit: medianNumber(present.map((quality) => quality.requirementFit).filter(Number.isFinite)),
+      visualCorrectness: medianNumber(present.map((quality) => quality.visualCorrectness).filter(Number.isFinite)),
+      artifactControl: medianNumber(present.map((quality) => quality.artifactControl).filter(Number.isFinite)),
+      textAccuracy: medianNumber(present.map((quality) => quality.textAccuracy).filter(Number.isFinite)),
+      preservation: medianNumber(present.map((quality) => quality.preservation).filter(Number.isFinite)),
+      judgeMs: summarize(judgeMs),
+      perImageScores: scores,
+      samples: present.flatMap((quality) => quality.samples ?? []).slice(0, 6),
+      judgeUsage: present.at(-1)?.judgeUsage,
+    },
+  };
+}
+
+function aggregateOpenAiUsageResult(usages) {
+  const present = usages.filter(Boolean);
+  if (present.length === 0) return {};
+  const sum = (path) => present.reduce((total, usage) => {
+    let value = usage;
+    for (const key of path) value = value?.[key];
+    return total + (Number.isFinite(value) ? value : 0);
+  }, 0);
+  return {
+    usage: {
+      input_tokens: sum(['input_tokens']),
+      output_tokens: sum(['output_tokens']),
+      total_tokens: sum(['total_tokens']),
+      input_tokens_details: {
+        cached_tokens: sum(['input_tokens_details', 'cached_tokens']),
+      },
+      output_tokens_details: {
+        reasoning_tokens: sum(['output_tokens_details', 'reasoning_tokens']),
+      },
+    },
+  };
+}
+
 async function imageB64Json(image) {
   if (typeof image.b64_json === 'string') return image.b64_json;
   if (typeof image.url !== 'string') return null;
@@ -1104,14 +1646,11 @@ function responsesImageInput(prompt, images) {
 }
 
 function imageStreamCollector(event, payload) {
-  if (event === 'image_generation.partial_image' || event === 'image_generation.completed') {
+  if (event === 'image_generation.completed') {
     return payload.b64_json ?? '';
   }
-  if (event === 'image_edit.partial_image' || event === 'image_edit.completed') {
+  if (event === 'image_edit.completed') {
     return payload.b64_json ?? '';
-  }
-  if (event === 'response.image_generation_call.partial_image') {
-    return payload.partial_image_b64 ?? '';
   }
   if (event === 'response.output_item.done' && payload.item?.type === 'image_generation_call') {
     return payload.item.result ?? '';
@@ -1141,7 +1680,13 @@ async function openAiImageGenerationStreamSample(baseUrl, isApi) {
   const response = isApi
     ? await postSse(`${baseUrl}/v1/responses`, {
         model: openAiModel,
-        input: prompt,
+        input: image2ViaGpt55Prompt({
+          action: 'generate',
+          prompt,
+          size: '1024x1024',
+          quality: 'low',
+          outputFormat: 'png',
+        }),
         reasoning: { effort: openAiImageQualityReasoningEffort('low') },
         stream: true,
         tools: [{
@@ -1150,14 +1695,12 @@ async function openAiImageGenerationStreamSample(baseUrl, isApi) {
           size: '1024x1024',
           quality: 'low',
           output_format: 'png',
-          partial_images: 1,
         }],
       }, openAiHeaders(true), () => '', imageStreamCollector)
     : await postSse(`${baseUrl}/v1/images/generations`, {
         model: 'image-2',
         prompt,
         stream: true,
-        partial_images: 1,
         size: '1024x1024',
         quality: 'low',
         output_format: 'png',
@@ -1170,83 +1713,34 @@ async function openAiImageGenerationStreamSample(baseUrl, isApi) {
 async function benchmarkOpenAiImageGenerationStreamPair(proxyBaseUrl) {
   const caseName = imageGenerationCaseNames.generationStreamPaired;
   if (!shouldRunImageGenerationPairBenchmark()) return;
-  const samples = [];
-  const sampleFailures = [];
-  for (let i = 0; i < repeats; i += 1) {
-    const proxyFirst = i % 2 === 0;
-    const order = proxyFirst ? 'proxy-first' : 'direct-first';
-    try {
-      const proxyRunner = () => openAiImageGenerationStreamSample(proxyBaseUrl, false)
-        .catch((err) => {
-          throw new Error(`proxy stream sample failed: ${errorMessage(err)}`);
-        });
-      const directRunner = () => openAiImageGenerationStreamSample('https://api.openai.com', true)
-        .catch((err) => {
-          throw new Error(`direct stream sample failed: ${errorMessage(err)}`);
-        });
-      const proxy = proxyFirst ? await proxyRunner() : null;
-      const direct = await directRunner();
-      const resolvedProxy = proxy ?? await proxyRunner();
-      const sample = {
-        order,
-        proxy: resolvedProxy,
-        direct,
-        totalDeltaMs: numericDelta(resolvedProxy.totalMs, direct.totalMs),
-        firstDataDeltaMs: numericDelta(resolvedProxy.firstDataMs, direct.firstDataMs),
-        firstImageDeltaMs: numericDelta(resolvedProxy.firstImageMs, direct.firstImageMs),
-      };
-      samples.push(sample);
-      console.log(`PASS ${imageGenerationPairTarget} ${caseName} #${i + 1}: ${JSON.stringify(sample)}`);
-    } catch (err) {
-      const failure = {
-        sample: i + 1,
-        order,
-        error: errorMessage(err),
-      };
-      sampleFailures.push(failure);
-      console.log(`FAIL ${imageGenerationPairTarget} ${caseName} #${i + 1}: ${failure.error}`);
+  await benchmarkCase(imageGenerationPairTarget, caseName, repeats, async (index) => {
+    const proxyRun = async () => openAiImageGenerationStreamSample(proxyBaseUrl, false);
+    const directRun = async () => openAiImageGenerationStreamSample('https://api.openai.com', true);
+    let proxy;
+    let direct;
+    const order = index % 2 === 0 ? 'direct-first' : 'proxy-first';
+    if (order === 'direct-first') {
+      direct = await directRun();
+      proxy = await proxyRun();
+    } else {
+      proxy = await proxyRun();
+      direct = await directRun();
     }
-  }
-  if (samples.length === 0) {
-    rows.push({
-      target: imageGenerationPairTarget,
-      case: caseName,
-      ok: false,
-      error: sampleFailures.at(-1)?.error ?? 'all paired samples failed',
-      sampleFailures,
-    });
-    return;
-  }
-  rows.push({
-    target: imageGenerationPairTarget,
-    case: caseName,
-    ok: sampleFailures.length === 0,
-    ...(sampleFailures.length > 0 ? { error: `${sampleFailures.length} paired sample(s) failed` } : {}),
-    paired: true,
-    proxy: streamLatencyAggregate(samples.map((sample) => sample.proxy)),
-    direct: streamLatencyAggregate(samples.map((sample) => sample.direct)),
-    totalDeltaMs: summarize(samples.map((sample) => sample.totalDeltaMs).filter(Number.isFinite)),
-    firstDataDeltaMs: summarize(samples.map((sample) => sample.firstDataDeltaMs).filter(Number.isFinite)),
-    firstImageDeltaMs: summarize(samples.map((sample) => sample.firstImageDeltaMs).filter(Number.isFinite)),
-    orders: samples.map((sample) => sample.order),
-    ...(sampleFailures.length > 0 ? { sampleFailures } : {}),
-    sample: samples.at(-1),
+    return {
+      totalMs: proxy.totalMs,
+      firstImageMs: proxy.firstImageMs,
+      proxyTotalMs: proxy.totalMs,
+      directTotalMs: direct.totalMs,
+      proxyFirstImageMs: proxy.firstImageMs,
+      directFirstImageMs: direct.firstImageMs,
+      firstImageDeltaMs: Number.isFinite(proxy.firstImageMs) && Number.isFinite(direct.firstImageMs)
+        ? proxy.firstImageMs - direct.firstImageMs
+        : null,
+      order,
+      proxy,
+      direct,
+    };
   });
-}
-
-function streamLatencyAggregate(samples) {
-  return {
-    totalMs: summarize(samples.map((sample) => sample.totalMs).filter(Number.isFinite)),
-    firstDataMs: summarize(samples.map((sample) => sample.firstDataMs).filter(Number.isFinite)),
-    firstTextMs: summarize(samples.map((sample) => sample.firstTextMs).filter(Number.isFinite)),
-    firstToolArgumentMs: summarize(samples.map((sample) => sample.firstToolArgumentMs).filter(Number.isFinite)),
-    firstImageMs: summarize(samples.map((sample) => sample.firstImageMs).filter(Number.isFinite)),
-    chunks: samples.map((sample) => sample.chunks).filter(Number.isFinite),
-  };
-}
-
-function numericDelta(left, right) {
-  return Number.isFinite(left) && Number.isFinite(right) ? left - right : null;
 }
 
 async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
@@ -1437,7 +1931,7 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
         }, anthropicHeaders(isApi));
         assertAnthropicMessageShape(response.body, 'end_turn');
         const text = response.body.content?.find((block) => block.type === 'text')?.text ?? '';
-        const reference = await semanticReference('anthropic.messages', target, `${task.id}:${index}`, prompt);
+        const { reference, referenceError } = await safeSemanticReference('anthropic.messages', target, `${task.id}:${index}`, prompt);
         const judged = await scoreSemanticQuality({
           target,
           caseName: `anthropic.messages.semantic_quality.${task.id}`,
@@ -1445,7 +1939,7 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
           text,
           reference,
         });
-        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged };
+        return { totalMs: response.totalMs, text, quality: scoreQualityOutput(text, task), ...judged, referenceError };
       });
     }
   }
@@ -1455,21 +1949,19 @@ async function benchmarkCase(target, caseName, count, fn) {
   if (!shouldRunCase(caseName)) return;
   const samples = [];
   for (let i = 0; i < count; i += 1) {
+    currentBenchmarkContext = { target, caseName };
     try {
       const sample = await fn(i + 1);
       attachBackendTiming(target, sample);
       samples.push(sample);
       console.log(`PASS ${target} ${caseName} #${i + 1}: ${JSON.stringify(sample)}`);
     } catch (err) {
-      const row = {
-        target,
-        case: caseName,
-        ok: false,
-        error: errorMessage(err),
-      };
+      const row = failedBenchmarkRow(target, caseName, err);
       rows.push(row);
       console.log(`FAIL ${target} ${caseName} #${i + 1}: ${row.error}`);
       return;
+    } finally {
+      currentBenchmarkContext = null;
     }
   }
   const row = {
@@ -1486,6 +1978,8 @@ async function benchmarkCase(target, caseName, count, fn) {
   };
   const backendTiming = summarizeBackendTimings(samples);
   if (backendTiming) row.backendTiming = backendTiming;
+  const modelWorkPct = summarizeModelWorkPct(samples);
+  if (modelWorkPct) row.modelWorkPct = modelWorkPct;
   const imageQualityScores = samples.map((sample) => sample.imageQuality?.score).filter(Number.isFinite);
   if (imageQualityScores.length > 0) row.imageQuality = summarize(imageQualityScores);
   const imageJudgeMs = samples.map((sample) => sample.imageQuality?.judgeMs?.median ?? sample.imageQuality?.judgeMs).filter(Number.isFinite);
@@ -1504,6 +1998,7 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
   if (!shouldRunCase(caseName)) return;
   const samples = [];
   for (let i = 0; i < count; i += 1) {
+    currentBenchmarkContext = { target, caseName };
     try {
       const sample = await fn(i + 1);
       attachBackendTiming(target, sample);
@@ -1512,19 +2007,17 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
         totalMs: sample.totalMs,
         quality: sample.quality,
         semanticQuality: sample.semanticQuality,
+        referenceError: sample.referenceError,
         judgeMs: sample.judgeMs,
         backendTiming: sample.backendTiming,
       })}`);
     } catch (err) {
-      const row = {
-        target,
-        case: caseName,
-        ok: false,
-        error: errorMessage(err),
-      };
+      const row = failedBenchmarkRow(target, caseName, err);
       rows.push(row);
       console.log(`FAIL ${target} ${caseName} #${i + 1}: ${row.error}`);
       return;
+    } finally {
+      currentBenchmarkContext = null;
     }
   }
   const row = {
@@ -1543,8 +2036,14 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
   if (backendTiming) row.backendTiming = backendTiming;
   const outliers = sampleOutliers(samples);
   if (outliers.length > 0) row.outliers = outliers;
+  const referenceErrors = samples.map((sample) => sample.referenceError).filter(Boolean);
+  if (referenceErrors.length > 0) {
+    row.referenceErrors = referenceErrors;
+    row.ok = false;
+    row.error = `semantic reference failed: ${referenceErrors[0]}`;
+  }
   const lowestSemanticScore = Math.min(...semanticScores);
-  if (semanticScores.length > 0 && minSemanticQuality > 0 && lowestSemanticScore < minSemanticQuality) {
+  if (row.ok && semanticScores.length > 0 && minSemanticQuality > 0 && lowestSemanticScore < minSemanticQuality) {
     row.ok = false;
     row.error = `semantic quality below ${minSemanticQuality}: ${lowestSemanticScore}`;
   }
@@ -1553,12 +2052,12 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
 
 async function postJson(url, body, headers) {
   const startedAt = performance.now();
-  const res = await fetch(url, {
+  const res = await guardedProxyFetch(url, () => fetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(stripUndefined(body)),
     signal: AbortSignal.timeout(timeoutMs),
-  });
+  }));
   const text = await res.text();
   let parsed;
   try {
@@ -1573,12 +2072,12 @@ async function postJson(url, body, headers) {
 async function postMultipart(url, fields, files, headers) {
   const form = multipartForm(fields, files);
   const startedAt = performance.now();
-  const res = await fetch(url, {
+  const res = await guardedProxyFetch(url, () => fetch(url, {
     method: 'POST',
     headers,
     body: form,
     signal: AbortSignal.timeout(timeoutMs),
-  });
+  }));
   const text = await res.text();
   let parsed;
   try {
@@ -1592,12 +2091,12 @@ async function postMultipart(url, fields, files, headers) {
 
 async function postJsonExpectOpenAiError(url, body, headers, expected) {
   const startedAt = performance.now();
-  const res = await fetch(url, {
+  const res = await guardedProxyFetch(url, () => fetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(stripUndefined(body)),
     signal: AbortSignal.timeout(timeoutMs),
-  });
+  }));
   const text = await res.text();
   let parsed;
   try {
@@ -1633,12 +2132,12 @@ async function postJsonExpectOpenAiError(url, body, headers, expected) {
 
 async function postJsonExpectOpenAiErrorShape(url, body, headers, expected) {
   const startedAt = performance.now();
-  const res = await fetch(url, {
+  const res = await guardedProxyFetch(url, () => fetch(url, {
     method: 'POST',
     headers,
     body: JSON.stringify(stripUndefined(body)),
     signal: AbortSignal.timeout(timeoutMs),
-  });
+  }));
   const text = await res.text();
   let parsed;
   try {
@@ -1691,73 +2190,75 @@ async function postSse(url, body, headers, collectText, collectToolArgument = ()
 }
 
 async function postSseRequest(url, request, collectText, collectToolArgument = () => '') {
-  const startedAt = performance.now();
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: request.headers,
-    body: request.body,
-    signal: AbortSignal.timeout(timeoutMs),
+  return await guardedProxyFetch(url, async () => {
+    const startedAt = performance.now();
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: request.headers,
+      body: request.body,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error(`${url} ${res.status}: ${truncate(await res.text())}`);
+    if (!res.body) throw new Error(`${url} did not return a readable stream`);
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let firstDataMs = null;
+    let firstTextMs = null;
+    let firstToolArgumentMs = null;
+    let chunks = 0;
+    let text = '';
+    let toolArguments = '';
+    let done = false;
+    const events = [];
+
+    function processFrame(frame) {
+      const lines = frame.split(/\n/).map((line) => line.trimEnd());
+      const event = lines.find((line) => line.startsWith('event: '))?.slice(7) ?? 'message';
+      const data = lines.find((line) => line.startsWith('data: '))?.slice(6);
+      if (!data) return;
+      if (data === '[DONE]') {
+        done = true;
+        return;
+      }
+      if (firstDataMs === null) firstDataMs = elapsed(startedAt);
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        return;
+      }
+      events.push({ event, payload });
+      const delta = collectText(event, payload);
+      if (delta) {
+        if (firstTextMs === null) firstTextMs = elapsed(startedAt);
+        chunks += 1;
+        text += delta;
+      }
+      const toolArgumentDelta = collectToolArgument(event, payload);
+      if (toolArgumentDelta) {
+        if (firstToolArgumentMs === null) firstToolArgumentMs = elapsed(startedAt);
+        chunks += 1;
+        toolArguments += toolArgumentDelta;
+      }
+    }
+
+    while (true) {
+      const read = await reader.read();
+      if (read.done) break;
+      buffer += decoder.decode(read.value, { stream: true });
+      let index;
+      while ((index = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, index);
+        buffer = buffer.slice(index + 2);
+        processFrame(frame);
+      }
+    }
+    buffer += decoder.decode();
+    const finalFrame = buffer.trim();
+    if (finalFrame) processFrame(finalFrame);
+    return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, firstToolArgumentMs, chunks, text, toolArguments, done, events };
   });
-  if (!res.ok) throw new Error(`${url} ${res.status}: ${truncate(await res.text())}`);
-  if (!res.body) throw new Error(`${url} did not return a readable stream`);
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let firstDataMs = null;
-  let firstTextMs = null;
-  let firstToolArgumentMs = null;
-  let chunks = 0;
-  let text = '';
-  let toolArguments = '';
-  let done = false;
-  const events = [];
-
-  function processFrame(frame) {
-    const lines = frame.split(/\n/).map((line) => line.trimEnd());
-    const event = lines.find((line) => line.startsWith('event: '))?.slice(7) ?? 'message';
-    const data = lines.find((line) => line.startsWith('data: '))?.slice(6);
-    if (!data) return;
-    if (data === '[DONE]') {
-      done = true;
-      return;
-    }
-    if (firstDataMs === null) firstDataMs = elapsed(startedAt);
-    let payload;
-    try {
-      payload = JSON.parse(data);
-    } catch {
-      return;
-    }
-    events.push({ event, payload });
-    const delta = collectText(event, payload);
-    if (delta) {
-      if (firstTextMs === null) firstTextMs = elapsed(startedAt);
-      chunks += 1;
-      text += delta;
-    }
-    const toolArgumentDelta = collectToolArgument(event, payload);
-    if (toolArgumentDelta) {
-      if (firstToolArgumentMs === null) firstToolArgumentMs = elapsed(startedAt);
-      chunks += 1;
-      toolArguments += toolArgumentDelta;
-    }
-  }
-
-  while (true) {
-    const read = await reader.read();
-    if (read.done) break;
-    buffer += decoder.decode(read.value, { stream: true });
-    let index;
-    while ((index = buffer.indexOf('\n\n')) !== -1) {
-      const frame = buffer.slice(0, index);
-      buffer = buffer.slice(index + 2);
-      processFrame(frame);
-    }
-  }
-  buffer += decoder.decode();
-  const finalFrame = buffer.trim();
-  if (finalFrame) processFrame(finalFrame);
-  return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, firstToolArgumentMs, chunks, text, toolArguments, done, events };
 }
 
 function multipartForm(fields, files) {
@@ -1856,10 +2357,14 @@ function fixtureDataUrl(name) {
   if (imageFixtureCache.has(name)) return imageFixtureCache.get(name);
   const fixtures = {
     red_square: () => solidPngDataUrl(64, 64, { r: 255, g: 0, b: 0, a: 255 }),
+    red_square_on_white: () => centeredSquarePngDataUrl(96, 96, { r: 255, g: 255, b: 255, a: 255 }, { r: 255, g: 0, b: 0, a: 255 }),
     blue_square: () => solidPngDataUrl(64, 64, { r: 0, g: 76, b: 255, a: 255 }),
     green_square: () => solidPngDataUrl(64, 64, { r: 0, g: 180, b: 80, a: 255 }),
     transparent_red_square: () => solidPngDataUrl(64, 64, { r: 255, g: 0, b: 0, a: 96 }),
     center_mask: () => centerMaskPngDataUrl(64, 64),
+    style_reference_card: () => styleReferenceCardPngDataUrl(),
+    teal_mug_reference: () => tealMugReferencePngDataUrl(),
+    warm_palette_reference: () => warmPaletteReferencePngDataUrl(),
   };
   const create = fixtures[name];
   if (!create) throw new Error(`unknown image fixture: ${name}`);
@@ -1888,6 +2393,44 @@ function solidPngDataUrl(width, height, rgba) {
     pixels[row] = 0;
     for (let x = 0; x < width; x += 1) {
       const offset = row + 1 + x * 4;
+      pixels[offset] = rgba.r;
+      pixels[offset + 1] = rgba.g;
+      pixels[offset + 2] = rgba.b;
+      pixels[offset + 3] = rgba.a;
+    }
+  }
+
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(pixels)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
+
+function centeredSquarePngDataUrl(width, height, background, square) {
+  const stride = 1 + width * 4;
+  const pixels = Buffer.alloc(stride * height);
+  const side = Math.floor(Math.min(width, height) * 0.58);
+  const left = Math.floor((width - side) / 2);
+  const top = Math.floor((height - side) / 2);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * stride;
+    pixels[row] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const offset = row + 1 + x * 4;
+      const inSquare = x >= left && x < left + side && y >= top && y < top + side;
+      const rgba = inSquare ? square : background;
       pixels[offset] = rgba.r;
       pixels[offset + 1] = rgba.g;
       pixels[offset + 2] = rgba.b;
@@ -1947,6 +2490,100 @@ function centerMaskPngDataUrl(width, height) {
     pngChunk('IEND', Buffer.alloc(0)),
   ]);
   return `data:image/png;base64,${png.toString('base64')}`;
+}
+
+function styleReferenceCardPngDataUrl() {
+  const cream = { r: 246, g: 236, b: 211, a: 255 };
+  const navy = { r: 18, g: 46, b: 74, a: 255 };
+  const coral = { r: 238, g: 108, b: 92, a: 255 };
+  const blue = { r: 65, g: 155, b: 210, a: 255 };
+  return customPngDataUrl(128, 128, (x, y) => {
+    const dx = x - 64;
+    const dy = y - 63;
+    const radius = Math.sqrt(dx * dx + dy * dy);
+    if (radius >= 37 && radius <= 45) return navy;
+    if (Math.abs(y - (0.58 * x + 22)) < 5 && x > 22 && x < 104) return coral;
+    if ((x - 35) ** 2 + (y - 90) ** 2 < 12 ** 2) return blue;
+    return cream;
+  });
+}
+
+function tealMugReferencePngDataUrl() {
+  const background = { r: 244, g: 247, b: 248, a: 255 };
+  const teal = { r: 28, g: 138, b: 139, a: 255 };
+  const darkTeal = { r: 10, g: 79, b: 91, a: 255 };
+  const highlight = { r: 91, g: 188, b: 185, a: 255 };
+  return customPngDataUrl(128, 128, (x, y) => {
+    const body = roundedRectContains(x, y, 34, 34, 82, 94, 12);
+    const handleOuter = ellipseContains(x, y, 91, 63, 24, 27);
+    const handleInner = ellipseContains(x, y, 91, 63, 13, 16);
+    if (handleOuter && !handleInner) return teal;
+    if (body) {
+      if (y >= 36 && y <= 42) return darkTeal;
+      if (x >= 44 && x <= 50 && y >= 45 && y <= 86) return highlight;
+      return teal;
+    }
+    if (x >= 43 && x <= 77 && y >= 94 && y <= 98) return darkTeal;
+    return background;
+  });
+}
+
+function warmPaletteReferencePngDataUrl() {
+  const sand = { r: 225, g: 192, b: 145, a: 255 };
+  const cream = { r: 248, g: 239, b: 218, a: 255 };
+  const navy = { r: 19, g: 48, b: 77, a: 255 };
+  const coral = { r: 234, g: 112, b: 93, a: 255 };
+  const teal = { r: 33, g: 140, b: 142, a: 255 };
+  return customPngDataUrl(128, 128, (x, y) => {
+    if (y < 34) return cream;
+    if (Math.abs(y - (0.4 * x + 58)) < 8) return coral;
+    if (x > 82 && y > 52 && y < 104) return navy;
+    if ((x - 40) ** 2 + (y - 78) ** 2 < 18 ** 2) return teal;
+    return sand;
+  });
+}
+
+function customPngDataUrl(width, height, pixelFor) {
+  const stride = 1 + width * 4;
+  const pixels = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * stride;
+    pixels[row] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const rgba = pixelFor(x, y);
+      const offset = row + 1 + x * 4;
+      pixels[offset] = rgba.r;
+      pixels[offset + 1] = rgba.g;
+      pixels[offset + 2] = rgba.b;
+      pixels[offset + 3] = rgba.a;
+    }
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(pixels)),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+  return `data:image/png;base64,${png.toString('base64')}`;
+}
+
+function roundedRectContains(x, y, left, top, right, bottom, radius) {
+  const cx = Math.max(left + radius, Math.min(x, right - radius));
+  const cy = Math.max(top + radius, Math.min(y, bottom - radius));
+  return x >= left && x <= right && y >= top && y <= bottom
+    && (x - cx) ** 2 + (y - cy) ** 2 <= radius ** 2;
+}
+
+function ellipseContains(x, y, centerX, centerY, radiusX, radiusY) {
+  return ((x - centerX) / radiusX) ** 2 + ((y - centerY) / radiusY) ** 2 <= 1;
 }
 
 function pngChunk(type, data) {
@@ -2174,7 +2811,8 @@ function pushBackendTiming(target, timing) {
 }
 
 function attachBackendTiming(target, sample) {
-  const queue = backendTimingQueues.get(target);
+  const queue = backendTimingQueues.get(target)
+    ?? (target === imageGenerationPairTarget ? backendTimingQueues.get('proxy-codex') : undefined);
   if (!queue?.length) return;
   sample.backendTiming = queue.shift();
 }
@@ -2191,12 +2829,30 @@ function summarizeBackendTimings(samples) {
     'turnStartMs',
     'turnWaitMs',
     'usageWaitMs',
+    'firstTextDeltaMs',
+    'firstToolCallDeltaMs',
+    'firstToolArgumentDeltaMs',
     'totalMs',
   ]) {
     const values = timings.map((timing) => timing[key]).filter(Number.isFinite);
     if (values.length > 0) summary[key] = summarize(values);
   }
   return summary;
+}
+
+function summarizeModelWorkPct(samples) {
+  const values = samples
+    .map((sample) => modelWorkPct(sample))
+    .filter(Number.isFinite);
+  return values.length > 0 ? summarize(values) : null;
+}
+
+function modelWorkPct(sample) {
+  const timing = sample.backendTiming;
+  if (!timing || !Number.isFinite(timing.turnWaitMs) || !Number.isFinite(sample.totalMs) || sample.totalMs <= 0) {
+    return Number.NaN;
+  }
+  return Number((timing.turnWaitMs / sample.totalMs * 100).toFixed(1));
 }
 
 function extractOpenAiResponseText(body) {
@@ -2360,7 +3016,8 @@ function qualityTasks() {
         'Write exactly five English bullets for an Images API benchmark plan.',
         'Cover generation, edit, variation, URL response, and streaming image generation.',
         'Include a vision judge requirement for image quality.',
-        'State that image-2 through the proxy is compared with gpt-5.5 Responses image_generation when direct Images API does not support image-2.',
+        'State that proxy Images API requests must not call direct provider APIs; provider egress from a proxy target scores 0.',
+        'State that image-2 through the proxy is the formal image2_via_gpt55 route and must not call direct provider APIs.',
         'Mention direct Images API positive and negative baseline rows.',
         'Do not claim variations are supported by GPT Image models.',
       ].join(' '),
@@ -2434,6 +3091,20 @@ async function semanticReference(kind, target, index, prompt, options = {}) {
   return value;
 }
 
+async function safeSemanticReference(kind, target, index, prompt, options = {}) {
+  try {
+    return {
+      reference: await semanticReference(kind, target, index, prompt, options),
+      referenceError: undefined,
+    };
+  } catch (err) {
+    return {
+      reference: null,
+      referenceError: errorMessage(err),
+    };
+  }
+}
+
 function semanticReferenceProvider(target) {
   if (target === 'proxy-codex') return 'openai';
   if (target === 'proxy-claude') return 'anthropic';
@@ -2493,13 +3164,13 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
 
 async function fetchAnthropicSemanticReference(prompt) {
   const response = await postJson('https://api.anthropic.com/v1/messages', {
-    model: anthropicModels.sonnet,
-    max_tokens: 640,
+    model: anthropicModels.opus,
+    max_tokens: 1024,
     messages: [{ role: 'user', content: prompt }],
   }, anthropicHeaders(true));
   assertAnthropicMessageShape(response.body, 'end_turn');
   return {
-    target: `anthropic-api:${anthropicModels.sonnet}`,
+    target: `anthropic-api:${anthropicModels.opus}`,
     totalMs: response.totalMs,
     text: response.body.content?.find((block) => block.type === 'text')?.text ?? '',
     usage: response.body.usage,
@@ -2655,16 +3326,7 @@ async function scoreImageQualityOnce(spec) {
       },
       {
         role: 'user',
-        content: [
-          { type: 'text', text: imageQualityJudgePrompt(spec) },
-          {
-            type: 'image_url',
-            image_url: {
-              url: `data:${spec.mediaType ?? 'image/png'};base64,${spec.b64Json}`,
-              detail: 'high',
-            },
-          },
-        ],
+        content: imageQualityJudgeContent(spec),
       },
     ],
     response_format: {
@@ -2687,19 +3349,47 @@ async function scoreImageQualityOnce(spec) {
   };
 }
 
+function imageQualityJudgeContent(spec) {
+  const content = [{ type: 'text', text: imageQualityJudgePrompt(spec) }];
+  const references = Array.isArray(spec.referenceImages) ? spec.referenceImages : [];
+  references.forEach((image, index) => {
+    content.push({ type: 'text', text: `Reference image ${index + 1}:` });
+    content.push({
+      type: 'image_url',
+      image_url: {
+        url: image,
+        detail: 'high',
+      },
+    });
+  });
+  content.push({ type: 'text', text: 'Candidate output image to score:' });
+  content.push({
+    type: 'image_url',
+    image_url: {
+      url: `data:${spec.mediaType ?? 'image/png'};base64,${spec.b64Json}`,
+      detail: 'high',
+    },
+  });
+  return content;
+}
+
 function imageQualityJudgePrompt(spec) {
+  const referenceCount = Array.isArray(spec.referenceImages) ? spec.referenceImages.length : 0;
   return [
     `Operation: ${spec.kind ?? 'image generation'}`,
     'Original request:',
     spec.prompt,
     `Requirements: ${(spec.requirements ?? []).join('; ')}`,
+    referenceCount > 0
+      ? `Reference images: ${referenceCount}. They are provided before the candidate image. Evaluate reference fidelity only where the original request asks for it; do not reward copying reference subjects that the request says not to copy.`
+      : 'Reference images: none.',
     [
       'Rubric:',
       '- requirementFit: visible satisfaction of the explicit request and listed requirements.',
       '- visualCorrectness: correct objects, colors, composition, background, aspect, and style.',
       '- artifactControl: no blank/corrupt output, obvious distortions, duplicate artifacts, or malformed geometry.',
       '- textAccuracy: visible text is absent when forbidden, or legible and spelled correctly when requested.',
-      '- preservation: for edits, preserve source identity/composition outside the requested change; for pure generation, score 100 unless preservation is applicable.',
+      '- preservation: for edits and reference-guided generation, preserve or apply the requested source/reference identity, style, palette, product details, or composition; for pure generation without references, score 100 unless preservation is applicable.',
       'Overall score is 0 to 100. Penalize hard for blank images, wrong primary object/color, unwanted text, or edit changes outside the request.',
       'List concrete visible violations only; use an empty array if none.',
     ].join('\n'),
@@ -2937,8 +3627,8 @@ function shouldRunImageGenerationBenchmarks() {
 }
 
 function shouldRunImageGenerationPairBenchmark() {
-  const caseSelected = Boolean(caseFilters && shouldRunCase(imageGenerationCaseNames.generationStreamPaired));
-  const pairTargetSelected = Boolean(targetFilters && shouldRunTarget(imageGenerationPairTarget));
+  const caseSelected = exactOrWildcardFilterMatches(imageGenerationCaseNames.generationStreamPaired, caseFilters);
+  const pairTargetSelected = exactOrWildcardFilterMatches(imageGenerationPairTarget, targetFilters);
   if (!caseSelected && !pairTargetSelected) return false;
   if (!targetFilters) return true;
   return pairTargetSelected || (shouldRunTarget('proxy-codex') && shouldRunTarget(openAiApiTarget));
@@ -2963,6 +3653,19 @@ function matchesFilter(value, filter) {
     return new RegExp(`^${pattern}$`).test(value);
   }
   return value === filter || value.includes(filter);
+}
+
+function exactOrWildcardFilterMatches(value, filters) {
+  if (!filters) return false;
+  return filters.some((filter) => {
+    if (filter === 'all') return true;
+    if (!filter.includes('*')) return value === filter;
+    const pattern = filter
+      .split('*')
+      .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, '\\$&'))
+      .join('.*');
+    return new RegExp(`^${pattern}$`).test(value);
+  });
 }
 
 function readFilters(value) {
@@ -3092,6 +3795,12 @@ function optionalReasoningEffort(value) {
   if (value === undefined) return undefined;
   if (isReasoningEffort(value)) return value;
   throw new Error(`Unsupported request reasoning effort: ${value}`);
+}
+
+function codexAppServerProxyMode(value) {
+  if (value === undefined) return undefined;
+  if (isCodexAppServerProxyMode(value)) return value;
+  throw new Error(`Unsupported Codex proxy mode: ${value}`);
 }
 
 function errorMessage(err) {

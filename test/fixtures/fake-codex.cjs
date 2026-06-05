@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 const readline = require('node:readline');
 
+assertNoDirectProviderEnv();
+
 let threadSeq = 0;
 let turnSeq = 0;
+let lastThreadStartParams = null;
+let lastTurnStartParams = null;
+let activeImageTurns = 0;
+let maxActiveImageTurns = 0;
 
 function write(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -74,6 +80,131 @@ function emitEarlyTurn(threadId, turnId) {
   });
 }
 
+function emitToolTurn(threadId, turnId) {
+  write({
+    method: 'item/agentMessage/delta',
+    params: {
+      threadId,
+      turnId,
+      delta: '{"status":"tool_calls","text":"","toolCalls":[{"arguments":"{\\"city\\"',
+    },
+  });
+  write({
+    method: 'item/agentMessage/delta',
+    params: {
+      threadId,
+      turnId,
+      delta: ':\\"Seoul\\"}","id":"call_1","name":"get_weather"}]}',
+    },
+  });
+  write({
+    method: 'thread/tokenUsage/updated',
+    params: {
+      threadId,
+      turnId,
+      tokenUsage: {
+        last: {
+          totalTokens: 15,
+          inputTokens: 9,
+          cachedInputTokens: 2,
+          outputTokens: 4,
+          reasoningOutputTokens: 0,
+        },
+      },
+    },
+  });
+  write({
+    method: 'turn/completed',
+    params: {
+      threadId,
+      turn: { id: turnId, status: 'completed' },
+    },
+  });
+}
+
+function emitToolArgumentsOnlyTurn(threadId, turnId) {
+  write({
+    method: 'item/agentMessage/delta',
+    params: {
+      threadId,
+      turnId,
+      delta: '{"city"',
+    },
+  });
+  write({
+    method: 'item/agentMessage/delta',
+    params: {
+      threadId,
+      turnId,
+      delta: ':"Seoul"}',
+    },
+  });
+  write({
+    method: 'thread/tokenUsage/updated',
+    params: {
+      threadId,
+      turnId,
+      tokenUsage: {
+        last: {
+          totalTokens: 11,
+          inputTokens: 7,
+          cachedInputTokens: 2,
+          outputTokens: 4,
+          reasoningOutputTokens: 0,
+        },
+      },
+    },
+  });
+  write({
+    method: 'turn/completed',
+    params: {
+      threadId,
+      turn: { id: turnId, status: 'completed' },
+    },
+  });
+}
+
+function emitImageTurn(threadId, turnId, options = {}) {
+  const revisedPrompt = options.revisedPrompt ?? 'fake revised image prompt';
+  write({
+    method: 'item/completed',
+    params: {
+      threadId,
+      turnId,
+      item: {
+        type: 'imageGeneration',
+        id: `image_${turnId}`,
+        status: 'completed',
+        revisedPrompt,
+        result: Buffer.from('fake-codex-image-result'.repeat(80)).toString('base64'),
+      },
+    },
+  });
+  write({
+    method: 'thread/tokenUsage/updated',
+    params: {
+      threadId,
+      turnId,
+      tokenUsage: {
+        last: {
+          totalTokens: 17,
+          inputTokens: 11,
+          cachedInputTokens: 4,
+          outputTokens: 6,
+          reasoningOutputTokens: 2,
+        },
+      },
+    },
+  });
+  write({
+    method: 'turn/completed',
+    params: {
+      threadId,
+      turn: { id: turnId, status: 'completed' },
+    },
+  });
+}
+
 function inputText(payload) {
   return JSON.stringify(payload.params?.input ?? []);
 }
@@ -94,6 +225,7 @@ rl.on('line', (line) => {
   }
   if (payload.method === 'thread/start') {
     threadSeq += 1;
+    lastThreadStartParams = payload.params ?? null;
     result(payload.id, { thread: { id: `thread_${threadSeq}` } });
     return;
   }
@@ -101,9 +233,42 @@ rl.on('line', (line) => {
     turnSeq += 1;
     const threadId = payload.params?.threadId ?? `thread_${threadSeq}`;
     const turnId = `turn_${turnSeq}`;
-    if (inputText(payload).includes('EARLY_DELTA')) {
+    const input = inputText(payload);
+    lastTurnStartParams = payload.params ?? null;
+    if (input.includes('imageGeneration result')) {
+      result(payload.id, { turn: { id: turnId } });
+      if (input.includes('PARALLEL_IMAGE_DELAY')) {
+        activeImageTurns += 1;
+        maxActiveImageTurns = Math.max(maxActiveImageTurns, activeImageTurns);
+        setTimeout(() => {
+          emitImageTurn(threadId, turnId, {
+            revisedPrompt: `fake revised image prompt max-active:${maxActiveImageTurns}`,
+          });
+          activeImageTurns -= 1;
+        }, 80);
+        return;
+      }
+      setTimeout(() => emitImageTurn(threadId, turnId), 0);
+      return;
+    }
+    if (input.includes('EARLY_DELTA')) {
       emitEarlyTurn(threadId, turnId);
       result(payload.id, { turn: { id: turnId } });
+      return;
+    }
+    if (input.includes('TOOL_STREAM_DIAGNOSTIC')) {
+      result(payload.id, { turn: { id: turnId } });
+      const schema = payload.params?.outputSchema;
+      const argsOnly = schema?.properties?.city;
+      setTimeout(() => {
+        if (argsOnly) emitToolArgumentsOnlyTurn(threadId, turnId);
+        else emitToolTurn(threadId, turnId);
+      }, 0);
+      return;
+    }
+    if (input.includes('DEBUG_PAYLOAD')) {
+      result(payload.id, { turn: { id: turnId } });
+      setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(debugPayload())), 0);
       return;
     }
     const effort = payload.params?.effort;
@@ -128,3 +293,70 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => process.exit(0));
+
+function assertNoDirectProviderEnv() {
+  if (process.env.FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV !== '1') return;
+  const found = Object.keys(process.env).filter(isDirectProviderEnvName);
+  if (found.length > 0) {
+    process.stderr.write(`direct provider env leaked to fake codex: ${found.join(',')}\n`);
+    process.exit(91);
+  }
+}
+
+function debugPayload() {
+  return {
+    threadStart: pick(lastThreadStartParams, [
+      'baseInstructions',
+      'developerInstructions',
+      'personality',
+      'experimentalRawEvents',
+      'persistExtendedHistory',
+      'config',
+    ]),
+    turnStart: pick(lastTurnStartParams, [
+      'effort',
+      'summary',
+      'personality',
+      'outputSchema',
+      'input',
+    ]),
+  };
+}
+
+function pick(value, keys) {
+  const out = {};
+  for (const key of keys) {
+    if (Object.hasOwn(value ?? {}, key)) out[key] = value[key];
+  }
+  return out;
+}
+
+function isDirectProviderEnvName(name) {
+  const prefixes = [
+    'ANTHROPIC',
+    'AZURE_OPENAI',
+    'COHERE',
+    'DEEPSEEK',
+    'GEMINI',
+    'GOOGLE',
+    'GROQ',
+    'MISTRAL',
+    'OPENAI',
+    'OPENROUTER',
+    'PERPLEXITY',
+    'TOGETHER',
+    'XAI',
+  ];
+  const suffixes = [
+    'ACCESS_TOKEN',
+    'API_BASE',
+    'API_KEY',
+    'AUTH_TOKEN',
+    'BASE_URL',
+    'ENDPOINT',
+    'ORG_ID',
+    'ORGANIZATION',
+    'PROJECT',
+  ];
+  return prefixes.some((prefix) => suffixes.some((suffix) => name === `${prefix}_${suffix}`));
+}

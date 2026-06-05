@@ -4,18 +4,28 @@ import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promi
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import readline from 'node:readline';
-import { codexProxyFallbackReasoningEffort } from '../settings.js';
+import {
+  codexProxyFallbackReasoningEffort,
+  codexProxyFallbackVerbosity,
+} from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
 import {
   baseInstructions,
   buildPrompt,
   developerInstructions,
+  forcedSingleToolCall,
   hasToolDecisionSchema,
   outputSchemaFor,
   parseBackendOutput,
+  requestInstructionText,
   usageFor,
 } from './backend-contract.js';
+import {
+  image2QualityToGpt55ReasoningEffort,
+  image2ViaGpt55PromptFromRequest,
+} from './image2-via-gpt55.js';
 import { prepareCodexInput } from './multimodal.js';
+import { proxyChildProcessEnv } from './process-env.js';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
@@ -23,8 +33,15 @@ import type {
   LocalUsage,
   NormalizedRequest,
   NormalizedReasoningEffort,
+  NormalizedVerbosity,
+  OpenAiGeneratedImage,
+  OpenAiImageGenerationClient,
+  OpenAiImageGenerationRequest,
+  OpenAiImageGenerationResult,
+  OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { ToolCallDeltaExtractor } from './tool-call-stream.js';
+import { ProxyRequestError } from './types.js';
+import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface CodexAppServerBackendOptions {
   readonly command?: string;
@@ -32,6 +49,9 @@ interface CodexAppServerBackendOptions {
   readonly model?: string;
   readonly timeoutMs: number;
   readonly reasoningEffort?: CodexReasoningEffort;
+  readonly verbosity?: CodexVerbosity;
+  readonly imageGeneration?: boolean;
+  readonly proxyMode?: CodexAppServerProxyMode;
   readonly onTiming?: (timing: CodexTurnTiming) => void;
 }
 
@@ -56,9 +76,24 @@ interface TurnWaiter {
   reject: (err: Error) => void;
 }
 
+interface ImageTurnWaiter {
+  readonly threadId: string;
+  readonly turnId: string;
+  images: OpenAiGeneratedImage[];
+  usage?: LocalUsage;
+  completed: boolean;
+  completedAt?: number;
+  usageUpdatedAt?: number;
+  usageGraceTimer?: NodeJS.Timeout;
+  onImage?: (image: OpenAiGeneratedImage) => void;
+  resolve: (value: ImageTurnResult) => void;
+  reject: (err: Error) => void;
+}
+
 interface BufferedTurnState {
   textDeltas: string[];
   finalText?: string;
+  imageGenerations: OpenAiGeneratedImage[];
   usage?: LocalUsage;
   usageUpdatedAt?: number;
   completed: boolean;
@@ -75,7 +110,20 @@ interface TurnResult {
   readonly usageWaitMs?: number;
 }
 
+interface ImageTurnResult {
+  readonly images: readonly OpenAiGeneratedImage[];
+  readonly usage?: LocalUsage;
+  readonly usageWaitMs?: number;
+  readonly timing?: CodexTurnTiming;
+}
+
 type CodexReasoningEffort = NormalizedReasoningEffort;
+type CodexVerbosity = NormalizedVerbosity;
+export type CodexAppServerProxyMode =
+  | 'api-isolated'
+  | 'omit-personality'
+  | 'base-only'
+  | 'no-instructions';
 
 export interface CodexIsolation {
   readonly rootDir: string;
@@ -84,34 +132,45 @@ export interface CodexIsolation {
   readonly defaultModel?: string;
 }
 
-interface CodexTurnTiming {
-  readonly ensureStartedMs: number;
-  readonly promptBuildMs: number;
-  readonly threadStartMs: number;
-  readonly inputPrepareMs: number;
-  readonly turnStartMs: number;
-  readonly turnWaitMs: number;
-  readonly usageWaitMs: number;
+interface CodexTurnTimingDraft {
+  ensureStartedMs: number;
+  promptBuildMs: number;
+  threadStartMs: number;
+  inputPrepareMs: number;
+  turnStartMs: number;
+  turnWaitMs: number;
+  usageWaitMs: number;
+  firstTextDeltaMs?: number;
+  firstToolCallDeltaMs?: number;
+  firstToolArgumentDeltaMs?: number;
+}
+
+interface CodexTurnTiming extends Readonly<CodexTurnTimingDraft> {
   readonly totalMs: number;
 }
 
 const USAGE_NOTIFICATION_GRACE_MS = 100;
 const BUFFERED_TURN_STATE_TTL_MS = 30_000;
 const FALLBACK_CODEX_MODEL = 'gpt-5.5';
+const CODEX_APP_SERVER_PROXY_MODES: readonly CodexAppServerProxyMode[] = [
+  'api-isolated',
+  'omit-personality',
+  'base-only',
+  'no-instructions',
+];
 const DISABLED_CODEX_CONTEXT_FEATURES = [
   'apps',
   'browser_use',
   'computer_use',
   'goals',
   'hooks',
-  'image_generation',
   'multi_agent',
   'plugins',
   'shell_tool',
   'workspace_dependencies',
 ] as const;
 
-export class CodexAppServerBackend implements LocalCliBackend {
+export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenerationClient {
   readonly name = 'codex-app-server';
   readonly model: string;
 
@@ -120,6 +179,9 @@ export class CodexAppServerBackend implements LocalCliBackend {
   private readonly configuredModel?: string;
   private readonly timeoutMs: number;
   private readonly reasoningEffort: CodexReasoningEffort;
+  private readonly verbosity: CodexVerbosity;
+  private readonly imageGeneration: boolean;
+  private readonly proxyMode: CodexAppServerProxyMode;
   private readonly onTiming?: (timing: CodexTurnTiming) => void;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
@@ -128,6 +190,7 @@ export class CodexAppServerBackend implements LocalCliBackend {
   private stderr = '';
   private readonly pending = new Map<number, PendingRequest>();
   private readonly turnWaiters = new Map<string, TurnWaiter>();
+  private readonly imageTurnWaiters = new Map<string, ImageTurnWaiter>();
   private readonly bufferedTurnStates = new Map<string, BufferedTurnState>();
   private isolation: CodexIsolation | null = null;
 
@@ -138,33 +201,78 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.configuredModel = options.model;
     this.timeoutMs = options.timeoutMs;
     this.reasoningEffort = options.reasoningEffort ?? codexProxyFallbackReasoningEffort();
+    this.verbosity = options.verbosity ?? codexProxyFallbackVerbosity();
+    this.imageGeneration = options.imageGeneration ?? false;
+    this.proxyMode = options.proxyMode ?? 'api-isolated';
     this.onTiming = options.onTiming;
   }
 
-  async generate(
+  generate(
     request: NormalizedRequest,
     signal?: AbortSignal,
-  ): Promise<LocalCompletionResult> {
+  ): Promise<LocalCompletionResult>;
+  generate(
+    request: OpenAiImageGenerationRequest,
+    signal?: AbortSignal,
+  ): Promise<OpenAiImageGenerationResult>;
+  async generate(
+    request: NormalizedRequest | OpenAiImageGenerationRequest,
+    signal?: AbortSignal,
+  ): Promise<LocalCompletionResult | OpenAiImageGenerationResult> {
+    if (isOpenAiImageGenerationRequest(request)) {
+      return this.runImageRequest(request, signal);
+    }
     return this.runTurn(request, signal);
   }
 
-  async *stream(
+  stream(
     request: NormalizedRequest,
     signal?: AbortSignal,
-  ): AsyncIterable<LocalStreamEvent> {
+  ): AsyncIterable<LocalStreamEvent>;
+  stream(
+    request: OpenAiImageGenerationRequest,
+    signal?: AbortSignal,
+  ): AsyncIterable<OpenAiImageGenerationStreamEvent>;
+  async *stream(
+    request: NormalizedRequest | OpenAiImageGenerationRequest,
+    signal?: AbortSignal,
+  ): AsyncIterable<LocalStreamEvent | OpenAiImageGenerationStreamEvent> {
+    if (isOpenAiImageGenerationRequest(request)) {
+      for await (const event of this.streamImageRequest(request, signal)) yield event;
+      return;
+    }
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const toolExtractor = hasToolDecisionSchema(request)
+    const forcedTool = forcedSingleToolCall(request);
+    const toolExtractor = forcedTool
+      ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
+      : hasToolDecisionSchema(request)
       ? new ToolCallDeltaExtractor()
       : null;
+    let firstToolCallDeltaMs: number | undefined;
+    let firstToolArgumentDeltaMs: number | undefined;
     const run = this.runTurn(
       request,
       signal,
-      (delta) => {
+      (delta, elapsedMs) => {
         if (toolExtractor) {
-          for (const event of toolExtractor.push(delta)) queue.push(event);
+          for (const event of toolExtractor.push(delta)) {
+            if (firstToolCallDeltaMs === undefined) firstToolCallDeltaMs = elapsedMs;
+            if (
+              event.type === 'tool_call_delta'
+              && event.argumentsDelta
+              && firstToolArgumentDeltaMs === undefined
+            ) {
+              firstToolArgumentDeltaMs = elapsedMs;
+            }
+            queue.push(event);
+          }
         } else {
           queue.push({ type: 'text_delta', delta });
         }
+      },
+      (timing) => {
+        if (firstToolCallDeltaMs !== undefined) timing.firstToolCallDeltaMs = firstToolCallDeltaMs;
+        if (firstToolArgumentDeltaMs !== undefined) timing.firstToolArgumentDeltaMs = firstToolArgumentDeltaMs;
       },
     )
       .then((result) => queue.push({ type: 'completed', result }))
@@ -179,11 +287,72 @@ export class CodexAppServerBackend implements LocalCliBackend {
     }
   }
 
-  private async runTurn(
-    request: NormalizedRequest,
+  private async runImageRequest(
+    request: OpenAiImageGenerationRequest,
     signal?: AbortSignal,
-    onTextDelta?: (delta: string) => void,
-  ): Promise<LocalCompletionResult> {
+  ): Promise<OpenAiImageGenerationResult> {
+    if (!this.imageGeneration) throw unsupportedImageGenerationError();
+    const startedAt = Date.now();
+    const images: OpenAiGeneratedImage[] = [];
+    let usage: LocalUsage | undefined;
+    const emitPerTurnTiming = request.n === 1;
+    const results = await Promise.all(
+      Array.from(
+        { length: request.n },
+        (_, index) => this.runSingleImageTurn(request, index, signal, emitPerTurnTiming),
+      ),
+    );
+    for (const result of results) {
+      images.push(...result.images);
+      usage = mergeUsage(usage, result.usage);
+    }
+    if (!emitPerTurnTiming) {
+      const timings = results.map((result) => result.timing).filter(isCodexTurnTiming);
+      if (timings.length > 0) {
+        this.onTiming?.(aggregateParallelImageTurnTiming(timings, Date.now() - startedAt));
+      }
+    }
+    return {
+      created: Math.floor(Date.now() / 1000),
+      images,
+      background: request.background,
+      outputFormat: request.outputFormat,
+      quality: request.quality,
+      size: request.size,
+      ...(usage ? { usage } : {}),
+      latencyMs: Date.now() - startedAt,
+    };
+  }
+
+  private async *streamImageRequest(
+    request: OpenAiImageGenerationRequest,
+    signal?: AbortSignal,
+  ): AsyncIterable<OpenAiImageGenerationStreamEvent> {
+    if (!this.imageGeneration) throw unsupportedImageGenerationError();
+    for (let index = 0; index < request.n; index += 1) {
+      const result = await this.runSingleImageTurn(request, index, signal);
+      for (const image of result.images) {
+        yield {
+          type: 'completed',
+          created: Math.floor(Date.now() / 1000),
+          image,
+          partialImageIndex: index,
+          background: request.background,
+          outputFormat: request.outputFormat,
+          quality: request.quality,
+          size: request.size,
+          usage: result.usage,
+        };
+      }
+    }
+  }
+
+  private async runSingleImageTurn(
+    request: OpenAiImageGenerationRequest,
+    imageIndex: number,
+    signal?: AbortSignal,
+    emitTiming = true,
+  ): Promise<ImageTurnResult> {
     const startedAt = Date.now();
     const timing = {
       ensureStartedMs: 0,
@@ -195,14 +364,117 @@ export class CodexAppServerBackend implements LocalCliBackend {
       usageWaitMs: 0,
     };
     let phaseStartedAt = Date.now();
+    const reasoningEffort = image2QualityToGpt55ReasoningEffort(request.quality);
+    await this.ensureStarted();
+    timing.ensureStartedMs = Date.now() - phaseStartedAt;
+    phaseStartedAt = Date.now();
+    const prompt = buildCodexImageGenerationPrompt(request, imageIndex);
+    timing.promptBuildMs = Date.now() - phaseStartedAt;
+    const threadStartedAt = Date.now();
+    const threadPromise = this.startThread(reasoningEffort, this.verbosity, 'image').then((value) => {
+      timing.threadStartMs = Date.now() - threadStartedAt;
+      return value;
+    });
+    const inputStartedAt = Date.now();
+    const preparedInputPromise = prepareCodexInput(
+      codexImageGenerationInputRequest(request),
+      prompt,
+    ).then((value) => {
+      timing.inputPrepareMs = Date.now() - inputStartedAt;
+      return value;
+    });
+    let threadId: string | null = null;
+    let preparedInput: Awaited<ReturnType<typeof prepareCodexInput>> | null = null;
+    let turnId: string | null = null;
+    const abort = async (): Promise<void> => {
+      if (!turnId) return;
+      await this.send('turn/interrupt', { threadId, turnId }).catch(() => undefined);
+    };
+    const onAbort = (): void => {
+      void abort();
+    };
+    if (signal) {
+      if (signal.aborted) await abort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+
+    try {
+      [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
+      const cwd = this.isolation?.workDir ?? this.cwd;
+      phaseStartedAt = Date.now();
+      const turn = await this.send('turn/start', {
+        threadId,
+        cwd,
+        runtimeWorkspaceRoots: [cwd],
+        environments: [],
+        input: preparedInput.input,
+        model: this.modelOverrideForCodexImage(),
+        effort: reasoningEffort,
+        summary: 'none',
+        ...turnPersonalityParams(this.proxyMode),
+        outputSchema: null,
+      });
+      timing.turnStartMs = Date.now() - phaseStartedAt;
+      turnId = readPath<string>(turn, ['result', 'turn', 'id']);
+      if (!turnId) throw new Error('codex app-server did not return a turn id');
+      phaseStartedAt = Date.now();
+      const result = await this.waitForImageTurn(threadId, turnId, signal);
+      timing.turnWaitMs = Date.now() - phaseStartedAt;
+      timing.usageWaitMs = result.usageWaitMs ?? 0;
+      if (result.images.length === 0) {
+        throw new Error('codex app-server completed image request without an imageGeneration result');
+      }
+      const completedTiming = {
+        ...timing,
+        totalMs: Date.now() - startedAt,
+      };
+      if (emitTiming) this.onTiming?.(completedTiming);
+      return { ...result, timing: completedTiming };
+    } finally {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      if (preparedInput) await preparedInput.cleanup();
+      else void preparedInputPromise.then((value) => value.cleanup()).catch(() => undefined);
+      if (threadId) this.archiveThread(threadId);
+    }
+  }
+
+  private async runTurn(
+    request: NormalizedRequest,
+    signal?: AbortSignal,
+    onTextDelta?: (delta: string, elapsedMs: number) => void,
+    decorateTiming?: (timing: CodexTurnTimingDraft) => void,
+  ): Promise<LocalCompletionResult> {
+    const startedAt = Date.now();
+    const timing: CodexTurnTimingDraft = {
+      ensureStartedMs: 0,
+      promptBuildMs: 0,
+      threadStartMs: 0,
+      inputPrepareMs: 0,
+      turnStartMs: 0,
+      turnWaitMs: 0,
+      usageWaitMs: 0,
+    };
+    const observedTextDelta = (delta: string): void => {
+      const elapsedMs = Date.now() - startedAt;
+      if (timing.firstTextDeltaMs === undefined) timing.firstTextDeltaMs = elapsedMs;
+      onTextDelta?.(delta, elapsedMs);
+    };
+    let phaseStartedAt = Date.now();
     await this.ensureStarted();
     timing.ensureStartedMs = Date.now() - phaseStartedAt;
     phaseStartedAt = Date.now();
     const reasoningEffort = request.reasoningEffort ?? this.reasoningEffort;
-    const prompt = buildPrompt(request);
+    const verbosity = request.verbosity ?? this.verbosity;
+    const splitInstructions = shouldSplitRequestInstructions(this.proxyMode);
+    const prompt = buildPrompt(request, {
+      includeInstructionMessages: !splitInstructions,
+    });
+    const apiRequestInstructions = splitInstructions
+      ? requestInstructionText(request)
+      : '';
     timing.promptBuildMs = Date.now() - phaseStartedAt;
     const threadStartedAt = Date.now();
-    const threadPromise = this.startThread(reasoningEffort).then((value) => {
+    const threadPromise = this.startThread(reasoningEffort, verbosity, 'text', apiRequestInstructions).then((value) => {
       timing.threadStartMs = Date.now() - threadStartedAt;
       return value;
     });
@@ -240,19 +512,20 @@ export class CodexAppServerBackend implements LocalCliBackend {
         model: this.modelOverrideFor(request.model),
         effort: reasoningEffort,
         summary: 'none',
-        personality: 'none',
+        ...turnPersonalityParams(this.proxyMode),
         outputSchema: outputSchemaFor(request),
       });
       timing.turnStartMs = Date.now() - phaseStartedAt;
       turnId = readPath<string>(turn, ['result', 'turn', 'id']);
       if (!turnId) throw new Error('codex app-server did not return a turn id');
       phaseStartedAt = Date.now();
-      const turnResult = await this.waitForTurn(threadId, turnId, signal, onTextDelta);
+      const turnResult = await this.waitForTurn(threadId, turnId, signal, observedTextDelta);
       timing.turnWaitMs = Date.now() - phaseStartedAt;
       timing.usageWaitMs = turnResult.usageWaitMs ?? 0;
       const parsed = parseBackendOutput(request, turnResult.text);
       const usage = turnResult.usage ?? usageFor(request, parsed.text, parsed.toolCalls);
       const totalMs = Date.now() - startedAt;
+      decorateTiming?.(timing);
       this.onTiming?.({
         ...timing,
         totalMs,
@@ -283,6 +556,10 @@ export class CodexAppServerBackend implements LocalCliBackend {
       waiter.reject(new Error('codex app-server backend closed'));
     }
     this.turnWaiters.clear();
+    for (const waiter of this.imageTurnWaiters.values()) {
+      waiter.reject(new Error('codex app-server backend closed'));
+    }
+    this.imageTurnWaiters.clear();
     this.clearBufferedTurnStates();
     this.lineReader?.close();
     this.child?.kill('SIGTERM');
@@ -302,6 +579,8 @@ export class CodexAppServerBackend implements LocalCliBackend {
     const isolation = await createCodexIsolation({
       configuredModel: this.configuredModel,
       reasoningEffort: this.reasoningEffort,
+      verbosity: this.verbosity,
+      imageGeneration: this.imageGeneration,
     });
     this.isolation = isolation;
     const appServerArgs = [
@@ -309,6 +588,8 @@ export class CodexAppServerBackend implements LocalCliBackend {
       ...codexContextIsolationArgs({
         model: this.configuredModel ?? isolation.defaultModel ?? FALLBACK_CODEX_MODEL,
         reasoningEffort: this.reasoningEffort,
+        verbosity: this.verbosity,
+        imageGeneration: this.imageGeneration,
       }),
       '--listen',
       'stdio://',
@@ -316,13 +597,9 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.child = spawn(this.command, appServerArgs, {
       cwd: isolation.workDir,
       shell: false,
-      env: {
-        ...process.env,
+      env: proxyChildProcessEnv({
         CODEX_HOME: isolation.homeDir,
-        TERM: process.env.TERM && process.env.TERM !== 'dumb'
-          ? process.env.TERM
-          : 'xterm-256color',
-      },
+      }),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -357,7 +634,12 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.notify('initialized', {});
   }
 
-  private async startThread(reasoningEffort: CodexReasoningEffort): Promise<string> {
+  private async startThread(
+    reasoningEffort: CodexReasoningEffort,
+    verbosity: CodexVerbosity,
+    mode: 'text' | 'image' = 'text',
+    apiRequestInstructions = '',
+  ): Promise<string> {
     const cwd = this.isolation?.workDir ?? this.cwd;
     const thread = await this.send('thread/start', {
       cwd,
@@ -367,14 +649,14 @@ export class CodexAppServerBackend implements LocalCliBackend {
       environments: [],
       dynamicTools: [],
       ephemeral: true,
-      baseInstructions: baseInstructions(),
-      developerInstructions: developerInstructions(),
-      personality: 'none',
+      ...threadInstructionParams(this.proxyMode, mode, apiRequestInstructions),
+      ...threadPersonalityParams(this.proxyMode),
       experimentalRawEvents: false,
       persistExtendedHistory: false,
       config: {
         model_reasoning_effort: reasoningEffort,
         model_reasoning_summary: 'none',
+        model_verbosity: verbosity,
         web_search: 'disabled',
       },
     });
@@ -482,6 +764,15 @@ export class CodexAppServerBackend implements LocalCliBackend {
       if (!key) return;
       const waiter = this.turnWaiters.get(key);
       const item = asRecord(data.item);
+      const image = imageGenerationFromThreadItem(item);
+      if (image) {
+        const imageWaiter = this.imageTurnWaiters.get(key);
+        if (imageWaiter) this.appendImageGeneration(imageWaiter, image);
+        else this.bufferTurnState(key, (state) => {
+          state.imageGenerations.push(image);
+        });
+        return;
+      }
       if (waiter && item?.type === 'agentMessage' && typeof item.text === 'string') {
         waiter.text = item.text;
       } else if (item?.type === 'agentMessage' && typeof item.text === 'string') {
@@ -502,7 +793,13 @@ export class CodexAppServerBackend implements LocalCliBackend {
         waiter.usage = usage;
         waiter.usageUpdatedAt = Date.now();
         if (waiter.completed) this.resolveTurnWaiter(threadId, turnId);
-      } else if (usage) {
+      }
+      const imageWaiter = usage ? this.imageTurnWaiters.get(key) : null;
+      if (imageWaiter && usage) {
+        imageWaiter.usage = usage;
+        imageWaiter.usageUpdatedAt = Date.now();
+        if (imageWaiter.completed) this.resolveImageTurnWaiter(threadId, turnId);
+      } else if (usage && !waiter) {
         this.bufferTurnState(key, (state) => {
           state.usage = usage;
           state.usageUpdatedAt = Date.now();
@@ -517,17 +814,30 @@ export class CodexAppServerBackend implements LocalCliBackend {
       if (!threadId || !turnId) return;
       const key = `${threadId}:${turnId}`;
       const waiter = this.turnWaiters.get(key);
+      const imageWaiter = this.imageTurnWaiters.get(key);
       if (!waiter) {
-        this.bufferTurnState(key, (state) => {
-          if (turn?.status === 'failed') {
-            state.error = new Error(JSON.stringify(turn.error ?? 'turn failed'));
-          } else {
-            state.completed = true;
-            state.completedAt = Date.now();
-          }
-        });
-        return;
+        if (!imageWaiter) {
+          this.bufferTurnState(key, (state) => {
+            if (turn?.status === 'failed') {
+              state.error = new Error(JSON.stringify(turn.error ?? 'turn failed'));
+            } else {
+              state.completed = true;
+              state.completedAt = Date.now();
+            }
+          });
+          return;
+        }
       }
+      if (imageWaiter) {
+        if (turn?.status === 'failed') {
+          this.imageTurnWaiters.delete(key);
+          imageWaiter.reject(new Error(JSON.stringify(turn.error ?? 'turn failed')));
+        } else {
+          this.markImageWaiterCompleted(threadId, turnId, imageWaiter, Date.now());
+        }
+        if (!waiter) return;
+      }
+      if (!waiter) return;
       if (turn?.status === 'failed') {
         this.turnWaiters.delete(key);
         waiter.reject(new Error(JSON.stringify(turn.error ?? 'turn failed')));
@@ -542,6 +852,14 @@ export class CodexAppServerBackend implements LocalCliBackend {
     waiter.onTextDelta?.(delta);
   }
 
+  private appendImageGeneration(
+    waiter: ImageTurnWaiter,
+    image: OpenAiGeneratedImage,
+  ): void {
+    waiter.images.push(image);
+    waiter.onImage?.(image);
+  }
+
   private markWaiterCompleted(
     threadId: string,
     turnId: string,
@@ -554,6 +872,24 @@ export class CodexAppServerBackend implements LocalCliBackend {
     else {
       waiter.usageGraceTimer = setTimeout(
         () => this.resolveTurnWaiter(threadId, turnId),
+        USAGE_NOTIFICATION_GRACE_MS,
+      );
+    }
+  }
+
+  private markImageWaiterCompleted(
+    threadId: string,
+    turnId: string,
+    waiter: ImageTurnWaiter,
+    completedAt: number,
+  ): void {
+    waiter.completed = true;
+    waiter.completedAt = completedAt;
+    if (waiter.usage || waiter.images.length > 0) {
+      this.resolveImageTurnWaiter(threadId, turnId);
+    } else {
+      waiter.usageGraceTimer = setTimeout(
+        () => this.resolveImageTurnWaiter(threadId, turnId),
         USAGE_NOTIFICATION_GRACE_MS,
       );
     }
@@ -574,6 +910,98 @@ export class CodexAppServerBackend implements LocalCliBackend {
       usageWaitMs: waiter.completedAt
         ? Math.max(0, (waiter.usageUpdatedAt ?? Date.now()) - waiter.completedAt)
         : 0,
+    });
+  }
+
+  private resolveImageTurnWaiter(threadId: string, turnId: string): void {
+    const key = `${threadId}:${turnId}`;
+    const waiter = this.imageTurnWaiters.get(key);
+    if (!waiter) return;
+    this.imageTurnWaiters.delete(key);
+    if (waiter.usageGraceTimer) {
+      clearTimeout(waiter.usageGraceTimer);
+      waiter.usageGraceTimer = undefined;
+    }
+    waiter.resolve({
+      images: waiter.images,
+      usage: waiter.usage,
+      usageWaitMs: waiter.completedAt
+        ? Math.max(0, (waiter.usageUpdatedAt ?? Date.now()) - waiter.completedAt)
+        : 0,
+    });
+  }
+
+  private waitForImageTurn(
+    threadId: string,
+    turnId: string,
+    signal?: AbortSignal,
+    onImage?: (image: OpenAiGeneratedImage) => void,
+  ): Promise<ImageTurnResult> {
+    const key = `${threadId}:${turnId}`;
+    return new Promise((resolve, reject) => {
+      let waiter: ImageTurnWaiter | undefined;
+      const timer = setTimeout(() => {
+        this.imageTurnWaiters.delete(key);
+        cleanup();
+        reject(new Error(`image turn timed out after ${this.timeoutMs}ms`));
+      }, this.timeoutMs);
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        if (waiter?.usageGraceTimer) {
+          clearTimeout(waiter.usageGraceTimer);
+          waiter.usageGraceTimer = undefined;
+        }
+        if (signal) signal.removeEventListener('abort', abortFromSignal);
+      };
+      const abortFromSignal = (): void => {
+        this.imageTurnWaiters.delete(key);
+        cleanup();
+        reject(new Error('request aborted'));
+      };
+      waiter = {
+        threadId,
+        turnId,
+        images: [],
+        completed: false,
+        onImage,
+        resolve: (value) => {
+          cleanup();
+          resolve(value);
+        },
+        reject: (err) => {
+          cleanup();
+          reject(err);
+        },
+      };
+      this.imageTurnWaiters.set(key, waiter);
+      if (signal) {
+        if (signal.aborted) {
+          abortFromSignal();
+          return;
+        }
+        signal.addEventListener('abort', abortFromSignal, { once: true });
+      }
+      const buffered = this.takeBufferedTurnState(key);
+      if (buffered) {
+        waiter.images = [...buffered.imageGenerations];
+        waiter.usage = buffered.usage;
+        waiter.usageUpdatedAt = buffered.usageUpdatedAt;
+        for (const image of buffered.imageGenerations) waiter.onImage?.(image);
+        if (buffered.error) {
+          this.imageTurnWaiters.delete(key);
+          cleanup();
+          reject(buffered.error);
+          return;
+        }
+        if (buffered.completed) {
+          this.markImageWaiterCompleted(
+            threadId,
+            turnId,
+            waiter,
+            buffered.completedAt ?? Date.now(),
+          );
+        }
+      }
     });
   }
 
@@ -666,6 +1094,8 @@ export class CodexAppServerBackend implements LocalCliBackend {
     this.pending.clear();
     for (const waiter of this.turnWaiters.values()) waiter.reject(wrapped);
     this.turnWaiters.clear();
+    for (const waiter of this.imageTurnWaiters.values()) waiter.reject(wrapped);
+    this.imageTurnWaiters.clear();
     this.clearBufferedTurnStates();
   }
 
@@ -677,9 +1107,14 @@ export class CodexAppServerBackend implements LocalCliBackend {
     return requestModel;
   }
 
+  private modelOverrideForCodexImage(): string | undefined {
+    return this.configuredModel;
+  }
+
   private bufferTurnState(key: string, apply: (state: BufferedTurnState) => void): void {
     const state = this.bufferedTurnStates.get(key) ?? {
       textDeltas: [],
+      imageGenerations: [],
       completed: false,
     };
     if (state.cleanupTimer) clearTimeout(state.cleanupTimer);
@@ -707,6 +1142,186 @@ export class CodexAppServerBackend implements LocalCliBackend {
     }
     this.bufferedTurnStates.clear();
   }
+}
+
+export function isCodexAppServerProxyMode(value: unknown): value is CodexAppServerProxyMode {
+  return typeof value === 'string'
+    && CODEX_APP_SERVER_PROXY_MODES.includes(value as CodexAppServerProxyMode);
+}
+
+function threadInstructionParams(
+  proxyMode: CodexAppServerProxyMode,
+  mode: 'text' | 'image',
+  apiRequestInstructions = '',
+): Record<string, string> {
+  if (proxyMode === 'no-instructions') return {};
+  const base = mode === 'image' ? imageGenerationBaseInstructions() : baseInstructions();
+  if (proxyMode === 'base-only') return { baseInstructions: base };
+  const developer = mode === 'image'
+    ? imageGenerationDeveloperInstructions()
+    : developerInstructions();
+  return {
+    baseInstructions: base,
+    developerInstructions: [developer, apiRequestInstructions].filter(Boolean).join('\n\n'),
+  };
+}
+
+function shouldSplitRequestInstructions(proxyMode: CodexAppServerProxyMode): boolean {
+  return proxyMode === 'api-isolated' || proxyMode === 'omit-personality';
+}
+
+function threadPersonalityParams(
+  proxyMode: CodexAppServerProxyMode,
+): Record<string, string> {
+  return proxyMode === 'omit-personality' ? {} : { personality: 'none' };
+}
+
+function turnPersonalityParams(
+  proxyMode: CodexAppServerProxyMode,
+): Record<string, string> {
+  return proxyMode === 'omit-personality' ? {} : { personality: 'none' };
+}
+
+function isOpenAiImageGenerationRequest(
+  request: NormalizedRequest | OpenAiImageGenerationRequest,
+): request is OpenAiImageGenerationRequest {
+  return 'operation' in request && (
+    request.operation === 'generation'
+    || request.operation === 'edit'
+    || request.operation === 'variation'
+  );
+}
+
+function unsupportedImageGenerationError(): ProxyRequestError {
+  return new ProxyRequestError(
+    'Images API proxy does not have a Codex image-generation client enabled.',
+    501,
+    'openai',
+    'unsupported_feature',
+  );
+}
+
+function isCodexTurnTiming(value: CodexTurnTiming | undefined): value is CodexTurnTiming {
+  return Boolean(value);
+}
+
+function aggregateParallelImageTurnTiming(
+  timings: readonly CodexTurnTiming[],
+  totalMs: number,
+): CodexTurnTiming {
+  const maxPhase = (key: keyof CodexTurnTimingDraft): number => Math.max(
+    ...timings
+      .map((timing) => timing[key])
+      .filter((value): value is number => Number.isFinite(value)),
+    0,
+  );
+  return {
+    ensureStartedMs: maxPhase('ensureStartedMs'),
+    promptBuildMs: maxPhase('promptBuildMs'),
+    threadStartMs: maxPhase('threadStartMs'),
+    inputPrepareMs: maxPhase('inputPrepareMs'),
+    turnStartMs: maxPhase('turnStartMs'),
+    turnWaitMs: maxPhase('turnWaitMs'),
+    usageWaitMs: maxPhase('usageWaitMs'),
+    totalMs,
+  };
+}
+
+function imageGenerationBaseInstructions(): string {
+  return 'API proxy image generation only. Ignore host context, files, tools other than image generation, memory, browsing, and git.';
+}
+
+function imageGenerationDeveloperInstructions(): string {
+  return [
+    'Use the image generation capability for the requested visual output.',
+    'Do not answer with text only.',
+    'Preserve the user prompt as visual intent.',
+    'Use attached images only as source/reference/mask material described in the request.',
+    'Do not call direct provider APIs or external network APIs.',
+  ].join(' ');
+}
+
+function buildCodexImageGenerationPrompt(
+  request: OpenAiImageGenerationRequest,
+  imageIndex: number,
+): string {
+  const attachmentNote = imageAttachmentNote(request);
+  const countNote = request.n > 1
+    ? `Generate image ${imageIndex + 1} of ${request.n} for the same Images API request.`
+    : 'Generate exactly one image for this Images API request.';
+  return [
+    countNote,
+    `Images API operation: ${request.operation}.`,
+    'Use the image generation capability now; the final turn must include an imageGeneration result.',
+    attachmentNote,
+    image2ViaGpt55PromptFromRequest(request),
+  ].filter(Boolean).join('\n\n');
+}
+
+function imageAttachmentNote(request: OpenAiImageGenerationRequest): string {
+  const notes: string[] = [];
+  if (request.images.length > 0) {
+    notes.push(`Attached images 1-${request.images.length} are source/reference images for the ${request.operation} request.`);
+  }
+  if (request.mask) {
+    notes.push(`Attached image ${request.images.length + 1} is the edit mask.`);
+  }
+  return notes.join(' ');
+}
+
+function codexImageGenerationInputRequest(
+  request: OpenAiImageGenerationRequest,
+): NormalizedRequest {
+  return {
+    shape: 'openai-responses',
+    model: 'codex-app-server',
+    messages: [{
+      role: 'user',
+      content: '',
+      images: [
+        ...request.images,
+        ...(request.mask ? [request.mask] : []),
+      ],
+    }],
+    stream: false,
+    streamOptions: { includeUsage: false, includeObfuscation: false },
+    jsonMode: false,
+    tools: [],
+    toolChoice: { type: 'auto' },
+    raw: request.raw,
+  };
+}
+
+function imageGenerationFromThreadItem(
+  item: Record<string, unknown> | null,
+): OpenAiGeneratedImage | null {
+  if (item?.type !== 'imageGeneration') return null;
+  if (typeof item.result !== 'string' || !item.result.trim()) return null;
+  return {
+    b64Json: item.result,
+    ...(typeof item.revisedPrompt === 'string' && item.revisedPrompt.trim()
+      ? { revisedPrompt: item.revisedPrompt }
+      : {}),
+  };
+}
+
+function mergeUsage(
+  current: LocalUsage | undefined,
+  next: LocalUsage | undefined,
+): LocalUsage | undefined {
+  if (!current) return next;
+  if (!next) return current;
+  return {
+    inputTokens: current.inputTokens + next.inputTokens,
+    outputTokens: current.outputTokens + next.outputTokens,
+    totalTokens: (current.totalTokens ?? 0) + (next.totalTokens ?? 0),
+    cachedInputTokens: (current.cachedInputTokens ?? 0) + (next.cachedInputTokens ?? 0),
+    cacheCreationInputTokens: (current.cacheCreationInputTokens ?? 0) + (next.cacheCreationInputTokens ?? 0),
+    cacheReadInputTokens: (current.cacheReadInputTokens ?? 0) + (next.cacheReadInputTokens ?? 0),
+    reasoningOutputTokens: (current.reasoningOutputTokens ?? 0) + (next.reasoningOutputTokens ?? 0),
+    source: current.source === 'provider' && next.source === 'provider' ? 'provider' : 'estimated',
+    raw: [current.raw, next.raw].filter(Boolean),
+  };
 }
 
 function turnStateKey(threadId: unknown, turnId: unknown): string | null {
@@ -757,6 +1372,8 @@ export function usageFromCodexTokenUsage(value: unknown): LocalUsage | null {
 export function codexContextIsolationArgs(options: {
   readonly model: string;
   readonly reasoningEffort: CodexReasoningEffort;
+  readonly verbosity: CodexVerbosity;
+  readonly imageGeneration?: boolean;
 }): string[] {
   return [
     '-c',
@@ -765,6 +1382,8 @@ export function codexContextIsolationArgs(options: {
     `model_reasoning_effort=${tomlString(options.reasoningEffort)}`,
     '-c',
     'model_reasoning_summary="none"',
+    '-c',
+    `model_verbosity=${tomlString(options.verbosity)}`,
     '-c',
     'web_search="disabled"',
     '-c',
@@ -778,6 +1397,8 @@ export function codexContextIsolationArgs(options: {
       `features.${feature}=false`,
     ]),
     '-c',
+    `features.image_generation=${options.imageGeneration ? 'true' : 'false'}`,
+    '-c',
     'notify=[]',
     '-c',
     'analytics.enabled=false',
@@ -787,6 +1408,8 @@ export function codexContextIsolationArgs(options: {
 export async function createCodexIsolation(options: {
   readonly configuredModel?: string;
   readonly reasoningEffort: CodexReasoningEffort;
+  readonly verbosity: CodexVerbosity;
+  readonly imageGeneration?: boolean;
 }): Promise<CodexIsolation> {
   const rootDir = await mkdtemp(join(tmpdir(), 'ggui-codex-proxy-'));
   const homeDir = join(rootDir, 'codex-home');
@@ -804,6 +1427,8 @@ export async function createCodexIsolation(options: {
     minimalCodexConfigToml({
       model: defaultModel ?? FALLBACK_CODEX_MODEL,
       reasoningEffort: options.reasoningEffort,
+      verbosity: options.verbosity,
+      imageGeneration: options.imageGeneration,
     }),
     { mode: 0o600 },
   );
@@ -819,11 +1444,14 @@ export async function createCodexIsolation(options: {
 export function minimalCodexConfigToml(options: {
   readonly model: string;
   readonly reasoningEffort: CodexReasoningEffort;
+  readonly verbosity: CodexVerbosity;
+  readonly imageGeneration?: boolean;
 }): string {
   return [
     `model = ${tomlString(options.model)}`,
     `model_reasoning_effort = ${tomlString(options.reasoningEffort)}`,
     'model_reasoning_summary = "none"',
+    `model_verbosity = ${tomlString(options.verbosity)}`,
     'web_search = "disabled"',
     'approval_policy = "never"',
     'sandbox_mode = "read-only"',
@@ -833,6 +1461,7 @@ export function minimalCodexConfigToml(options: {
     '',
     '[features]',
     ...DISABLED_CODEX_CONTEXT_FEATURES.map((feature) => `${feature} = false`),
+    `image_generation = ${options.imageGeneration ? 'true' : 'false'}`,
     '',
     '[shell_environment_policy]',
     'inherit = "none"',

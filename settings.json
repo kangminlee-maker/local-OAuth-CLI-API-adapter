@@ -1,5 +1,7 @@
 {
   "codexProxy": {
-    "fallbackReasoningEffort": "medium"
+    "fallbackReasoningEffort": "medium",
+    "fallbackVerbosity": "medium",
+    "imageModel": "gpt-5.5"
   }
 }

@@ -139,11 +139,28 @@ async function validateExtractedPackage(packageDir) {
     /ui-gen/,
   ];
   for await (const filePath of walk(packageDir)) {
+    const packageRelativePath = relative(packageDir, filePath);
     const content = await readFile(filePath, 'utf8');
     const found = forbidden.find((pattern) => pattern.test(content));
     if (found) {
-      throw new Error(`Package file contains forbidden reference ${found}: ${relative(packageDir, filePath)}`);
+      throw new Error(`Package file contains forbidden reference ${found}: ${packageRelativePath}`);
     }
+    if (packageRelativePath.startsWith('dist/')) {
+      validateRuntimeFileDoesNotCallDirectProvider(content, packageRelativePath);
+    }
+  }
+}
+
+function validateRuntimeFileDoesNotCallDirectProvider(content, filePath) {
+  const forbidden = [
+    /https:\/\/api\.(?:openai|anthropic)\.com/,
+    /\bapi\.(?:openai|anthropic)\.com\b/,
+    /Bearer\s+\$\{process\.env/,
+    /x-api-key['"]?\s*:\s*process\.env/,
+  ];
+  const found = forbidden.find((pattern) => pattern.test(content));
+  if (found) {
+    throw new Error(`Runtime file contains direct provider egress reference ${found}: ${filePath}`);
   }
 }
 

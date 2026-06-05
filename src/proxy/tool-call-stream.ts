@@ -63,6 +63,48 @@ export class ToolCallDeltaExtractor {
   }
 }
 
+export class KnownToolArgumentsDeltaExtractor {
+  private started = false;
+  private sawArgument = false;
+
+  constructor(
+    private readonly index: number,
+    private readonly id: string,
+    private readonly name: string,
+  ) {}
+
+  push(delta: string): LocalStreamEvent[] {
+    const argumentsDelta = this.normalizeDelta(delta);
+    if (!argumentsDelta) return [];
+    const out: LocalStreamEvent[] = [];
+    if (!this.started) {
+      this.started = true;
+      out.push({
+        type: 'tool_call_delta',
+        index: this.index,
+        id: this.id,
+        name: this.name,
+        argumentsDelta: '',
+      });
+    }
+    out.push({
+      type: 'tool_call_delta',
+      index: this.index,
+      id: this.id,
+      name: this.name,
+      argumentsDelta,
+    });
+    return out;
+  }
+
+  private normalizeDelta(delta: string): string {
+    if (this.sawArgument) return delta;
+    const trimmed = delta.replace(/^\s+/, '');
+    if (trimmed) this.sawArgument = true;
+    return trimmed;
+  }
+}
+
 export function missingToolCallArgumentDelta(
   streamedArguments: string,
   finalCall: LocalToolCall,

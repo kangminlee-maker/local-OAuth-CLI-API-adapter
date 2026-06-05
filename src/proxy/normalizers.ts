@@ -7,6 +7,7 @@ import type {
   NormalizedReasoningEffort,
   NormalizedTool,
   NormalizedToolChoice,
+  NormalizedVerbosity,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
 
@@ -26,6 +27,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
     temperature: readOptionalNumber(input.temperature),
     reasoningEffort: readOpenAiReasoningEffort(input.reasoning_effort ?? asRecord(input.reasoning)?.effort),
+    verbosity: readOpenAiVerbosity(input.verbosity ?? asRecord(input.text)?.verbosity),
     stream: input.stream === true,
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: isOpenAiJsonMode(input.response_format),
@@ -53,6 +55,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     maxTokens: readOptionalNumber(input.max_output_tokens),
     temperature: readOptionalNumber(input.temperature),
     reasoningEffort: readOpenAiReasoningEffort(reasoning?.effort),
+    verbosity: readOpenAiVerbosity(text?.verbosity),
     stream: input.stream === true,
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: format?.type === 'json_object' || format?.type === 'json_schema',
@@ -76,6 +79,12 @@ function readOpenAiReasoningEffort(value: unknown): NormalizedReasoningEffort | 
     return value;
   }
   throw new ProxyRequestError('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.', 400);
+}
+
+function readOpenAiVerbosity(value: unknown): NormalizedVerbosity | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (value === 'low' || value === 'medium' || value === 'high') return value;
+  throw new ProxyRequestError('verbosity must be one of low, medium, or high.', 400);
 }
 
 export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequest {
@@ -503,7 +512,13 @@ function readOpenAiJsonSchema(value: unknown): unknown {
 }
 
 function readRole(value: unknown): NormalizedMessage['role'] {
-  if (value === 'system' || value === 'user' || value === 'assistant' || value === 'tool') {
+  if (
+    value === 'system'
+    || value === 'developer'
+    || value === 'user'
+    || value === 'assistant'
+    || value === 'tool'
+  ) {
     return value;
   }
   return 'user';

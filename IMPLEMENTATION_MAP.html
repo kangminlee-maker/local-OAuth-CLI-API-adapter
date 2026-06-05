@@ -1,533 +1,667 @@
 <!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>ggui OAuth CLI Add-on Implementation Map</title>
+  <title>ggui OAuth CLI 애드온 구현 지도</title>
   <style>
     :root {
       color-scheme: light;
       --ink: #202124;
       --muted: #5f6368;
-      --line: #dadce0;
-      --surface: #f8f9fa;
+      --line: #d8dee4;
+      --surface: #f6f8fa;
+      --soft: #eef4ff;
       --accent: #0b57d0;
       --ok: #137333;
       --warn: #b06000;
+      --bad: #b3261e;
+    }
+    * {
+      box-sizing: border-box;
     }
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", sans-serif;
       color: var(--ink);
-      background: white;
-      line-height: 1.5;
+      background: #fff;
+      line-height: 1.55;
     }
     main {
-      max-width: 1120px;
+      max-width: 1240px;
       margin: 0 auto;
-      padding: 32px 20px 48px;
+      padding: 32px 20px 56px;
     }
-    h1, h2 {
-      line-height: 1.2;
+    h1, h2, h3 {
+      line-height: 1.25;
       margin: 0;
     }
     h1 {
-      font-size: 28px;
+      font-size: 30px;
       margin-bottom: 8px;
     }
     h2 {
-      font-size: 18px;
-      margin-top: 28px;
+      font-size: 20px;
+      margin-top: 32px;
       margin-bottom: 12px;
+    }
+    h3 {
+      font-size: 16px;
+      margin: 18px 0 8px;
     }
     p {
       margin: 0 0 12px;
-      color: var(--muted);
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      border: 1px solid var(--line);
-      background: white;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 10px 12px;
-      text-align: left;
-      vertical-align: top;
-    }
-    th {
-      background: var(--surface);
-      font-size: 13px;
       color: var(--muted);
     }
     code {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 0.95em;
     }
-    .flow {
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    th, td {
+      border-bottom: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    tr:last-child td {
+      border-bottom: 0;
+    }
+    .lead {
+      font-size: 16px;
+      max-width: 980px;
+    }
+    .cards {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
     }
-    .step {
+    .card {
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 12px;
       background: var(--surface);
+      padding: 12px;
     }
-    .step strong {
+    .card strong {
       display: block;
       margin-bottom: 6px;
     }
+    .band {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--soft);
+      padding: 14px;
+      margin: 12px 0;
+    }
     .ok {
       color: var(--ok);
-      font-weight: 600;
+      font-weight: 700;
     }
     .warn {
       color: var(--warn);
-      font-weight: 600;
+      font-weight: 700;
     }
-    @media (max-width: 760px) {
-      .flow {
+    .bad {
+      color: var(--bad);
+      font-weight: 700;
+    }
+    .small {
+      display: inline-block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+    .table-wrap table {
+      min-width: 1180px;
+      border: 0;
+    }
+    .benchmark-section {
+      margin-top: 18px;
+    }
+    .benchmark-section h3 {
+      margin-top: 0;
+    }
+    .bench td:nth-child(4),
+    .bench td:nth-child(5),
+    .bench td:nth-child(6) {
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .model-work-table td:nth-child(n+2) {
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .diagnostic-table td:nth-child(2) {
+      text-align: right;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+    .sortable-table th button {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      width: 100%;
+      border: 0;
+      padding: 0;
+      color: inherit;
+      background: transparent;
+      font: inherit;
+      font-weight: 700;
+      text-align: left;
+      cursor: pointer;
+    }
+    .sortable-table th button::after {
+      content: "↕";
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .sortable-table th[aria-sort="ascending"] button::after {
+      content: "↑";
+      color: var(--accent);
+    }
+    .sortable-table th[aria-sort="descending"] button::after {
+      content: "↓";
+      color: var(--accent);
+    }
+    @media (max-width: 860px) {
+      .cards {
         grid-template-columns: 1fr;
+      }
+      main {
+        padding: 24px 14px 40px;
       }
     }
   </style>
 </head>
 <body>
   <main>
-    <h1>ggui OAuth CLI Add-on Implementation Map</h1>
-    <p>Current map for the local OAuth CLI API adapter, focused on runtime proxy behavior and benchmark-sensitive contracts.</p>
+    <h1>ggui OAuth CLI 애드온 구현 지도</h1>
+    <p class="lead">이 문서는 로컬 OAuth CLI를 OpenAI·Anthropic 호환 API 표면으로 노출하는 설치형 프록시의 현재 구현 경계, 검증 기준, 남은 최적화 지점을 한눈에 정리합니다.</p>
 
-    <h2>Runtime Flow</h2>
-    <section class="flow" aria-label="Runtime flow">
-      <div class="step">
-        <strong>1. HTTP API</strong>
-        <code>startLocalApiProxy</code> accepts OpenAI Chat, OpenAI Responses, OpenAI Images generation, and Anthropic Messages compatible requests.
+    <h2>현재 목표</h2>
+    <div class="band">
+      <p>프록시는 실제 provider API와 같은 입출력 표면을 보여야 하지만, 런타임에서는 direct provider API를 호출하지 않아야 합니다. direct API는 명시적인 비교 벤치마크, 기준 답변 생성, 품질 판정에만 사용합니다.</p>
+      <p><code>proxy-codex</code>의 OpenAI Chat 장애 보고서 의미 품질은 타임라인 보존 규칙 이후 95점 기준을 통과했습니다. 이미지 <code>b64_json</code> 생성은 단일 요청 품질 보강과 <code>n&gt;1</code> 병렬 실행을 반영했습니다. 남은 큰 병목은 이미지 스트리밍 첫 완성 이미지 지연과 더 넓은 semantic suite 반복 검증입니다.</p>
+    </div>
+
+    <h2>런타임 흐름</h2>
+    <section class="cards" aria-label="런타임 흐름">
+      <div class="card">
+        <strong>1. API 수신</strong>
+        <code>startLocalApiProxy</code>가 OpenAI Chat, OpenAI Responses, OpenAI Images, Anthropic Messages 호환 요청을 받습니다.
       </div>
-      <div class="step">
-        <strong>2. Normalize</strong>
-        Provider-shaped input is normalized into internal messages, tools, image references, image-generation fallback requests, schema mode, and stream mode.
+      <div class="card">
+        <strong>2. 요청 정규화</strong>
+        provider별 입력을 내부 메시지, 도구, 이미지 참조, 응답 형식, 스트리밍 모드, effort, verbosity로 변환합니다.
       </div>
-      <div class="step">
-        <strong>3. Local CLI Backend</strong>
-        Requests route to <code>CodexAppServerBackend</code> or <code>ClaudeCodeBackend</code> using local OAuth CLI auth.
+      <div class="card">
+        <strong>3. 로컬 CLI 실행</strong>
+        OpenAI 표면은 <code>CodexAppServerBackend</code>, Anthropic 표면은 <code>ClaudeCodeBackend</code>로 보내며, 자식 프로세스는 provider API 키를 받지 않습니다.
       </div>
-      <div class="step">
-        <strong>4. Provider Shape</strong>
-        Text, tool calls, streaming deltas, and provider token usage are mapped back to exact API-compatible responses.
+      <div class="card">
+        <strong>4. 응답 재구성</strong>
+        텍스트, 도구 호출, SSE delta, provider token usage, 이미지 응답을 원래 API 스키마에 맞춰 반환합니다.
       </div>
     </section>
 
-    <h2>Installable Package Boundary</h2>
+    <h2>구현 경계</h2>
     <table>
       <thead>
         <tr>
-          <th>Boundary</th>
-          <th>Current Authority</th>
-          <th>Reason</th>
-          <th>Verification</th>
+          <th>영역</th>
+          <th>현재 권위</th>
+          <th>의도</th>
+          <th>검증</th>
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td>CLI entry point</td>
-          <td><code>src/proxy-cli.ts</code> builds to <code>dist/proxy-cli.js</code> and is the only package bin.</td>
-          <td>The installable adapter should expose the proxy runtime without loading generator, add-on, or sibling-repository code.</td>
-          <td class="ok"><code>pnpm pack:adapter</code> installs the tarball into a temp consumer project and checks the bin help.</td>
+          <td>설치형 실행 파일</td>
+          <td><code>src/proxy-cli.ts</code>가 <code>dist/proxy-cli.js</code>로 빌드되어 패키지의 단일 bin이 됩니다.</td>
+          <td>다른 레포에서 이 저장소나 <code>@ggui-ai/*</code>에 의존하지 않고 독립 실행되도록 합니다.</td>
+          <td class="ok"><code>pnpm pack:adapter</code>, <code>pnpm test:e2e:adapter</code></td>
         </tr>
         <tr>
-          <td>Artifact contents</td>
-          <td><code>package.json files</code> plus <code>scripts/package-adapter.mjs</code> define and validate the distributable file set.</td>
-          <td>The package contains compiled proxy files, settings, README, and benchmark design docs only.</td>
-          <td class="ok">The package check rejects source, tests, repo-local paths, sibling package links, and <code>@ggui-ai/*</code> references.</td>
+          <td>프록시 런타임 격리</td>
+          <td><code>createCodexIsolation()</code>, <code>proxyChildProcessEnv()</code>, 임시 workspace root</td>
+          <td>로컬 OAuth 인증은 유지하되 프로젝트 파일, 사용자 메모리, MCP, 플러그인, direct provider env가 요청에 섞이지 않게 합니다.</td>
+          <td class="ok"><code>pnpm verify:runtime-boundary</code>, 낮은 병렬도의 <code>pnpm test</code>, 설치형 E2E</td>
         </tr>
         <tr>
-          <td>Consumer install</td>
-          <td>Other repositories install the verified <code>artifacts/*.tgz</code>, release asset, or registry package.</td>
-          <td>This avoids <code>file:../source-checkout</code> links and keeps the target repository independent from this working tree.</td>
-          <td class="ok"><code>pnpm test:e2e:adapter</code> also starts the installed bin in a temp consumer project and verifies HTTP chat and SSE streaming responses.</td>
+          <td>사용자 입력 보존</td>
+          <td><code>buildPrompt()</code>, <code>requestInstructionText()</code></td>
+          <td>사용자 prompt를 축약하지 않고, API의 system/developer 메시지만 Codex thread instruction으로 구조적으로 분리합니다. 지연·스트리밍·도구·usage 운영 보고서에서는 요청에 담긴 타임라인 체크포인트를 보존합니다.</td>
+          <td class="ok">역할 보존 테스트, 타임라인 보존 instruction 테스트, 로컬 role-fidelity 샘플 통과</td>
+        </tr>
+        <tr>
+          <td>요청 effort와 verbosity</td>
+          <td><code>settings.json</code>, <code>codexProxy.fallbackReasoningEffort</code>, <code>codexProxy.fallbackVerbosity</code></td>
+          <td>요청값이 있으면 API 요청을 따르고, 없으면 설정 파일의 medium 기본값을 사용합니다.</td>
+          <td class="ok">effort/verbosity 정규화 테스트와 로컬 proxy 샘플 통과</td>
+        </tr>
+        <tr>
+          <td><code>image-2</code> 대체 경로</td>
+          <td><code>src/proxy/image2-via-gpt55.ts</code>, Images API 정규화 로직</td>
+          <td><code>image-2</code> 요청을 정식 프록시 경로로 받아 Codex OAuth의 <code>gpt-5.5</code> 이미지 생성 능력에 매핑합니다. 현재 품질 매핑은 <code>high→high</code>, <code>medium→medium</code>, <code>low→low</code>입니다.</td>
+          <td class="ok">generation, URL 응답, streaming, edit, variation, disabled field 테스트</td>
         </tr>
       </tbody>
     </table>
 
-    <h2>Codex Proxy Context Isolation</h2>
+    <h2>벤치마크 읽는 법</h2>
+    <div class="band">
+      <p>아래 표는 현재 기준으로 direct와 proxy가 같은 suite에서 함께 측정된 속도·품질 행 전체를 <strong>Direct, Proxy, Proxy/Direct * 100 (%)</strong> 형태로 정리한 것입니다.</p>
+      <p>속도 행은 낮을수록 좋으므로 100% 초과는 proxy가 direct보다 느리다는 뜻입니다. 품질 행은 높을수록 좋으므로 100%에 가까울수록 direct 기준에 가까우며, 95점 미만은 현재 품질 게이트 미달입니다.</p>
+      <p>계약 오류 응답처럼 품질이나 체감 속도 판단이 아닌 스키마 호환성 행은 이 표에서 제외하고 근거 artifact에만 남겼습니다.</p>
+    </div>
+
+    <h2>속도 벤치마크 표</h2>
+    <section class="benchmark-section" aria-labelledby="speed-benchmark-title">
+      <h3 id="speed-benchmark-title">속도</h3>
+      <div class="table-wrap">
+        <table class="bench sortable-table">
+          <thead>
+            <tr>
+              <th scope="col" data-sort-type="text"><button type="button">표면</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">케이스</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">지표</button></th>
+              <th scope="col" data-sort-type="number"><button type="button">Direct</button></th>
+              <th scope="col" data-sort-type="number"><button type="button">Proxy</button></th>
+              <th scope="col" data-sort-type="number"><button type="button">Proxy/Direct * 100 (%)</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">판정</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">근거</button></th>
+            </tr>
+          </thead>
+          <tbody>
+              <tr><td>OpenAI Chat</td><td>텍스트</td><td>totalMs 중앙값</td><td>1,337</td><td>3,645</td><td>272.6%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>스트리밍</td><td>totalMs 중앙값</td><td>2,665</td><td>3,241</td><td>121.6%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>스트리밍</td><td>firstDataMs 중앙값</td><td>2,448</td><td>3</td><td>0.1%</td><td>Proxy 빠름</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code><br><span class="small">SSE 첫 데이터는 빈 이벤트와 메타 이벤트를 포함합니다.</span></td></tr>
+              <tr><td>OpenAI Chat</td><td>스트리밍</td><td>firstTextMs 중앙값</td><td>2,449</td><td>2,970</td><td>121.3%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>스트리밍 usage</td><td>totalMs 중앙값</td><td>1,452</td><td>3,690</td><td>254.1%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>스트리밍 usage</td><td>firstDataMs 중앙값</td><td>1,364</td><td>1</td><td>0.1%</td><td>Proxy 빠름</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code><br><span class="small">SSE 첫 데이터는 빈 이벤트와 메타 이벤트를 포함합니다.</span></td></tr>
+              <tr><td>OpenAI Chat</td><td>스트리밍 usage</td><td>firstTextMs 중앙값</td><td>1,366</td><td>3,499</td><td>256.1%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>도구 호출</td><td>totalMs 중앙값</td><td>2,620</td><td>4,309</td><td>164.5%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>도구 스트리밍</td><td>totalMs 중앙값</td><td>2,101</td><td>4,264</td><td>203.0%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>도구 스트리밍</td><td>firstDataMs 중앙값</td><td>1,998</td><td>1</td><td>0.1%</td><td>Proxy 빠름</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code><br><span class="small">SSE 첫 데이터는 빈 이벤트와 메타 이벤트를 포함합니다.</span></td></tr>
+              <tr><td>OpenAI Chat</td><td>도구 스트리밍</td><td>firstToolArgumentMs 중앙값</td><td>2,000</td><td>4,037</td><td>201.8%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>도구 결과</td><td>totalMs 중앙값</td><td>1,418</td><td>3,446</td><td>243.0%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>이미지 입력</td><td>totalMs 중앙값</td><td>1,558</td><td>2,563</td><td>164.5%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Chat</td><td>다중 이미지 입력</td><td>totalMs 중앙값</td><td>1,653</td><td>2,654</td><td>160.6%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Responses</td><td>텍스트</td><td>totalMs 중앙값</td><td>1,623</td><td>2,875</td><td>177.1%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Responses</td><td>스트리밍</td><td>totalMs 중앙값</td><td>1,850</td><td>2,792</td><td>150.9%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Responses</td><td>스트리밍</td><td>firstDataMs 중앙값</td><td>390</td><td>2</td><td>0.5%</td><td>Proxy 빠름</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code><br><span class="small">SSE 첫 데이터는 빈 이벤트와 메타 이벤트를 포함합니다.</span></td></tr>
+              <tr><td>OpenAI Responses</td><td>스트리밍</td><td>firstTextMs 중앙값</td><td>1,220</td><td>2,454</td><td>201.1%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Responses</td><td>도구 호출</td><td>totalMs 중앙값</td><td>1,563</td><td>3,156</td><td>201.9%</td><td>Proxy 느림</td><td><code>bench-responses-tool-arguments-only-20260605.json</code><br><span class="small">non-stream은 이번 3회에서 Codex turn tail latency가 커져 이전보다 나빠졌습니다.</span></td></tr>
+              <tr><td>OpenAI Responses</td><td>도구 스트리밍</td><td>totalMs 중앙값</td><td>1,246</td><td>2,111</td><td>169.4%</td><td>Proxy 느림</td><td><code>bench-responses-tool-arguments-only-20260605.json</code></td></tr>
+              <tr><td>OpenAI Responses</td><td>도구 스트리밍</td><td>firstDataMs 중앙값</td><td>366</td><td>1</td><td>0.3%</td><td>Proxy 빠름</td><td><code>bench-responses-tool-arguments-only-20260605.json</code><br><span class="small">SSE 첫 데이터는 빈 이벤트와 메타 이벤트를 포함합니다.</span></td></tr>
+              <tr><td>OpenAI Responses</td><td>도구 스트리밍</td><td>firstToolArgumentMs 중앙값</td><td>923</td><td>1,566</td><td>169.7%</td><td>Proxy 느림</td><td><code>bench-responses-tool-arguments-only-20260605.json</code><br><span class="small">arguments-only fast path 이후 이전 2,240ms 대비 674ms 줄었습니다.</span></td></tr>
+              <tr><td>OpenAI Responses</td><td>이미지 입력</td><td>totalMs 중앙값</td><td>1,928</td><td>3,375</td><td>175.1%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>OpenAI Responses</td><td>다중 이미지 입력</td><td>totalMs 중앙값</td><td>1,578</td><td>3,247</td><td>205.8%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>텍스트</td><td>totalMs 중앙값</td><td>1,755</td><td>2,057</td><td>117.2%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>스트리밍</td><td>totalMs 중앙값</td><td>1,393</td><td>2,070</td><td>148.6%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>스트리밍</td><td>firstDataMs 중앙값</td><td>1,047</td><td>1</td><td>0.1%</td><td>Proxy 빠름</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code><br><span class="small">SSE 첫 데이터는 빈 이벤트와 메타 이벤트를 포함합니다.</span></td></tr>
+              <tr><td>Anthropic Messages</td><td>스트리밍</td><td>firstTextMs 중앙값</td><td>1,049</td><td>1,703</td><td>162.3%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>도구 사용</td><td>totalMs 중앙값</td><td>1,791</td><td>2,215</td><td>123.7%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>도구 스트리밍</td><td>totalMs 중앙값</td><td>1,718</td><td>2,661</td><td>154.9%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>도구 스트리밍</td><td>firstDataMs 중앙값</td><td>1,364</td><td>1</td><td>0.1%</td><td>Proxy 빠름</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code><br><span class="small">SSE 첫 데이터는 빈 이벤트와 메타 이벤트를 포함합니다.</span></td></tr>
+              <tr><td>Anthropic Messages</td><td>도구 스트리밍</td><td>firstToolArgumentMs 중앙값</td><td>1,692</td><td>2,421</td><td>143.1%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>도구 결과</td><td>totalMs 중앙값</td><td>1,838</td><td>1,996</td><td>108.6%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>이미지 입력</td><td>totalMs 중앙값</td><td>2,113</td><td>3,595</td><td>170.1%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Anthropic Messages</td><td>다중 이미지 입력</td><td>totalMs 중앙값</td><td>1,571</td><td>3,637</td><td>231.5%</td><td>Proxy 느림</td><td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td></tr>
+              <tr><td>Images API</td><td>생성 b64_json</td><td>totalMs 중앙값</td><td>18,153</td><td>30,802</td><td>169.7%</td><td>Proxy 느림</td><td><code>bench-image-b64-flat-constraints-20260605.json</code><br><span class="small">flat/solid 색상 제약 보강 후 단일 b64 재측정입니다.</span></td></tr>
+              <tr><td>Images API</td><td>생성 b64_json n=3 병렬</td><td>totalMs 중앙값</td><td>19,402</td><td>69,542</td><td>358.4%</td><td>Proxy 느림</td><td><code>bench-image-b64-n3-parallel-flat-constraints-20260605.json</code><br><span class="small">direct 3장 중 1장이 품질 92점으로 흔들렸고, proxy는 최저 95점으로 통과했습니다.</span></td></tr>
+              <tr><td>Images API</td><td>API 필드 생성</td><td>totalMs 중앙값</td><td>41,691</td><td>26,043</td><td>62.5%</td><td>Proxy 빠름</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>스트리밍 생성</td><td>totalMs 중앙값</td><td>16,620</td><td>30,021</td><td>180.6%</td><td>Proxy 느림</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>스트리밍 생성</td><td>firstImageMs 중앙값</td><td>14,648</td><td>30,021</td><td>204.9%</td><td>Proxy 느림</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>실사 제품 생성</td><td>totalMs 중앙값</td><td>51,362</td><td>34,027</td><td>66.2%</td><td>Proxy 빠름</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>투명 자산 생성</td><td>totalMs 중앙값</td><td>49,057</td><td>67,153</td><td>136.9%</td><td>Proxy 느림</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>텍스트 포스터 생성</td><td>totalMs 중앙값</td><td>49,458</td><td>32,728</td><td>66.2%</td><td>Proxy 빠름</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code><br><span class="small">direct와 proxy 모두 품질 94점으로 95 게이트 미달입니다.</span></td></tr>
+              <tr><td>Images API</td><td>reference style 생성</td><td>totalMs 중앙값</td><td>57,775</td><td>27,399</td><td>47.4%</td><td>Proxy 빠름</td><td><code>bench-image-reference-realistic-20260605.json</code><br><span class="small">reference image를 judge 입력에 함께 제공했습니다.</span></td></tr>
+              <tr><td>Images API</td><td>reference product 생성</td><td>totalMs 중앙값</td><td>61,515</td><td>28,035</td><td>45.6%</td><td>Proxy 빠름</td><td><code>bench-image-reference-realistic-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>multi-reference hero 생성</td><td>totalMs 중앙값</td><td>67,129</td><td>39,188</td><td>58.4%</td><td>Proxy 빠름</td><td><code>bench-image-reference-realistic-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>편집</td><td>totalMs 중앙값</td><td>15,394</td><td>18,081</td><td>117.5%</td><td>Proxy 느림</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>구도 보존 편집</td><td>totalMs 중앙값</td><td>16,251</td><td>18,125</td><td>111.5%</td><td>Proxy 느림</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>다중 이미지 편집</td><td>totalMs 중앙값</td><td>20,060</td><td>21,292</td><td>106.1%</td><td>Proxy 느림</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>변형</td><td>totalMs 중앙값</td><td>17,855</td><td>19,814</td><td>111.0%</td><td>Proxy 느림</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>paired completed-image 스트리밍</td><td>totalMs 중앙값</td><td>17,300</td><td>64,067</td><td>370.3%</td><td>Proxy 느림</td><td><code>bench-image2-first-image-no-partial-completed-paired-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>paired completed-image 스트리밍</td><td>firstImageMs 중앙값</td><td>16,919</td><td>64,067</td><td>378.7%</td><td>Proxy 느림</td><td><code>bench-image2-first-image-no-partial-completed-paired-20260605.json</code><br><span class="small">partial image payload는 지원하지 않고 지표에서도 제외합니다.</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <h2>품질 벤치마크 표</h2>
+    <section class="benchmark-section" aria-labelledby="quality-benchmark-title">
+      <h3 id="quality-benchmark-title">품질</h3>
+      <div class="table-wrap">
+        <table class="bench sortable-table">
+          <thead>
+            <tr>
+              <th scope="col" data-sort-type="text"><button type="button">표면</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">케이스</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">지표</button></th>
+              <th scope="col" data-sort-type="number"><button type="button">Direct</button></th>
+              <th scope="col" data-sort-type="number"><button type="button">Proxy</button></th>
+              <th scope="col" data-sort-type="number"><button type="button">Proxy/Direct * 100 (%)</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">판정</button></th>
+              <th scope="col" data-sort-type="text"><button type="button">근거</button></th>
+            </tr>
+          </thead>
+          <tbody>
+              <tr><td>OpenAI Chat</td><td>realistic semantic suite</td><td>semanticQuality 최저점</td><td>100 (direct 기준)</td><td>95</td><td>95.0%</td><td>통과</td><td><code>bench-semantic-after-tool-args-only-final-20260605.json</code><br><span class="small">Chat 10개 행은 모두 95점 이상입니다.</span></td></tr>
+              <tr><td>OpenAI Chat</td><td>한국어 장애 보고서</td><td>semanticQuality 중앙값</td><td>100 (direct 기준)</td><td>98</td><td>98.0%</td><td>통과</td><td><code>bench-semantic-chat-timeline-detail-3x-20260605.json</code></td></tr>
+              <tr><td>OpenAI Responses</td><td>한국어 장애 보고서</td><td>semanticQuality</td><td>100 (direct 기준)</td><td>95</td><td>95.0%</td><td>통과</td><td><code>bench-semantic-after-tool-args-only-final-failures-fixed-20260605.json</code><br><span class="small">전체 suite 중 실패했던 행을 일반 규칙 보강 후 targeted closure로 재측정했습니다.</span></td></tr>
+              <tr><td>OpenAI Responses</td><td>provider error policy</td><td>semanticQuality</td><td>100 (direct 기준)</td><td>96</td><td>96.0%</td><td>통과</td><td><code>bench-semantic-after-tool-args-only-provider-error-fixed-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>생성 b64_json</td><td>imageQuality 중앙값</td><td>95</td><td>98</td><td>103.2%</td><td>통과</td><td><code>bench-image-b64-flat-constraints-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>생성 b64_json n=3 병렬</td><td>imageQuality 최저점</td><td>92</td><td>95</td><td>103.3%</td><td>Proxy 통과, direct 샘플 미달</td><td><code>bench-image-b64-n3-parallel-flat-constraints-20260605.json</code><br><span class="small">proxy-only 게이트 재확인은 <code>bench-image-b64-n3-parallel-proxy-gate-20260605.json</code>에서 최저 95점으로 통과했습니다.</span></td></tr>
+              <tr><td>Images API</td><td>API 필드 생성</td><td>imageQuality 중앙값</td><td>100</td><td>98</td><td>98.0%</td><td>통과</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>실사 제품 생성</td><td>imageQuality 중앙값</td><td>96</td><td>96</td><td>100.0%</td><td>통과</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>투명 자산 생성</td><td>imageQuality 중앙값</td><td>96</td><td>98</td><td>102.1%</td><td>통과</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>텍스트 포스터 생성</td><td>imageQuality 중앙값</td><td>94</td><td>94</td><td>100.0%</td><td class="bad">게이트 미달</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code><br><span class="small">direct 기준 대비 열화는 아니지만 95점 절대 게이트는 통과하지 못했습니다.</span></td></tr>
+              <tr><td>Images API</td><td>reference style 생성</td><td>imageQuality 중앙값</td><td>92</td><td>91</td><td>98.9%</td><td class="bad">게이트 미달</td><td><code>bench-image-reference-realistic-20260605.json</code><br><span class="small">direct와 proxy 모두 flat vector style에 미세 shading이 들어가 95점 미만입니다.</span></td></tr>
+              <tr><td>Images API</td><td>reference product 생성</td><td>imageQuality 중앙값</td><td>96</td><td>95</td><td>99.0%</td><td>통과</td><td><code>bench-image-reference-realistic-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>multi-reference hero 생성</td><td>imageQuality 중앙값</td><td>93</td><td>95</td><td>102.2%</td><td>Proxy 통과, direct 샘플 미달</td><td><code>bench-image-reference-realistic-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>편집</td><td>imageQuality 중앙값</td><td>100</td><td>100</td><td>100.0%</td><td>통과</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>구도 보존 편집</td><td>imageQuality 중앙값</td><td>96</td><td>96</td><td>100.0%</td><td>통과</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>다중 이미지 편집</td><td>imageQuality 중앙값</td><td>98</td><td>97</td><td>99.0%</td><td>통과</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+              <tr><td>Images API</td><td>변형</td><td>imageQuality 중앙값</td><td>96</td><td>100</td><td>104.2%</td><td>통과</td><td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <h2>벤치마크 해석</h2>
     <table>
       <thead>
         <tr>
-          <th>Concern</th>
-          <th>Current Authority</th>
-          <th>Reason</th>
-          <th>Verification</th>
+          <th>영역</th>
+          <th>현재 판단</th>
+          <th>다음 의미</th>
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td>User prompt preservation</td>
-          <td><code>buildPrompt(request)</code> remains the request payload authority.</td>
-          <td>The optimization removes ambient CLI context only; it does not summarize, rewrite, or shrink API input.</td>
-          <td class="ok">Schema/output parity tests and live benchmark completions pass.</td>
+          <td>OpenAI 텍스트·도구 속도</td>
+          <td class="warn"><code>proxy-codex</code>는 대부분 direct 대비 1.2배에서 2.7배 느립니다. Responses 도구 스트리밍의 firstToolArgumentMs는 arguments-only fast path 후 direct 대비 169.7%로 줄었지만, non-stream 도구 호출은 이번 3회에서 201.9%로 악화되었습니다.</td>
+          <td>도구 wrapper 파싱 지연은 줄었고, 남은 병목은 Codex app-server turn 내부의 첫 delta 및 tail latency입니다. firstData는 조기 SSE 이벤트 때문에 빠르게 보이므로 사용자 체감 지표로 쓰지 않습니다.</td>
         </tr>
         <tr>
-          <td>Codex auth</td>
-          <td><code>createCodexIsolation()</code> copies only <code>auth.json</code> into an ephemeral <code>CODEX_HOME</code>.</td>
-          <td>Local OAuth auth is preserved while user MCP, plugins, hooks, projects, memory, and history stay out of the proxy run.</td>
-          <td class="ok">Unit test asserts auth copy and config exclusion.</td>
+          <td>Anthropic 텍스트·도구 속도</td>
+          <td class="warn"><code>proxy-claude</code>는 direct Opus 대비 대체로 1.1배에서 2.3배 느립니다.</td>
+          <td>중앙값은 OpenAI proxy보다 안정적이지만, 멀티모달과 스트리밍 꼬리 지연을 계속 분리 계측해야 합니다.</td>
         </tr>
         <tr>
-          <td>Ambient tool context</td>
-          <td><code>DISABLED_CODEX_CONTEXT_FEATURES</code> disables apps, plugins, browser/computer tools, shell tool, multi-agent, hooks, goals, workspace dependencies, and Codex web search.</td>
-          <td>These features are useful in Codex sessions but inflate model-visible API proxy context.</td>
-          <td class="ok">Input tokens dropped from about 14k to about 1.9-2.0k in proxy-codex text/tool cases.</td>
+          <td>의미 품질</td>
+          <td class="ok">OpenAI Chat realistic semantic suite는 최종 10/10 통과했습니다. OpenAI Responses는 전체 suite 재측정에서 18/20이었고, 남은 두 케이스는 일반 규칙 보강 후 각각 95점, 96점으로 targeted closure 통과했습니다.</td>
+          <td>타임라인 체크포인트, proxy/direct 영향 범위, 조건-결과 연결, 부정 제약, provider error shape, 한국어 incident 문체를 일반 규칙으로 유지하고 3회 반복 suite로 안정성을 다시 확인해야 합니다.</td>
         </tr>
         <tr>
-          <td>Workspace context</td>
-          <td>Each Codex thread and turn uses an ephemeral temp workspace as <code>cwd</code> and <code>runtimeWorkspaceRoots</code>.</td>
-          <td>API completion requests should not read repository files or project instructions unless the API payload includes them.</td>
-          <td class="ok">AGENTS/project context no longer drives the proxy-codex token count.</td>
+          <td>이미지 품질</td>
+          <td class="warn">하향 effort 매핑 후 대부분 95점 이상을 유지하지만, 텍스트 포스터는 direct와 proxy 모두 94점으로 미달입니다. 새 reference style 생성도 direct 92점, proxy 91점으로 95점 미만입니다.</td>
+          <td>proxy만의 품질 열화는 아니지만, 텍스트가 포함된 이미지와 reference style transfer의 flatness/gradient 억제는 별도 개선 대상입니다. reference product와 multi-reference hero는 proxy가 95점으로 통과했습니다.</td>
+        </tr>
+        <tr>
+          <td>이미지 속도</td>
+          <td class="warn"><code>image2_via_gpt55</code> 하향 매핑 후 proxy 평균 totalMs는 이전 대비 46.4% 수준으로 줄었습니다. 단일 b64 생성은 최신 샘플에서 30.8초로 낮아졌고, <code>n&gt;1</code> 비스트리밍 요청은 병렬 실행으로 순차합 대신 가장 느린 이미지 turn tail을 기다립니다.</td>
+          <td>편집류는 direct에 근접했지만, b64 생성과 스트리밍 firstImageMs는 여전히 모델 turnWaitMs가 대부분입니다. partial image는 지원하지 않으므로, 남은 과제는 완성 이미지가 나오기까지의 Codex image turn 시간을 줄이는 것입니다.</td>
         </tr>
       </tbody>
     </table>
 
-    <h2>Benchmark Snapshot</h2>
+    <h2>Responses 도구 지연 분해</h2>
+    <div class="band">
+      <p>arguments-only fast path 이후 proxy의 HTTP/SSE 전달 오버헤드는 계속 작습니다. <code>firstToolArgumentMs</code> 1,566ms 중 backend 내부 <code>firstToolArgumentDeltaMs</code>가 1,563ms라서, HTTP forwarding 차이는 약 3ms입니다.</p>
+      <p>단일 required tool 경로는 더 이상 <code>status/text/toolCalls</code> wrapper를 모델이 생성할 때까지 기다리지 않습니다. <code>firstTextDeltaMs</code>, <code>firstToolCallDeltaMs</code>, <code>firstToolArgumentDeltaMs</code>가 모두 1,563ms로 맞춰졌으므로 남은 차이는 JSON wrapper 파싱보다 Codex turn의 첫 delta 지연입니다.</p>
+    </div>
+    <div class="table-wrap">
+      <table class="diagnostic-table sortable-table">
+        <thead>
+          <tr>
+            <th scope="col" data-sort-type="text"><button type="button">구간</button></th>
+            <th scope="col" data-sort-type="number"><button type="button">중앙값</button></th>
+            <th scope="col" data-sort-type="text"><button type="button">판단</button></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>proxy HTTP firstDataMs</td><td>1</td><td>초기 SSE 메타 이벤트는 즉시 나갑니다.</td></tr>
+          <tr><td>Codex firstTextDeltaMs</td><td>1,563</td><td>arguments-only JSON object의 첫 텍스트 delta가 나온 시점입니다.</td></tr>
+          <tr><td>Codex firstToolCallDeltaMs</td><td>1,563</td><td>forced single tool이라 첫 argument delta와 동시에 tool call delta를 만들 수 있습니다.</td></tr>
+          <tr><td>Codex firstToolArgumentDeltaMs</td><td>1,563</td><td>모델이 tool argument object를 내기 시작한 즉시 내부 delta로 전환됩니다.</td></tr>
+          <tr><td>proxy HTTP firstToolArgumentMs</td><td>1,566</td><td>backend delta 이후 HTTP 전달 오버헤드는 약 3ms입니다.</td></tr>
+          <tr><td>direct firstToolArgumentMs</td><td>923</td><td>provider native Responses tool stream 기준입니다.</td></tr>
+          <tr><td>proxy stream totalMs</td><td>2,111</td><td>direct stream totalMs 1,246ms 대비 169.4%입니다.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>이미지 모델 작업 비율</h2>
+    <div class="band">
+      <p><code>proxy-codex</code> 이미지 경로는 <code>turn/start</code> 이후 이미지 결과를 받을 때까지의 <code>turnWaitMs</code>를 모델 작업시간에 가장 가까운 proxy-side 값으로 기록합니다.</p>
+      <p>계산식은 <code>turnWaitMs / totalMs * 100</code>입니다. 이 값은 provider 내부의 순수 추론시간만 뜻하지는 않고, Codex app-server turn 처리와 이미지 결과 대기를 포함합니다. 그래도 HTTP wrapper, prompt 조립, thread 시작 같은 비모델 오버헤드를 분리해 병목 위치를 판단하는 데 사용할 수 있습니다.</p>
+    </div>
+    <div class="table-wrap">
+      <table class="model-work-table sortable-table">
+        <thead>
+          <tr>
+            <th scope="col" data-sort-type="text"><button type="button">케이스</button></th>
+            <th scope="col" data-sort-type="number"><button type="button">totalMs</button></th>
+            <th scope="col" data-sort-type="number"><button type="button">turnWaitMs</button></th>
+            <th scope="col" data-sort-type="number"><button type="button">모델 작업 비율</button></th>
+            <th scope="col" data-sort-type="number"><button type="button">비모델 오버헤드</button></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>생성 b64_json</td><td>30,802</td><td>29,938</td><td>97.2%</td><td>864</td></tr>
+          <tr><td>생성 b64_json n=3 병렬</td><td>59,561</td><td>58,829</td><td>98.8%</td><td>732</td></tr>
+          <tr><td>API 필드 생성</td><td>26,043</td><td>26,033</td><td>100.0%</td><td>10</td></tr>
+          <tr><td>URL 응답 생성</td><td>49,922</td><td>49,915</td><td>100.0%</td><td>7</td></tr>
+          <tr><td>스트리밍 생성</td><td>30,021</td><td>30,007</td><td>100.0%</td><td>14</td></tr>
+          <tr><td>실사 제품 생성</td><td>34,027</td><td>34,014</td><td>100.0%</td><td>13</td></tr>
+          <tr><td>투명 자산 생성</td><td>67,153</td><td>67,143</td><td>100.0%</td><td>10</td></tr>
+          <tr><td>텍스트 포스터 생성</td><td>32,728</td><td>32,704</td><td>99.9%</td><td>24</td></tr>
+          <tr><td>reference style 생성</td><td>27,399</td><td>26,653</td><td>97.3%</td><td>746</td></tr>
+          <tr><td>reference product 생성</td><td>28,035</td><td>28,023</td><td>100.0%</td><td>12</td></tr>
+          <tr><td>multi-reference hero 생성</td><td>39,188</td><td>39,172</td><td>100.0%</td><td>16</td></tr>
+          <tr><td>편집</td><td>18,081</td><td>18,067</td><td>99.9%</td><td>14</td></tr>
+          <tr><td>구도 보존 편집</td><td>18,125</td><td>18,114</td><td>99.9%</td><td>11</td></tr>
+          <tr><td>다중 이미지 편집</td><td>21,292</td><td>21,278</td><td>99.9%</td><td>14</td></tr>
+          <tr><td>multipart 스트리밍 편집</td><td>17,842</td><td>17,820</td><td>99.9%</td><td>22</td></tr>
+          <tr><td>변형</td><td>19,814</td><td>19,800</td><td>99.9%</td><td>14</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>근거 artifact</h2>
     <table>
       <thead>
         <tr>
-          <th>Case</th>
-          <th>Before</th>
-          <th>After</th>
-          <th>Impact</th>
+          <th>파일</th>
+          <th>역할</th>
+          <th>비고</th>
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td><code>proxy-codex openai.chat.text</code></td>
-          <td>5242ms, 13984 prompt tokens</td>
-          <td>1713ms, 1884 prompt tokens</td>
-          <td class="ok">67.3% lower latency, 86.5% lower input tokens</td>
+          <td><code>bench-current-provider-parity-speed-20260604-200423-opus.json</code></td>
+          <td>OpenAI direct, Anthropic Opus direct, proxy-codex, proxy-claude의 같은 케이스 3회 반복 속도 중앙값</td>
+          <td>일반 텍스트, 스트리밍, 도구, 이미지 입력 속도 표의 기준입니다.</td>
         </tr>
         <tr>
-          <td><code>proxy-codex openai.chat.tool_call</code></td>
-          <td>5154ms, 14147 prompt tokens</td>
-          <td>3294ms, 2047 prompt tokens</td>
-          <td class="ok">36.1% lower latency, 85.5% lower input tokens</td>
+          <td><code>bench-semantic-chat-timeline-detail-3x-20260605.json</code>, <code>bench-semantic-role-fidelity-incident-3x-20260605.json</code></td>
+          <td>direct provider 답변 기준의 의미 품질 3회 판정</td>
+          <td>OpenAI Chat은 타임라인 보존 규칙 이후 98점 중앙값으로 통과했고, OpenAI Responses는 기존 95점으로 통과입니다.</td>
         </tr>
         <tr>
-          <td><code>proxy-codex anthropic.messages.tool_result</code></td>
-          <td>4164ms, 14056 input tokens</td>
-          <td>1871ms, 1956 input tokens</td>
-          <td class="ok">55.1% lower latency, 86.1% lower input tokens</td>
+          <td><code>bench-responses-tool-diagnostics-20260605.json</code>, <code>bench-responses-tool-diagnostics-no-instructions-20260605.json</code>, <code>bench-responses-tool-diagnostics-low-effort-20260605.json</code></td>
+          <td>OpenAI Responses 도구 호출·도구 스트리밍의 direct/proxy 속도와 Codex app-server 내부 delta 타이밍</td>
+          <td>HTTP forwarding이 아니라 Codex turn 내부의 JSON tool decision 생성·파싱 구간이 주 병목입니다. no-instructions와 low effort는 구조적 개선을 만들지 못했습니다.</td>
         </tr>
         <tr>
-          <td><code>proxy-codex openai.chat.json_schema</code></td>
-          <td>4800ms, 14010 prompt tokens</td>
-          <td>3064ms, 1910 prompt tokens</td>
-          <td class="ok">36.2% lower latency, 86.4% lower input tokens</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h2>Claude Structured Fast Path</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Concern</th>
-          <th>Current Authority</th>
-          <th>Reason</th>
-          <th>Verification</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Structured non-image requests</td>
-          <td><code>ClaudeCodeBackend</code> now routes non-image JSON/tool requests through the persistent stream-json session.</td>
-          <td>This avoids per-request Claude process startup and expensive <code>--json-schema</code> structured-output validation for hot proxy paths.</td>
-          <td class="ok">OpenAI Chat tool_call dropped from 8174ms to 1955ms in the latest quality-gated benchmark.</td>
+          <td><code>bench-responses-tool-arguments-only-20260605.json</code></td>
+          <td>단일 required tool을 arguments-only schema로 실행한 뒤 OpenAI direct와 proxy-codex의 Responses 도구 속도 재측정</td>
+          <td>도구 스트리밍 firstToolArgumentMs는 2,240ms에서 1,566ms로 줄었지만, direct 923ms 대비 169.7%라 Codex turn 첫 delta 지연이 남았습니다.</td>
         </tr>
         <tr>
-          <td>Image requests</td>
-          <td>Image-bearing requests stay on the one-shot stream-json path.</td>
-          <td>Image payload setup and file cleanup remain isolated from the long-lived text session.</td>
-          <td class="ok">Real multimodal benchmark passed 9/9 after switching the benchmark fixture to a provider-accepted generated 64x64 red PNG.</td>
+          <td><code>bench-semantic-after-tool-args-only-final-20260605.json</code>, <code>bench-semantic-after-tool-args-only-final-failures-fixed-20260605.json</code>, <code>bench-semantic-after-tool-args-only-provider-error-fixed-20260605.json</code></td>
+          <td>arguments-only fast path와 semantic contract 규칙 보강 후 provider-paired realistic semantic quality 확인</td>
+          <td>전체 재측정은 18/20 통과였고, 남은 한국어 incident와 provider error policy는 일반 규칙 보강 후 targeted closure에서 각각 95점, 96점으로 통과했습니다.</td>
         </tr>
         <tr>
-          <td>Quality gate</td>
-          <td>Semantic quality benchmark uses provider-paired direct API references: proxy-codex compares with OpenAI API, proxy-claude with Anthropic API.</td>
-          <td>Context or schema enforcement changes can improve speed while subtly changing answer quality, and API-surface matching is not the same as backend-provider quality matching. The judge treats direct provider output as a semantic reference, not a strict style template.</td>
-          <td class="ok">Latest realistic semantic suite passed 24/24 with proxy semantic scores from 96 to 100 at a 95-point gate; latest non-multimodal schema run passed 54/54.</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h2>Image Generation Fallback</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Concern</th>
-          <th>Current Authority</th>
-          <th>Reason</th>
-          <th>Verification</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><code>image-2</code> Images API requests</td>
-          <td><code>/v1/images/generations</code>, <code>/v1/images/edits</code>, and <code>/v1/images/variations</code> normalize Images API input, then call OpenAI Responses with <code>gpt-5.5</code>, the built-in <code>image_generation</code> tool, and a <code>quality</code>-derived reasoning effort (<code>high/default -> xhigh</code>, <code>medium -> high</code>, <code>low -> medium</code>).</td>
-          <td>Direct probing showed <code>gpt-5.5</code> is rejected by the Images endpoint but succeeds through Responses <code>image_generation</code>, so the proxy preserves the caller-facing Images shape while using the viable provider path.</td>
-          <td class="ok">Expanded opt-in image benchmark passed 7/7; detail-focused follow-up passed 5/5 for API fields, multipart edit streaming, and multipart variation, alongside the 2/2 stream dedupe rerun.</td>
+          <td><code>bench-image-quality-opus-reference-20260604-203356.json</code></td>
+          <td>하향 effort 매핑 전 이미지 생성·편집·변형의 direct/proxy 속도와 vision judge 품질</td>
+          <td>이전 매핑에서는 proxy 평균 totalMs가 최신 하향 매핑 대비 약 2.15배 컸습니다.</td>
         </tr>
         <tr>
-          <td>Returned image shape</td>
-          <td>Proxy responses return <code>created</code>, exactly one of <code>data[].b64_json</code> or <code>data[].url</code>, optional metadata, and Images-compatible SSE events for streamed partial/final images.</td>
-          <td>GPT image outputs are base64 images; URL responses are served from a local in-memory generated-image store with a bounded TTL. Optional response metadata is emitted only when the proxy can derive it from request/result state.</td>
-          <td class="ok">Contract tests cover request routing, URL fetchback, streaming partial/final events, JSON edit image references, multipart <code>image[]</code> uploads, multipart-only variations, option validation, metadata preservation, and multi-image <code>n</code>.</td>
+          <td><code>bench-image2-first-image-no-partial-completed-paired-20260605.json</code></td>
+          <td>partial 미지원 정책 반영 후 paired completed-image 스트리밍 지연 비교</td>
+          <td>proxy firstImageMs는 64,067ms, direct completed image 기준은 16,919ms로 direct 대비 378.7%입니다. proxy turnWaitMs는 63,136ms로 전체의 98.5%입니다.</td>
+        </tr>
+        <tr>
+          <td><code>bench-image-proxy-model-work-pct-20260605.json</code></td>
+          <td>하향 effort 매핑 전 proxy-codex 이미지 경로의 totalMs, turnWaitMs, 모델 작업 비율 분리 계측</td>
+          <td>12개 이미지 항목의 모델 작업 비율은 98.9%에서 100.0%이며, 평균은 99.9%였습니다.</td>
+        </tr>
+        <tr>
+          <td><code>bench-image-effort-lowered-proxy-direct-20260605.json</code></td>
+          <td><code>image-2</code> 품질을 <code>gpt-5.5</code> 동일 effort로 낮춘 뒤 direct/proxy 속도, 품질, 모델 작업 비율 재측정</td>
+          <td>20개 행 통과, 2개 행 실패입니다. 실패는 텍스트 포스터 direct/proxy 각각 94점으로 95점 게이트 미달입니다.</td>
+        </tr>
+        <tr>
+          <td><code>bench-image-reference-realistic-20260605.json</code></td>
+          <td>reference image가 제공된 실사용형 이미지 생성 3축(style, product, multi-reference)의 direct/proxy 속도와 reference-aware vision judge 품질</td>
+          <td>proxy는 세 reference 케이스 모두 direct보다 빨랐습니다. product/multi-reference는 proxy 95점으로 통과했고, style reference는 direct 92점, proxy 91점으로 95점 게이트 미달입니다.</td>
+        </tr>
+        <tr>
+          <td><code>bench-image2-proxy-direct-api-fields-edit-after-generalized-route.json</code>, <code>bench-image2-general-image-cases-proxy-direct.json</code></td>
+          <td>이미지 필드·편집 일반화 보조 확인</td>
+          <td>표에는 최신 대표 artifact를 사용했고, 이 파일들은 같은 방향의 보조 근거입니다.</td>
         </tr>
       </tbody>
     </table>
 
-    <h2>Tool Result Continuation</h2>
+    <h2>다음 작업 목록</h2>
     <table>
       <thead>
         <tr>
-          <th>Concern</th>
-          <th>Current Authority</th>
-          <th>Reason</th>
-          <th>Verification</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Auto tool result turns</td>
-          <td><code>backend-contract</code> disables the proxy tool-decision schema only when <code>tool_choice</code> is <code>auto</code> and the latest normalized message is a provider tool result.</td>
-          <td>This matches the next step of the provider tool loop: after a tool result, the assistant normally produces a final message instead of another tool-decision envelope.</td>
-          <td class="ok">OpenAI Chat tool_result improved from 2465ms to 2003ms on proxy-codex and from 3496ms to 1514ms on proxy-claude.</td>
-        </tr>
-        <tr>
-          <td>Forced tool calls</td>
-          <td><code>required</code> and named tool choices still use the tool-decision schema.</td>
-          <td>Those requests explicitly ask the provider to choose or call tools, so the proxy still needs structured tool-call extraction.</td>
-          <td class="ok">Contract tests cover auto-before-tool, required-after-result, final-answer mode, and JSON-schema preservation.</td>
-        </tr>
-        <tr>
-          <td>Benchmark variance</td>
-          <td><code>api-comparison-benchmark</code> supports <code>--suite</code>, <code>--targets</code>, and <code>--cases</code> filters with exact, substring, and wildcard matching.</td>
-          <td>Single-sample latency gates can fail on Codex provider outliers unrelated to a changed branch, so outlier cases need targeted repeated medians, while suite presets prevent accidental case omissions.</td>
-          <td class="ok">Rows now include outlier tags; proxy-codex outliers also identify the dominant backend phase when timing is available.</td>
-        </tr>
-        <tr>
-          <td>API benchmark design</td>
-          <td><code>docs/api-benchmark-design.md</code> defines contract, provider parity, semantic quality, image quality, latency, and release-gate suites.</td>
-          <td>Quality checks must compare against the right direct provider authority and must use diverse real-use prompts and fixtures instead of a single friendly smoke case.</td>
-          <td class="ok">Benchmark implementation now includes suite presets, 10 semantic prompt shapes, direct Images positive/negative rows, image error parity rows, red/blue multi-image rows, and vision-based <code>imageQuality</code> gates; the lightweight real Images negative probe passed 7/7.</td>
-        </tr>
-        <tr>
-          <td>Codex JSON schema latency</td>
-          <td>No prompt-only schema or idle-thread prewarm fast path is active.</td>
-          <td>Both probes preserved schema exactness and semantic quality, but neither improved median latency over the structured-output baseline.</td>
-          <td class="warn">Baseline median 2088ms; prompt-only schema 2465ms; idle-thread prewarm 2605ms. Keep the structured schema path.</td>
-        </tr>
-        <tr>
-          <td>Compact Codex proxy context</td>
-          <td>Codex proxy threads and turns force <code>personality: none</code>, <code>model_reasoning_summary: none</code>, <code>web_search: disabled</code>, and shorter API-wrapper instructions.</td>
-          <td>This preserves the user prompt while removing proxy-added conversational context that direct provider APIs do not need.</td>
-          <td class="ok">Representative benchmark passed 14/14; semantic quality stayed 98-99; representative Codex input is now about 1.9-2.0k tokens.</td>
-        </tr>
-        <tr>
-          <td>Codex context floor probe</td>
-          <td>Direct app-server probes compared the product payload, no wrapper, base-only wrapper, and shorter wrapper variants.</td>
-          <td>The current wrapper is needed to suppress default Codex instructions; omitting it increased input from about 4.6k to 8.7k tokens.</td>
-          <td class="warn">A more aggressive shorter wrapper saved only about 33 tokens and weakens response guardrails, so it is not active.</td>
-        </tr>
-        <tr>
-          <td>Codex usage-tail timing</td>
-          <td>The Codex waiter now resolves immediately when provider token usage arrives after <code>turn/completed</code>, while keeping the 100ms fallback only for missing usage.</td>
-          <td>This preserves exact provider usage and removes a deterministic tail in reversed notification order without changing API response schemas.</td>
-          <td class="warn">Fake app-server test proves the tail removal. Real Codex timing probes show <code>usageWaitMs=0</code>; current latency is dominated by provider <code>turnWaitMs</code>.</td>
-        </tr>
-        <tr>
-          <td>Benchmark phase diagnostics</td>
-          <td><code>api-comparison-benchmark</code> records proxy-codex-only <code>backendTiming</code> summaries outside the public API response.</td>
-          <td>Contract exactness stays intact while benchmarks can separate local overhead from provider turn latency.</td>
-          <td class="ok">Six-case streaming probe passed 6/6; outliers were dominated by <code>turnWaitMs</code>, usually with 0.89-1.00 turn-wait share.</td>
-        </tr>
-        <tr>
-          <td>Codex partial streaming</td>
-          <td><code>CodexAppServerBackend</code> buffers text, completion, and provider-usage notifications that arrive before a turn waiter exists.</td>
-          <td>App-server can emit <code>item/agentMessage/delta</code> before <code>turn/completed</code>; buffering prevents early deltas from being lost if they race ahead of <code>turn/start</code> response handling.</td>
-          <td class="ok">Fake app-server race tests pass. Real protocol probe found <code>rawResponseItem/completed</code> is not earlier than text deltas, so <code>experimentalRawEvents</code> remains off.</td>
-        </tr>
-        <tr>
-          <td>Streaming first-latency comparison</td>
-          <td>Streaming benchmark now compares first text/tool-argument latency against direct OpenAI and Anthropic APIs; image stream rows also expose <code>firstImageMs</code>.</td>
-          <td>Public API schema stays exact while the benchmark separates first SSE data, first text, first tool argument/image payload, total latency, and proxy-codex backend phases.</td>
-          <td class="warn">The targeted paired <code>image-2</code> stream diagnostic passed 1/1 rows over 3 repeats before quota exhaustion. Proxy <code>firstImageMs</code> median was 9.620s versus direct Responses 13.741s, while total latency was 17.012s versus 14.274s. A later 10-repeat run reached provider <code>insufficient_quota</code>; stream errors now preserve provider fields and paired diagnostics retain <code>sampleFailures</code>.</td>
-        </tr>
-        <tr>
-          <td>Codex reasoning effort</td>
-          <td>Proxy-Codex reads request-level effort from OpenAI Chat <code>reasoning_effort</code> and Responses <code>reasoning.effort</code>.</td>
-          <td>The API request is the authority; CLI <code>--reasoning-effort</code> is an explicit override, and <code>settings.json</code> <code>codexProxy.fallbackReasoningEffort</code> is the fallback when both are omitted.</td>
-          <td class="ok">Supported efforts <code>none</code>, <code>low</code>, <code>medium</code>, <code>high</code>, and <code>xhigh</code> each passed 20/20 across four runs. <code>settings.json</code> currently selects <code>medium</code>. Current direct <code>gpt-5.5</code> rejects <code>minimal</code>; negative parity benchmark passed 4/4 with matching 400 invalid-request shapes.</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h2>Reasoning Effort Matrix</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Request Effort</th>
-          <th>Proxy Chat</th>
-          <th>Proxy Responses</th>
-          <th>Semantic Gate</th>
-          <th>Direct API Chat</th>
-          <th>Conclusion</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><code>none</code></td>
-          <td>1850ms median, 4219ms p95</td>
-          <td>1817ms median, 4516ms p95</td>
-          <td class="ok">99 score; 4855ms semantic median</td>
-          <td>1160ms median</td>
-          <td class="warn">Good quality, but schema p95 is noisy.</td>
-        </tr>
-        <tr>
-          <td><code>low</code></td>
-          <td>1812ms median, 7308ms p95</td>
-          <td>1728ms median, 3089ms p95</td>
-          <td class="ok">99 score; 3196ms semantic median</td>
-          <td>1265ms median</td>
-          <td class="warn">Fast median, but Chat p95 has the worst low-effort outlier.</td>
-        </tr>
-        <tr>
-          <td><code>medium</code></td>
-          <td>1911ms median, 3130ms p95</td>
-          <td>1781ms median, 2487ms p95</td>
-          <td class="ok">99 score; 2973ms semantic median</td>
-          <td>1397ms median</td>
-          <td class="ok">Best balanced effort after four runs: stable p95, high quality, and reasonable semantic latency.</td>
-        </tr>
-        <tr>
-          <td><code>high</code></td>
-          <td>2345ms median, 4614ms p95</td>
-          <td>2009ms median, 3388ms p95</td>
-          <td class="ok">99 score; 7454ms semantic median</td>
-          <td>1463ms median</td>
-          <td class="warn">Quality stays high, but semantic latency is consistently much slower.</td>
-        </tr>
-        <tr>
-          <td><code>xhigh</code></td>
-          <td>2956ms median, 5716ms p95</td>
-          <td>2408ms median, 3223ms p95</td>
-          <td class="ok">98 score; 10536ms semantic median</td>
-          <td>1593ms median</td>
-          <td class="warn">Not just a spike: higher effort creates a persistent latency tail without quality gain.</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h2>Next Optimization Queue</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Priority</th>
-          <th>Work</th>
-          <th>Expected Speed Impact</th>
-          <th>Expected Quality Impact</th>
+          <th>순서</th>
+          <th>작업</th>
+          <th>속도 영향</th>
+          <th>품질 영향</th>
+          <th>완료 기준</th>
         </tr>
       </thead>
       <tbody>
         <tr>
           <td>1</td>
-          <td>Reduce proxy-codex <code>turnWaitMs</code> and token floor without changing user prompts.</td>
-          <td class="ok">High; stream and semantic runs show proxy-codex latency is still dominated by provider turn wait.</td>
-          <td class="warn">Medium to high risk; wrapper/context changes must preserve provider-paired semantic scores at 95+.</td>
+          <td>Codex app-server turn 내부의 첫 delta와 tail latency를 더 분리합니다. 같은 prompt에서 thread/start, turn/start, first text delta, usage, completion 사이의 변동성을 반복 측정하고, warm thread와 fresh thread를 분리합니다.</td>
+          <td class="ok">높습니다. 도구 스트리밍 firstToolArgumentMs는 wrapper 제거 후에도 direct 대비 169.7%이고, semantic 벤치에서도 turnWaitMs가 14초대까지 튀었습니다.</td>
+          <td>낮거나 중간입니다. 계측 중심 작업이지만 context 격리 설정을 건드리면 품질 회귀 위험이 있습니다.</td>
+          <td>turnWaitMs outlier 원인 후보를 warm/fresh thread, model first delta, app-server queue, usage 후착 중 하나 이상으로 좁힘</td>
         </tr>
         <tr>
           <td>2</td>
-          <td>Evaluate native provider tool-call or lighter structured-output paths for proxy-codex.</td>
-          <td class="ok">High for first tool-argument latency if it avoids waiting for full schema JSON text.</td>
-          <td class="warn">High risk; must keep OpenAI/Anthropic tool-call stream schemas exact and avoid partial JSON regressions.</td>
+          <td>Responses tool native surface를 확인합니다. 현재 forced single tool은 arguments-only로 개선되었지만, 여러 tool 또는 auto tool decision은 여전히 wrapper schema 경로입니다.</td>
+          <td class="ok">높습니다. native tool delta를 받을 수 있으면 firstToolArgument가 direct에 더 가까워질 수 있습니다.</td>
+          <td class="warn">중간입니다. OpenAI Responses event schema와 tool choice semantics를 정확히 유지해야 합니다.</td>
+          <td>auto/multi-tool schema exact 통과, forced single tool 개선 유지, direct 대비 firstToolArgument 비율 추가 하락</td>
         </tr>
         <tr>
           <td>3</td>
-          <td>Stabilize proxy-claude latency outliers, especially image and OpenAI-shaped stream rows.</td>
-          <td>Medium; medians are close to direct API, but semantic and stream samples still show isolated long tails.</td>
-          <td>Low to medium; mostly runtime/session management, but image routing must preserve provider behavior.</td>
+          <td>이미지 스트리밍의 completed-image firstImageMs를 앞당길 수 있는 런타임 경로를 확인합니다. partial image는 지원하지 않고 <code>partial_images &gt; 0</code>은 400으로 거절합니다.</td>
+          <td class="ok">매우 높습니다. no-partial paired 기준 firstImageMs가 direct 대비 378.7%이고, proxy turnWaitMs가 전체의 98.5%입니다.</td>
+          <td>낮거나 중간입니다. 최종 이미지 품질만 유지하면 되지만, 모델/effort/프롬프트 변환을 바꾸면 품질 회귀 위험이 있습니다.</td>
+          <td>completed-image firstImageMs 개선, 최종 imageQuality 95점 이상 유지, <code>partial_images</code> 거절 계약 유지</td>
         </tr>
         <tr>
           <td>4</td>
-          <td>Run repeated provider-paired realistic semantic suite.</td>
-          <td>Low direct speed impact; it makes optimization decisions safer.</td>
-          <td class="ok">High; the suite now has 10 real task shapes, and final one-sample realistic suite passed 24/24 at 96-100, but repeats are still needed to measure variance.</td>
+          <td>provider-paired semantic realistic suite를 3회 반복으로 다시 실행합니다. 이번 작업은 targeted closure까지 통과했지만, 전체 20-row suite 단일 실행에서는 중간에 18/20도 관찰되었습니다.</td>
+          <td>낮거나 중간입니다. 품질 안정화 규칙은 출력이 조금 길어질 수 있습니다.</td>
+          <td class="ok">높습니다. 95점 게이트를 단일 성공이 아니라 반복 안정성으로 확인합니다.</td>
+          <td>Chat/Responses realistic semantic suite 3회 반복에서 모든 행 95점 이상 또는 실패 패턴의 일반 규칙화</td>
         </tr>
         <tr>
           <td>5</td>
-          <td>Extend usage-token parity reporting to compare proxy backend usage, public response usage, and direct provider usage side by side.</td>
-          <td>Low speed impact.</td>
-          <td class="ok">High contract value; it clarifies exact provider-usage authority while exposing token-floor regressions.</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <h2>Streaming Latency Snapshot</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Stream Case</th>
-          <th>Proxy-Codex</th>
-          <th>Proxy-Claude</th>
-          <th>Direct API</th>
-          <th>Interpretation</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>OpenAI Chat first text</td>
-          <td>2333ms</td>
-          <td>1404ms</td>
-          <td>885ms</td>
-          <td class="warn">Proxy-Codex sends first stream data in about 1ms, but first text still waits on Codex turn progress.</td>
-        </tr>
-        <tr>
-          <td>OpenAI Responses first text</td>
-          <td>3228ms</td>
-          <td>1284ms</td>
-          <td>1136ms</td>
-          <td class="warn">Responses stream shape is immediate, but proxy-codex text arrival is still turn-wait dominated.</td>
-        </tr>
-        <tr>
-          <td>OpenAI Chat first tool argument</td>
-          <td>2744ms</td>
-          <td>1786ms</td>
-          <td>689ms</td>
-          <td class="warn">Chat tool pre-start reduces first stream data to about 1ms, but actual arguments remain backend-gated.</td>
-        </tr>
-        <tr>
-          <td>OpenAI Responses first tool argument</td>
-          <td>3550ms</td>
-          <td>1743ms</td>
-          <td>985ms</td>
-          <td class="warn">Argument delta streaming works, but proxy-codex remains tied to provider turn completion.</td>
-        </tr>
-        <tr>
-          <td>Anthropic Messages first text</td>
-          <td>1598ms</td>
-          <td>1201ms</td>
-          <td>1088ms</td>
-          <td class="ok">Anthropic text streaming is now closer to direct API in this 3-repeat run.</td>
-        </tr>
-        <tr>
-          <td>Anthropic Messages first tool argument</td>
-          <td>2391ms</td>
-          <td>1526ms</td>
-          <td>1296ms</td>
-          <td class="ok">Proxy-Claude remains close to direct Sonnet; proxy-codex is slower but improved versus the previous 3.0s run.</td>
+          <td>provider API egress 금지와 benchmark anti-overfit 검사를 계속 전역 게이트로 유지합니다.</td>
+          <td>직접 속도 개선은 낮습니다.</td>
+          <td class="ok">높습니다. 프록시 목적과 품질 벤치 신뢰성을 지키는 안전장치입니다.</td>
+          <td><code>pnpm test</code>, <code>pnpm verify:runtime-boundary</code>, 설치형 E2E 통과</td>
         </tr>
       </tbody>
     </table>
   </main>
+  <script>
+    (() => {
+      const collator = new Intl.Collator('ko', { numeric: true, sensitivity: 'base' });
+
+      function numericValue(text) {
+        const normalized = text.replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+        return normalized ? Number(normalized[0]) : Number.NaN;
+      }
+
+      function cellValue(row, index, type) {
+        const text = row.cells[index]?.textContent?.trim() ?? '';
+        if (type === 'number') return numericValue(text);
+        return text;
+      }
+
+      function compareValues(left, right, type) {
+        if (type === 'number') {
+          const leftNumber = Number.isNaN(left) ? Number.NEGATIVE_INFINITY : left;
+          const rightNumber = Number.isNaN(right) ? Number.NEGATIVE_INFINITY : right;
+          return leftNumber - rightNumber;
+        }
+        return collator.compare(left, right);
+      }
+
+      function sortTable(table, columnIndex, type, direction) {
+        const tbody = table.tBodies[0];
+        const rows = Array.from(tbody.rows);
+        rows.sort((leftRow, rightRow) => {
+          const compared = compareValues(
+            cellValue(leftRow, columnIndex, type),
+            cellValue(rightRow, columnIndex, type),
+            type,
+          );
+          return direction === 'ascending' ? compared : -compared;
+        });
+        rows.forEach((row) => tbody.appendChild(row));
+      }
+
+      for (const table of document.querySelectorAll('.sortable-table')) {
+        const headers = Array.from(table.tHead.rows[0].cells);
+        headers.forEach((header, columnIndex) => {
+          const button = header.querySelector('button');
+          if (!button) return;
+          header.setAttribute('aria-sort', 'none');
+          button.addEventListener('click', () => {
+            const nextDirection = header.getAttribute('aria-sort') === 'ascending'
+              ? 'descending'
+              : 'ascending';
+            headers.forEach((item) => item.setAttribute('aria-sort', 'none'));
+            header.setAttribute('aria-sort', nextDirection);
+            sortTable(table, columnIndex, header.dataset.sortType ?? 'text', nextDirection);
+          });
+        });
+      }
+    })();
+  </script>
 </body>
 </html>

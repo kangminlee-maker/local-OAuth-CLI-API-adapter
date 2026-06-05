@@ -4,12 +4,15 @@ import readline from 'node:readline';
 import { AsyncQueue } from './async-queue.js';
 import {
   buildPrompt,
+  claudeSystemPrompt,
+  forcedSingleToolCall,
   hasToolDecisionSchema,
   outputSchemaFor,
   parseBackendOutput,
   usageFor,
 } from './backend-contract.js';
 import { claudeMessageContentFor, hasImageInputs } from './multimodal.js';
+import { proxyChildProcessEnv } from './process-env.js';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
@@ -17,7 +20,7 @@ import type {
   LocalUsage,
   NormalizedRequest,
 } from './types.js';
-import { ToolCallDeltaExtractor } from './tool-call-stream.js';
+import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface ClaudeCodeBackendOptions {
   readonly command?: string;
@@ -81,7 +84,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     signal?: AbortSignal,
   ): AsyncIterable<LocalStreamEvent> {
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const toolExtractor = hasToolDecisionSchema(request)
+    const forcedTool = forcedSingleToolCall(request);
+    const toolExtractor = forcedTool
+      ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
+      : hasToolDecisionSchema(request)
       ? new ToolCallDeltaExtractor()
       : null;
     const shouldStreamText = !toolExtractor && this.canStreamTextDeltas(request);
@@ -257,7 +263,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     ], {
       cwd: this.cwd,
       shell: false,
-      env: processEnv(),
+      env: proxyChildProcessEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -381,22 +387,7 @@ function schemaArgsFor(request: NormalizedRequest): string[] {
 function claudeContextIsolationArgs(): string[] {
   return [
     '--system-prompt',
-    [
-      'You are an API completion backend inside a local proxy.',
-      'Treat each user message as a standalone provider API request.',
-      'Do not use or mention repository files, git status, host tools, commands, browsing, memory, or inability to inspect them unless the user explicitly asks.',
-      'Do not add prefaces, caveats, file-status notes, or extra headings unless requested.',
-      'Preserve exact requested output counts, formats, and word limits.',
-      'Preserve numbers, thresholds, labels, and technical identifiers exactly.',
-      'Do not rename multi-word domain terms.',
-      'Preserve explicitly required phrases verbatim, including small words.',
-      'If a numeric threshold is described as a score or threshold, keep that qualifier.',
-      'When short cells or bullets are requested, use compact concrete factors from the prompt without parenthetical rationale.',
-      'For direction fields, keep explicit direction words and add only essential concrete factors.',
-      'Treat dominance as a major contributor, not a sole cause.',
-      'Do not invent product consequences, metrics, policies, or operational claims.',
-      'Do not add workflow actions, remediation, merge, deploy, or release conditions unless stated.',
-    ].join(' '),
+    claudeSystemPrompt(),
     '--disable-slash-commands',
     '--strict-mcp-config',
     '--mcp-config',
@@ -429,7 +420,7 @@ function runClaudeProcess(
     const child = spawn(command, [...args], {
       cwd: options.cwd,
       shell: false,
-      env: processEnv(),
+      env: proxyChildProcessEnv(),
       signal: controller.signal,
       stdio: options.stdinMessage ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
     });
@@ -561,13 +552,4 @@ function parseJsonObject(line: string): JsonObject | null {
 function asRecord(value: unknown): JsonObject | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as JsonObject;
-}
-
-function processEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    TERM: process.env.TERM && process.env.TERM !== 'dumb'
-      ? process.env.TERM
-      : 'xterm-256color',
-  };
 }

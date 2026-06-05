@@ -53,6 +53,7 @@ try {
   await assertModels(openAiBaseUrl);
   await assertChatCompletion(openAiBaseUrl);
   await assertChatStream(openAiBaseUrl);
+  await assertImage2Generation(openAiBaseUrl);
 
   process.stdout.write(`installed adapter E2E passed: ${openAiBaseUrl}\n`);
 } finally {
@@ -116,7 +117,12 @@ function startProxy(consumerDir, codexHome, fakeCodexPath, port) {
     detached: process.platform !== 'win32',
     env: {
       ...process.env,
+      ANTHROPIC_API_KEY: 'fake-anthropic-key',
+      ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
       CODEX_HOME: codexHome,
+      FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV: '1',
+      OPENAI_API_KEY: 'fake-openai-key',
+      OPENAI_BASE_URL: 'https://api.openai.com/v1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -221,6 +227,19 @@ async function assertChatStream(baseUrl) {
   assert.ok(chunks.some((chunk) => chunk.usage?.prompt_tokens === 7));
 }
 
+async function assertImage2Generation(baseUrl) {
+  const res = await postJson(`${baseUrl}/images/generations`, {
+    model: 'image-2',
+    prompt: 'A small red square.',
+    response_format: 'b64_json',
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.data.length, 1);
+  assert.match(Buffer.from(body.data[0].b64_json, 'base64').toString('utf8'), /installed-fake-image/);
+  assert.equal(body.data[0].revised_prompt, 'installed fake revised image prompt');
+}
+
 async function postJson(url, body) {
   return fetch(url, {
     method: 'POST',
@@ -280,6 +299,8 @@ function killProcess(child, signal) {
 function fakeCodexSource() {
   return String.raw`#!/usr/bin/env node
 const readline = require('node:readline');
+
+assertNoDirectProviderEnv();
 
 let threadSeq = 0;
 let turnSeq = 0;
@@ -352,6 +373,38 @@ function emitEarlyTurn(threadId, turnId) {
   });
 }
 
+function emitImageTurn(threadId, turnId) {
+  write({
+    method: 'item/completed',
+    params: {
+      threadId,
+      turnId,
+      item: {
+        type: 'imageGeneration',
+        id: 'image_' + turnId,
+        status: 'completed',
+        revisedPrompt: 'installed fake revised image prompt',
+        result: Buffer.from('installed-fake-image'.repeat(90)).toString('base64'),
+      },
+    },
+  });
+  write({
+    method: 'thread/tokenUsage/updated',
+    params: {
+      threadId,
+      turnId,
+      tokenUsage: { last: usage(17, 11, 4, 6, 2) },
+    },
+  });
+  write({
+    method: 'turn/completed',
+    params: {
+      threadId,
+      turn: { id: turnId, status: 'completed' },
+    },
+  });
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   let payload;
@@ -375,7 +428,13 @@ rl.on('line', (line) => {
     turnSeq += 1;
     const threadId = payload.params && payload.params.threadId || 'thread_' + threadSeq;
     const turnId = 'turn_' + turnSeq;
-    if (inputText(payload).includes('EARLY_DELTA')) {
+    const input = inputText(payload);
+    if (input.includes('imageGeneration result')) {
+      result(payload.id, { turn: { id: turnId } });
+      setTimeout(() => emitImageTurn(threadId, turnId), 0);
+      return;
+    }
+    if (input.includes('EARLY_DELTA')) {
       emitEarlyTurn(threadId, turnId);
       result(payload.id, { turn: { id: turnId } });
       return;
@@ -398,5 +457,44 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => process.exit(0));
+
+function assertNoDirectProviderEnv() {
+  if (process.env.FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV !== '1') return;
+  const found = Object.keys(process.env).filter(isDirectProviderEnvName);
+  if (found.length > 0) {
+    process.stderr.write('direct provider env leaked to installed fake codex: ' + found.join(',') + '\n');
+    process.exit(91);
+  }
+}
+
+function isDirectProviderEnvName(name) {
+  const prefixes = [
+    'ANTHROPIC',
+    'AZURE_OPENAI',
+    'COHERE',
+    'DEEPSEEK',
+    'GEMINI',
+    'GOOGLE',
+    'GROQ',
+    'MISTRAL',
+    'OPENAI',
+    'OPENROUTER',
+    'PERPLEXITY',
+    'TOGETHER',
+    'XAI',
+  ];
+  const suffixes = [
+    'ACCESS_TOKEN',
+    'API_BASE',
+    'API_KEY',
+    'AUTH_TOKEN',
+    'BASE_URL',
+    'ENDPOINT',
+    'ORG_ID',
+    'ORGANIZATION',
+    'PROJECT',
+  ];
+  return prefixes.some((prefix) => suffixes.some((suffix) => name === prefix + '_' + suffix));
+}
 `;
 }

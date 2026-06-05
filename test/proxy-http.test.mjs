@@ -73,6 +73,14 @@ beforeEach(async () => {
           outputFormat: request.outputFormat,
           quality: request.quality,
           size: request.size,
+          usage: {
+            inputTokens: 11,
+            outputTokens: 6,
+            totalTokens: 17,
+            cachedInputTokens: 4,
+            reasoningOutputTokens: 2,
+            source: 'provider',
+          },
           latencyMs: 1,
         };
       },
@@ -161,11 +169,162 @@ afterEach(async () => {
 });
 
 test('image-2 quality maps to gpt-5.5 reasoning effort', () => {
-  assert.equal(openAiImageQualityReasoningEffort(undefined), 'xhigh');
-  assert.equal(openAiImageQualityReasoningEffort('high'), 'xhigh');
-  assert.equal(openAiImageQualityReasoningEffort('medium'), 'high');
-  assert.equal(openAiImageQualityReasoningEffort('low'), 'medium');
-  assert.equal(openAiImageQualityReasoningEffort('auto'), 'xhigh');
+  assert.equal(openAiImageQualityReasoningEffort(undefined), 'high');
+  assert.equal(openAiImageQualityReasoningEffort('high'), 'high');
+  assert.equal(openAiImageQualityReasoningEffort('medium'), 'medium');
+  assert.equal(openAiImageQualityReasoningEffort('low'), 'low');
+  assert.equal(openAiImageQualityReasoningEffort('auto'), 'high');
+});
+
+test('default Images API proxy rejects local CLI image generation without direct OpenAI fallback', async () => {
+  const originalKey = process.env.OPENAI_API_KEY;
+  const originalFetch = globalThis.fetch;
+  process.env.OPENAI_API_KEY = 'fake-openai-key';
+  let openAiCalls = 0;
+  const localOnly = await startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 10_000,
+    backend: {
+      name: 'fake-backend',
+      model: 'fake-local-model',
+      async generate() {
+        throw new Error('text backend should not be used for images');
+      },
+      async close() {},
+    },
+  });
+
+  globalThis.fetch = async (url, init) => {
+    const target = typeof url === 'string' ? url : url instanceof URL ? url.href : url?.url;
+    if (typeof target === 'string' && target.startsWith('https://api.openai.com/')) {
+      openAiCalls += 1;
+      throw new Error('unexpected direct OpenAI API call');
+    }
+    return originalFetch(url, init);
+  };
+
+  try {
+    const res = await fetch(`${localOnly.url}/v1/images/generations`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-image-1.5',
+        prompt: 'A small red square.',
+      }),
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 501);
+    assert.equal(body.error.type, 'unsupported_feature');
+    assert.match(body.error.message, /Direct OpenAI API fallback is disabled/);
+    assert.equal(openAiCalls, 0);
+  } finally {
+    await localOnly.close();
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = originalKey;
+  }
+});
+
+test('default streaming Images API proxy reports unsupported without direct OpenAI fallback', async () => {
+  const localOnly = await startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 10_000,
+    backend: {
+      name: 'fake-backend',
+      model: 'fake-local-model',
+      async generate() {
+        throw new Error('text backend should not be used for images');
+      },
+      async close() {},
+    },
+  });
+
+  try {
+    const res = await fetch(`${localOnly.url}/v1/images/generations`, {
+      method: 'POST',
+      headers: {
+        authorization: 'Bearer local',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-image-1.5',
+        prompt: 'A streaming red square.',
+        stream: true,
+      }),
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /event: error/);
+    assert.match(text, /"type":"unsupported_feature"/);
+    assert.match(text, /Direct OpenAI API fallback is disabled/);
+  } finally {
+    await localOnly.close();
+  }
+});
+
+test('POST /v1/images/generations accepts image-2 through the local image2_via_gpt55 route', async () => {
+  const res = await fetch(`${started.url}/v1/images/generations`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer local',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'image-2',
+      prompt: 'A small red square.',
+      response_format: 'b64_json',
+    }),
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].model, 'image-2');
+  assert.equal(seenImageGenerationRequests[0].responseFormat, 'b64_json');
+  assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:A small red square.').toString('base64'));
+});
+
+test('POST /v1/images/generations reports image-2 transparent background as a disabled model value', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'A transparent sticker.',
+    background: 'transparent',
+    output_format: 'png',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'image_generation_user_error');
+  assert.equal(body.error.param, 'tools');
+  assert.equal(body.error.code, 'invalid_value');
+  assert.match(body.error.message, /Transparent background is not supported/);
+});
+
+test('POST /v1/images/generations rejects response_format for GPT image models', async () => {
+  const res = await fetch(`${started.url}/v1/images/generations`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer local',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-image-1.5',
+      prompt: 'A small red square.',
+      response_format: 'b64_json',
+    }),
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.equal(body.error.param, 'response_format');
+  assert.equal(body.error.code, 'unknown_parameter');
 });
 
 test('GET /v1/models returns an OpenAI-compatible model list', async () => {
@@ -252,9 +411,9 @@ test('POST /v1/responses preserves input_image URL parts', async () => {
   assert.equal(seenRequests[0].messages[0].images[0].detail, 'low');
 });
 
-test('POST /v1/images/generations maps image-2 requests to the image generation client', async () => {
+test('POST /v1/images/generations maps GPT image requests to the image generation client', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'gpt-image-1.5',
     prompt: 'A small red square.',
     n: 2,
     size: '1024x1024',
@@ -264,14 +423,13 @@ test('POST /v1/images/generations maps image-2 requests to the image generation 
     background: 'opaque',
     moderation: 'low',
     user: 'end-user-123',
-    response_format: 'b64_json',
   });
   const body = await res.json();
 
   assert.equal(res.status, 200);
   assert.equal(seenRequests.length, 0);
   assert.equal(seenImageGenerationRequests.length, 1);
-  assert.equal(seenImageGenerationRequests[0].model, 'image-2');
+  assert.equal(seenImageGenerationRequests[0].model, 'gpt-image-1.5');
   assert.equal(seenImageGenerationRequests[0].prompt, 'A small red square.');
   assert.equal(seenImageGenerationRequests[0].n, 2);
   assert.equal(seenImageGenerationRequests[0].size, '1024x1024');
@@ -286,6 +444,11 @@ test('POST /v1/images/generations maps image-2 requests to the image generation 
   assert.equal(body.quality, 'low');
   assert.equal(body.output_format, 'webp');
   assert.equal(body.background, 'opaque');
+  assert.equal(body.usage.input_tokens, 11);
+  assert.equal(body.usage.output_tokens, 6);
+  assert.equal(body.usage.total_tokens, 17);
+  assert.equal(body.usage.input_tokens_details.cached_tokens, 4);
+  assert.equal(body.usage.output_tokens_details.reasoning_tokens, 2);
   assert.equal(body.data.length, 2);
   assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:A small red square.').toString('base64'));
   assert.equal(body.data[0].revised_prompt, 'revised 1: A small red square.');
@@ -293,7 +456,7 @@ test('POST /v1/images/generations maps image-2 requests to the image generation 
 
 test('POST /v1/images/generations supports URL response format with local image URLs', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'dall-e-2',
     prompt: 'A small red square.',
     response_format: 'url',
   });
@@ -317,31 +480,45 @@ test('POST /v1/images/generations supports URL response format with local image 
   );
 });
 
-test('POST /v1/images/generations streams partial and completed image events', async () => {
+test('POST /v1/images/generations streams completed image events without partial output', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'gpt-image-1.5',
     prompt: 'A streaming red square.',
     stream: true,
-    partial_images: 1,
   });
   const text = await res.text();
 
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-type') ?? '', /text\/event-stream/);
   assert.equal(seenImageGenerationRequests[0].stream, true);
-  assert.equal(seenImageGenerationRequests[0].partialImages, 1);
-  assert.match(text, /event: image_generation\.partial_image/);
-  assert.match(text, /"type":"image_generation\.partial_image"/);
-  assert.match(text, /"partial_image_index":0/);
+  assert.equal(seenImageGenerationRequests[0].partialImages, 0);
+  assert.doesNotMatch(text, /image_generation\.partial_image/);
   assert.match(text, /event: image_generation\.completed/);
   assert.match(text, /"type":"image_generation\.completed"/);
   assert.equal((text.match(/event: image_generation\.completed/g) ?? []).length, 1);
   assert.match(text, /"b64_json"/);
 });
 
+test('POST /v1/images/generations rejects partial_images because partial output is unsupported', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'gpt-image-1.5',
+    prompt: 'A streaming red square.',
+    stream: true,
+    partial_images: 1,
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'image_generation_user_error');
+  assert.equal(body.error.param, 'partial_images');
+  assert.equal(body.error.code, 'unsupported_value');
+  assert.match(body.error.message, /partial_images is not supported/);
+  assert.equal(seenImageGenerationRequests.length, 0);
+});
+
 test('POST /v1/images/generations stream preserves provider error fields', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'gpt-image-1.5',
     prompt: 'FAIL_IMAGE_STREAM_PROVIDER',
     stream: true,
   });
@@ -356,7 +533,7 @@ test('POST /v1/images/generations stream preserves provider error fields', async
 
 test('POST /v1/images/edits accepts JSON image references', async () => {
   const res = await postJson('/v1/images/edits', {
-    model: 'image-2',
+    model: 'gpt-image-1.5',
     prompt: 'Make the square green.',
     images: [{ image_url: pngDataUrl }],
     mask: { image_url: pngDataUrl },
@@ -364,7 +541,6 @@ test('POST /v1/images/edits accepts JSON image references', async () => {
     output_format: 'jpeg',
     output_compression: 55,
     moderation: 'auto',
-    response_format: 'b64_json',
   });
   const body = await res.json();
 
@@ -380,15 +556,30 @@ test('POST /v1/images/edits accepts JSON image references', async () => {
   assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Make the square green.').toString('base64'));
 });
 
+test('POST /v1/images/edits reports image-2 input_fidelity as an API-disabled field', async () => {
+  const res = await postJson('/v1/images/edits', {
+    model: 'image-2',
+    prompt: 'Make the square green.',
+    images: [{ image_url: pngDataUrl }],
+    input_fidelity: 'high',
+    response_format: 'b64_json',
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'image_generation_user_error');
+  assert.equal(body.error.param, 'tools');
+  assert.equal(body.error.code, 'invalid_input_fidelity_model');
+});
+
 test('POST /v1/images/edits accepts multipart image array fields and string options', async () => {
   const form = new FormData();
-  form.set('model', 'image-2');
+  form.set('model', 'gpt-image-1.5');
   form.append('image[]', new Blob([Buffer.from('fake-png-1')], { type: 'image/png' }), 'source-1.png');
   form.append('image[]', new Blob([Buffer.from('fake-png-2')], { type: 'image/png' }), 'source-2.png');
   form.set('prompt', 'Combine these images.');
   form.set('n', '2');
   form.set('stream', 'true');
-  form.set('partial_images', '1');
   const res = await fetch(`${started.url}/v1/images/edits`, {
     method: 'POST',
     headers: { authorization: 'Bearer local' },
@@ -401,14 +592,14 @@ test('POST /v1/images/edits accepts multipart image array fields and string opti
   assert.equal(seenImageGenerationRequests[0].images.length, 2);
   assert.equal(seenImageGenerationRequests[0].n, 2);
   assert.equal(seenImageGenerationRequests[0].stream, true);
-  assert.equal(seenImageGenerationRequests[0].partialImages, 1);
-  assert.match(text, /event: image_edit\.partial_image/);
+  assert.equal(seenImageGenerationRequests[0].partialImages, 0);
+  assert.doesNotMatch(text, /image_edit\.partial_image/);
   assert.match(text, /event: image_edit\.completed/);
 });
 
 test('POST /v1/images/variations accepts multipart image uploads', async () => {
   const form = new FormData();
-  form.set('model', 'image-2');
+  form.set('model', 'dall-e-2');
   form.set('image', new Blob([Buffer.from('fake-png')], { type: 'image/png' }), 'source.png');
   form.set('response_format', 'b64_json');
   const res = await fetch(`${started.url}/v1/images/variations`, {
@@ -427,9 +618,27 @@ test('POST /v1/images/variations accepts multipart image uploads', async () => {
   assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Create a variation of the provided image.').toString('base64'));
 });
 
+test('POST /v1/images/variations accepts image-2 multipart uploads through image2_via_gpt55', async () => {
+  const form = new FormData();
+  form.set('model', 'image-2');
+  form.set('image', new Blob([Buffer.from('fake-png')], { type: 'image/png' }), 'source.png');
+  form.set('response_format', 'b64_json');
+  const res = await fetch(`${started.url}/v1/images/variations`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer local' },
+    body: form,
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].operation, 'variation');
+  assert.equal(seenImageGenerationRequests[0].model, 'image-2');
+  assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Create a variation of the provided image.').toString('base64'));
+});
+
 test('POST /v1/images/variations rejects JSON image input to match the Images API form-data shape', async () => {
   const res = await postJson('/v1/images/variations', {
-    model: 'image-2',
+    model: 'dall-e-2',
     image: pngDataUrl,
     response_format: 'b64_json',
   });
@@ -442,7 +651,7 @@ test('POST /v1/images/variations rejects JSON image input to match the Images AP
 
 test('POST /v1/images/generations rejects output compression without jpeg or webp output', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'gpt-image-1.5',
     prompt: 'A small red square.',
     output_format: 'png',
     output_compression: 80,
@@ -450,8 +659,8 @@ test('POST /v1/images/generations rejects output compression without jpeg or web
   const body = await res.json();
 
   assert.equal(res.status, 400);
-  assert.equal(body.error.type, 'invalid_request_error');
-  assert.match(body.error.message, /output_compression/);
+  assert.equal(body.error.type, 'image_generation_user_error');
+  assert.equal(body.error.code, 'invalid_png_output_compression');
 });
 
 test('POST /v1/messages preserves Anthropic image blocks', async () => {

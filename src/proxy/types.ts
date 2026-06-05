@@ -1,9 +1,10 @@
 export type ApiShape = 'openai-chat' | 'openai-responses' | 'anthropic-messages';
 
 export type NormalizedReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type NormalizedVerbosity = 'low' | 'medium' | 'high';
 
 export interface NormalizedMessage {
-  readonly role: 'system' | 'user' | 'assistant' | 'tool';
+  readonly role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
   readonly content: string;
   readonly images: readonly NormalizedImage[];
 }
@@ -47,6 +48,7 @@ export interface NormalizedRequest {
   readonly maxTokens?: number;
   readonly temperature?: number;
   readonly reasoningEffort?: NormalizedReasoningEffort;
+  readonly verbosity?: NormalizedVerbosity;
   readonly stream: boolean;
   readonly streamOptions: NormalizedStreamOptions;
   readonly jsonMode: boolean;
@@ -143,6 +145,7 @@ export interface OpenAiImageGenerationClient {
     request: OpenAiImageGenerationRequest,
     signal?: AbortSignal,
   ): AsyncIterable<OpenAiImageGenerationStreamEvent>;
+  close?(): Promise<void>;
 }
 
 export type LocalStreamEvent =
@@ -181,6 +184,8 @@ export class ProxyRequestError extends Error {
     readonly statusCode: number,
     readonly provider: 'openai' | 'anthropic' = 'openai',
     readonly type = 'invalid_request_error',
+    readonly param: string | null = null,
+    readonly code: string | null = null,
   ) {
     super(message);
   }

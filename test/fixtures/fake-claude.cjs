@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 const readline = require('node:readline');
 
+assertNoDirectProviderEnv();
+
 const args = process.argv.slice(2);
 const isPersistent = args.includes('--input-format') && args.includes('stream-json');
 const hasSchema = args.includes('--json-schema');
 const systemPromptIndex = args.indexOf('--system-prompt');
+const jsonSchema = readJsonSchemaArg();
+const isToolArgumentsOnlySchema = Boolean(jsonSchema?.properties?.city)
+  && !jsonSchema?.properties?.toolCalls;
 
 if (
   systemPromptIndex === -1
@@ -118,6 +123,47 @@ function emitStructured() {
   });
 }
 
+function emitToolArgumentsOnly() {
+  const structured_output = { city: 'Seoul' };
+  const streamed = '{"city":"Seoul"}';
+  write({ type: 'system', subtype: 'init', session_id: 'fake_session' });
+  write({ type: 'stream_event', event: { type: 'message_start' }, session_id: 'fake_session' });
+  write({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_start',
+      index: 0,
+      content_block: { type: 'text', text: '' },
+    },
+    session_id: 'fake_session',
+  });
+  for (const delta of ['{"city"', ':"Seoul"}']) {
+    write({
+      type: 'stream_event',
+      event: {
+        type: 'content_block_delta',
+        index: 0,
+        delta: { type: 'text_delta', text: delta },
+      },
+      session_id: 'fake_session',
+    });
+  }
+  write({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 }, session_id: 'fake_session' });
+  write({
+    type: 'result',
+    subtype: 'success',
+    result: streamed,
+    structured_output,
+    session_id: 'fake_session',
+    usage: {
+      input_tokens: 5,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: 4,
+    },
+  });
+}
+
 function emitJsonObject() {
   const text = '{"adapter":"local-oauth-cli","ok":true}';
   write({ type: 'system', subtype: 'init', session_id: 'fake_session' });
@@ -179,13 +225,66 @@ if (isPersistent) {
       ? content.map((part) => part?.text ?? '').join('')
       : String(content ?? '');
     if (text.trim() === '/clear') emitText('');
+    else if (isToolArgumentsOnlySchema || text.includes('Return only the JSON object for that tool\'s arguments.')) {
+      emitToolArgumentsOnly();
+    }
     else if (hasSchema || text.includes('Schema JSON only.')) emitStructured();
     else if (text.includes('Valid JSON only.')) emitJsonObject();
     else emitText('OK');
   });
   rl.on('close', () => process.exit(0));
 } else if (hasSchema) {
-  emitStructured();
+  if (isToolArgumentsOnlySchema) emitToolArgumentsOnly();
+  else emitStructured();
 } else {
   emitText('OK');
+}
+
+function readJsonSchemaArg() {
+  const index = args.indexOf('--json-schema');
+  if (index === -1) return null;
+  try {
+    return JSON.parse(args[index + 1] ?? 'null');
+  } catch {
+    return null;
+  }
+}
+
+function assertNoDirectProviderEnv() {
+  if (process.env.FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV !== '1') return;
+  const found = Object.keys(process.env).filter(isDirectProviderEnvName);
+  if (found.length > 0) {
+    process.stderr.write(`direct provider env leaked to fake claude: ${found.join(',')}\n`);
+    process.exit(91);
+  }
+}
+
+function isDirectProviderEnvName(name) {
+  const prefixes = [
+    'ANTHROPIC',
+    'AZURE_OPENAI',
+    'COHERE',
+    'DEEPSEEK',
+    'GEMINI',
+    'GOOGLE',
+    'GROQ',
+    'MISTRAL',
+    'OPENAI',
+    'OPENROUTER',
+    'PERPLEXITY',
+    'TOGETHER',
+    'XAI',
+  ];
+  const suffixes = [
+    'ACCESS_TOKEN',
+    'API_BASE',
+    'API_KEY',
+    'AUTH_TOKEN',
+    'BASE_URL',
+    'ENDPOINT',
+    'ORG_ID',
+    'ORGANIZATION',
+    'PROJECT',
+  ];
+  return prefixes.some((prefix) => suffixes.some((suffix) => name === `${prefix}_${suffix}`));
 }

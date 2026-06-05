@@ -1,14 +1,17 @@
 import { readFileSync } from 'node:fs';
-import type { NormalizedReasoningEffort } from './proxy/types.js';
+import type { NormalizedReasoningEffort, NormalizedVerbosity } from './proxy/types.js';
 
 export interface AddonSettings {
   readonly codexProxy: {
     readonly fallbackReasoningEffort: NormalizedReasoningEffort;
+    readonly fallbackVerbosity: NormalizedVerbosity;
+    readonly imageModel: string;
   };
 }
 
 const SETTINGS_URL = new URL('../settings.json', import.meta.url);
 const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+const VERBOSITIES = ['low', 'medium', 'high'] as const;
 
 let cachedSettings: AddonSettings | null = null;
 
@@ -31,6 +34,14 @@ export function loadSettings(): AddonSettings {
         codexProxy?.fallbackReasoningEffort,
         'codexProxy.fallbackReasoningEffort',
       ),
+      fallbackVerbosity: readVerbositySetting(
+        codexProxy?.fallbackVerbosity,
+        'codexProxy.fallbackVerbosity',
+      ),
+      imageModel: readNonEmptyStringSetting(
+        codexProxy?.imageModel,
+        'codexProxy.imageModel',
+      ),
     },
   };
   return cachedSettings;
@@ -40,8 +51,20 @@ export function codexProxyFallbackReasoningEffort(): NormalizedReasoningEffort {
   return loadSettings().codexProxy.fallbackReasoningEffort;
 }
 
+export function codexProxyFallbackVerbosity(): NormalizedVerbosity {
+  return loadSettings().codexProxy.fallbackVerbosity;
+}
+
+export function codexProxyImageModel(): string {
+  return loadSettings().codexProxy.imageModel;
+}
+
 export function isReasoningEffort(value: unknown): value is NormalizedReasoningEffort {
   return typeof value === 'string' && REASONING_EFFORTS.includes(value as NormalizedReasoningEffort);
+}
+
+export function isVerbosity(value: unknown): value is NormalizedVerbosity {
+  return typeof value === 'string' && VERBOSITIES.includes(value as NormalizedVerbosity);
 }
 
 function readReasoningEffortSetting(
@@ -50,6 +73,19 @@ function readReasoningEffortSetting(
 ): NormalizedReasoningEffort {
   if (isReasoningEffort(value)) return value;
   throw new Error(`${key} must be one of ${REASONING_EFFORTS.join(', ')}.`);
+}
+
+function readVerbositySetting(
+  value: unknown,
+  key: string,
+): NormalizedVerbosity {
+  if (isVerbosity(value)) return value;
+  throw new Error(`${key} must be one of ${VERBOSITIES.join(', ')}.`);
+}
+
+function readNonEmptyStringSetting(value: unknown, key: string): string {
+  if (typeof value === 'string' && value.trim()) return value.trim();
+  throw new Error(`${key} must be a non-empty string.`);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

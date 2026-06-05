@@ -56,6 +56,11 @@ not depend on this source repository after installation. For independence, avoid
 release asset containing that tarball, or a registry package built from the same
 artifact flow.
 
+The proxy also strips direct provider credential/routing environment variables
+from spawned local CLI backends, including OpenAI/Anthropic API keys and base
+URLs. The target backend should authenticate through its local OAuth CLI session,
+not inherited provider API key settings.
+
 For local development in this repository:
 
 ```bash
@@ -117,12 +122,12 @@ pnpm bench:api -- --targets=proxy-codex --cases=tool_call_stream,tool_use,tool_r
 pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=request_reasoning_effort --request-reasoning-effort=none --repeats 3
 pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=request_reasoning_effort --request-reasoning-effort=minimal --expect-provider-errors=true
 pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex,proxy-claude --repeats 1
-pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:sonnet --repeats 3
+pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --repeats 3
 pnpm bench:api -- --suite=quality-realistic --targets=proxy-codex,proxy-claude --min-semantic-quality=95
 pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api:gpt-5.5 --image-quality-repeats=1 --min-image-quality=90 --repeats 1
 pnpm bench:api -- --include-multimodal=true
-pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=openai.images.generation,openai.images.generation_api_fields,openai.images.generation_url,openai.images.generation_stream,openai.images.edit,openai.images.edit_multipart_stream,openai.images.variation --include-image-generation=true
-pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=openai.images.generation_stream_paired --repeats 3
+pnpm bench:api -- --targets=proxy-codex,openai-api:gpt-5.5 --cases=openai.images.generation_api_fields.image2_via_gpt55,openai.images.edit.image2_via_gpt55 --include-image-generation=true --image-quality-repeats=1 --min-image-quality=90
+pnpm bench:api -- --targets=proxy-codex-vs-openai-api:gpt-5.5 --cases=openai.images.generation_stream_paired.image2_via_gpt55 --include-image-generation=true
 pnpm bench:api -- --output /tmp/api-bench.json
 pnpm bench:api -- --baseline /tmp/api-bench.json --regression-targets=proxy
 ```
@@ -180,6 +185,15 @@ request-level OpenAI reasoning effort settings first: Chat Completions
 when it is also omitted, `settings.json` supplies
 `codexProxy.fallbackReasoningEffort`, currently `medium` because the repeated
 matrix benchmark showed the best speed/quality stability there.
+Proxy-Codex also preserves OpenAI verbosity structurally: Chat Completions
+`verbosity` and Responses `text.verbosity` are mapped to Codex
+`model_verbosity`, with `settings.json` `codexProxy.fallbackVerbosity`
+currently set to the OpenAI default `medium` when the request omits it.
+For role fidelity, OpenAI Chat `system`/`developer` messages and Responses
+`instructions` are lifted into Codex thread instructions, while user,
+assistant, and tool messages remain in the tagged conversation input. This keeps
+the user message text intact while avoiding a flat one-message transcript for
+API-level instructions.
 Use `--request-reasoning-effort` in benchmarks to send those request fields to
 both proxy and direct OpenAI targets. Current direct `gpt-5.5` rejects
 `minimal`, so that value is useful as an unsupported-value parity probe rather
@@ -188,33 +202,42 @@ assert matching provider error shapes. Multimodal image benchmarks use a
 deterministic generated PNG fixture family that direct OpenAI and Anthropic APIs
 accept, including single red-square and red/blue multi-image order cases, so
 proxy image paths are compared against real provider behavior.
-Image generation benchmarks are opt-in because they create billable images.
-They verify that local `/v1/images/generations`, `/v1/images/edits`, and
-`/v1/images/variations` `image-2` requests are handled through OpenAI Responses
-`gpt-5.5` `image_generation` and returned in Images API-compatible `b64_json`,
-`url`, or SSE stream shapes. The image cases include API-detail coverage for
-`background`, `quality`, `size`, `output_format`, `output_compression`,
-`moderation`, `input_fidelity`, JSON edit image references, multipart
-`image[]` uploads, multipart-only variations, direct Images API positive
-baselines with `gpt-image-1.5`, unsupported `image-2` negative baselines, and
-missing/invalid request error shape rows. Current direct Images negative rows
-record OpenAI's `image_generation_user_error` cases and the deprecated
-variations endpoint's empty 404 separately from proxy-local 400
-`invalid_request_error` rows. Current Responses `image_generation` edit also
-rejects `input_fidelity=high` for the underlying `gpt-image-2` model, so that
-option is tracked as an unsupported-input error row rather than part of the main
-edit quality benchmark. `--image-quality-repeats` runs an OpenAI vision
-JSON-schema judge over generated image bytes and
-`--min-image-quality=90` makes image quality a hard gate.
-For `image-2` proxy execution, the caller's image `quality` also selects the
-Responses reasoning effort used by `gpt-5.5`: `high` or omitted quality maps to
-`xhigh`, `medium` maps to `high`, and `low` maps to `medium`.
+Image generation benchmarks are opt-in because direct provider image rows create
+billable images. For the Codex runtime, `model: "image-2"` is the formal local
+proxy image route: the proxy translates the OpenAI Images API request into a
+Codex OAuth `gpt-5.5` image-generation turn and never falls back to direct
+OpenAI API calls. Direct Images API positive/negative rows remain separate
+baselines, including official GPT image model rows and direct `image-2`
+rejection behavior.
+Semantic quality reference failures are reported as `referenceErrors`, separate
+from proxy output quality. For proxy-claude, the direct Anthropic comparison
+authority is Opus (`claude-opus-4-8`); `max_tokens` failures mean the request's
+output cap was reached, not that subscription usage was exhausted.
+The `image-realistic` suite intentionally covers more than the red-square
+contract fixture: it includes photoreal product generation, asset-icon
+generation, text-poster generation, composition-preservation edits, and
+disabled-field rows such as `background: transparent` for `image-2` so prompt
+translation improvements must generalize across visual task types without
+silently accepting unsupported API fields.
+Benchmark proxy requests are guarded: if a proxy target makes
+a direct `api.openai.com` or `api.anthropic.com` call during a local proxy
+request, that benchmark row is failed and quality is forced to 0. Direct OpenAI
+image generation quality/latency rows still run only under explicit direct API
+targets.
+The same runtime boundary is enforced before tests and packaging with
+`pnpm verify:runtime-boundary`: proxy runtime code must not embed direct
+provider hosts, read direct provider credential env names outside the child-env
+sanitizer, call outbound HTTP clients, or pass ambient `process.env` wholesale
+to local CLI children. The verifier also rejects benchmark fixture/task literals
+inside `src` or packaged `dist`, so benchmark gains must come from general API
+translation and runtime behavior rather than hardcoded benchmark prompts.
 Defaults:
 
 - OpenAI API: `gpt-5.5`
 - Codex proxy fallback effort: `settings.json` `codexProxy.fallbackReasoningEffort`
+- Codex proxy fallback verbosity: `settings.json` `codexProxy.fallbackVerbosity`
+- Codex proxy image model: `settings.json` `codexProxy.imageModel`
 - Anthropic API Opus: `claude-opus-4-8`
-- Anthropic API Sonnet: `claude-sonnet-4-6`
 - Anthropic API Haiku: `claude-haiku-4-5-20251001`
 
 It performs real provider calls and may consume paid credits/rate limits.
@@ -247,14 +270,16 @@ Supported subset:
 - image inputs for OpenAI Chat `image_url`, OpenAI Responses `input_image`, and
   Anthropic Messages `image` blocks
 - image sources as remote URLs, data URLs/base64, and local `file://` URLs
-- OpenAI Images generation, edit, and variation requests for `image-2`,
-  translated to `gpt-5.5` Responses `image_generation` using `OPENAI_API_KEY`,
-  with `b64_json`, local temporary `url`, and streaming image outputs returned
-  in Images API-compatible shapes; generation/edit options such as
-  `background`, `quality`, `size`, `output_format`, `output_compression`,
+- OpenAI Images generation, edit, and variation through the Codex
+  `image2_via_gpt55` route for `model: "image-2"`, including URL responses,
+  streaming image generation, multipart edits, and multipart variations.
+  Direct OpenAI fallback is disabled structurally.
+  Generation/edit options such as `background`, `quality`, `size`,
+  `output_format`, `output_compression`,
   `moderation`, `input_fidelity`, `style`, `user`, `stream`, and
-  `partial_images` are validated and forwarded where supported by the Responses
-  image tool
+  `partial_images` are validated where the Images API surface requires them;
+  `input_fidelity` is treated as a disabled image-2 API field rather than a
+  quality failure
 - provider token usage details where the CLI exposes them, including cached and
   reasoning-token breakdowns where available; estimated usage is used only as a
   fallback

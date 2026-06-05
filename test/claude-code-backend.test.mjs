@@ -122,6 +122,27 @@ test('ClaudeCodeBackend extracts live tool argument deltas from structured outpu
   }
 });
 
+test('ClaudeCodeBackend does not pass direct provider env to child CLI', async () => {
+  const snapshot = snapshotProviderEnv();
+  setProviderEnv();
+  const backend = new ClaudeCodeBackend({
+    command: fakeClaude,
+    cwd: process.cwd(),
+    timeoutMs: 10_000,
+  });
+
+  try {
+    const result = await backend.generate({
+      ...textRequest(),
+      stream: false,
+    });
+    assert.equal(result.text, 'OK');
+  } finally {
+    await backend.close();
+    restoreProviderEnv(snapshot);
+  }
+});
+
 function textRequest() {
   return {
     shape: 'openai-chat',
@@ -133,6 +154,33 @@ function textRequest() {
     toolChoice: { type: 'auto' },
     raw: {},
   };
+}
+
+function snapshotProviderEnv() {
+  return new Map(providerEnvNames().map((name) => [name, process.env[name]]));
+}
+
+function restoreProviderEnv(snapshot) {
+  for (const [name, value] of snapshot) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
+}
+
+function setProviderEnv() {
+  for (const name of providerEnvNames()) {
+    process.env[name] = name === 'FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV' ? '1' : `${name}_secret`;
+  }
+}
+
+function providerEnvNames() {
+  return [
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_BASE_URL',
+    'FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV',
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+  ];
 }
 
 function imageTextRequest() {

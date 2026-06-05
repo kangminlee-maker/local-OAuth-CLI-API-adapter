@@ -3,6 +3,7 @@ import { ClaudeCodeBackend } from './proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from './proxy/codex-app-server-backend.js';
 import { startLocalApiProxy } from './proxy/http-server.js';
 import {
+  codexProxyImageModel,
   codexProxyFallbackReasoningEffort,
   isReasoningEffort,
 } from './settings.js';
@@ -40,8 +41,18 @@ async function proxy(args: readonly string[]): Promise<number> {
         timeoutMs,
         reasoningEffort: parseReasoningEffort(options.reasoningEffort),
       });
+  const imageGenerationClient = runtimeName === 'codex'
+    ? new CodexAppServerBackend({
+        command: options.command,
+        cwd: options.cwd ?? process.cwd(),
+        model: options.imageModel ?? codexProxyImageModel(),
+        timeoutMs,
+        imageGeneration: true,
+      })
+    : undefined;
   const started = await startLocalApiProxy({
     backend,
+    imageGenerationClient,
     host,
     port,
     requestTimeoutMs: timeoutMs,
@@ -77,6 +88,7 @@ interface ParsedOptions {
   readonly extraArg?: readonly string[];
   readonly cwd?: string;
   readonly reasoningEffort?: string;
+  readonly imageModel?: string;
 }
 
 function parseOptions(args: readonly string[]): ParsedOptions {
@@ -142,6 +154,7 @@ Options:
   --timeout-ms <number>              Runtime timeout. Default: 180000.
   --cwd <dir>                        Working directory for proxy backend. Default: current cwd.
   --reasoning-effort <effort>        Codex proxy fallback effort. Default: settings.json (${codexProxyFallbackReasoningEffort()}).
+  --image-model <model>              Codex model for image-2 via gpt-5.5 route. Default: settings.json (${codexProxyImageModel()}).
 
 Examples:
   ggui-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/project

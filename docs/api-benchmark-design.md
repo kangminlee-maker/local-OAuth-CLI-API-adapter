@@ -9,11 +9,15 @@
 - OpenAI Responses API: https://platform.openai.com/docs/api-reference/responses
 - Anthropic Messages API: https://docs.anthropic.com/en/api/messages
 
-공식 API가 직접 지원하지 않는 proxy-specific 우회 경로는 가장 가까운 provider authority를 명시한다. 예를 들어 `image-2` Images 요청은 proxy 표면은 `/v1/images/*`이지만 실제 실행 authority는 OpenAI Responses `gpt-5.5` `image_generation` tool이다.
+Proxy runtime은 local OAuth CLI auth를 쓰는 것이 제품 목적이다. 따라서 proxy target이 benchmark 중 direct provider API(`api.openai.com`, `api.anthropic.com`)를 호출하면 해당 row는 실패로 기록하고 quality를 0점 처리한다. Direct provider API 호출은 `openai-api:*`, `anthropic-api:*` 같은 direct target에서만 허용한다.
 
-`image-2` proxy 실행은 Images 요청의 `quality` 값을 `gpt-5.5` Responses reasoning effort에도 deterministic하게 반영한다. `quality=high` 또는 생략값은 `reasoning.effort=xhigh`, `quality=medium`은 `high`, `quality=low`는 `medium`으로 매핑한다.
+이 경계는 benchmark만의 사후 판정이 아니라 런타임 구조 검증으로도 고정한다. `pnpm verify:runtime-boundary`는 `src`/`dist` proxy runtime에서 direct provider host, provider credential env, outbound HTTP client, ambient `process.env` pass-through를 금지하고, child CLI env sanitization만 별도 authority로 허용한다. 이 검증은 `pnpm test`와 `pnpm pack`의 `prepack` 단계에서 실행된다.
 
-2026-06-03 실제 OpenAI API negative probe 기준으로, Images API의 unsupported `image-2`와 PNG `output_compression` 오류는 `image_generation_user_error`를 반환하고, deprecated variation endpoint는 빈 body의 404를 반환한다. Responses `image_generation` edit의 `input_fidelity=high`도 현재 underlying `gpt-image-2` 모델에서 `invalid_input_fidelity_model`로 거부된다. Proxy-local variation JSON 오류는 proxy가 지원하는 `/v1/images/variations` 표면의 400 `invalid_request_error` contract로 별도 검증한다.
+같은 verifier는 benchmark fixture 또는 문제 문항 리터럴이 runtime에 들어오는 것도 금지한다. Benchmark prompt, fixture 이름, expected tool/result token은 `scripts/`, `test/`, docs에만 존재해야 하며, `src`/`dist` runtime은 API field translation, provider-surface validation, context isolation, streaming forwarding 같은 일반 규칙만 가져야 한다.
+
+현재 Codex Images proxy에서 `image-2`는 실험적 우회가 아니라 정식 `image2_via_gpt55` 경로이다. `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations` 요청은 OpenAI Images API surface로 입력을 normalize한 뒤 Codex OAuth `gpt-5.5` image-generation turn으로 변환한다. Proxy runtime은 direct provider API fallback을 금지하며, benchmark 중 proxy target이 `api.openai.com` 또는 `api.anthropic.com`을 호출하면 해당 row는 0점 실패로 처리한다.
+
+2026-06-04 기준으로 `image-2` route의 품질 비교 authority는 direct OpenAI Images API의 invalid-model 응답이 아니라 direct OpenAI `gpt-5.5` Responses `image_generation` 결과이다. Direct Images API의 `gpt-image-1.5` positive/negative row는 별도 baseline으로 남긴다. `input_fidelity`는 image-2 API field capability에서 비활성화된 항목으로 보고, `invalid_input_fidelity_model`은 proxy 품질 실패가 아니라 disabled-field contract 확인 row로 다룬다. Proxy-local variation JSON 오류는 proxy가 지원하는 `/v1/images/variations` 표면의 400 `invalid_request_error` contract로 별도 검증한다.
 
 ## 비교 Authority
 
@@ -21,9 +25,12 @@
 | --- | --- | --- | --- |
 | `proxy-codex` | OpenAI Chat | OpenAI Chat Completions | schema, exact output, stream shape, usage, semantic quality |
 | `proxy-codex` | OpenAI Responses | OpenAI Responses | schema, function call/tool result, stream shape, usage, semantic quality |
-| `proxy-codex` | OpenAI Images | OpenAI Images where supported, otherwise OpenAI Responses `image_generation` | request/response shape, image event shape, URL handling, image quality |
-| `proxy-claude` | Anthropic Messages | Anthropic Messages | schema, text/tool/image block behavior, stream shape, usage, semantic quality |
-| `proxy-claude` | OpenAI-shaped compatibility | Anthropic Messages semantic reference, OpenAI contract shape | public schema must be OpenAI-compatible, answer quality must match Anthropic provider behavior |
+| `proxy-codex` | OpenAI Images | OpenAI `gpt-5.5` Responses `image_generation` for `image2_via_gpt55` quality; direct Images API rows only as separate baselines | schema, image quality, stream latency, URL/edit/variation behavior, no direct-provider egress |
+| `proxy-claude` | Anthropic Messages | Anthropic Messages Opus (`claude-opus-4-8`) | schema, text/tool/image block behavior, stream shape, usage, semantic quality |
+
+Cross-provider semantic references are not valid benchmark authority: `proxy-codex` quality is compared only with OpenAI direct API, and `proxy-claude` quality is compared only with Anthropic direct API. The benchmark runner therefore does not execute OpenAI-shaped quality rows for `proxy-claude` or Anthropic quality rows for `proxy-codex`.
+
+If a direct semantic reference fails, the benchmark records `referenceErrors` and fails that row as a reference-availability problem rather than treating it as proxy output quality. This distinction matters for provider `max_tokens` failures: `max_tokens` is the per-request output cap, not subscription or credit exhaustion.
 
 ## Suite 계층
 
@@ -47,10 +54,13 @@
 | Anthropic text | `anthropic.messages.text` | Korean answer, system prompt, max_tokens boundary | Messages schema, stop reason, usage |
 | Anthropic tool | `tool_use`, `tool_result`, `tool_use_stream` | forced tool name, rejected tool schema, streamed JSON fragments | content block schema and input JSON exact |
 | Multimodal input | OpenAI/Anthropic red PNG fixture, red/blue multi-image order | URL vs base64, unsupported `file_id`, invalid image bytes | direct provider accepts fixture before proxy quality is judged |
-| Images generation | `generation`, `generation_api_fields`, `generation_url`, `generation_stream`, targeted `generation_stream_paired`, direct `gpt-image-1.5` positive, direct `image-2` negative | transparent output, text rendering, photoreal product, Korean prompt | `data[]` item has exactly one of `url`/`b64_json`; metadata only when known; stream events deduped |
-| Images edit | `edit`, `edit_multi_image`, `edit_multipart_stream`, direct `gpt-image-1.5` edit positive | mask PNG, high input fidelity, invalid mask size | JSON `images` and multipart `image[]` both covered; direct Responses baseline where Images API differs |
-| Images variation | multipart `variation`, JSON variation negative | non-square/oversize negative | variation is multipart-only; unsupported model differences explicit |
-| Error parity | reasoning effort unsupported probe, missing prompt, invalid output compression, unsupported input fidelity, JSON variation body | invalid enum, conflicting image fields, oversized body, bad multipart boundary | status, `error.type`, optional `param`, optional `code`, message presence match provider style |
+| Images generation | proxy/direct `image2_via_gpt55`, direct `gpt-image-1.5` positive, direct Images `image-2` negative baseline, photoreal product, asset icon, text poster | Korean prompt, dense visual layout, large canvas variants | proxy `image-2` returns OpenAI Images-compatible payload without direct provider egress; direct rows verify provider image quality and current API errors |
+
+Direct GPT image model positive rows do not send `response_format`; GPT image models return `b64_json` by default and the parameter is only valid for DALL-E-style response formatting. Proxy GPT image rows reject `response_format` with the same `unknown_parameter` error surface.
+| Images reference-guided generation | style reference, product identity reference, product + palette multi-reference | deterministic reference PNG fixtures, direct Responses `input_image`, proxy Images edit JSON `images` | judge receives reference image(s) and candidate image together; style fidelity, product identity, palette transfer, and unwanted copying are scored |
+| Images edit | proxy/direct `image2_via_gpt55`, direct `gpt-image-1.5` edit positive, composition-preservation edit | mask PNG, invalid mask size | JSON `images` and multipart `image[]` validation covered; image-2 input fidelity disabled row is contract, not quality failure |
+| Images variation | proxy `image2_via_gpt55`, JSON variation negative | non-square/oversize negative | variation is multipart-only; direct Images variation remains DALL-E-2-only baseline |
+| Error parity | reasoning effort unsupported probe, missing prompt, invalid output compression, input fidelity disabled, JSON variation body | invalid enum, conflicting image fields, oversized body, bad multipart boundary | status, `error.type`, optional `param`, optional `code`, message presence match provider style |
 
 ## 품질 벤치 설계
 
@@ -80,14 +90,18 @@ Gate:
 
 | 축 | 케이스 예 | 평가 기준 |
 | --- | --- | --- |
-| 단순 생성 | 빨간 사각형, 투명 배경 아이콘 | 색/형태/배경/투명도 충족 |
-| 텍스트 포함 | 짧은 영문 라벨, 한글 라벨 | 텍스트 가독성, 오탈자 수 |
+| 단순 생성 | 빨간 사각형 | 색/형태/배경 충족 |
+| 에셋 생성 | 앱 아이콘/스티커형 에셋 | 주요 객체, 배경 옵션, 텍스트 없음 |
+| 텍스트 포함 | 짧은 영문 라벨, 한글 라벨 후보 | 텍스트 가독성, 오탈자 수 |
 | 실물풍 | 제품 mockup, 인테리어 장면 | prompt 객체/스타일/구성 반영 |
-| 편집 | 색상 변경, 객체 제거, 배경 유지 | 원본 보존, 변경 영역 정확도 |
+| reference style generation | 스타일 카드 참조로 새 아이콘 생성 | 참조 스타일/팔레트 반영, 참조 subject 복사 금지, flatness |
+| reference product generation | 제품 참조로 스튜디오 이미지 생성 | 제품 identity, 색상, 형태, handle/rim 같은 세부 요소 보존 |
+| multi-reference generation | 제품 참조 + 팔레트 참조 조합 | reference별 역할 구분, 제품 보존, palette/style transfer |
+| 편집 | 색상 변경, 객체 제거, 배경 유지, 보존 중심 편집 | 원본 보존, 변경 영역 정확도 |
 | mask edit | 투명 mask 영역만 교체 | mask 외부 보존 |
 | multi-image edit | 로고/색상/제품 참조 합성 | 참조 이미지 fidelity |
 | URL response | 반환 URL fetchback | 200, content-type, TTL/expiry error |
-| streaming | partial/final image | first partial latency, final event 중복 없음 |
+| streaming | completed image | first completed-image latency, final event 중복 없음, partial 미지원 |
 
 Gate:
 
@@ -95,6 +109,9 @@ Gate:
 - edit preservation score: minimum 85
 - text rendering score: minimum 80, text-heavy cases는 별도 tracked risk
 - hard fail: 빈/손상 이미지, 잘못된 content-type, prompt 핵심 객체 누락, URL fetch 실패
+- disabled-field contract: direct `gpt-5.5` image_generation이 거절하는 `background: transparent`는 proxy `image-2`에서도 400 `image_generation_user_error`로 맞춘다.
+- prompt 또는 translator 개선은 특정 benchmark 문항에만 맞춘 문구가 아니라 flat/style, geometry, edit preservation, output field translation처럼 실제 요청 전반에 적용되는 일반 규칙이어야 한다.
+- reference-guided generation 품질 평가는 출력 이미지만 보지 않는다. judge 입력에 reference image(s)를 먼저 넣고 candidate output을 뒤에 넣어, 참조 fidelity와 요구사항 충족을 같이 평가한다.
 
 ## Latency Metrics
 
@@ -104,7 +121,7 @@ Gate:
 | `firstDataMs` | SSE 첫 data 수신 | stream |
 | `firstTextMs` | 첫 텍스트 delta | text stream |
 | `firstToolArgumentMs` | 첫 tool/function/image b64 delta | tool stream, image stream |
-| `firstImageMs` | 이미지 stream의 첫 b64 payload delta; `firstToolArgumentMs`의 이미지 전용 alias | image stream |
+| `firstImageMs` | 이미지 stream의 첫 completed b64 payload 도착 시간; partial image payload는 proxy 벤치 지표에서 제외 | image stream |
 | `chunks` | 의미 있는 delta 수 | stream |
 | `backendTiming.turnWaitMs` | proxy-codex provider turn 대기 | proxy-codex |
 | `usageWaitMs` | provider usage 후착 대기 | proxy-codex |
@@ -113,8 +130,11 @@ Gate:
 
 - proxy median total latency: direct API 대비 +30% 또는 +750ms 초과 시 regression 후보
 - stream first data: non-image text/tool은 direct 대비 별도 추적
-- image stream latency: direct Responses API의 `response.created` 같은 초기 lifecycle event는 Images API 호환 payload가 아니므로 `firstDataMs`가 아니라 `firstImageMs`/`firstToolArgumentMs`를 사용자 체감 지표로 본다
-- order-sensitive image stream diagnostics: `openai.images.generation_stream_paired`는 proxy/direct 순서를 repeat마다 교차 실행해 시간대 편향을 줄이고 paired delta를 남긴다
+- image stream latency: direct Responses API의 `response.created` 같은 초기 lifecycle event와 `partial_image` payload는 Images API proxy의 완성 이미지 표면이 아니므로, completed image 기준의 `firstImageMs`/`firstToolArgumentMs`를 사용자 체감 지표로 본다
+- partial image streaming은 proxy 표면에서 지원하지 않는다. `partial_images > 0`은 provider-style 400으로 거절하고, stream은 `image_generation.completed` 또는 `image_edit.completed`만 사용자에게 보낸다.
+- order-sensitive image stream diagnostics: `openai.images.generation_stream_paired`는 partial 없이 proxy/direct 순서를 repeat마다 교차 실행해 시간대 편향을 줄이고, 첫 완성 이미지 payload 기준 paired delta를 남긴다
+- multi-image b64 diagnostics: `openai.images.generation.image2_via_gpt55.b64_json_n3_parallel`은 proxy Images API의 `n: 3` 단일 요청을 direct gpt-5.5 image_generation 3개 병렬 실행과 비교한다. proxy 런타임은 비스트리밍 `n > 1` 요청을 독립 image turn 병렬 실행으로 처리하며, backendTiming은 요청 단위 critical path aggregate만 남긴다.
+- multi-image quality aggregation: 다중 이미지 케이스는 첫 이미지만 보지 않고 모든 이미지의 `imageQuality`를 채점한다. row의 `imageQuality.score`는 이미지별 점수의 최저점으로 기록해, 한 장만 실패한 경우도 게이트가 감지하도록 한다.
 - paired diagnostics keep `sampleFailures` with provider error details such as `insufficient_quota`, so a quota/rate-limit failure can be separated from proxy latency regression
 - image generation/edit은 provider 자체 변동성이 크므로 p50/p95와 outlier reason을 함께 본다
 
@@ -130,7 +150,7 @@ pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex,proxy-claude --re
 Provider parity:
 
 ```bash
-pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:sonnet --repeats 3 --output /tmp/api-provider-parity.json
+pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --repeats 3 --output /tmp/api-provider-parity.json
 ```
 
 Semantic quality:
@@ -148,7 +168,7 @@ pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api:gpt-5
 Release gate:
 
 ```bash
-pnpm bench:api -- --suite=release-gate --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:sonnet --semantic-quality-repeats 3 --min-semantic-quality=95 --repeats 5 --output /tmp/api-release-gate.json
+pnpm bench:api -- --suite=release-gate --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --semantic-quality-repeats 3 --min-semantic-quality=95 --repeats 5 --output /tmp/api-release-gate.json
 ```
 
 Suite 기본값:
@@ -167,8 +187,8 @@ Suite 기본값:
 | --- | --- | --- | --- |
 | Done | benchmark suite preset 옵션 추가 | 긴 `--cases`를 매번 수동 조합하면 누락 위험이 큼 | `--suite=contract-smoke,provider-parity,image-realistic`로 케이스 선택 가능 |
 | Done | image vision judge 추가 | 이미지 품질을 b64 크기/프롬프트만으로 판단하면 실사용 품질을 놓침 | 이미지 출력이 `imageQuality` score, sub-score, violation list를 남김 |
-| Done | direct Images API negative/positive baseline 추가 | `image-2` 우회와 공식 Images 모델의 차이를 명시해야 함 | `gpt-image-1.5` generation/edit positive, unsupported `image-2` negative row |
-| Done | error parity matrix 추가 | invalid enum, missing prompt, bad multipart가 실제 SDK 사용에서 자주 발생 | missing prompt, invalid compression, unsupported input fidelity, JSON variation body가 status/type/message shape를 검증 |
+| Done | direct Images API negative/positive baseline 추가 | `image2_via_gpt55`와 공식 Images 모델의 차이를 명시해야 함 | `gpt-image-1.5` generation/edit positive, direct Images `image-2` negative baseline row |
+| Done | error parity matrix 추가 | invalid enum, missing prompt, bad multipart가 실제 SDK 사용에서 자주 발생 | missing prompt, invalid compression, image-2 input fidelity disabled, JSON variation body가 status/type/message shape를 검증 |
 | Done | multi-fixture image inputs 추가 | 단일 빨간 PNG는 실사용 이미지를 대표하지 못함 | red/blue/green/transparent/mask PNG fixture family와 red/blue multi-image rows |
 | Done | semantic task suite 확장 | 품질이 한두 prompt에 과적합될 수 있음 | 한국어/영어/JSON/tool/triage/summary 10개 prompt shape |
 | P2 | benchmark cost estimator | image/release suite는 비용이 큼 | 실행 전 예상 provider call 수와 image call 수 출력 |
