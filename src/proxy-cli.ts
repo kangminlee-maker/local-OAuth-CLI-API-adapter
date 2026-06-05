@@ -2,6 +2,10 @@
 import { ClaudeCodeBackend } from './proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from './proxy/codex-app-server-backend.js';
 import { startLocalApiProxy } from './proxy/http-server.js';
+import { ClaudeNativeCliChatSession } from './chat/claude-native-session.js';
+import { CodexNativeCliChatSession } from './chat/codex-native-session.js';
+import { LocalCliChatSessionManager } from './chat/session-manager.js';
+import type { LocalCliChatRuntimeFactoryInput } from './chat/types.js';
 import {
   codexProxyImageModel,
   codexProxyFallbackReasoningEffort,
@@ -26,17 +30,18 @@ async function proxy(args: readonly string[]): Promise<number> {
   const port = parseIntOption(options.port, 8787);
   const timeoutMs = parseIntOption(options.timeoutMs, 180_000);
   const runtimeName = parseProxyRuntimeName(options.runtime ?? 'codex');
+  const cwd = options.cwd ?? process.cwd();
   const backend = runtimeName === 'claude'
     ? new ClaudeCodeBackend({
         command: options.command,
-        cwd: options.cwd ?? process.cwd(),
+        cwd,
         model: options.model,
         timeoutMs,
         extraArgs: options.extraArg,
       })
     : new CodexAppServerBackend({
         command: options.command,
-        cwd: options.cwd ?? process.cwd(),
+        cwd,
         model: options.model,
         timeoutMs,
         reasoningEffort: parseReasoningEffort(options.reasoningEffort),
@@ -44,15 +49,38 @@ async function proxy(args: readonly string[]): Promise<number> {
   const imageGenerationClient = runtimeName === 'codex'
     ? new CodexAppServerBackend({
         command: options.command,
-        cwd: options.cwd ?? process.cwd(),
+        cwd,
         model: options.imageModel ?? codexProxyImageModel(),
         timeoutMs,
         imageGeneration: true,
       })
     : undefined;
+  const chatSessionManager = new LocalCliChatSessionManager({
+    defaultCwd: cwd,
+    runtimes: {
+      [runtimeName]: async (input: LocalCliChatRuntimeFactoryInput) => runtimeName === 'claude'
+        ? ClaudeNativeCliChatSession.create({
+            command: options.command,
+            cwd: input.cwd,
+            model: input.model ?? options.model,
+            timeoutMs,
+            extraArgs: options.extraArg,
+          })
+        : CodexNativeCliChatSession.create({
+            command: options.command,
+            cwd: input.cwd,
+            model: input.model ?? options.model,
+            timeoutMs,
+            reasoningEffort: input.options?.reasoningEffort ?? parseReasoningEffort(options.reasoningEffort),
+            verbosity: input.options?.verbosity,
+            imageGeneration: input.options?.imageGeneration,
+          }),
+    },
+  });
   const started = await startLocalApiProxy({
     backend,
     imageGenerationClient,
+    chatSessionManager,
     host,
     port,
     requestTimeoutMs: timeoutMs,
@@ -63,6 +91,7 @@ async function proxy(args: readonly string[]): Promise<number> {
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
   process.stdout.write(`  openai: OPENAI_BASE_URL=${started.url}/v1\n`);
   process.stdout.write(`  anthropic: ANTHROPIC_BASE_URL=${started.url}\n`);
+  process.stdout.write(`  local chat: ${started.url}/local/cli/sessions\n`);
 
   const shutdown = async (): Promise<void> => {
     await started.close();
@@ -142,7 +171,7 @@ function helpText(): string {
   return `local-oauth-cli
 
 Commands:
-  proxy      Start an OpenAI/Anthropic-compatible local API subset proxy.
+  proxy      Start an OpenAI/Anthropic-compatible proxy plus native local CLI chat API.
 
 Options:
   --runtime <codex|claude>           Runtime to use.
@@ -159,6 +188,10 @@ Options:
 Examples:
   local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/project
   local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/project
+
+Native local CLI chat endpoint:
+  POST /local/cli/sessions
+  POST /local/cli/sessions/{session_id}/turns
 `;
 }
 

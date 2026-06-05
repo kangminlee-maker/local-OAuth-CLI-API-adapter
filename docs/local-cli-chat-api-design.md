@@ -42,6 +42,18 @@ local OAuth CLI를 이용해 실제 chat 환경을 구현하는 API를 추가한
 
 초기 버전은 HTTP + SSE만 둔다. WebSocket은 필요해질 때 추가한다.
 
+현재 구현된 endpoint:
+
+| Method | Path | Status |
+| --- | --- | --- |
+| `POST` | `/local/cli/sessions` | Implemented |
+| `GET` | `/local/cli/sessions/{session_id}` | Implemented |
+| `POST` | `/local/cli/sessions/{session_id}/turns` | Implemented for JSON and SSE |
+| `POST` | `/local/cli/sessions/{session_id}/interrupt` | Implemented |
+| `DELETE` | `/local/cli/sessions/{session_id}` | Implemented |
+
+The installable `local-oauth-cli proxy --runtime <runtime>` process enables native local chat sessions for the selected runtime. Start separate proxy processes when both Codex and Claude native chat sessions are needed at the same time.
+
 ### Create session
 
 ```http
@@ -229,6 +241,13 @@ Recommended hot path:
 
 Do not rebuild OpenAI Chat or Responses objects on this path. That is the main speed and quality win.
 
+Current behavior:
+
+- Uses an isolated `CODEX_HOME` with copied local Codex auth and direct provider env sanitization.
+- Starts one app-server thread per local chat session.
+- Uses the caller `cwd` as the runtime workspace root with read-only sandbox and `approvalPolicy: "never"`.
+- Emits app-server notifications as raw `cli.event` payloads and exposes `text_delta` / `usage` projections when present.
+
 ### Claude
 
 Recommended hot path:
@@ -240,6 +259,13 @@ Recommended hot path:
 5. Close the process on session close.
 
 When a turn needs flags that Claude only supports at process start, either reject that option for persistent chat sessions or create a separate one-shot non-chat request path. Do not silently break session continuity.
+
+Current behavior:
+
+- Uses one persistent `claude -p --input-format stream-json --output-format stream-json` process per local chat session.
+- Does not send `/clear` after turns.
+- Disables slash commands and uses an empty strict MCP config by default.
+- Emits Claude JSONL messages as raw `cli.event` payloads and exposes `text_delta` / `usage` projections when present.
 
 ## Event envelope
 
@@ -308,16 +334,16 @@ The API should not compress or rewrite user prompts for performance.
 - No hidden project context unless explicitly enabled by session options.
 - No session sharing across unrelated consumers unless caller explicitly reuses the same `session_id`.
 
-## Implementation plan
+## Implementation status
 
-| Step | Work | Done when |
+| Area | Status | Current behavior |
 | --- | --- | --- |
-| 1 | Add `src/chat/types.ts` for session, turn, event envelope types | Types express session lifecycle without provider API concepts |
-| 2 | Add `src/chat/session-manager.ts` | Can create, lookup, interrupt, close sessions |
-| 3 | Add Codex native chat backend | Uses app-server `thread/start`, `turn/start`, `turn/interrupt`, `thread/archive` and forwards raw notifications |
-| 4 | Add Claude native chat backend | Uses persistent stream-json process without per-turn `/clear` |
-| 5 | Add HTTP endpoints under `/local/cli/sessions` | Create, inspect, turn, interrupt, close work over HTTP/SSE |
-| 6 | Add package export `./chat` for embedded consumers | Consumers can use the session manager without HTTP if desired |
+| Types | Implemented | `src/chat/types.ts` expresses session lifecycle without provider API concepts |
+| Session manager | Implemented | Can create, inspect, interrupt, close, stream turns, and collect non-stream turns |
+| Codex native backend | Implemented | Uses app-server `thread/start`, `turn/start`, `turn/interrupt`, `thread/archive` and forwards raw notifications |
+| Claude native backend | Implemented | Uses persistent stream-json process without per-turn `/clear` |
+| HTTP endpoints | Implemented | Create, inspect, turn, interrupt, and close work over HTTP/SSE |
+| Embedded package export | Not yet implemented | HTTP/bin usage works; embedded consumers do not yet have a dedicated `./chat` export |
 | 7 | Add E2E tests with fake Codex/Claude native event streams | Raw event forwarding, interrupt, close, env isolation pass |
 | 8 | Add benchmark rows for native chat | Compare first text delta and total turn time against provider-compatible proxy path |
 

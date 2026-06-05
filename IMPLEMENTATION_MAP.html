@@ -194,11 +194,12 @@
 <body>
   <main>
     <h1>Local OAuth CLI 애드온 구현 지도</h1>
-    <p class="lead">이 문서는 로컬 OAuth CLI를 OpenAI·Anthropic 호환 API 표면으로 노출하는 설치형 프록시의 현재 구현 경계, 검증 기준, 남은 최적화 지점을 한눈에 정리합니다.</p>
+    <p class="lead">이 문서는 로컬 OAuth CLI를 OpenAI·Anthropic 호환 API 표면과 native local CLI chat 표면으로 노출하는 설치형 프록시의 현재 구현 경계, 검증 기준, 남은 최적화 지점을 한눈에 정리합니다.</p>
 
     <h2>현재 목표</h2>
     <div class="band">
       <p>프록시는 실제 provider API와 같은 입출력 표면을 보여야 하지만, 런타임에서는 direct provider API를 호출하지 않아야 합니다. direct API는 명시적인 비교 벤치마크, 기준 답변 생성, 품질 판정에만 사용합니다.</p>
+      <p>별도 <code>/local/cli/sessions</code> 표면은 provider-compatible 응답 재구성을 피하고, Codex app-server 또는 Claude stream-json session의 raw event를 작은 SSE envelope로 전달하는 native chat API입니다.</p>
       <p><code>proxy-codex</code>의 OpenAI Chat 장애 보고서 의미 품질은 타임라인 보존 규칙 이후 95점 기준을 통과했습니다. 이미지 <code>b64_json</code> 생성은 단일 요청 품질 보강과 <code>n&gt;1</code> 병렬 실행을 반영했습니다. 남은 큰 병목은 이미지 스트리밍 첫 완성 이미지 지연과 더 넓은 semantic suite 반복 검증입니다.</p>
     </div>
 
@@ -219,6 +220,10 @@
       <div class="card">
         <strong>4. 응답 재구성</strong>
         텍스트, 도구 호출, SSE delta, provider token usage, 이미지 응답을 원래 API 스키마에 맞춰 반환합니다.
+      </div>
+      <div class="card">
+        <strong>5. Native chat</strong>
+        <code>/local/cli/sessions</code>는 provider 응답으로 재구성하지 않고 raw CLI event를 <code>cli.event</code> SSE envelope로 전달합니다.
       </div>
     </section>
 
@@ -262,6 +267,12 @@
           <td><code>src/proxy/image2-via-gpt55.ts</code>, Images API 정규화 로직</td>
           <td><code>image-2</code> 요청을 정식 프록시 경로로 받아 Codex OAuth의 <code>gpt-5.5</code> 이미지 생성 능력에 매핑합니다. 현재 품질 매핑은 <code>high→high</code>, <code>medium→medium</code>, <code>low→low</code>입니다.</td>
           <td class="ok">generation, URL 응답, streaming, edit, variation, disabled field 테스트</td>
+        </tr>
+        <tr>
+          <td>Native local CLI chat</td>
+          <td><code>src/chat/*</code>, <code>/local/cli/sessions</code>, <code>LocalCliChatSessionManager</code></td>
+          <td>OpenAI/Anthropic provider shape로 변환하지 않고, Codex app-server raw notification 또는 Claude stream-json raw message를 session/turn SSE envelope로 전달합니다.</td>
+          <td class="ok"><code>test/local-cli-chat-http.test.mjs</code>, <code>pnpm test</code>, <code>pnpm pack:adapter</code></td>
         </tr>
       </tbody>
     </table>

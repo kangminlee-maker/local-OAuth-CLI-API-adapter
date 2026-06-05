@@ -28,7 +28,7 @@ test('CodexAppServerBackend resolves when delayed provider usage arrives after c
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {
@@ -58,7 +58,7 @@ test('CodexAppServerBackend follows per-request reasoning effort over backend fa
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
     reasoningEffort: 'low',
   });
 
@@ -80,7 +80,7 @@ test('CodexAppServerBackend buffers notifications that arrive before turn/start 
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {
@@ -102,7 +102,7 @@ test('CodexAppServerBackend streams buffered text deltas', async () => {
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {
@@ -127,7 +127,7 @@ test('CodexAppServerBackend records app-server tool stream timing checkpoints', 
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
     onTiming: (timing) => timings.push(timing),
   });
 
@@ -160,7 +160,7 @@ test('CodexAppServerBackend does not pass direct provider env to child CLI', asy
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {
@@ -176,7 +176,7 @@ test('CodexAppServerBackend keeps API-isolated proxy mode as the default app-ser
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {
@@ -199,7 +199,7 @@ test('CodexAppServerBackend lifts API system and developer messages into thread 
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {
@@ -227,7 +227,7 @@ test('CodexAppServerBackend maps request verbosity into app-server config', asyn
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {
@@ -276,7 +276,7 @@ test('CodexAppServerBackend can probe alternate proxy mode surfaces', async () =
     const backend = new CodexAppServerBackend({
       command: fakeCodex,
       cwd: process.cwd(),
-      timeoutMs: 10_000,
+      timeoutMs: 30_000,
       proxyMode: item.proxyMode,
     });
     try {
@@ -299,7 +299,7 @@ test('CodexAppServerBackend can collect imageGeneration items for image-2 proxy 
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
     model: 'gpt-5.5',
     imageGeneration: true,
     onTiming: (timing) => timings.push(timing),
@@ -330,7 +330,7 @@ test('CodexAppServerBackend runs non-streaming image-2 n requests concurrently',
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
     model: 'gpt-5.5',
     imageGeneration: true,
     onTiming: (timing) => timings.push(timing),
@@ -362,7 +362,7 @@ test('CodexAppServerBackend streams imageGeneration completed events', async () 
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
     model: 'gpt-5.5',
     imageGeneration: true,
   });

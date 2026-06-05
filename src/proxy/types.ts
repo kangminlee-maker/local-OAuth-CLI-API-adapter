@@ -1,3 +1,5 @@
+import type { LocalCliChatSessionManager } from '../chat/session-manager.js';
+
 export type ApiShape = 'openai-chat' | 'openai-responses' | 'anthropic-messages';
 
 export type NormalizedReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
@@ -173,6 +175,7 @@ export interface LocalCliBackend {
 export interface ProxyServerOptions {
   readonly backend: LocalCliBackend;
   readonly imageGenerationClient?: OpenAiImageGenerationClient;
+  readonly chatSessionManager?: LocalCliChatSessionManager;
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;

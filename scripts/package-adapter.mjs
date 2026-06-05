@@ -100,6 +100,7 @@ function validateTarballEntries(entries) {
     'package/settings.json',
     'package/dist/proxy-cli.js',
     'package/dist/settings.js',
+    'package/dist/chat/session-manager.js',
     'package/dist/proxy/http-server.js',
     'package/docs/api-benchmark-design.md',
     'package/docs/api-interface-contract.md',

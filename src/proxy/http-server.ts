@@ -32,6 +32,11 @@ import {
   normalizeOpenAiChatRequest,
   normalizeOpenAiResponsesRequest,
 } from './normalizers.js';
+import {
+  LocalCliChatError,
+  type LocalCliChatCreateInput,
+  type LocalCliChatTurnInput,
+} from '../chat/types.js';
 
 export interface StartedProxyServer {
   readonly server: Server;
@@ -79,6 +84,7 @@ export async function startLocalApiProxy(
         }),
         options.backend.close(),
         closeImageGenerationClient(options),
+        options.chatSessionManager?.closeAll() ?? Promise.resolve(),
       ]);
       generatedImages.clear();
     },
@@ -107,6 +113,10 @@ async function handleRequest(
   }
   try {
     const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    if (path === '/local/cli/sessions' || path.startsWith('/local/cli/sessions/')) {
+      await handleLocalCliChatRequest(req, res, options, path);
+      return;
+    }
     if (req.method === 'GET' && path === '/v1/models') {
       writeJson(res, 200, openAiModelsResponse(backend));
       return;
@@ -179,6 +189,57 @@ async function handleRequest(
   } catch (err) {
     writeError(res, err, errorShape);
   }
+}
+
+async function handleLocalCliChatRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: ProxyServerOptions,
+  path: string,
+): Promise<void> {
+  const manager = options.chatSessionManager;
+  if (!manager) {
+    throw new ProxyRequestError('Local CLI chat sessions are not enabled for this server.', 501);
+  }
+  if (path === '/local/cli/sessions' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    writeJson(res, 201, await manager.create(asRecordPayload(body) as unknown as LocalCliChatCreateInput));
+    return;
+  }
+  const match = /^\/local\/cli\/sessions\/([^/]+)(?:\/([^/]+))?$/.exec(path);
+  if (!match) throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
+  const sessionId = decodeURIComponent(match[1] ?? '');
+  const action = match[2] ? decodeURIComponent(match[2]) : '';
+  if (!action && req.method === 'GET') {
+    writeJson(res, 200, manager.get(sessionId));
+    return;
+  }
+  if (!action && req.method === 'DELETE') {
+    const closed = await manager.close(sessionId);
+    writeJson(res, 200, {
+      session_id: closed.id,
+      status: closed.status,
+    });
+    return;
+  }
+  if (action === 'interrupt' && req.method === 'POST') {
+    const interrupted = await manager.interrupt(sessionId);
+    writeJson(res, 200, {
+      session_id: interrupted.id,
+      status: 'interrupting',
+    });
+    return;
+  }
+  if (action === 'turns' && req.method === 'POST') {
+    const body = await readJsonBody(req) as LocalCliChatTurnInput;
+    if (body.stream) {
+      await writeLocalCliChatStream(res, manager.streamTurn(sessionId, body));
+    } else {
+      writeJson(res, 200, await manager.runTurn(sessionId, body));
+    }
+    return;
+  }
+  throw new ProxyRequestError(`Unsupported local CLI chat endpoint: ${path}`, 404);
 }
 
 async function handleOpenAiImageRequest(
@@ -2050,6 +2111,23 @@ async function writeSseData(res: ServerResponse, payload: unknown): Promise<void
   }
 }
 
+async function writeLocalCliChatStream(
+  res: ServerResponse,
+  events: AsyncIterable<{
+    readonly event: string;
+    readonly session_id: string;
+    readonly turn_id?: string;
+    readonly runtime: string;
+    readonly raw: unknown;
+  }>,
+): Promise<void> {
+  writeSseHeaders(res);
+  for await (const event of events) {
+    await writeSseEvent(res, event.event, event);
+  }
+  res.end();
+}
+
 function chunkText(text: string): string[] {
   if (!text) return [];
   const chunks: string[] = [];
@@ -2077,6 +2155,17 @@ function writeError(
   err: unknown,
   shape: ErrorResponseShape = 'openai',
 ): void {
+  if (err instanceof LocalCliChatError) {
+    writeJson(res, err.statusCode, {
+      error: {
+        message: err.message,
+        type: 'local_cli_chat_error',
+        param: null,
+        code: err.code,
+      },
+    });
+    return;
+  }
   if (err instanceof ProxyRequestError) {
     if (err.provider === 'anthropic') {
       writeJson(res, err.statusCode, {

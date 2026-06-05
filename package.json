@@ -11,6 +11,7 @@
     "dist/proxy-cli.d.ts",
     "dist/settings.js",
     "dist/settings.d.ts",
+    "dist/chat/",
     "dist/proxy/",
     "settings.json",
     "README.md",

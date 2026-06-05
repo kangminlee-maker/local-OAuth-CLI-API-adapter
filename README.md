@@ -89,6 +89,20 @@ Planned local CLI chat sessions are intentionally separate from the
 provider-compatible API surface. That design lives in
 [`docs/local-cli-chat-api-design.md`](docs/local-cli-chat-api-design.md).
 
+Native local CLI chat sessions are available under:
+
+```text
+POST   /local/cli/sessions
+GET    /local/cli/sessions/{session_id}
+POST   /local/cli/sessions/{session_id}/turns
+POST   /local/cli/sessions/{session_id}/interrupt
+DELETE /local/cli/sessions/{session_id}
+```
+
+This path keeps a small `cli.event` / `cli.completed` / `cli.error` SSE
+envelope and preserves raw CLI events as the authority instead of rebuilding
+OpenAI or Anthropic provider responses.
+
 Common supported features:
 
 - SSE text deltas

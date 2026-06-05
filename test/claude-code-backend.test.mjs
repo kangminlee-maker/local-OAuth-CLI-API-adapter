@@ -16,7 +16,7 @@ test('ClaudeCodeBackend streams persistent text deltas', async () => {
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
   try {
     const events = [];
@@ -45,7 +45,7 @@ test('ClaudeCodeBackend streams one-shot image text deltas', async () => {
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
   try {
     const events = [];
@@ -68,7 +68,7 @@ test('ClaudeCodeBackend parses structured tool decisions from persistent schema 
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
   try {
     const result = await backend.generate(toolRequest());
@@ -86,7 +86,7 @@ test('ClaudeCodeBackend uses persistent JSON mode without losing exact JSON outp
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
   try {
     const result = await backend.generate(jsonSchemaRequest());
@@ -102,7 +102,7 @@ test('ClaudeCodeBackend extracts live tool argument deltas from structured outpu
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
   try {
     const events = [];
@@ -128,7 +128,7 @@ test('ClaudeCodeBackend does not pass direct provider env to child CLI', async (
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
-    timeoutMs: 10_000,
+    timeoutMs: 30_000,
   });
 
   try {

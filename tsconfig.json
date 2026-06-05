@@ -16,6 +16,7 @@
   "include": [
     "src/proxy-cli.ts",
     "src/settings.ts",
+    "src/chat/**/*.ts",
     "src/proxy/**/*.ts"
   ]
 }

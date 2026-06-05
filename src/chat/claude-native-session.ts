@@ -1,0 +1,214 @@
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import readline from 'node:readline';
+import { AsyncQueue } from '../proxy/async-queue.js';
+import { claudeMessageContentFor } from '../proxy/multimodal.js';
+import { proxyChildProcessEnv } from '../proxy/process-env.js';
+import { chatNormalizedRequest, chatPromptText } from './input.js';
+import type {
+  LocalCliChatRuntimeEvent,
+  LocalCliChatRuntimeSession,
+  LocalCliChatTurnInput,
+} from './types.js';
+
+type JsonObject = Record<string, unknown>;
+
+interface ActiveTurn {
+  readonly queue: AsyncQueue<LocalCliChatRuntimeEvent>;
+}
+
+export interface ClaudeNativeCliChatSessionOptions {
+  readonly command?: string;
+  readonly cwd: string;
+  readonly model?: string;
+  readonly timeoutMs: number;
+  readonly extraArgs?: readonly string[];
+}
+
+export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
+  readonly runtime = 'claude' as const;
+  readonly native: Record<string, unknown>;
+
+  private readonly command: string;
+  private readonly cwd: string;
+  private readonly model: string;
+  private readonly timeoutMs: number;
+  private readonly extraArgs: readonly string[];
+  private child: ChildProcessWithoutNullStreams | null = null;
+  private lineReader: readline.Interface | null = null;
+  private stderr = '';
+  private activeTurn: ActiveTurn | null = null;
+
+  private constructor(options: Required<ClaudeNativeCliChatSessionOptions>) {
+    this.command = options.command;
+    this.cwd = options.cwd;
+    this.model = options.model;
+    this.timeoutMs = options.timeoutMs;
+    this.extraArgs = options.extraArgs;
+    this.native = {
+      input_format: 'stream-json',
+      output_format: 'stream-json',
+    };
+  }
+
+  static async create(
+    options: ClaudeNativeCliChatSessionOptions,
+  ): Promise<ClaudeNativeCliChatSession> {
+    const session = new ClaudeNativeCliChatSession({
+      command: options.command ?? 'claude',
+      cwd: options.cwd,
+      model: options.model ?? 'claude-code-cli',
+      timeoutMs: options.timeoutMs,
+      extraArgs: options.extraArgs ?? [],
+    });
+    await session.start();
+    return session;
+  }
+
+  async *startTurn(
+    input: LocalCliChatTurnInput,
+    signal?: AbortSignal,
+  ): AsyncIterable<LocalCliChatRuntimeEvent> {
+    if (!this.child) throw new Error('claude native chat session is not running');
+    if (this.activeTurn) throw new Error('claude native chat session already has a running turn');
+    const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
+    const timer = setTimeout(() => {
+      queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms`));
+      this.activeTurn = null;
+    }, this.timeoutMs);
+    const abort = (): void => {
+      queue.fail(new Error('request aborted'));
+      this.child?.kill('SIGINT');
+      this.activeTurn = null;
+    };
+    this.activeTurn = { queue };
+    if (signal) {
+      if (signal.aborted) abort();
+      else signal.addEventListener('abort', abort, { once: true });
+    }
+    try {
+      const request = chatNormalizedRequest(input, this.model);
+      this.child.stdin.write(`${JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: await claudeMessageContentFor(request, chatPromptText(input)),
+        },
+        parent_tool_use_id: null,
+      })}\n`);
+      for await (const event of queue) yield event;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', abort);
+      if (this.activeTurn?.queue === queue) this.activeTurn = null;
+    }
+  }
+
+  async interrupt(): Promise<void> {
+    this.activeTurn?.queue.fail(new Error('request interrupted'));
+    this.activeTurn = null;
+    this.child?.kill('SIGINT');
+  }
+
+  async close(): Promise<void> {
+    this.activeTurn?.queue.close();
+    this.activeTurn = null;
+    this.lineReader?.close();
+    this.child?.kill('SIGTERM');
+    this.child = null;
+    this.lineReader = null;
+  }
+
+  private async start(): Promise<void> {
+    this.child = spawn(this.command, [
+      '-p',
+      '--input-format',
+      'stream-json',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--include-partial-messages',
+      '--disable-slash-commands',
+      '--strict-mcp-config',
+      '--mcp-config',
+      '{"mcpServers":{}}',
+      '--setting-sources',
+      'user',
+      '--tools',
+      '',
+      '--no-session-persistence',
+      ...(this.model ? ['--model', this.model] : []),
+      ...this.extraArgs,
+    ], {
+      cwd: this.cwd,
+      shell: false,
+      env: proxyChildProcessEnv(),
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    this.child.stderr.setEncoding('utf8');
+    this.child.stderr.on('data', (chunk) => {
+      this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
+    });
+    this.child.on('error', (err) => this.failActive(err));
+    this.child.on('close', (code, signal) => {
+      this.failActive(new Error(`claude code exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`));
+      this.child = null;
+      this.lineReader = null;
+    });
+    this.lineReader = readline.createInterface({ input: this.child.stdout });
+    this.lineReader.on('line', (line) => this.handleLine(line));
+  }
+
+  private handleLine(line: string): void {
+    const message = parseJsonObject(line);
+    if (!message || !this.activeTurn) return;
+    const event = eventFromClaudeMessage(message);
+    this.activeTurn.queue.push(event);
+    if (message.type === 'result') {
+      if (message.subtype === 'success') this.activeTurn.queue.close();
+      else this.activeTurn.queue.fail(new Error(readErrorMessage(message)));
+      this.activeTurn = null;
+    }
+  }
+
+  private failActive(err: Error): void {
+    const detail = this.stderr ? `\n${this.stderr.slice(-2000)}` : '';
+    this.activeTurn?.queue.fail(new Error(`${err.message}${detail}`));
+    this.activeTurn = null;
+  }
+}
+
+function eventFromClaudeMessage(message: JsonObject): LocalCliChatRuntimeEvent {
+  const event = asRecord(message.event);
+  const delta = asRecord(event?.delta);
+  const textDelta = event?.type === 'content_block_delta'
+    && delta?.type === 'text_delta'
+    && typeof delta.text === 'string'
+    ? delta.text
+    : undefined;
+  return {
+    raw: message,
+    ...(textDelta !== undefined ? { textDelta } : {}),
+    ...(message.type === 'result' && message.usage !== undefined ? { usage: message.usage } : {}),
+  };
+}
+
+function parseJsonObject(line: string): JsonObject | null {
+  if (!line.trim()) return null;
+  try {
+    const parsed = JSON.parse(line) as unknown;
+    return asRecord(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function asRecord(value: unknown): JsonObject | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as JsonObject;
+}
+
+function readErrorMessage(message: JsonObject): string {
+  if (typeof message.result === 'string' && message.result.trim()) return message.result;
+  if (typeof message.error === 'string' && message.error.trim()) return message.error;
+  return JSON.stringify(message);
+}
