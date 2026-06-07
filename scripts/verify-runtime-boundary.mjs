@@ -15,7 +15,9 @@ const sourceOnlyChecks = [
   {
     name: 'runtime source must not use outbound fetch',
     pattern: /\bfetch\s*\(/,
-    allow: [],
+    allow: [
+      'src/proxy/codex-backend-transport.ts',
+    ],
   },
   {
     name: 'runtime source must not use outbound HTTP clients',
@@ -39,6 +41,24 @@ const runtimeChecks = [
     name: 'runtime must not embed direct provider hosts',
     pattern: /(?:https:\/\/)?api\.(?:openai|anthropic)\.com/,
     allow: [],
+  },
+  {
+    name: 'runtime must not embed ChatGPT Codex backend host outside codex-backend transport',
+    pattern: /(?:https:\/\/)?chatgpt\.com\/backend-api\/codex/,
+    allow: [
+      'src/proxy/codex-backend-transport.ts',
+      'dist/proxy/codex-backend-transport.js',
+      'dist/proxy/codex-backend-transport.d.ts',
+    ],
+  },
+  {
+    name: 'runtime must not embed Codex OAuth refresh host outside codex-backend transport',
+    pattern: /(?:https:\/\/)?auth\.openai\.com\/oauth\/token/,
+    allow: [
+      'src/proxy/codex-backend-transport.ts',
+      'dist/proxy/codex-backend-transport.js',
+      'dist/proxy/codex-backend-transport.d.ts',
+    ],
   },
   {
     name: 'runtime must not read direct provider credential env names',

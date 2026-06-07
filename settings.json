@@ -1,5 +1,7 @@
 {
   "codexProxy": {
+    "transport": "codex-backend",
+    "imageTransport": "codex-backend",
     "fallbackReasoningEffort": "medium",
     "fallbackVerbosity": "medium",
     "imageModel": "gpt-5.5"

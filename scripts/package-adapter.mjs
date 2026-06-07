@@ -182,9 +182,22 @@ async function validateConsumerInstall(consumerDir, tarballPath) {
   if (!help.includes('Commands:') || !help.includes('proxy')) {
     throw new Error('Installed CLI help did not expose the proxy command.');
   }
-  if (help.includes('generate') || help.includes('serve')) {
+  const commandsSection = sectionBetween(help, 'Commands:', '\n\n');
+  const commandLines = commandsSection
+    .split(/\r?\n/)
+    .filter((line) => /^  [a-z][a-z-]*\s+/.test(line));
+  const exposedCommands = commandLines.map((line) => line.trim().split(/\s+/)[0]);
+  if (exposedCommands.some((command) => command !== 'proxy')) {
     throw new Error('Installed CLI exposes non-proxy commands.');
   }
+}
+
+function sectionBetween(text, start, end) {
+  const startIndex = text.indexOf(start);
+  if (startIndex === -1) return '';
+  const contentStart = startIndex + start.length;
+  const endIndex = text.indexOf(end, contentStart);
+  return text.slice(contentStart, endIndex === -1 ? undefined : endIndex);
 }
 
 function legacyNamespacePattern() {

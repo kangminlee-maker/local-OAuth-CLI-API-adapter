@@ -13,11 +13,11 @@ Proxy runtime은 local OAuth CLI auth를 쓰는 것이 제품 목적이다. 따�
 
 Input/output interface contract의 단일 문서는 `docs/api-interface-contract.md`이다. 이 벤치마크 문서는 그 contract가 실제 provider 대비 schema, event, usage, error, semantic/image quality 기준을 만족하는지 검증하는 방법을 정의한다.
 
-이 경계는 benchmark만의 사후 판정이 아니라 런타임 구조 검증으로도 고정한다. `pnpm verify:runtime-boundary`는 `src`/`dist` proxy runtime에서 direct provider host, provider credential env, outbound HTTP client, ambient `process.env` pass-through를 금지하고, child CLI env sanitization만 별도 authority로 허용한다. 이 검증은 `pnpm test`와 `pnpm pack`의 `prepack` 단계에서 실행된다.
+이 경계는 benchmark만의 사후 판정이 아니라 런타임 구조 검증으로도 고정한다. `pnpm verify:runtime-boundary`는 `src`/`dist` proxy runtime에서 direct provider host, provider credential env, ambient `process.env` pass-through를 금지하고, child CLI env sanitization만 별도 authority로 허용한다. outbound HTTP는 `codex-backend` transport가 ChatGPT Codex backend에 연결하거나 Codex OAuth access token을 refresh하는 경우에만 허용된다. 이 검증은 `pnpm test`와 `pnpm pack`의 `prepack` 단계에서 실행된다.
 
 같은 verifier는 benchmark fixture 또는 문제 문항 리터럴이 runtime에 들어오는 것도 금지한다. Benchmark prompt, fixture 이름, expected tool/result token은 `scripts/`, `test/`, docs에만 존재해야 하며, `src`/`dist` runtime은 API field translation, provider-surface validation, context isolation, streaming forwarding 같은 일반 규칙만 가져야 한다.
 
-현재 Codex Images proxy에서 `image-2`는 실험적 우회가 아니라 정식 `image2_via_gpt55` 경로이다. `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations` 요청은 OpenAI Images API surface로 입력을 normalize한 뒤 Codex OAuth `gpt-5.5` image-generation turn으로 변환한다. Proxy runtime은 direct provider API fallback을 금지하며, benchmark 중 proxy target이 `api.openai.com` 또는 `api.anthropic.com`을 호출하면 해당 row는 0점 실패로 처리한다.
+현재 Codex Images proxy에서 `image-2`는 실험적 우회가 아니라 정식 `image2_via_gpt55` 경로이다. `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations` 요청은 OpenAI Images API surface로 입력을 normalize한 뒤 Codex OAuth `gpt-5.5` backend Responses `image_generation` tool로 변환한다. Proxy runtime은 direct provider API fallback을 금지하며, benchmark 중 proxy target이 `api.openai.com` 또는 `api.anthropic.com`을 호출하면 해당 row는 0점 실패로 처리한다.
 
 2026-06-04 기준으로 `image-2` route의 품질 비교 authority는 direct OpenAI Images API의 invalid-model 응답이 아니라 direct OpenAI `gpt-5.5` Responses `image_generation` 결과이다. Direct Images API의 `gpt-image-1.5` positive/negative row는 별도 baseline으로 남긴다. `input_fidelity`는 image-2 API field capability에서 비활성화된 항목으로 보고, `invalid_input_fidelity_model`은 proxy 품질 실패가 아니라 disabled-field contract 확인 row로 다룬다. Proxy-local variation JSON 오류는 proxy가 지원하는 `/v1/images/variations` 표면의 400 `invalid_request_error` contract로 별도 검증한다.
 
@@ -25,12 +25,14 @@ Input/output interface contract의 단일 문서는 `docs/api-interface-contract
 
 | Proxy target | API surface | Direct comparison authority | 비교 기준 |
 | --- | --- | --- | --- |
-| `proxy-codex` | OpenAI Chat | OpenAI Chat Completions | schema, exact output, stream shape, usage, semantic quality |
-| `proxy-codex` | OpenAI Responses | OpenAI Responses | schema, function call/tool result, stream shape, usage, semantic quality |
-| `proxy-codex` | OpenAI Images | OpenAI `gpt-5.5` Responses `image_generation` for `image2_via_gpt55` quality; direct Images API rows only as separate baselines | schema, image quality, stream latency, URL/edit/variation behavior, no direct-provider egress |
+| `proxy-codex` | OpenAI Chat | OpenAI Chat Completions | product hybrid path: text/tool uses `codex-backend`; schema, exact output, stream shape, usage, semantic quality |
+| `proxy-codex` | OpenAI Responses | OpenAI Responses | product hybrid path: text/tool uses `codex-backend`; schema, function call/tool result, stream shape, usage, semantic quality |
+| `proxy-codex` | OpenAI Images | OpenAI `gpt-5.5` Responses `image_generation` for `image2_via_gpt55` quality through Codex backend; direct Images API rows only as separate baselines | schema, image quality, stream latency, URL/edit/variation behavior, no direct-provider egress |
+| `proxy-codex-app-server` | OpenAI Chat/Responses text and tools | OpenAI Chat/Responses | diagnostic target for the older app-server text/tool path and `turnWaitMs` decomposition; not the product hot path |
+| `proxy-codex-backend` | OpenAI Chat/Responses text and tools | OpenAI Chat/Responses | diagnostic target for the standalone thinner ChatGPT Codex backend transport; product path is `proxy-codex` |
 | `proxy-claude` | Anthropic Messages | Anthropic Messages Opus (`claude-opus-4-8`) | schema, text/tool/image block behavior, stream shape, usage, semantic quality |
 
-Cross-provider semantic references are not valid benchmark authority: `proxy-codex` quality is compared only with OpenAI direct API, and `proxy-claude` quality is compared only with Anthropic direct API. The benchmark runner therefore does not execute OpenAI-shaped quality rows for `proxy-claude` or Anthropic quality rows for `proxy-codex`.
+Cross-provider semantic references are not valid benchmark authority: `proxy-codex`, `proxy-codex-app-server`, and `proxy-codex-backend` quality are compared only with OpenAI direct API, and `proxy-claude` quality is compared only with Anthropic direct API. The benchmark runner therefore does not execute OpenAI-shaped quality rows for `proxy-claude` or Anthropic quality rows for Codex targets.
 
 If a direct semantic reference fails, the benchmark records `referenceErrors` and fails that row as a reference-availability problem rather than treating it as proxy output quality. This distinction matters for provider `max_tokens` failures: `max_tokens` is the per-request output cap, not subscription or credit exhaustion.
 
@@ -113,6 +115,7 @@ Gate:
 - hard fail: 빈/손상 이미지, 잘못된 content-type, prompt 핵심 객체 누락, URL fetch 실패
 - disabled-field contract: direct `gpt-5.5` image_generation이 거절하는 `background: transparent`는 proxy `image-2`에서도 400 `image_generation_user_error`로 맞춘다.
 - prompt 또는 translator 개선은 특정 benchmark 문항에만 맞춘 문구가 아니라 flat/style, geometry, edit preservation, output field translation처럼 실제 요청 전반에 적용되는 일반 규칙이어야 한다.
+- flat/vector reference-style PNG 후처리는 benchmark fixture 전용 보정이 아니라, reference-style flat graphic 요청 전반에서 gradient/background shading을 줄이는 deterministic edge-preserving 규칙이어야 한다. 작은 accent 색상과 outline/antialiasing이 손상되면 품질 실패로 본다.
 - reference-guided generation 품질 평가는 출력 이미지만 보지 않는다. judge 입력에 reference image(s)를 먼저 넣고 candidate output을 뒤에 넣어, 참조 fidelity와 요구사항 충족을 같이 평가한다.
 
 ## Latency Metrics
@@ -125,8 +128,8 @@ Gate:
 | `firstToolArgumentMs` | 첫 tool/function/image b64 delta | tool stream, image stream |
 | `firstImageMs` | 이미지 stream의 첫 completed b64 payload 도착 시간; partial image payload는 proxy 벤치 지표에서 제외 | image stream |
 | `chunks` | 의미 있는 delta 수 | stream |
-| `backendTiming.turnWaitMs` | proxy-codex provider turn 대기 | proxy-codex |
-| `usageWaitMs` | provider usage 후착 대기 | proxy-codex |
+| `backendTiming.turnWaitMs` | Codex app-server provider turn 대기 | `proxy-codex-app-server`, image rows under `proxy-codex` |
+| `usageWaitMs` | provider usage 후착 대기 | `proxy-codex-app-server`, image rows under `proxy-codex` |
 
 Gate:
 
@@ -147,6 +150,7 @@ Gate:
 ```bash
 pnpm test
 pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex,proxy-claude --repeats 1
+pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex-app-server,proxy-codex-backend --repeats 1
 ```
 
 Provider parity:

@@ -54,7 +54,7 @@ export function image2ViaGpt55Prompt(
     ...backgroundConstraints(options.background),
     ...formatConstraints(options),
     ...editConstraints(options),
-    ...flatGraphicConstraints(prompt),
+    ...flatGraphicConstraints(options),
     ...negativePromptConstraints(prompt),
   ];
   return [
@@ -92,9 +92,9 @@ function geometryConstraints(prompt: string, size: string | undefined): string[]
   const constraints: string[] = [];
   if (/\bsquare\b/.test(lower)) {
     constraints.push('If the prompt requests a square, the visible subject must be a true 1:1 square, not a rectangle.');
-    if (size && size !== 'auto') {
+    const parsed = size && size !== 'auto' ? parseSize(size) : null;
+    if (size && size !== 'auto' && shouldConstrainSquareSubject(lower, parsed)) {
       constraints.push('Keep the square shape independent from the canvas aspect ratio; use background margins around it as needed.');
-      const parsed = parseSize(size);
       if (parsed) {
         const side = Math.round(Math.min(parsed.width, parsed.height) * 0.62);
         const horizontalMargin = Math.round((parsed.width - side) / 2);
@@ -114,6 +114,20 @@ function geometryConstraints(prompt: string, size: string | undefined): string[]
     constraints.push('Keep the primary subject visually centered in the frame.');
   }
   return constraints;
+}
+
+function shouldConstrainSquareSubject(
+  lowerPrompt: string,
+  size: { width: number; height: number } | null,
+): boolean {
+  if (!size) return true;
+  if (size.width !== size.height) return true;
+  return !describesSquareFormat(lowerPrompt);
+}
+
+function describesSquareFormat(lowerPrompt: string): boolean {
+  return /\bsquare\s+(?:(?:\w+)\s+){0,3}(?:poster|canvas|image|background|frame|layout|composition|card|cover|page)\b/.test(lowerPrompt)
+    || /\b(?:poster|canvas|image|background|frame|layout|composition|card|cover|page)\s+(?:is\s+|should\s+be\s+|must\s+be\s+)?square\b/.test(lowerPrompt);
 }
 
 function backgroundConstraints(background: string | undefined): string[] {
@@ -144,6 +158,8 @@ function editConstraints(options: Image2ViaGpt55PromptOptions): string[] {
   if (options.action !== 'edit') return [];
   return [
     'This is an edit request: preserve the source image canvas, subject size, position, background, margins, and composition unless the prompt explicitly changes them.',
+    'Treat non-target regions as locked: keep unchanged colors, edges, geometry, placement, margins, and flatness as close to the source image as possible.',
+    ...targetedEditPreservationConstraints(options.prompt),
     ...(options.imageCount
       ? [`The first ${options.imageCount} attached image${options.imageCount === 1 ? ' is the source image' : 's are source images'}; keep source identity and composition unless the prompt asks otherwise.`]
       : []),
@@ -160,6 +176,25 @@ function editConstraints(options: Image2ViaGpt55PromptOptions): string[] {
   ];
 }
 
+function targetedEditPreservationConstraints(prompt: string): string[] {
+  const lower = prompt.toLowerCase();
+  const constraints: string[] = [];
+  if (/\bbackground\b/.test(lower) && /\b(change|replace|edit)\b/.test(lower)) {
+    constraints.push('For background-only edits, keep every foreground subject unchanged and render the new background as one uniform flat region with no gradient, vignette, lighting falloff, texture, or soft shading.');
+  }
+  if (describesColorReplacement(lower)) {
+    constraints.push('For color replacement edits, replace the entire target object or color region with the requested new color; do not leave visible remnants of the original target color on or around the changed object.');
+    constraints.push('Keep surrounding background and non-target regions unchanged; never turn the original target color into a new background field or border unless the prompt explicitly asks for it.');
+    constraints.push('If the source is a simple flat shape, keep the edited shape a single uniform flat fill with crisp edges and no mottling, gradient, texture, or partial recoloring.');
+  }
+  return constraints;
+}
+
+function describesColorReplacement(lowerPrompt: string): boolean {
+  return /\b(?:change|replace|turn|make|convert|recolor|edit)\b/.test(lowerPrompt)
+    && /\b(?:red|green|blue|yellow|orange|purple|pink|black|white|gray|grey|brown|navy|teal|cyan|magenta)\b/.test(lowerPrompt);
+}
+
 function negativePromptConstraints(prompt: string): string[] {
   const lower = prompt.toLowerCase();
   const constraints: string[] = [];
@@ -172,17 +207,23 @@ function negativePromptConstraints(prompt: string): string[] {
   return constraints;
 }
 
-function flatGraphicConstraints(prompt: string): string[] {
-  if (!asksForFlatGraphic(prompt)) return [];
-  return [
+function flatGraphicConstraints(options: Image2ViaGpt55PromptOptions): string[] {
+  const prompt = options.prompt;
+  if (!asksForFlatGraphicPrompt(prompt)) return [];
+  const constraints = [
     'If the prompt requests a flat, solid, vector, minimal, or simple graphic style, preserve that style with uniform color regions and crisp edges.',
     'For solid-color subjects, make each fill a single uniform tone with no internal shading, tonal variation, texture, glossy highlight, or painterly softness.',
     'Keep flat backgrounds equally uniform; do not add vignette, depth falloff, studio lighting, or paper/canvas texture.',
     'Avoid depth cues such as bevels, lighting, drop shadows, gradients, texture, material rendering, or soft shading unless the prompt explicitly asks for them.',
   ];
+  if (options.imageCount && options.action === 'generate') {
+    constraints.push('When attached images are style references for a flat/vector prompt, extract the reference grammar as hard outlines, simple geometry, palette, margins, and uniform fills; do not add plausible lighting, gradients, or soft shading.');
+    constraints.push('For flat/vector reference style transfer, treat any gradient, shadow, vignette, texture, or soft tonal modeling as a style mismatch rather than an aesthetic improvement.');
+  }
+  return constraints;
 }
 
-function asksForFlatGraphic(prompt: string): boolean {
+export function asksForFlatGraphicPrompt(prompt: string): boolean {
   const lower = prompt.toLowerCase();
   return /\bflat\b/.test(lower) ||
     /\bsolid\b/.test(lower) ||

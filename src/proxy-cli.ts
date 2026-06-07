@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { ClaudeCodeBackend } from './proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from './proxy/codex-app-server-backend.js';
+import { CodexBackendTransport } from './proxy/codex-backend-transport.js';
 import { startLocalApiProxy } from './proxy/http-server.js';
 import { ClaudeNativeCliChatSession } from './chat/claude-native-session.js';
 import { CodexNativeCliChatSession } from './chat/codex-native-session.js';
@@ -9,9 +10,14 @@ import type { LocalCliChatRuntimeFactoryInput } from './chat/types.js';
 import {
   codexProxyImageModel,
   codexProxyFallbackReasoningEffort,
+  codexProxyImageTransport,
+  codexProxyTransport,
+  isCodexProxyImageTransport,
+  isCodexProxyTransport,
   isReasoningEffort,
 } from './settings.js';
-import type { NormalizedReasoningEffort } from './proxy/types.js';
+import type { CodexProxyImageTransport, CodexProxyTransport } from './settings.js';
+import type { LocalCliBackend, NormalizedReasoningEffort, OpenAiImageGenerationClient } from './proxy/types.js';
 
 async function main(argv: readonly string[]): Promise<number> {
   const [command = 'help', ...args] = argv;
@@ -30,8 +36,16 @@ async function proxy(args: readonly string[]): Promise<number> {
   const port = parseIntOption(options.port, 8787);
   const timeoutMs = parseIntOption(options.timeoutMs, 180_000);
   const runtimeName = parseProxyRuntimeName(options.runtime ?? 'codex');
+  const selectedCodexTransport = parseCodexTransport(options.codexTransport ?? options.transport);
+  const selectedCodexImageTransport = parseCodexImageTransport(options.codexImageTransport);
+  if (runtimeName !== 'codex' && (options.codexTransport || options.transport)) {
+    throw new Error('codex transport can only be selected with --runtime codex.');
+  }
+  if (runtimeName !== 'codex' && options.codexImageTransport) {
+    throw new Error('codex image transport can only be selected with --runtime codex.');
+  }
   const cwd = options.cwd ?? process.cwd();
-  const backend = runtimeName === 'claude'
+  const backend: LocalCliBackend = runtimeName === 'claude'
     ? new ClaudeCodeBackend({
         command: options.command,
         cwd,
@@ -39,7 +53,8 @@ async function proxy(args: readonly string[]): Promise<number> {
         timeoutMs,
         extraArgs: options.extraArg,
       })
-    : new CodexAppServerBackend({
+    : createCodexBackend({
+        transport: selectedCodexTransport,
         command: options.command,
         cwd,
         model: options.model,
@@ -47,12 +62,12 @@ async function proxy(args: readonly string[]): Promise<number> {
         reasoningEffort: parseReasoningEffort(options.reasoningEffort),
       });
   const imageGenerationClient = runtimeName === 'codex'
-    ? new CodexAppServerBackend({
+    ? createCodexImageGenerationClient({
+        transport: selectedCodexImageTransport,
         command: options.command,
         cwd,
         model: options.imageModel ?? codexProxyImageModel(),
         timeoutMs,
-        imageGeneration: true,
       })
     : undefined;
   const chatSessionManager = new LocalCliChatSessionManager({
@@ -88,6 +103,8 @@ async function proxy(args: readonly string[]): Promise<number> {
 
   process.stdout.write(`local OAuth CLI API proxy ready\n`);
   process.stdout.write(`  backend: ${backend.name}\n`);
+  if (runtimeName === 'codex') process.stdout.write(`  codexTransport: ${selectedCodexTransport}\n`);
+  if (runtimeName === 'codex') process.stdout.write(`  codexImageTransport: ${selectedCodexImageTransport}\n`);
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
   process.stdout.write(`  openai: OPENAI_BASE_URL=${started.url}/v1\n`);
   process.stdout.write(`  anthropic: ANTHROPIC_BASE_URL=${started.url}\n`);
@@ -118,6 +135,9 @@ interface ParsedOptions {
   readonly cwd?: string;
   readonly reasoningEffort?: string;
   readonly imageModel?: string;
+  readonly codexTransport?: string;
+  readonly codexImageTransport?: string;
+  readonly transport?: string;
 }
 
 function parseOptions(args: readonly string[]): ParsedOptions {
@@ -159,12 +179,70 @@ function parseIntOption(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
+function parseCodexTransport(value: string | undefined): CodexProxyTransport {
+  if (value === undefined) return codexProxyTransport();
+  if (isCodexProxyTransport(value)) return value;
+  throw new Error('codex transport must be one of app-server or codex-backend.');
+}
+
+function parseCodexImageTransport(value: string | undefined): CodexProxyImageTransport {
+  if (value === undefined) return codexProxyImageTransport();
+  if (isCodexProxyImageTransport(value)) return value;
+  throw new Error('codex image transport must be one of app-server or codex-backend.');
+}
+
 function parseReasoningEffort(
   value: string | undefined,
 ): NormalizedReasoningEffort | undefined {
   if (value === undefined) return undefined;
   if (isReasoningEffort(value)) return value;
   throw new Error('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.');
+}
+
+function createCodexBackend(options: {
+  readonly transport: CodexProxyTransport;
+  readonly command?: string;
+  readonly cwd: string;
+  readonly model?: string;
+  readonly timeoutMs: number;
+  readonly reasoningEffort?: NormalizedReasoningEffort;
+}): LocalCliBackend {
+  if (options.transport === 'codex-backend') {
+    return new CodexBackendTransport({
+      model: options.model,
+      timeoutMs: options.timeoutMs,
+      reasoningEffort: options.reasoningEffort,
+    });
+  }
+  return new CodexAppServerBackend({
+    command: options.command,
+    cwd: options.cwd,
+    model: options.model,
+    timeoutMs: options.timeoutMs,
+    reasoningEffort: options.reasoningEffort,
+  });
+}
+
+function createCodexImageGenerationClient(options: {
+  readonly transport: CodexProxyImageTransport;
+  readonly command?: string;
+  readonly cwd: string;
+  readonly model?: string;
+  readonly timeoutMs: number;
+}): OpenAiImageGenerationClient {
+  if (options.transport === 'codex-backend') {
+    return new CodexBackendTransport({
+      model: options.model,
+      timeoutMs: options.timeoutMs,
+    });
+  }
+  return new CodexAppServerBackend({
+    command: options.command,
+    cwd: options.cwd,
+    model: options.model,
+    timeoutMs: options.timeoutMs,
+    imageGeneration: true,
+  });
 }
 
 function helpText(): string {
@@ -183,10 +261,14 @@ Options:
   --timeout-ms <number>              Runtime timeout. Default: 180000.
   --cwd <dir>                        Working directory for proxy backend. Default: current cwd.
   --reasoning-effort <effort>        Codex proxy fallback effort. Default: settings.json (${codexProxyFallbackReasoningEffort()}).
+  --codex-transport <transport>      Codex text/tool transport: app-server or codex-backend. Default: settings.json (${codexProxyTransport()}).
+  --codex-image-transport <transport>
+                                     Codex Images transport: app-server or codex-backend. Default: settings.json (${codexProxyImageTransport()}).
   --image-model <model>              Codex model for image-2 via gpt-5.5 route. Default: settings.json (${codexProxyImageModel()}).
 
 Examples:
   local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/project
+  local-oauth-cli proxy --runtime codex --codex-transport codex-backend --codex-image-transport codex-backend --port 8787
   local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/project
 
 Native local CLI chat endpoint:

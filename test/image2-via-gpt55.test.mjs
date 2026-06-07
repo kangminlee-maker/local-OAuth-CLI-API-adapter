@@ -47,6 +47,23 @@ test('image2_via_gpt55 prompt preserves square geometry on portrait canvas', () 
   assert.match(prompt, /Do not render any letters/);
 });
 
+test('image2_via_gpt55 does not inset square format prompts on square canvas', () => {
+  const prompt = image2ViaGpt55Prompt({
+    action: 'generate',
+    prompt: 'A clean square launch poster with a solid dark navy background. Text says LAUNCH DAY. No extra text.',
+    size: '1024x1024',
+    quality: 'medium',
+    outputFormat: 'png',
+  });
+
+  assert.match(prompt, /Original Images API prompt:/);
+  assert.match(prompt, /A clean square launch poster/);
+  assert.match(prompt, /true 1:1 square, not a rectangle/);
+  assert.doesNotMatch(prompt, /about 635x635px/);
+  assert.doesNotMatch(prompt, /Leave about 195px/);
+  assert.doesNotMatch(prompt, /use background margins around it as needed/);
+});
+
 test('image2_via_gpt55 prompt makes edit preservation explicit', () => {
   const prompt = image2ViaGpt55Prompt({
     action: 'edit',
@@ -61,10 +78,47 @@ test('image2_via_gpt55 prompt makes edit preservation explicit', () => {
   assert.match(prompt, /This is an edit request/);
   assert.match(prompt, /first 1 attached image is the source image/);
   assert.match(prompt, /preserve the source image canvas, subject size, position, background, margins, and composition/);
+  assert.match(prompt, /Treat non-target regions as locked/);
   assert.match(prompt, /Apply only the requested visual change/);
   assert.match(prompt, /do not crop, zoom, repaint the whole frame/);
+  assert.match(prompt, /replace the entire target object or color region/);
+  assert.match(prompt, /do not leave visible remnants of the original target color/);
+  assert.match(prompt, /never turn the original target color into a new background field or border/);
+  assert.match(prompt, /single uniform flat fill with crisp edges/);
   assert.match(prompt, /Use high input fidelity/);
   assert.match(prompt, /Do not render any letters/);
+});
+
+test('image2_via_gpt55 prompt tightens flat reference style transfer', () => {
+  const prompt = image2ViaGpt55Prompt({
+    action: 'generate',
+    prompt: 'Use the attached reference image to create a new flat vector icon. No text.',
+    size: '1024x1024',
+    quality: 'medium',
+    outputFormat: 'png',
+    imageCount: 1,
+  });
+
+  assert.match(prompt, /uniform color regions and crisp edges/);
+  assert.match(prompt, /attached images are style references/);
+  assert.match(prompt, /hard outlines, simple geometry, palette, margins, and uniform fills/);
+  assert.match(prompt, /treat any gradient, shadow, vignette, texture, or soft tonal modeling as a style mismatch/);
+});
+
+test('image2_via_gpt55 prompt locks foreground for background-only edits', () => {
+  const prompt = image2ViaGpt55Prompt({
+    action: 'edit',
+    prompt: 'Change only the white background to uniform pale blue. Keep the red square unchanged. No text.',
+    size: '1024x1024',
+    quality: 'low',
+    outputFormat: 'png',
+    imageCount: 1,
+  });
+
+  assert.match(prompt, /Treat non-target regions as locked/);
+  assert.match(prompt, /keep every foreground subject unchanged/);
+  assert.match(prompt, /one uniform flat region/);
+  assert.match(prompt, /no gradient, vignette, lighting falloff, texture, or soft shading/);
 });
 
 test('image2_via_gpt55 treats image-2 input_fidelity as disabled API surface', () => {

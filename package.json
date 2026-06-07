@@ -27,6 +27,7 @@
     "build": "rm -rf dist && tsc -p tsconfig.json",
     "catalog:runtime": "node scripts/update-runtime-capability-catalog.mjs",
     "smoke:runtime-capabilities": "node scripts/smoke-runtime-capabilities.mjs",
+    "probe:codex-backend-image": "node scripts/probe-codex-backend-image.mjs",
     "verify:runtime-boundary": "node scripts/verify-runtime-boundary.mjs",
     "prepack": "pnpm build && pnpm verify:runtime-boundary",
     "pack:adapter": "node scripts/package-adapter.mjs",

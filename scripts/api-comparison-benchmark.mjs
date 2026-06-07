@@ -6,6 +6,7 @@ import {
   CodexAppServerBackend,
   isCodexAppServerProxyMode,
 } from '../dist/proxy/codex-app-server-backend.js';
+import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js';
 import { openAiImageQualityReasoningEffort, startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { image2ViaGpt55Prompt } from '../dist/proxy/image2-via-gpt55.js';
 import { codexProxyImageModel, isReasoningEffort } from '../dist/settings.js';
@@ -217,17 +218,53 @@ const requestReasoningEffort = optionalReasoningEffort(options.requestReasoningE
 const codexProxyMode = codexAppServerProxyMode(options.codexProxyMode ?? options.codexProbeMode);
 const targetFilters = readFilters(options.targets ?? options.target);
 const caseFilters = mergeFilters(readFilters(options.cases ?? options.case), suiteCaseFilters);
+const codexImageAttemptLogPath = options.codexImageAttemptLog;
+const codexImageAttemptDiagnosticsEnabled = booleanOption(
+  options.codexImageAttemptDiagnostics,
+  Boolean(codexImageAttemptLogPath),
+);
 
 const rows = [];
 const servers = [];
 const semanticReferenceCache = new Map();
 const imageFixtureCache = new Map();
 const backendTimingQueues = new Map();
+const imageAttemptDiagnostics = [];
 
 try {
   let proxyCodex = null;
+  let proxyCodexAppServer = null;
+  let proxyCodexBackendTransport = null;
   let proxyClaude = null;
+  const selectedCodexImageTransport = codexImageTransport(options.codexImageTransport);
   if (shouldRunTarget('proxy-codex') || shouldRunImageGenerationPairBenchmark()) {
+    const proxyCodexTextBackend = new CodexBackendTransport({
+      model: options.codexBackendModel ?? options.codexModel,
+      timeoutMs,
+      reasoningEffort: reasoningEffort(options.reasoningEffort),
+    });
+    const proxyCodexImageBackend = selectedCodexImageTransport === 'codex-backend'
+      ? new CodexBackendTransport({
+          model: options.codexImageModel ?? codexProxyImageModel(),
+          timeoutMs,
+          ...(codexImageAttemptDiagnosticsEnabled
+            ? { onImageAttempt: (diagnostic) => recordImageAttemptDiagnostic('proxy-codex', diagnostic) }
+            : {}),
+        })
+      : new CodexAppServerBackend({
+          command: options.codexCommand,
+          cwd,
+          model: options.codexImageModel ?? codexProxyImageModel(),
+          timeoutMs,
+          imageGeneration: true,
+          proxyMode: codexProxyMode,
+          onTiming: (timing) => pushBackendTiming('proxy-codex', timing),
+        });
+    proxyCodex = await startProxy(proxyCodexTextBackend, {
+      imageGenerationClient: proxyCodexImageBackend,
+    });
+  }
+  if (shouldRunDiagnosticTarget('proxy-codex-app-server')) {
     const proxyCodexBackend = new CodexAppServerBackend({
       command: options.codexCommand,
       cwd,
@@ -235,20 +272,16 @@ try {
       timeoutMs,
       reasoningEffort: reasoningEffort(options.reasoningEffort),
       proxyMode: codexProxyMode,
-      onTiming: (timing) => pushBackendTiming('proxy-codex', timing),
+      onTiming: (timing) => pushBackendTiming('proxy-codex-app-server', timing),
     });
-    const proxyCodexImageBackend = new CodexAppServerBackend({
-      command: options.codexCommand,
-      cwd,
-      model: options.codexImageModel ?? codexProxyImageModel(),
+    proxyCodexAppServer = await startProxy(proxyCodexBackend);
+  }
+  if (shouldRunDiagnosticTarget('proxy-codex-backend')) {
+    proxyCodexBackendTransport = await startProxy(new CodexBackendTransport({
+      model: options.codexBackendModel ?? options.codexModel,
       timeoutMs,
-      imageGeneration: true,
-      proxyMode: codexProxyMode,
-      onTiming: (timing) => pushBackendTiming('proxy-codex', timing),
-    });
-    proxyCodex = await startProxy(proxyCodexBackend, {
-      imageGenerationClient: proxyCodexImageBackend,
-    });
+      reasoningEffort: reasoningEffort(options.reasoningEffort),
+    }));
   }
   if (shouldRunTarget('proxy-claude')) {
     proxyClaude = await startProxy(new ClaudeCodeBackend({
@@ -262,6 +295,10 @@ try {
   if (proxyCodex) await benchmarkOpenAiChatCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
   if (proxyCodex) await benchmarkOpenAiCompatible('proxy-codex', proxyCodex.url, proxyCodex.model, false);
   if (shouldRunImageGenerationBenchmarks() && proxyCodex) await benchmarkOpenAiImageGenerationCompatible('proxy-codex', proxyCodex.url, false);
+  if (proxyCodexAppServer) await benchmarkOpenAiChatCompatible('proxy-codex-app-server', proxyCodexAppServer.url, proxyCodexAppServer.model, false);
+  if (proxyCodexAppServer) await benchmarkOpenAiCompatible('proxy-codex-app-server', proxyCodexAppServer.url, proxyCodexAppServer.model, false);
+  if (proxyCodexBackendTransport) await benchmarkOpenAiChatCompatible('proxy-codex-backend', proxyCodexBackendTransport.url, proxyCodexBackendTransport.model, false);
+  if (proxyCodexBackendTransport) await benchmarkOpenAiCompatible('proxy-codex-backend', proxyCodexBackendTransport.url, proxyCodexBackendTransport.model, false);
   if (shouldRunTarget(openAiApiTarget)) {
     if (process.env.OPENAI_API_KEY) {
       await benchmarkOpenAiChatCompatible(openAiApiTarget, 'https://api.openai.com', openAiModel, true);
@@ -347,6 +384,7 @@ const regressionGate = baselinePath
   : null;
 const summary = {
   ...summaryBase,
+  ...(imageAttemptDiagnostics.length > 0 ? { imageAttemptDiagnostics } : {}),
   ...(regressionGate ? { regressionGate } : {}),
 };
 if (outputPath) {
@@ -2782,10 +2820,11 @@ function assertAnthropicMessageShape(body, stopReason) {
 
 function assertAnthropicStreamShape(events) {
   const eventTypes = events.map(({ event }) => event);
-  assertEqual(eventTypes[0], 'message_start', 'anthropic first stream event');
+  const lifecycleEvents = eventTypes.filter((event) => event !== 'ping');
+  assertEqual(lifecycleEvents[0], 'message_start', 'anthropic first non-ping stream event');
   assert(eventTypes.includes('content_block_delta'), 'anthropic stream missing content delta');
   assert(eventTypes.includes('message_delta'), 'anthropic stream missing message_delta');
-  assertEqual(eventTypes.at(-1), 'message_stop', 'anthropic last stream event');
+  assertEqual(lifecycleEvents.at(-1), 'message_stop', 'anthropic last non-ping stream event');
   for (const { event, payload } of events) {
     assertEqual(payload.type, event, `anthropic payload type for ${event}`);
   }
@@ -2808,6 +2847,16 @@ function pushBackendTiming(target, timing) {
   const queue = backendTimingQueues.get(target) ?? [];
   queue.push(timing);
   backendTimingQueues.set(target, queue);
+}
+
+function recordImageAttemptDiagnostic(target, diagnostic) {
+  const record = {
+    target,
+    case: currentBenchmarkContext?.caseName ?? null,
+    ...diagnostic,
+  };
+  imageAttemptDiagnostics.push(record);
+  if (codexImageAttemptLogPath) fs.appendFileSync(codexImageAttemptLogPath, `${JSON.stringify(record)}\n`);
 }
 
 function attachBackendTiming(target, sample) {
@@ -2942,11 +2991,11 @@ function qualityTasks() {
       expectedBullets: 5,
       prompt: [
         'Write a concise engineering handoff in English for the next maintainer of a local OAuth CLI API proxy.',
-        'Current facts: provider token usage is preserved in public usage fields; stream rows track firstDataMs, firstTextMs, and firstToolArgumentMs; semantic quality must stay at least 95; proxy-codex latency outliers are dominated by turnWaitMs; request-level effort overrides backend fallback settings.',
+        'Current facts: provider token usage is preserved in public usage fields; stream rows track firstDataMs, firstTextMs, and firstToolArgumentMs; semantic quality must stay at least 95; proxy-codex-app-server diagnostic latency outliers are dominated by turnWaitMs; request-level effort overrides backend fallback settings.',
         'Return exactly five bullets.',
         'Each bullet must name the product consequence first, then the technical authority.',
         'Preserve exact identifiers and numeric thresholds: write "at least 95" as a score, not 95%, and state that outliers are dominated by turnWaitMs.',
-        'Include these exact authority phrases once each: "stream rows track firstDataMs, firstTextMs, and firstToolArgumentMs"; "proxy-codex latency outliers are dominated by turnWaitMs"; "request-level effort overrides backend fallback settings".',
+        'Include these exact authority phrases once each: "stream rows track firstDataMs, firstTextMs, and firstToolArgumentMs"; "proxy-codex-app-server diagnostic latency outliers are dominated by turnWaitMs"; "request-level effort overrides backend fallback settings".',
         'Keep each bullet under 18 words.',
         'Avoid historical narration and avoid asking follow-up questions.',
       ].join(' '),
@@ -2958,7 +3007,7 @@ function qualityTasks() {
       expectedBullets: 4,
       prompt: [
         '한국어로 장애 보고서를 작성해줘.',
-        '상황: proxy-codex가 OpenAI Chat tool_call_stream에서 첫 tool argument를 7초 늦게 보냈고, 직접 OpenAI API는 1.2초였다.',
+        '상황: proxy-codex-app-server 진단 경로가 OpenAI Chat tool_call_stream에서 첫 tool argument를 7초 늦게 보냈고, 직접 OpenAI API는 1.2초였다.',
         '원인 후보: Codex turnWaitMs outlier, wrapper context 증가, usage 후착 대기 혼동.',
         '사실: public API schema와 provider usage 값은 정상이고, 사용자 prompt 축소는 금지되어 있다.',
         '출력은 제목 없이 정확히 네 개의 bullet만 사용해.',
@@ -3107,6 +3156,8 @@ async function safeSemanticReference(kind, target, index, prompt, options = {}) 
 
 function semanticReferenceProvider(target) {
   if (target === 'proxy-codex') return 'openai';
+  if (target === 'proxy-codex-app-server') return 'openai';
+  if (target === 'proxy-codex-backend') return 'openai';
   if (target === 'proxy-claude') return 'anthropic';
   return null;
 }
@@ -3621,6 +3672,10 @@ function shouldRunTarget(target) {
   return matchesFilters(target, targetFilters);
 }
 
+function shouldRunDiagnosticTarget(target) {
+  return Boolean(targetFilters) && shouldRunTarget(target);
+}
+
 function shouldRunImageGenerationBenchmarks() {
   return includeImageGeneration
     || Boolean(caseFilters && Object.values(imageGenerationCaseNames).some((caseName) => shouldRunCase(caseName)));
@@ -3801,6 +3856,12 @@ function codexAppServerProxyMode(value) {
   if (value === undefined) return undefined;
   if (isCodexAppServerProxyMode(value)) return value;
   throw new Error(`Unsupported Codex proxy mode: ${value}`);
+}
+
+function codexImageTransport(value) {
+  if (value === undefined) return 'codex-backend';
+  if (value === 'app-server' || value === 'codex-backend') return value;
+  throw new Error(`Unsupported Codex image transport: ${value}`);
 }
 
 function errorMessage(err) {

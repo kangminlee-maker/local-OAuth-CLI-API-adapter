@@ -1,8 +1,13 @@
 import { readFileSync } from 'node:fs';
 import type { NormalizedReasoningEffort, NormalizedVerbosity } from './proxy/types.js';
 
+export type CodexProxyTransport = 'app-server' | 'codex-backend';
+export type CodexProxyImageTransport = 'app-server' | 'codex-backend';
+
 export interface AddonSettings {
   readonly codexProxy: {
+    readonly transport: CodexProxyTransport;
+    readonly imageTransport: CodexProxyImageTransport;
     readonly fallbackReasoningEffort: NormalizedReasoningEffort;
     readonly fallbackVerbosity: NormalizedVerbosity;
     readonly imageModel: string;
@@ -10,6 +15,7 @@ export interface AddonSettings {
 }
 
 const SETTINGS_URL = new URL('../settings.json', import.meta.url);
+const CODEX_PROXY_TRANSPORTS = ['app-server', 'codex-backend'] as const;
 const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 const VERBOSITIES = ['low', 'medium', 'high'] as const;
 
@@ -30,6 +36,14 @@ export function loadSettings(): AddonSettings {
   if (!codexProxy) throw new Error('settings.json must define codexProxy.');
   cachedSettings = {
     codexProxy: {
+      transport: readCodexProxyTransportSetting(
+        codexProxy?.transport,
+        'codexProxy.transport',
+      ),
+      imageTransport: readCodexProxyImageTransportSetting(
+        codexProxy?.imageTransport,
+        'codexProxy.imageTransport',
+      ),
       fallbackReasoningEffort: readReasoningEffortSetting(
         codexProxy?.fallbackReasoningEffort,
         'codexProxy.fallbackReasoningEffort',
@@ -45,6 +59,14 @@ export function loadSettings(): AddonSettings {
     },
   };
   return cachedSettings;
+}
+
+export function codexProxyTransport(): CodexProxyTransport {
+  return loadSettings().codexProxy.transport;
+}
+
+export function codexProxyImageTransport(): CodexProxyImageTransport {
+  return loadSettings().codexProxy.imageTransport;
 }
 
 export function codexProxyFallbackReasoningEffort(): NormalizedReasoningEffort {
@@ -65,6 +87,30 @@ export function isReasoningEffort(value: unknown): value is NormalizedReasoningE
 
 export function isVerbosity(value: unknown): value is NormalizedVerbosity {
   return typeof value === 'string' && VERBOSITIES.includes(value as NormalizedVerbosity);
+}
+
+export function isCodexProxyTransport(value: unknown): value is CodexProxyTransport {
+  return typeof value === 'string' && CODEX_PROXY_TRANSPORTS.includes(value as CodexProxyTransport);
+}
+
+export function isCodexProxyImageTransport(value: unknown): value is CodexProxyImageTransport {
+  return isCodexProxyTransport(value);
+}
+
+function readCodexProxyTransportSetting(
+  value: unknown,
+  key: string,
+): CodexProxyTransport {
+  if (isCodexProxyTransport(value)) return value;
+  throw new Error(`${key} must be one of ${CODEX_PROXY_TRANSPORTS.join(', ')}.`);
+}
+
+function readCodexProxyImageTransportSetting(
+  value: unknown,
+  key: string,
+): CodexProxyImageTransport {
+  if (isCodexProxyImageTransport(value)) return value;
+  throw new Error(`${key} must be one of ${CODEX_PROXY_TRANSPORTS.join(', ')}.`);
 }
 
 function readReasoningEffortSetting(

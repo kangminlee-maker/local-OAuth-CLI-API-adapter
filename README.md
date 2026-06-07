@@ -38,6 +38,23 @@ Start the proxy from the consumer repository:
 pnpm exec local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
 ```
 
+Codex text/tool and Images requests can use the thinner backend transport:
+
+```bash
+pnpm exec local-oauth-cli proxy --runtime codex \
+  --codex-transport codex-backend \
+  --codex-image-transport codex-backend \
+  --port 8787
+```
+
+`codex-backend` uses the local Codex OAuth token against the ChatGPT Codex
+backend surface that Codex itself uses. It is not a direct OpenAI Platform API
+call and it does not use `OPENAI_API_KEY`. It refreshes expired Codex OAuth
+access tokens with the stored refresh token; if that refresh token is expired,
+revoked, or already used, sign in to Codex again. The default is
+`codex-backend` for provider-compatible text/tool and Images API requests,
+while native local chat still uses Codex app-server.
+
 Then point OpenAI-compatible clients at the local proxy:
 
 ```bash
@@ -129,7 +146,10 @@ OpenAI or Anthropic APIs.
 | Model list | `GET /v1/models` returns the configured local backend model, not the full provider catalog. |
 | Model execution | The request `model` is accepted, but execution is constrained by the selected local CLI backend. |
 | Context | Codex proxy runs with isolated home/workspace settings so ambient project context does not leak into API requests. |
+| Codex transport | `codexProxy.transport` defaults to `codex-backend`; text/tool uses ChatGPT Codex backend directly. |
+| Codex image transport | `codexProxy.imageTransport` defaults to `codex-backend`; Images API uses backend `image_generation` tool results, while native chat uses app-server. |
 | Images `image-2` | Implemented through the local Codex `gpt-5.5` image-generation route. |
+| Images flat/vector references | PNG flat/vector reference-style outputs may receive deterministic edge-preserving flattening to reduce gradients while preserving small accent colors and outlines. |
 | Images partial streaming | `partial_images > 0` is rejected; streams emit completed images only. |
 | Images `input_fidelity` | Treated as disabled for `image-2`. |
 | Provider `file_id` images | Rejected because the local CLI proxy cannot read provider Files API storage. |
@@ -275,6 +295,23 @@ pnpm smoke:real:claude:multimodal
 These commands use actual logged-in CLI sessions and may consume plan credits or
 rate limits.
 
+To verify the raw Codex backend image path and installed Codex binary schema:
+
+```bash
+pnpm probe:codex-backend-image
+```
+
+The probe calls only `chatgpt.com/backend-api/codex` plus Codex OAuth refresh if
+needed. It records whether backend SSE emits `image_generation_call.result` and
+saves the generated image under `artifacts/codex-backend-image-probe/`.
+For image latency request-shape probes, pass comma-separated variants and
+repeats, for example:
+
+```bash
+pnpm probe:codex-backend-image -- --repeats 2 --no-stop-after-success \
+  --variant tool_image_generation_required_with_controls,tool_image_generation_required_action_format
+```
+
 ## Benchmarks
 
 Run a comparison benchmark against direct provider APIs:
@@ -282,6 +319,7 @@ Run a comparison benchmark against direct provider APIs:
 ```bash
 pnpm bench:api
 pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex,proxy-claude --repeats 1
+pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex-app-server,proxy-codex-backend --repeats 1
 pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --repeats 3
 pnpm bench:api -- --suite=quality-realistic --targets=proxy-codex,proxy-claude --min-semantic-quality=95
 pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api:gpt-5.5 --image-quality-repeats=1 --min-image-quality=90 --repeats 1
@@ -290,6 +328,12 @@ pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api:gpt-5
 Benchmarks load `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment or
 `.env` for direct provider targets. Direct provider rows can consume paid
 credits and rate limits.
+For `proxy-codex`, image benchmark rows use `codex-backend` by default; pass
+`--codex-image-transport app-server` only when measuring the older diagnostic
+image path.
+When diagnosing Codex backend image latency or no-image completions, pass
+`--codex-image-attempt-diagnostics` to include attempt timelines in the summary,
+or `--codex-image-attempt-log artifacts/image-attempts.jsonl` to also write JSONL.
 
 Benchmark design and release gates are documented in
 [`docs/api-benchmark-design.md`](docs/api-benchmark-design.md). The benchmark
@@ -320,7 +364,15 @@ benchmark targets.
 
 ## Runtime Notes
 
-- `codex` uses `codex app-server` and the local Codex CLI auth state.
+- `codex` uses the hybrid Codex proxy path by default: `codex-backend` for
+  provider-compatible text/tool and Images API requests, and `codex app-server`
+  for native local chat sessions.
+- `codex-backend` calls `chatgpt.com/backend-api/codex` with the local Codex
+  OAuth token. For Images API requests it sends the backend Responses
+  `image_generation` tool and maps `image_generation_call.result` to OpenAI
+  Images-compatible `b64_json` or local URL responses. The transport
+  proactively refreshes the access token near expiry and retries once after
+  backend auth failures.
 - `claude` uses `claude -p` and the local Claude Code auth state.
 - Codex text streaming maps app-server agent-message deltas to the local API
   stream.

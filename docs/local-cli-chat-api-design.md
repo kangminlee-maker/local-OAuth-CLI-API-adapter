@@ -330,6 +330,8 @@ The API should not compress or rewrite user prompts for performance.
 - No direct provider API fallback.
 - No direct provider credentials in child CLI env.
 - No provider-compatible response synthesis in the native chat hot path.
+- `codex-backend` is a provider-compatible proxy transport, not the native chat
+  surface; native chat keeps raw CLI events as authority.
 - No consumer-specific stage names in the package API.
 - No hidden project context unless explicitly enabled by session options.
 - No session sharing across unrelated consumers unless caller explicitly reuses the same `session_id`.
