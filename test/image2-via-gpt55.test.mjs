@@ -121,6 +121,33 @@ test('image2_via_gpt55 prompt locks foreground for background-only edits', () =>
   assert.match(prompt, /no gradient, vignette, lighting falloff, texture, or soft shading/);
 });
 
+test('image2_via_gpt55 prompt applies proxy image route hints without rewriting intent', () => {
+  const prompt = image2ViaGpt55Prompt({
+    action: 'generate',
+    prompt: 'Create a simple flat circular badge: teal outer circle, white inner circle, and one small orange star in the center. No text.',
+    size: '1024x1024',
+    quality: 'low',
+    outputFormat: 'webp',
+    outputCompression: 95,
+    proxyRoute: {
+      visualClass: 'badge_or_emblem',
+      outputFormat: 'webp',
+      outputCompression: 95,
+      geometryMode: 'strict',
+    },
+  });
+
+  assert.match(prompt, /Original Images API prompt:/);
+  assert.match(prompt, /teal outer circle, white inner circle, and one small orange star/);
+  assert.match(prompt, /visual_class=badge_or_emblem/);
+  assert.match(prompt, /full badge inside the canvas with visible margin/);
+  assert.match(prompt, /outer shape visually distinct from the background/);
+  assert.match(prompt, /geometry_mode=strict/);
+  assert.match(prompt, /exact requested geometry/);
+  assert.match(prompt, /suitable for webp output/);
+  assert.match(prompt, /output_compression=95/);
+});
+
 test('image2_via_gpt55 treats image-2 input_fidelity as disabled API surface', () => {
   const prompt = image2ViaGpt55PromptFromRequest({
     operation: 'edit',

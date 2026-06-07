@@ -5,6 +5,7 @@ import { CodexBackendTransport } from './proxy/codex-backend-transport.js';
 import { startLocalApiProxy } from './proxy/http-server.js';
 import { ClaudeNativeCliChatSession } from './chat/claude-native-session.js';
 import { CodexNativeCliChatSession } from './chat/codex-native-session.js';
+import { renderLlmInstallGuideNotice } from './llm-install-guide.js';
 import { LocalCliChatSessionManager } from './chat/session-manager.js';
 import type { LocalCliChatRuntimeFactoryInput } from './chat/types.js';
 import {
@@ -19,10 +20,16 @@ import {
 import type { CodexProxyImageTransport, CodexProxyTransport } from './settings.js';
 import type { LocalCliBackend, NormalizedReasoningEffort, OpenAiImageGenerationClient } from './proxy/types.js';
 
+const LLM_INSTALL_GUIDE_ACCEPT_VERSION = 'v1';
+
 async function main(argv: readonly string[]): Promise<number> {
   const [command = 'help', ...args] = argv;
   if (command === 'help' || command === '--help' || command === '-h') {
     process.stdout.write(helpText());
+    return 0;
+  }
+  if (command === '--llm-guide' || command === 'llm-guide') {
+    process.stdout.write(renderLlmInstallGuideNotice());
     return 0;
   }
   if (command === 'proxy') return proxy(args);
@@ -32,6 +39,13 @@ async function main(argv: readonly string[]): Promise<number> {
 
 async function proxy(args: readonly string[]): Promise<number> {
   const options = parseOptions(args);
+  if (options.acceptLlmGuide !== LLM_INSTALL_GUIDE_ACCEPT_VERSION) {
+    process.stdout.write(renderLlmInstallGuideNotice());
+    process.stderr.write(
+      `Refusing to start proxy until the LLM install guide is acknowledged. Re-run with --accept-llm-guide=${LLM_INSTALL_GUIDE_ACCEPT_VERSION}.\n`,
+    );
+    return 1;
+  }
   const host = options.host ?? '127.0.0.1';
   const port = parseIntOption(options.port, 8787);
   const timeoutMs = parseIntOption(options.timeoutMs, 180_000);
@@ -138,6 +152,7 @@ interface ParsedOptions {
   readonly codexTransport?: string;
   readonly codexImageTransport?: string;
   readonly transport?: string;
+  readonly acceptLlmGuide?: string;
 }
 
 function parseOptions(args: readonly string[]): ParsedOptions {
@@ -252,6 +267,8 @@ Commands:
   proxy      Start an OpenAI/Anthropic-compatible proxy plus native local CLI chat API.
 
 Options:
+  --llm-guide                       Print the LLM install and usage guide.
+  --accept-llm-guide <version>       Required for proxy. Current version: ${LLM_INSTALL_GUIDE_ACCEPT_VERSION}.
   --runtime <codex|claude>           Runtime to use.
   --command <path>                   Override CLI binary path.
   --model <model>                    Pass a model to the selected CLI.
@@ -267,9 +284,9 @@ Options:
   --image-model <model>              Codex model for image-2 via gpt-5.5 route. Default: settings.json (${codexProxyImageModel()}).
 
 Examples:
-  local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/project
-  local-oauth-cli proxy --runtime codex --codex-transport codex-backend --codex-image-transport codex-backend --port 8787
-  local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/project
+  local-oauth-cli proxy --accept-llm-guide=${LLM_INSTALL_GUIDE_ACCEPT_VERSION} --runtime codex --port 8787 --cwd /path/to/project
+  local-oauth-cli proxy --accept-llm-guide=${LLM_INSTALL_GUIDE_ACCEPT_VERSION} --runtime codex --codex-transport codex-backend --codex-image-transport codex-backend --port 8787
+  local-oauth-cli proxy --accept-llm-guide=${LLM_INSTALL_GUIDE_ACCEPT_VERSION} --runtime claude --port 8788 --cwd /path/to/project
 
 Native local CLI chat endpoint:
   POST /local/cli/sessions

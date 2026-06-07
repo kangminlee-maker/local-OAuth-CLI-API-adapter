@@ -95,9 +95,12 @@ function listTarball(tarballPath) {
 
 function validateTarballEntries(entries) {
   const required = [
+    'package/LLM_INSTALL.md',
+    'package/postinstall.mjs',
     'package/package.json',
     'package/README.md',
     'package/settings.json',
+    'package/dist/llm-install-guide.js',
     'package/dist/proxy-cli.js',
     'package/dist/settings.js',
     'package/dist/chat/session-manager.js',
@@ -130,6 +133,9 @@ async function validateExtractedPackage(packageDir) {
   const packageJson = JSON.parse(await readFile(join(packageDir, 'package.json'), 'utf8'));
   if (packageJson.bin?.['local-oauth-cli'] !== './dist/proxy-cli.js') {
     throw new Error('Package bin must point to ./dist/proxy-cli.js');
+  }
+  if (packageJson.scripts?.postinstall !== 'node postinstall.mjs') {
+    throw new Error('Package postinstall must print the LLM install guide.');
   }
   if (packageJson.dependencies && Object.keys(packageJson.dependencies).length > 0) {
     throw new Error('Installable adapter package must not declare runtime dependencies.');
@@ -181,6 +187,23 @@ async function validateConsumerInstall(consumerDir, tarballPath) {
   });
   if (!help.includes('Commands:') || !help.includes('proxy')) {
     throw new Error('Installed CLI help did not expose the proxy command.');
+  }
+  if (!help.includes('--llm-guide')) {
+    throw new Error('Installed CLI help did not expose --llm-guide.');
+  }
+  if (!help.includes('--accept-llm-guide')) {
+    throw new Error('Installed CLI help did not expose --accept-llm-guide.');
+  }
+  const llmGuide = run(pnpm, ['exec', 'local-oauth-cli', '--llm-guide'], {
+    cwd: consumerDir,
+    capture: true,
+  });
+  if (
+    !llmGuide.includes('LLM install and usage guide')
+    || !llmGuide.includes('Required Runtime Boundaries')
+    || !llmGuide.includes('x_proxy_image_route')
+  ) {
+    throw new Error('Installed CLI --llm-guide did not print the LLM install guide.');
   }
   const commandsSection = sectionBetween(help, 'Commands:', '\n\n');
   const commandLines = commandsSection

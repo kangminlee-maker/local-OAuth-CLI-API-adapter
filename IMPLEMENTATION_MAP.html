@@ -199,7 +199,7 @@
       <p>프록시는 실제 provider API와 같은 입출력 표면을 보여야 하지만, 런타임에서는 direct provider API를 호출하지 않아야 합니다. direct API는 명시적인 비교 벤치마크, 기준 답변 생성, 품질 판정에만 사용합니다.</p>
       <p>별도 <code>/local/cli/sessions</code> 표면은 provider-compatible 응답 재구성을 피하고, Codex app-server 또는 Claude stream-json session의 raw event를 작은 SSE envelope로 전달하는 native chat API입니다.</p>
       <p>OpenAI provider-compatible text/tool과 Images API 표면의 기본 hot path는 <code>codex-backend</code>입니다. <code>proxy-codex</code>는 text/tool을 ChatGPT Codex backend SSE에 직접 매핑하고, Images API는 backend Responses <code>image_generation</code> tool의 <code>image_generation_call.result</code>를 OpenAI Images schema로 감쌉니다. native local chat은 Codex app-server를 유지합니다. access token은 만료 전 또는 인증 실패 후 refresh token으로 갱신하며, refresh token이 만료·폐기·재사용된 경우에만 재로그인을 요구합니다.</p>
-      <p><code>proxy-codex</code>의 provider error policy, 이미지 벤치 계획, Claude 한국어 incident는 direct provider 기준 targeted closure에서 모두 95점 이상을 통과했습니다. 이미지 <code>image2_via_gpt55</code>는 full direct 비교에서 backend image_generation tool 결과가 없는 completion이 12건 재현됐고, 이후 backend-only no-image semantic retry와 transient fetch retry를 추가했습니다. 실패 12개 targeted closure에서는 no-image 실패가 0건으로 줄었습니다. 최신 타임라인 기준 이미지 속도 병목은 proxy wrapper나 tool 선택 전 단계가 아니라 Codex image generator 결과 대기입니다. Codex app-server native <code>imageGeneration</code> 경로도 같은 단일 케이스에서 64.5초로, backend Responses tool 61.4초보다 빠르지 않았습니다. request-shape probe 결과에 따라 backend tool field에는 <code>action</code>, <code>output_format</code>, <code>output_compression</code>을 직접 전달합니다. 색상 교체 edit 보존 규칙 보강 후 edit는 proxy/direct 모두 95점 이상으로 회복했습니다. flat/vector reference-style은 edge-preserving PNG flat postprocess 적용 후 proxy 최저 96점으로 통과했고, 같은 run의 direct는 최저 89점으로 실패했습니다.</p>
+      <p><code>proxy-codex</code>의 provider error policy, 이미지 벤치 계획, Claude 한국어 incident는 direct provider 기준 targeted closure에서 모두 95점 이상을 통과했습니다. 이미지 <code>image2_via_gpt55</code>는 full direct 비교에서 backend image_generation tool 결과가 없는 completion이 12건 재현됐고, 이후 backend-only no-image semantic retry와 transient fetch retry를 추가했습니다. 실패 12개 targeted closure에서는 no-image 실패가 0건으로 줄었습니다. 최신 타임라인 기준 이미지 속도 병목은 proxy wrapper나 tool 선택 전 단계가 아니라 Codex image generator 결과 대기입니다. Codex app-server native <code>imageGeneration</code> 경로도 같은 단일 케이스에서 64.5초로, backend Responses tool 61.4초보다 빠르지 않았습니다. request-shape probe 결과에 따라 backend tool field에는 <code>action</code>, <code>output_format</code>, <code>output_compression</code>을 직접 전달합니다. 색상 교체 edit 보존 규칙 보강 후 edit는 proxy/direct 모두 95점 이상으로 회복했습니다. flat/vector reference-style은 edge-preserving PNG flat postprocess 적용 후 proxy 최저 96점으로 통과했고, 같은 run의 direct는 최저 89점으로 실패했습니다. 이미지 runtime transform PoC에서는 JPEG photoreal은 canonical 생성 후 runtime 변환이 47.1% 시간으로 빨랐지만, flat WebP는 158.9%로 느려 format/style별 capability rule이 필요합니다. 분류별 5회 format discovery에서는 <code>textOrLogoGraphic</code> WebP, <code>photorealRaster</code> WebP/PNG/default, <code>productIdentity</code> PNG/WebP/default가 통과했고, <code>referenceOrEdit</code>와 <code>unknownHybrid</code>는 포맷보다 품질 안정화가 먼저입니다. 추가 targeted discovery에서는 <code>simpleFlatGraphic</code>이 prompt 다양화 후 모든 포맷에서 min 95 미만이라 rule 승격을 보류했고, <code>photorealRaster</code>는 WebP가 가장 균형적인 후보입니다. 프롬프트만으로 format/geometry route를 안정적으로 판정하기 어려운 케이스를 위해 proxy-only <code>x_proxy_image_route</code> 확장 필드를 추가했고, 이 필드는 provider parity가 아닌 proxy enhanced 벤치 행으로 분리합니다.</p>
     </div>
 
     <h2>런타임 흐름</h2>
@@ -272,6 +272,18 @@
           <td><code>src/proxy/image2-via-gpt55.ts</code>, Images API 정규화 로직</td>
           <td><code>image-2</code> 요청을 정식 프록시 경로로 받아 Codex OAuth의 <code>gpt-5.5</code> 이미지 생성 능력에 매핑합니다. 현재 품질 매핑은 <code>high→high</code>, <code>medium→medium</code>, <code>low→low</code>입니다.</td>
           <td class="ok">generation, URL 응답, streaming, edit, variation, disabled field, square format, background-only preservation 테스트</td>
+        </tr>
+        <tr>
+          <td>Images proxy route hint</td>
+          <td><code>x_proxy_image_route</code>, <code>OpenAiImageProxyRoute</code></td>
+          <td>OpenAI Images 표준 필드를 보존하면서, 호출자가 알고 있는 이미지 분류와 geometry/output 포맷 의도를 proxy-only 확장 필드로 명시할 수 있습니다. 표준 <code>output_format</code>/<code>output_compression</code>이 있으면 표준 필드가 우선이고, 확장 필드는 provider parity 벤치가 아니라 proxy enhanced 벤치에서만 사용합니다.</td>
+          <td class="ok"><code>test/proxy-http.test.mjs</code>, <code>test/image2-via-gpt55.test.mjs</code></td>
+        </tr>
+        <tr>
+          <td>LLM 설치 가이드 게이트</td>
+          <td><code>LLM_INSTALL.md</code>, <code>postinstall.mjs</code>, <code>--llm-guide</code>, <code>--accept-llm-guide=v1</code></td>
+          <td>설치형 package는 LLM 전용 설치·이용 가이드를 포함하고 postinstall에서 전문을 출력합니다. pnpm처럼 dependency lifecycle script를 차단할 수 있는 환경을 위해 <code>proxy</code> 실행은 <code>--accept-llm-guide=v1</code> 없이는 가이드를 출력하고 종료합니다.</td>
+          <td class="ok"><code>test/llm-guide.test.mjs</code>, <code>scripts/package-adapter.mjs</code>, <code>scripts/e2e-installed-adapter.mjs</code></td>
         </tr>
         <tr>
           <td>Native local CLI chat</td>
@@ -601,6 +613,21 @@
           <td>size/quality를 tool에 유지한 required shape는 2회 모두 16-18초대였습니다. minimal tool은 빠르지만 1254x1254로 contract 위반입니다. string input은 backend가 거절합니다. JPEG/WebP tool field는 실제 파일 형식을 바꾸며, 제품 API fields WebP smoke도 통과했습니다.</td>
         </tr>
         <tr>
+          <td><code>artifacts/image-runtime-poc/image-runtime-poc.2026-06-07T03-33-15-119Z.json</code>, <code>artifacts/image-runtime-poc/image-runtime-poc.2026-06-07T03-35-54-655Z.json</code></td>
+          <td>모델 생성과 deterministic runtime format transform 분리 PoC</td>
+          <td>flat WebP는 모델 직접 WebP가 54.8초/100점이고 canonical PNG 생성 후 runtime WebP 변환은 87.0초/100점입니다. runtime 변환 자체는 303ms였지만 canonical 생성 대기가 길었습니다. photoreal JPEG는 모델 직접 JPEG가 75.2초/98점이고 canonical 생성 후 runtime JPEG 변환은 35.5초/97점입니다. 따라서 runtime transform은 전역 기본값이 아니라 format/style별 capability rule로 적용해야 합니다.</td>
+        </tr>
+        <tr>
+          <td><code>artifacts/image-format-classification/image-format-classification-5x.2026-06-07T08-15-11-561Z.json</code>, <code>artifacts/image-format-classification/latest.md</code></td>
+          <td>이미지 분류별 backend 요청 포맷 discovery 5회 반복</td>
+          <td><code>simpleFlatGraphic</code>은 default/png만 min 95 이상이고 JPEG/WebP는 92점 outlier가 있습니다. <code>textOrLogoGraphic</code>은 WebP가 median 41.2초, min 96점으로 가장 좋고 PNG도 통과하지만 느립니다. <code>photorealRaster</code>는 default/png/jpeg/webp 모두 min 97점 이상이며 WebP median 29.5초가 가장 빠릅니다. <code>productIdentity</code>는 default/png/webp가 통과하고 JPEG는 min 94점입니다. <code>referenceOrEdit</code>와 <code>unknownHybrid</code>는 모든 포맷에서 min 95 미만입니다.</td>
+        </tr>
+        <tr>
+          <td><code>artifacts/image-format-targeted/image-format-targeted-3x.2026-06-07T11-43-02-153Z.json</code>, <code>artifacts/image-format-targeted/latest.md</code></td>
+          <td><code>simpleFlatGraphic</code>와 <code>photorealRaster</code> prompt-diverse targeted format discovery</td>
+          <td><code>simpleFlatGraphic</code>은 4개 prompt × 3회에서 PNG min 88/median 90, JPEG min 82/median 99, WebP min 90/median 99로 어떤 포맷도 min 95를 만족하지 못했습니다. <code>photorealRaster</code>는 PNG min 96/median 97, JPEG min 95/median 97, WebP min 96/median 97로 모두 통과했고, WebP는 median 53.1초, max 75.7초, median 126KB로 가장 균형적입니다.</td>
+        </tr>
+        <tr>
           <td><code>bench-image-shape-field-reference-edit-api-2x-20260606213600.json</code>, <code>bench-image-shape-field-reference-edit-after-preservation-flat-rules-20260606215000.json</code></td>
           <td>제품 field 반영 후 API fields, reference style, edit 색상 교체의 direct/proxy 2회 비교</td>
           <td>보강 전 edit proxy 최저점은 78점이었고, 색상 교체 보존 규칙 보강 후 96점으로 회복했습니다. API fields/WebP는 97점 이상으로 통과했지만 proxy tail이 73.4초까지 튀었습니다. reference style은 proxy/direct 모두 90점으로 flat-vector gate 미달입니다.</td>
@@ -687,38 +714,38 @@
       <tbody>
         <tr>
           <td>1</td>
+          <td>이미지 output strategy rule을 보수적으로 설계합니다. 현재 승격 가능한 후보는 <code>photorealRaster → webp</code>, <code>textOrLogoGraphic → webp</code>, <code>productIdentity → png</code>이며, <code>simpleFlatGraphic</code>은 하위 분류나 품질 개선 전까지 제외합니다.</td>
+          <td class="ok">중간에서 높습니다. photoreal WebP는 prompt-diverse targeted run에서 PNG보다 median 11.9초 빠르고 max tail도 낮았습니다.</td>
+          <td class="warn">중간입니다. simple flat, reference/edit, unknown hybrid는 min 95 미만 샘플이 있어 기본 rule로 올리면 품질 회귀 위험이 있습니다.</td>
+          <td><code>settings.json</code>에서 on/off 가능한 strategy 설계, 통과 포맷만 기본 후보화, simple flat/reference/edit/unknownHybrid는 strategy off fallback으로 분리</td>
+        </tr>
+        <tr>
+          <td>2</td>
           <td>edge-preserving flat postprocess를 더 넓은 reference/flat graphic suite에 일반화 검증합니다. 현재 reference-style 단일축은 통과했지만, reference product, multi-reference, asset icon, text poster, URL 응답, streaming 응답에서 오작동하지 않는지 확인해야 합니다.</td>
           <td>낮거나 중간입니다. 후처리는 PNG CPU 작업이라 모델 대기 시간에 비하면 작지만, 큰 이미지에서 수십 ms 이상 추가될 수 있습니다.</td>
           <td class="ok">높습니다. 8색 강제 실패처럼 작은 의미 색상이나 edge를 망치는 회귀를 막아야 합니다.</td>
           <td>flat/vector reference 계열은 최저 95점 이상, photoreal/product reference 계열은 후처리 미적용 또는 품질 회귀 없음</td>
         </tr>
         <tr>
-          <td>2</td>
+          <td>3</td>
           <td>Codex backend image generator tail을 안정화합니다. API fields/WebP는 품질 통과 후에도 proxy 48.2초/73.4초로 흔들렸고, 최신 reference-style paired run도 61.9초/71.0초입니다.</td>
           <td class="ok">매우 높습니다. 현재 이미지 속도 문제의 대부분은 backend generator result 대기입니다.</td>
           <td>낮거나 중간입니다. retry/parallel 정책을 바꾸면 실패율과 품질 샘플링이 같이 움직일 수 있습니다.</td>
           <td>same prompt 반복에서 proxy tail이 direct 대비 150% 이내로 줄거나, tail 원인이 backend service queue/shape/retry 중 하나로 재현 가능하게 분리됨</td>
         </tr>
         <tr>
-          <td>3</td>
+          <td>4</td>
           <td>색상 교체 edit 보존 규칙을 일반 edit suite로 확장 검증합니다. 이번 red→green square는 proxy 최저 78점에서 96점으로 회복했지만, 더 다양한 object/color/background 조합에서 같은 효과를 확인해야 합니다.</td>
           <td>낮습니다. 보존 규칙은 품질 중심이며 입력 토큰이 약간 늘 수 있습니다.</td>
           <td class="ok">높습니다. edit 계열의 stochastic preservation 실패를 줄입니다.</td>
           <td>색상 교체, background-only, object-only edit 샘플에서 direct/proxy 모두 95점 이상 또는 실패 패턴의 일반 규칙화</td>
         </tr>
         <tr>
-          <td>4</td>
+          <td>5</td>
           <td>Responses tool native surface를 확인합니다. forced single tool은 arguments-only로 개선되었지만, 여러 tool 또는 auto tool decision은 여전히 wrapper schema 경로입니다.</td>
           <td class="ok">높습니다. native tool delta를 받을 수 있으면 firstToolArgument가 direct에 더 가까워질 수 있습니다.</td>
           <td class="warn">중간입니다. OpenAI Responses event schema와 tool choice semantics를 정확히 유지해야 합니다.</td>
           <td>auto/multi-tool schema exact 통과, forced single tool 개선 유지, direct 대비 firstToolArgument 비율 추가 하락</td>
-        </tr>
-        <tr>
-          <td>5</td>
-          <td>provider-paired semantic realistic suite와 provider API egress 금지/anti-overfit 검사를 release gate로 유지합니다.</td>
-          <td>직접 속도 개선은 낮습니다.</td>
-          <td class="ok">높습니다. proxy가 direct API를 몰래 호출하지 않고, direct 기준 품질 평가를 계속 신뢰할 수 있게 합니다.</td>
-          <td><code>pnpm test</code>, <code>pnpm verify:runtime-boundary</code>, semantic realistic suite 3회 반복 통과</td>
         </tr>
       </tbody>
     </table>

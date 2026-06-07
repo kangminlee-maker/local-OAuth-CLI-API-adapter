@@ -106,7 +106,26 @@ export interface OpenAiImageGenerationRequest {
   readonly responseFormat: 'b64_json' | 'url';
   readonly stream: boolean;
   readonly partialImages: number;
+  readonly proxyRoute?: OpenAiImageProxyRoute;
   readonly raw: unknown;
+}
+
+export type OpenAiImageProxyVisualClass =
+  | 'primitive_flat_shape'
+  | 'geometric_icon'
+  | 'badge_or_emblem'
+  | 'photoreal_raster'
+  | 'product_identity'
+  | 'reference_or_edit'
+  | 'unknown_hybrid';
+
+export type OpenAiImageProxyGeometryMode = 'auto' | 'strict' | 'loose';
+
+export interface OpenAiImageProxyRoute {
+  readonly visualClass?: OpenAiImageProxyVisualClass;
+  readonly outputFormat?: 'png' | 'jpeg' | 'webp';
+  readonly outputCompression?: number;
+  readonly geometryMode?: OpenAiImageProxyGeometryMode;
 }
 
 export interface OpenAiGeneratedImage {

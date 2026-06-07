@@ -21,6 +21,14 @@ Input/output interface contract의 단일 문서는 `docs/api-interface-contract
 
 2026-06-04 기준으로 `image-2` route의 품질 비교 authority는 direct OpenAI Images API의 invalid-model 응답이 아니라 direct OpenAI `gpt-5.5` Responses `image_generation` 결과이다. Direct Images API의 `gpt-image-1.5` positive/negative row는 별도 baseline으로 남긴다. `input_fidelity`는 image-2 API field capability에서 비활성화된 항목으로 보고, `invalid_input_fidelity_model`은 proxy 품질 실패가 아니라 disabled-field contract 확인 row로 다룬다. Proxy-local variation JSON 오류는 proxy가 지원하는 `/v1/images/variations` 표면의 400 `invalid_request_error` contract로 별도 검증한다.
 
+이미지 runtime transform PoC는 `scripts/poc-image-runtime-pipeline.mjs`로 별도 실행한다. 이 PoC는 모델이 최종 `output_format`을 직접 만들게 하는 경로와, 모델은 backend default/canonical 이미지를 만들고 local runtime이 JPEG/WebP 변환을 수행하는 경로를 비교한다. 결과 해석은 전역 기본값이 아니라 format/style별 capability rule 후보로만 사용한다. 2026-06-07 1회 PoC에서 flat WebP는 runtime 경로가 느렸고 품질은 동일했으며, photoreal JPEG는 runtime 경로가 빨랐고 품질은 1점 낮았다.
+
+분류별 backend format discovery는 `scripts/bench-image-format-classification.mjs`로 실행한다. 이 벤치는 `simpleFlatGraphic`, `textOrLogoGraphic`, `photorealRaster`, `productIdentity`, `referenceOrEdit`, `unknownHybrid` 각각에 대해 `default`, `png`, `jpeg`, `webp` backend 요청 포맷을 반복 측정한다. 2026-06-07 5회 결과에서는 여러 분류가 하나의 전역 포맷으로 수렴하지 않았고, `referenceOrEdit`와 `unknownHybrid`는 포맷 선택보다 이미지 생성/편집 품질 안정화가 선행되어야 함을 보였다.
+
+`simpleFlatGraphic`과 `photorealRaster`처럼 후보 포맷이 경합하는 분류는 `scripts/bench-image-format-targeted.mjs`로 prompt-diverse targeted discovery를 추가 실행한다. 2026-06-07 3회 결과에서는 `simpleFlatGraphic`의 `png/jpeg/webp` 모두 min 95를 만족하지 못해 format rule 승격을 보류했고, `photorealRaster`는 `png/jpeg/webp` 모두 min 95 이상을 유지했다. 이 중 WebP는 median 53.1초, max 75.7초, median bytes 126,819로 속도 tail과 payload size가 가장 균형적이었다.
+
+`x_proxy_image_route` 같은 proxy-only Images extension field를 사용한 결과는 provider parity row가 아니라 proxy enhanced row로 분리한다. Provider parity row에서는 direct API와 proxy가 같은 provider-compatible input surface를 받아야 하므로 proxy-only field를 제외한다.
+
 ## 비교 Authority
 
 | Proxy target | API surface | Direct comparison authority | 비교 기준 |

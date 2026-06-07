@@ -1,5 +1,8 @@
-import type { OpenAiImageGenerationRequest } from './types.js';
-import type { NormalizedReasoningEffort } from './types.js';
+import type {
+  NormalizedReasoningEffort,
+  OpenAiImageGenerationRequest,
+  OpenAiImageProxyRoute,
+} from './types.js';
 
 type Image2ViaGpt55Action = 'generate' | 'edit';
 
@@ -15,6 +18,7 @@ export interface Image2ViaGpt55PromptOptions {
   readonly inputFidelity?: string;
   readonly imageCount?: number;
   readonly hasMask?: boolean;
+  readonly proxyRoute?: OpenAiImageProxyRoute;
 }
 
 export function image2QualityToGpt55ReasoningEffort(
@@ -40,6 +44,7 @@ export function image2ViaGpt55PromptFromRequest(
     inputFidelity: request.model === 'image-2' ? undefined : request.inputFidelity,
     imageCount: request.images.length,
     hasMask: Boolean(request.mask),
+    proxyRoute: request.proxyRoute,
   });
 }
 
@@ -51,6 +56,7 @@ export function image2ViaGpt55Prompt(
     'Preserve the user prompt exactly as the visual intent; the following constraints only translate Images API options for the image_generation tool.',
     ...canvasConstraints(options.size),
     ...geometryConstraints(prompt, options.size),
+    ...proxyRouteConstraints(options.proxyRoute),
     ...backgroundConstraints(options.background),
     ...formatConstraints(options),
     ...editConstraints(options),
@@ -114,6 +120,70 @@ function geometryConstraints(prompt: string, size: string | undefined): string[]
     constraints.push('Keep the primary subject visually centered in the frame.');
   }
   return constraints;
+}
+
+function proxyRouteConstraints(route: OpenAiImageProxyRoute | undefined): string[] {
+  if (!route) return [];
+  return [
+    ...visualClassConstraints(route.visualClass),
+    ...geometryModeConstraints(route.geometryMode),
+  ];
+}
+
+function visualClassConstraints(
+  visualClass: OpenAiImageProxyRoute['visualClass'] | undefined,
+): string[] {
+  if (!visualClass) return [];
+  switch (visualClass) {
+    case 'primitive_flat_shape':
+      return [
+        'Proxy route visual_class=primitive_flat_shape: treat the request as exact flat primitive geometry, not an illustration.',
+        'Use uniform fills, crisp edges, plain background, and the minimum number of shapes needed to satisfy the prompt.',
+      ];
+    case 'geometric_icon':
+      return [
+        'Proxy route visual_class=geometric_icon: treat the request as a precise flat icon made from simple geometric shapes.',
+        'When the prompt names a primitive shape such as circle, semicircle, square, rectangle, star, or line, keep that primitive exact and avoid decorative substitutions.',
+        'Do not add waves, scallops, rays, badges, outlines, or extra marks unless the prompt explicitly asks for them.',
+      ];
+    case 'badge_or_emblem':
+      return [
+        'Proxy route visual_class=badge_or_emblem: treat the request as a centered flat badge/emblem with clear contained geometry.',
+        'Keep the full badge inside the canvas with visible margin; do not crop or let the outer shape touch the frame edge.',
+        'Keep the outer shape visually distinct from the background, and keep inner symbols smaller than the containing badge unless the prompt says otherwise.',
+      ];
+    case 'photoreal_raster':
+      return [
+        'Proxy route visual_class=photoreal_raster: prioritize a natural photographic raster image with realistic light, material, and camera behavior.',
+      ];
+    case 'product_identity':
+      return [
+        'Proxy route visual_class=product_identity: preserve product identity, proportions, brand-like visual consistency, and clean inspection-friendly framing.',
+      ];
+    case 'reference_or_edit':
+      return [
+        'Proxy route visual_class=reference_or_edit: use attached images as binding references for identity, composition, style, and unchanged regions.',
+      ];
+    case 'unknown_hybrid':
+      return [
+        'Proxy route visual_class=unknown_hybrid: avoid over-specialized assumptions and satisfy explicit prompt requirements conservatively.',
+      ];
+  }
+}
+
+function geometryModeConstraints(
+  geometryMode: OpenAiImageProxyRoute['geometryMode'] | undefined,
+): string[] {
+  if (!geometryMode || geometryMode === 'auto') return [];
+  if (geometryMode === 'strict') {
+    return [
+      'Proxy route geometry_mode=strict: resolve ambiguous terms toward exact requested geometry instead of decorative interpretation.',
+      'Keep positions, relative sizes, containment, margins, and named primitive shapes visibly correct.',
+    ];
+  }
+  return [
+    'Proxy route geometry_mode=loose: allow natural or stylized geometry when that better fits the prompt, while preserving explicit required objects and colors.',
+  ];
 }
 
 function shouldConstrainSquareSubject(

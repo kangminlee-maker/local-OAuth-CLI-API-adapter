@@ -212,6 +212,7 @@ Images requests accept JSON bodies, and edit/variation endpoints also accept `mu
 | `response_format` | optional | optional | optional | `b64_json` or `url`, default `b64_json`. Rejected for `gpt-image-*` models. |
 | `stream` | optional | optional | optional | Boolean. |
 | `partial_images` | optional | optional | optional | Only `0` or omitted is supported. Values above 0 return 400. |
+| `x_proxy_image_route` | optional | optional | optional | Proxy-only extension object. Multipart requests may pass it as a JSON string form field. |
 
 Image references support:
 
@@ -223,6 +224,18 @@ Image references support:
 - `{ "b64_json": "...", "media_type": "image/png" }`
 - multipart file parts
 - `{ "file_id": "..." }` is parsed but rejected before backend execution for local proxy paths.
+
+`x_proxy_image_route` is outside the provider-compatible OpenAI Images surface.
+It exists so applications can avoid ambiguous prompt-derived route inference
+when they already know the image class and desired output format. Standard
+Images API fields take priority over extension fields.
+
+| `x_proxy_image_route` field | Supported values | Handling |
+| --- | --- | --- |
+| `visual_class` | `primitive_flat_shape`, `geometric_icon`, `badge_or_emblem`, `photoreal_raster`, `product_identity`, `reference_or_edit`, `unknown_hybrid` | Adds route-specific generation constraints without changing the user prompt. |
+| `geometry_mode` | `auto`, `strict`, `loose` | Controls whether ambiguous shape language is resolved toward exact geometry or looser stylization. |
+| `output_format` | `png`, `jpeg`, `webp` | Used as effective output format only when standard `output_format` is omitted. |
+| `output_compression` | integer 0-100 | Used as effective compression only when standard `output_compression` is omitted; valid only with JPEG/WebP output. |
 
 ### Output spec
 
@@ -400,6 +413,7 @@ This section is the explicit list of areas where implementation intentionally di
 | `file_id` images | Parsed but rejected before backend execution. | Local CLI proxy cannot fetch provider file storage. Use URL, data URL, base64, or multipart image input. |
 | Images `image-2` | `image-2` is implemented through local Codex `gpt-5.5` backend Responses `image_generation`. | This is the formal local proxy route, not direct OpenAI `image-2` execution. `codexProxy.imageTransport` can select `app-server` for diagnostics/fallback. |
 | Images quality mapping | `quality: low -> effort/tool quality low`, `medium/standard -> medium`, `high/hd/auto/omitted -> high`. | Maps Images API quality intent to local Codex image-generation effort and backend tool controls. |
+| Images proxy route hints | `x_proxy_image_route` is accepted as a local extension only. | It is excluded from provider parity benchmarks and included only in proxy enhanced benchmarks. |
 | Images flat/vector references | Flat/vector reference-style PNG outputs may be postprocessed with deterministic edge-preserving flattening. | This reduces gradients/background shading while preserving small accent colors, outlines, and antialiasing. It only applies to flat/vector reference-style PNG requests and does not call direct provider APIs. |
 | Images `input_fidelity` | Disabled for `image-2`. | Treated as current `image-2` field capability, not as quality failure. |
 | Images partial streaming | `partial_images > 0` is rejected. Partial backend events are not forwarded. | Public proxy stream exposes completed images only. |

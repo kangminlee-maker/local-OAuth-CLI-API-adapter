@@ -14,6 +14,7 @@
     "types": ["node"]
   },
   "include": [
+    "src/llm-install-guide.ts",
     "src/proxy-cli.ts",
     "src/settings.ts",
     "src/chat/**/*.ts",

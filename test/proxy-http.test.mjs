@@ -454,6 +454,63 @@ test('POST /v1/images/generations maps GPT image requests to the image generatio
   assert.equal(body.data[0].revised_prompt, 'revised 1: A small red square.');
 });
 
+test('POST /v1/images/generations accepts proxy image route hints', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'Create a simple flat circular badge.',
+    x_proxy_image_route: {
+      visual_class: 'badge_or_emblem',
+      output_format: 'webp',
+      output_compression: 95,
+      geometry_mode: 'strict',
+    },
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].outputFormat, 'webp');
+  assert.equal(seenImageGenerationRequests[0].outputCompression, 95);
+  assert.deepEqual(seenImageGenerationRequests[0].proxyRoute, {
+    visualClass: 'badge_or_emblem',
+    outputFormat: 'webp',
+    outputCompression: 95,
+    geometryMode: 'strict',
+  });
+  assert.equal(body.output_format, 'webp');
+});
+
+test('POST /v1/images/generations keeps standard output_format ahead of proxy route output_format', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'Create a simple flat icon.',
+    output_format: 'png',
+    x_proxy_image_route: {
+      visual_class: 'geometric_icon',
+      output_format: 'webp',
+      geometry_mode: 'strict',
+    },
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(seenImageGenerationRequests[0].outputFormat, 'png');
+  assert.equal(seenImageGenerationRequests[0].proxyRoute.outputFormat, 'webp');
+});
+
+test('POST /v1/images/generations rejects invalid proxy image route hints', async () => {
+  const res = await postJson('/v1/images/generations', {
+    model: 'image-2',
+    prompt: 'Create a simple flat icon.',
+    x_proxy_image_route: {
+      visual_class: 'flat_icon',
+    },
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 400);
+  assert.match(body.error.message, /x_proxy_image_route\.visual_class/);
+  assert.equal(seenImageGenerationRequests.length, 0);
+});
+
 test('POST /v1/images/generations supports URL response format with local image URLs', async () => {
   const res = await postJson('/v1/images/generations', {
     model: 'dall-e-2',
@@ -580,6 +637,10 @@ test('POST /v1/images/edits accepts multipart image array fields and string opti
   form.set('prompt', 'Combine these images.');
   form.set('n', '2');
   form.set('stream', 'true');
+  form.set('x_proxy_image_route', JSON.stringify({
+    visual_class: 'reference_or_edit',
+    output_format: 'webp',
+  }));
   const res = await fetch(`${started.url}/v1/images/edits`, {
     method: 'POST',
     headers: { authorization: 'Bearer local' },
@@ -593,6 +654,8 @@ test('POST /v1/images/edits accepts multipart image array fields and string opti
   assert.equal(seenImageGenerationRequests[0].n, 2);
   assert.equal(seenImageGenerationRequests[0].stream, true);
   assert.equal(seenImageGenerationRequests[0].partialImages, 0);
+  assert.equal(seenImageGenerationRequests[0].outputFormat, 'webp');
+  assert.equal(seenImageGenerationRequests[0].proxyRoute.visualClass, 'reference_or_edit');
   assert.doesNotMatch(text, /image_edit\.partial_image/);
   assert.match(text, /event: image_edit\.completed/);
 });

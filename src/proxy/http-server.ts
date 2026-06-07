@@ -20,6 +20,7 @@ import type {
   OpenAiImageGenerationRequest,
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
+  OpenAiImageProxyRoute,
   ProxyServerOptions,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
@@ -52,6 +53,16 @@ const DEFAULT_IMAGE_GENERATION_QUALITY = 'auto';
 const DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT = 'png';
 const DEFAULT_IMAGE_GENERATION_BACKGROUND = 'auto';
 const GENERATED_IMAGE_TTL_MS = 60 * 60 * 1000;
+const IMAGE_PROXY_VISUAL_CLASSES = [
+  'primitive_flat_shape',
+  'geometric_icon',
+  'badge_or_emblem',
+  'photoreal_raster',
+  'product_identity',
+  'reference_or_edit',
+  'unknown_hybrid',
+] as const;
+const IMAGE_PROXY_GEOMETRY_MODES = ['auto', 'strict', 'loose'] as const;
 
 interface ParsedImageRequestBody {
   readonly body: unknown;
@@ -306,6 +317,11 @@ function normalizeOpenAiImageRequest(
   if (operation === 'variation' && !isMultipart) {
     throw new ProxyRequestError('image variations require multipart/form-data with an image file.', 400);
   }
+  const proxyRoute = optionalImageProxyRoute(input.x_proxy_image_route);
+  const outputFormat = optionalEnum(input.output_format, 'output_format', ['png', 'jpeg', 'webp'])
+    ?? proxyRoute?.outputFormat;
+  const outputCompression = optionalInteger(input.output_compression, 'output_compression', 0, 100)
+    ?? proxyRoute?.outputCompression;
   const request: OpenAiImageGenerationRequest = {
     operation,
     model,
@@ -316,8 +332,8 @@ function normalizeOpenAiImageRequest(
     size: optionalImageSize(input.size),
     quality: optionalEnum(input.quality, 'quality', ['standard', 'hd', 'low', 'medium', 'high', 'auto']),
     background: optionalEnum(input.background, 'background', ['transparent', 'opaque', 'auto']),
-    outputFormat: optionalEnum(input.output_format, 'output_format', ['png', 'jpeg', 'webp']),
-    outputCompression: optionalInteger(input.output_compression, 'output_compression', 0, 100),
+    outputFormat,
+    outputCompression,
     moderation: optionalEnum(input.moderation, 'moderation', ['low', 'auto']),
     inputFidelity: optionalEnum(input.input_fidelity, 'input_fidelity', ['high', 'low']),
     style: optionalEnum(input.style, 'style', ['vivid', 'natural']),
@@ -325,6 +341,7 @@ function normalizeOpenAiImageRequest(
     responseFormat,
     stream: optionalBoolean(input.stream, 'stream') ?? false,
     partialImages: partialImageCount(input.partial_images),
+    ...(proxyRoute ? { proxyRoute } : {}),
     raw: body,
   };
   validateOpenAiImageRequest(request);
@@ -571,6 +588,57 @@ function optionalBoolean(value: unknown, field: string): boolean | undefined {
   if (value === true || value === 'true') return true;
   if (value === false || value === 'false') return false;
   throw new ProxyRequestError(`${field} must be a boolean.`, 400);
+}
+
+function optionalImageProxyRoute(value: unknown): OpenAiImageProxyRoute | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  const input = imageProxyRoutePayload(value);
+  const visualClass = optionalEnum(
+    input.visual_class,
+    'x_proxy_image_route.visual_class',
+    IMAGE_PROXY_VISUAL_CLASSES,
+  );
+  const outputFormat = optionalEnum(
+    input.output_format,
+    'x_proxy_image_route.output_format',
+    ['png', 'jpeg', 'webp'],
+  );
+  const outputCompression = optionalInteger(
+    input.output_compression,
+    'x_proxy_image_route.output_compression',
+    0,
+    100,
+  );
+  const geometryMode = optionalEnum(
+    input.geometry_mode,
+    'x_proxy_image_route.geometry_mode',
+    IMAGE_PROXY_GEOMETRY_MODES,
+  );
+  const route: OpenAiImageProxyRoute = {
+    ...(visualClass ? { visualClass } : {}),
+    ...(outputFormat ? { outputFormat } : {}),
+    ...(outputCompression !== undefined ? { outputCompression } : {}),
+    ...(geometryMode ? { geometryMode } : {}),
+  };
+  return Object.keys(route).length > 0 ? route : undefined;
+}
+
+function imageProxyRoutePayload(value: unknown): Record<string, unknown> {
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      throw new ProxyRequestError('x_proxy_image_route must be a JSON object.', 400);
+    }
+    throw new ProxyRequestError('x_proxy_image_route must be a JSON object.', 400);
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  throw new ProxyRequestError('x_proxy_image_route must be a JSON object.', 400);
 }
 
 function optionalImageSize(value: unknown): string | undefined {

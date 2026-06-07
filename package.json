@@ -7,8 +7,12 @@
     "local-oauth-cli": "./dist/proxy-cli.js"
   },
   "files": [
+    "LLM_INSTALL.md",
+    "postinstall.mjs",
     "dist/proxy-cli.js",
     "dist/proxy-cli.d.ts",
+    "dist/llm-install-guide.js",
+    "dist/llm-install-guide.d.ts",
     "dist/settings.js",
     "dist/settings.d.ts",
     "dist/chat/",
@@ -30,6 +34,7 @@
     "probe:codex-backend-image": "node scripts/probe-codex-backend-image.mjs",
     "verify:runtime-boundary": "node scripts/verify-runtime-boundary.mjs",
     "prepack": "pnpm build && pnpm verify:runtime-boundary",
+    "postinstall": "node postinstall.mjs",
     "pack:adapter": "node scripts/package-adapter.mjs",
     "test:e2e:adapter": "node scripts/e2e-installed-adapter.mjs",
     "test": "pnpm build && pnpm verify:runtime-boundary && node --test --test-concurrency=2 test/*.test.mjs",

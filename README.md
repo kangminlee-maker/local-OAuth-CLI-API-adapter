@@ -9,6 +9,14 @@ The package is meant for local development and automation flows where a consumer
 tool can point `OPENAI_BASE_URL` or `ANTHROPIC_BASE_URL` at a loopback proxy.
 The proxy runtime does not fall back to direct OpenAI or Anthropic API calls.
 
+LLM agents installing this package must read [`LLM_INSTALL.md`](LLM_INSTALL.md).
+The packaged artifact prints that guide during `postinstall`, and it can be
+re-read at any time with:
+
+```bash
+local-oauth-cli --llm-guide
+```
+
 ## Quick Start
 
 Build a verified installable tarball from this repository:
@@ -35,13 +43,14 @@ pnpm add -g /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
 Start the proxy from the consumer repository:
 
 ```bash
-pnpm exec local-oauth-cli proxy --runtime codex --port 8787 --cwd /path/to/target-repo
+pnpm exec local-oauth-cli proxy --accept-llm-guide=v1 --runtime codex --port 8787 --cwd /path/to/target-repo
 ```
 
 Codex text/tool and Images requests can use the thinner backend transport:
 
 ```bash
 pnpm exec local-oauth-cli proxy --runtime codex \
+  --accept-llm-guide=v1 \
   --codex-transport codex-backend \
   --codex-image-transport codex-backend \
   --port 8787
@@ -65,7 +74,7 @@ OPENAI_API_KEY=local
 For Anthropic-compatible clients, start a Claude runtime proxy:
 
 ```bash
-pnpm exec local-oauth-cli proxy --runtime claude --port 8788 --cwd /path/to/target-repo
+pnpm exec local-oauth-cli proxy --accept-llm-guide=v1 --runtime claude --port 8788 --cwd /path/to/target-repo
 ```
 
 Then configure:
@@ -149,6 +158,7 @@ OpenAI or Anthropic APIs.
 | Codex transport | `codexProxy.transport` defaults to `codex-backend`; text/tool uses ChatGPT Codex backend directly. |
 | Codex image transport | `codexProxy.imageTransport` defaults to `codex-backend`; Images API uses backend `image_generation` tool results, while native chat uses app-server. |
 | Images `image-2` | Implemented through the local Codex `gpt-5.5` image-generation route. |
+| Images proxy route hints | Optional `x_proxy_image_route` is a proxy-only extension for explicit visual class, geometry mode, and output format routing. |
 | Images flat/vector references | PNG flat/vector reference-style outputs may receive deterministic edge-preserving flattening to reduce gradients while preserving small accent colors and outlines. |
 | Images partial streaming | `partial_images > 0` is rejected; streams emit completed images only. |
 | Images `input_fidelity` | Treated as disabled for `image-2`. |
@@ -202,6 +212,43 @@ curl http://127.0.0.1:8787/v1/images/generations \
   }'
 ```
 
+OpenAI Images with explicit proxy routing hints:
+
+```bash
+curl http://127.0.0.1:8787/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{
+    "model": "image-2",
+    "prompt": "Create a simple flat circular badge: teal outer circle, white inner circle, and one small orange star in the center. No text.",
+    "quality": "low",
+    "response_format": "b64_json",
+    "x_proxy_image_route": {
+      "visual_class": "badge_or_emblem",
+      "geometry_mode": "strict",
+      "output_format": "webp",
+      "output_compression": 95
+    }
+  }'
+```
+
+`x_proxy_image_route` is not an OpenAI field. It is accepted only by this local
+proxy to avoid guessing the image route from ambiguous prompts. Standard Images
+API fields still take priority: if both `output_format` and
+`x_proxy_image_route.output_format` are present, `output_format` wins.
+
+Supported proxy route fields:
+
+| Field | Values | Effect |
+| --- | --- | --- |
+| `visual_class` | `primitive_flat_shape`, `geometric_icon`, `badge_or_emblem`, `photoreal_raster`, `product_identity`, `reference_or_edit`, `unknown_hybrid` | Adds route-specific generation constraints without rewriting the prompt. |
+| `geometry_mode` | `auto`, `strict`, `loose` | Controls whether ambiguous shape language is resolved toward exact geometry or looser stylization. |
+| `output_format` | `png`, `jpeg`, `webp` | Used as the effective output format only when standard `output_format` is omitted. |
+| `output_compression` | integer `0-100` | Used as the effective compression only when standard `output_compression` is omitted; valid only with JPEG/WebP output. |
+
+For multipart image edits or variations, pass `x_proxy_image_route` as a JSON
+string form field.
+
 Anthropic Messages:
 
 ```bash
@@ -221,9 +268,15 @@ curl http://127.0.0.1:8788/v1/messages \
 ## Package Independence
 
 The installable proxy bin contains only the proxy runtime files,
-`settings.json`, README, and contract/design docs. It does not install or load
-sibling-repository packages and does not depend on this source checkout after
-installation.
+`settings.json`, `LLM_INSTALL.md`, README, and contract/design docs. It does not
+install or load sibling-repository packages and does not depend on this source
+checkout after installation.
+
+The package `postinstall` script prints `LLM_INSTALL.md` from the installed
+package root. If that file is missing, the install should be treated as invalid.
+Some package managers can block dependency lifecycle scripts; for that reason
+`local-oauth-cli proxy` also requires `--accept-llm-guide=v1` and otherwise
+prints the guide before exiting.
 
 For independence, avoid `file:../path-to-adapter-source` installs. Use the
 verified tarball, a release asset containing that tarball, or a registry package
@@ -323,6 +376,9 @@ pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex-app-server,proxy-
 pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --repeats 3
 pnpm bench:api -- --suite=quality-realistic --targets=proxy-codex,proxy-claude --min-semantic-quality=95
 pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api:gpt-5.5 --image-quality-repeats=1 --min-image-quality=90 --repeats 1
+pnpm build && node scripts/poc-image-runtime-pipeline.mjs --cases flat-webp,photo-jpeg --repeats 1
+pnpm build && node scripts/bench-image-format-classification.mjs --repeats 5
+pnpm build && node scripts/bench-image-format-targeted.mjs --repeats 3
 ```
 
 Benchmarks load `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` from the environment or
@@ -340,10 +396,22 @@ Benchmark design and release gates are documented in
 runner compares schema exactness, response shape, streaming event shape, usage,
 latency, semantic quality, image quality, and provider error parity.
 
+`scripts/poc-image-runtime-pipeline.mjs` is a repo-local benchmark helper for
+checking whether Images API output formatting should be handled by the model or
+by deterministic local runtime transforms. It is intentionally not included in
+the installable package.
+`scripts/bench-image-format-classification.mjs` extends that check across image
+classes such as simple flat graphics, text/logo graphics, photoreal raster,
+product identity, reference/edit, and hybrid prompts.
+`scripts/bench-image-format-targeted.mjs` narrows the comparison to prompt-diverse
+simple flat graphics and photoreal raster images before promoting a format rule.
+
 Proxy benchmark rows are guarded: if a local proxy target makes a direct
 provider API call during a proxy request, the row fails and quality is forced to
 0. Direct OpenAI/Anthropic calls are allowed only under explicit direct provider
 benchmark targets.
+Benchmarks that include `x_proxy_image_route` should be labeled as proxy
+enhanced rows. Provider parity rows should omit proxy-only extension fields.
 
 ## Reference Docs
 
