@@ -7,11 +7,12 @@ export type NormalizedVerbosity = 'low' | 'medium' | 'high';
 
 // Anthropic `output_config.effort` channel (distinct from the OpenAI/codex
 // `reasoning_effort` enum: includes `max`, excludes `none`/`minimal`).
-export type NormalizedEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type NormalizedAnthropicEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 // Anthropic `thinking` field, threaded to `claude --thinking`/`--thinking-display`.
+// `enabled` is the pre-adaptive extended-thinking mode (still valid on the CLI).
 export interface NormalizedThinking {
-  readonly type: 'adaptive' | 'disabled';
+  readonly type: 'adaptive' | 'enabled' | 'disabled';
   readonly display?: 'summarized' | 'omitted';
 }
 
@@ -62,7 +63,7 @@ export interface NormalizedRequest {
   readonly reasoningEffort?: NormalizedReasoningEffort;
   readonly verbosity?: NormalizedVerbosity;
   // Anthropic `output_config.effort`, routed to `claude --effort` (claude runtime).
-  readonly effort?: NormalizedEffort;
+  readonly effort?: NormalizedAnthropicEffort;
   // Anthropic `output_config.task_budget.total`, routed to `claude --task-budget`.
   readonly taskBudgetTokens?: number;
   // Anthropic `thinking`, routed to `claude --thinking`/`--thinking-display`.
@@ -102,9 +103,10 @@ export interface LocalCompletionResult {
   readonly usage: LocalUsage;
   readonly latencyMs: number;
   // CLI-reported stop reason (e.g. end_turn, max_tokens, refusal) when available;
-  // mapped onto the Anthropic response `stop_reason` / `stop_details`.
+  // mapped onto the Anthropic response `stop_reason` / `stop_details` / `stop_sequence`.
   readonly stopReason?: string;
   readonly stopDetails?: unknown;
+  readonly stopSequence?: string | null;
 }
 
 export interface OpenAiImageGenerationRequest {

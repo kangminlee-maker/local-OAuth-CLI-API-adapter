@@ -1006,6 +1006,146 @@ test('Anthropic messages passes through max_tokens stop_reason', async () => {
   }
 });
 
+test('Anthropic messages drops stop_details that contradict a downgraded stop_reason', async () => {
+  const server = await startProxyWithBackend({
+    name: 'overflow-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_of',
+        model: request.model,
+        text: 'partial',
+        toolCalls: [],
+        usage: { inputTokens: 3, outputTokens: 1, source: 'provider' },
+        latencyMs: 1,
+        // A reason not in the Anthropic passthrough set: stop_reason downgrades to
+        // end_turn, so the raw details must not ride along.
+        stopReason: 'model_context_window_exceeded',
+        stopDetails: { type: 'model_context_window_exceeded' },
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'x' }],
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.stop_reason, 'end_turn');
+    assert.equal(body.stop_details, null);
+  } finally {
+    await server.close();
+  }
+});
+
+test('Anthropic messages threads the matched stop_sequence', async () => {
+  const server = await startProxyWithBackend({
+    name: 'stopseq-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_ss',
+        model: request.model,
+        text: 'up to here',
+        toolCalls: [],
+        usage: { inputTokens: 3, outputTokens: 2, source: 'provider' },
+        latencyMs: 1,
+        stopReason: 'stop_sequence',
+        stopSequence: '###',
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'x' }],
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.stop_reason, 'stop_sequence');
+    assert.equal(body.stop_sequence, '###');
+  } finally {
+    await server.close();
+  }
+});
+
+test('Anthropic stream emits refusal text + stop_reason when not pre-streamed', async () => {
+  const server = await startProxyWithBackend({
+    name: 'stream-refusal-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_sr',
+        model: request.model,
+        text: 'I cannot help with that.',
+        toolCalls: [],
+        usage: { inputTokens: 3, outputTokens: 6, source: 'provider' },
+        latencyMs: 1,
+        stopReason: 'refusal',
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      stream: true,
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'x' }],
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    // Before the fix, a refusal with non-streamed text emitted zero content blocks.
+    assert.match(text, /event: content_block_start/);
+    assert.match(text, /"text":"I cannot help with that\."/);
+    assert.match(text, /"stop_reason":"refusal"/);
+  } finally {
+    await server.close();
+  }
+});
+
+test('Anthropic stream carries max_tokens stop_reason in message_delta', async () => {
+  const server = await startProxyWithBackend({
+    name: 'stream-maxtokens-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_smt',
+        model: request.model,
+        text: 'partial',
+        toolCalls: [],
+        usage: { inputTokens: 3, outputTokens: 1, source: 'provider' },
+        latencyMs: 1,
+        stopReason: 'max_tokens',
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      stream: true,
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'x' }],
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    assert.match(text, /"stop_reason":"max_tokens"/);
+    assert.match(text, /"text":"partial"/);
+  } finally {
+    await server.close();
+  }
+});
+
 test('Anthropic messages usage preserves provider cache token fields', async () => {
   const usageServer = await startProxyWithBackend({
     name: 'usage-backend',

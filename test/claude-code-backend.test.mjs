@@ -255,19 +255,25 @@ function toolRequest() {
   };
 }
 
-async function spawnedArgv(request) {
+async function spawnedArgv(request, model) {
   const backend = new ClaudeCodeBackend({
     command: echoArgvClaude,
     cwd: process.cwd(),
+    model,
     timeoutMs: 30_000,
   });
   try {
     const result = await backend.generate(request);
-    return JSON.parse(result.text);
+    // Non-tool turns echo argv in result.text; forced-tool turns route the echoed
+    // CLI output into the tool call's arguments.
+    const raw = result.text || result.toolCalls?.[0]?.arguments || '';
+    return JSON.parse(raw);
   } finally {
     await backend.close();
   }
 }
+
+const PROBE_SCHEMA = { type: 'object', additionalProperties: false, properties: {}, required: [] };
 
 function anthropicTuningRequest(overrides) {
   return {
@@ -291,11 +297,15 @@ test('forwards output_config effort to claude --effort (one-shot argv)', async (
   assert.equal(argv[i + 1], 'low');
 });
 
-test('gates effort out for Haiku models (no --effort)', async () => {
+test('gates effort out for the configured Haiku model on a one-shot turn', async () => {
+  // Force one-shot via output_config.format so the spawned argv is inspectable, and
+  // gate on the configured (CLI-run) model, not the client-supplied request.model.
   const argv = await spawnedArgv(
-    anthropicTuningRequest({ model: 'claude-haiku-4-5', effort: 'high' }),
+    anthropicTuningRequest({ effort: 'high', jsonMode: true, jsonSchema: PROBE_SCHEMA }),
+    'claude-haiku-4-5',
   );
-  assert.ok(!argv.includes('--effort'), `did not expect --effort: ${argv.join(' ')}`);
+  assert.ok(argv.includes('--json-schema'), `expected one-shot argv: ${argv.join(' ')}`);
+  assert.ok(!argv.includes('--effort'), `did not expect --effort for Haiku: ${argv.join(' ')}`);
 });
 
 test('forwards output_config.format schema to claude --json-schema', async () => {
@@ -316,6 +326,7 @@ test('forwards task_budget to claude --task-budget', async () => {
 test('forwards thinking on capable models and gates adaptive on Haiku', async () => {
   const opus = await spawnedArgv(
     anthropicTuningRequest({ thinking: { type: 'adaptive', display: 'omitted' } }),
+    'claude-opus-4-8',
   );
   const t = opus.indexOf('--thinking');
   assert.ok(t !== -1, `expected --thinking in argv: ${opus.join(' ')}`);
@@ -323,7 +334,39 @@ test('forwards thinking on capable models and gates adaptive on Haiku', async ()
   assert.equal(opus[opus.indexOf('--thinking-display') + 1], 'omitted');
 
   const haiku = await spawnedArgv(
-    anthropicTuningRequest({ model: 'claude-haiku-4-5', thinking: { type: 'adaptive' } }),
+    anthropicTuningRequest({ thinking: { type: 'adaptive' }, jsonMode: true, jsonSchema: PROBE_SCHEMA }),
+    'claude-haiku-4-5',
   );
-  assert.ok(!haiku.includes('--thinking'), `did not expect adaptive --thinking: ${haiku.join(' ')}`);
+  assert.ok(haiku.includes('--json-schema'), `expected one-shot argv: ${haiku.join(' ')}`);
+  assert.ok(!haiku.includes('--thinking'), `did not expect adaptive --thinking for Haiku: ${haiku.join(' ')}`);
+});
+
+test('forced tool + per-request effort: one-shot argv forwards both --json-schema and --effort', async () => {
+  const argv = await spawnedArgv(
+    { ...toolRequest(), shape: 'anthropic-messages', effort: 'low', streamOptions: { includeUsage: false, includeObfuscation: false } },
+    'claude-opus-4-8',
+  );
+  assert.ok(argv.includes('--effort'), `expected --effort: ${argv.join(' ')}`);
+  assert.ok(argv.includes('--json-schema'), `expected forced-tool --json-schema: ${argv.join(' ')}`);
+});
+
+test('forced tool + per-request effort: one-shot still returns the tool call', async () => {
+  const backend = new ClaudeCodeBackend({
+    command: fakeClaude,
+    cwd: process.cwd(),
+    model: 'claude-opus-4-8',
+    timeoutMs: 30_000,
+  });
+  try {
+    const result = await backend.generate({
+      ...toolRequest(),
+      shape: 'anthropic-messages',
+      effort: 'low',
+      streamOptions: { includeUsage: false, includeObfuscation: false },
+    });
+    assert.equal(result.toolCalls[0].name, 'get_weather');
+    assert.equal(result.toolCalls[0].arguments, '{"city":"Seoul"}');
+  } finally {
+    await backend.close();
+  }
 });

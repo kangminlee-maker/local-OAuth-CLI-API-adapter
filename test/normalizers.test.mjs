@@ -137,3 +137,58 @@ test('Anthropic normalizer reads output_config.task_budget and thinking', () => 
   assert.equal(request.taskBudgetTokens, 20000);
   assert.deepEqual(request.thinking, { type: 'adaptive', display: 'omitted' });
 });
+
+function anthropicBody(overrides) {
+  return {
+    model: 'claude-opus-4-8',
+    max_tokens: 256,
+    messages: [{ role: 'user', content: 'Say OK' }],
+    ...overrides,
+  };
+}
+
+test('Anthropic normalizer rejects non-tokens / sub-minimum / fractional task_budget', () => {
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest(anthropicBody({ output_config: { task_budget: { type: 'duration_seconds', total: 30 } } })),
+    /task_budget.type must be tokens/,
+  );
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest(anthropicBody({ output_config: { task_budget: { type: 'tokens', total: 5000 } } })),
+    /at least 20000/,
+  );
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest(anthropicBody({ output_config: { task_budget: { type: 'tokens', total: 20000.5 } } })),
+    /must be an integer/,
+  );
+});
+
+test('Anthropic normalizer accepts thinking enabled and rejects unknown types', () => {
+  const enabled = normalizeAnthropicMessagesRequest(anthropicBody({ thinking: { type: 'enabled' } }));
+  assert.deepEqual(enabled.thinking, { type: 'enabled', display: undefined });
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest(anthropicBody({ thinking: { type: 'sometimes' } })),
+    /thinking.type must be one of/,
+  );
+});
+
+test('Anthropic normalizer drops display for disabled thinking', () => {
+  const request = normalizeAnthropicMessagesRequest(anthropicBody({ thinking: { type: 'disabled', display: 'summarized' } }));
+  assert.deepEqual(request.thinking, { type: 'disabled', display: undefined });
+});
+
+test('Anthropic normalizer rejects json_schema format without a schema', () => {
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest(anthropicBody({ output_config: { format: { type: 'json_schema' } } })),
+    /requires a schema/,
+  );
+});
+
+test('Anthropic normalizer rejects output_config.format combined with tools', () => {
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest(anthropicBody({
+      output_config: { format: { type: 'json_schema', schema: { type: 'object' } } },
+      tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+    })),
+    /not supported together with tools/,
+  );
+});

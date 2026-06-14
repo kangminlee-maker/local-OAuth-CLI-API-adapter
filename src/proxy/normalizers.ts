@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url';
 import type {
-  NormalizedEffort,
+  NormalizedAnthropicEffort,
   NormalizedImage,
   NormalizedImageDetail,
   NormalizedMessage,
@@ -97,6 +97,17 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   messages.push(...readAnthropicMessages(input.messages));
   const outputConfig = asRecord(input.output_config);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
+  const tools = readAnthropicTools(input.tools);
+  if (outputFormat !== undefined && tools.length > 0) {
+    // The proxy has a single structured-output channel (claude --json-schema); a
+    // forced/decision tool schema and output_config.format would collide, so the
+    // user's format schema would be silently dropped. Reject instead.
+    throw new ProxyRequestError(
+      'output_config.format is not supported together with tools.',
+      400,
+      'anthropic',
+    );
+  }
   return {
     shape: 'anthropic-messages',
     model: readString(input.model, 'codex-app-server'),
@@ -110,22 +121,38 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     streamOptions: readStreamOptions(undefined),
     jsonMode: outputFormat !== undefined,
     jsonSchema: outputFormat,
-    tools: readAnthropicTools(input.tools),
+    tools,
     toolChoice: readAnthropicToolChoice(input.tool_choice),
     raw: body,
   };
 }
 
 // Anthropic structured outputs: `output_config.format = {type:'json_schema', schema}`
-// (accepts a nested `json_schema.schema` variant). Returns the schema or undefined.
+// (accepts a nested `json_schema.schema` variant). A json_schema format with no
+// resolvable schema is malformed input, not absence — reject it (fail-loud).
 function readAnthropicOutputFormat(value: unknown): unknown {
   const format = asRecord(value);
-  if (format?.type !== 'json_schema') return undefined;
+  if (!format) return undefined;
+  if (format.type !== 'json_schema') {
+    throw new ProxyRequestError(
+      'output_config.format.type must be json_schema.',
+      400,
+      'anthropic',
+    );
+  }
   const nested = asRecord(format.json_schema);
-  return format.schema ?? nested?.schema;
+  const schema = format.schema ?? nested?.schema;
+  if (schema === undefined || schema === null) {
+    throw new ProxyRequestError(
+      'output_config.format of type json_schema requires a schema.',
+      400,
+      'anthropic',
+    );
+  }
+  return schema;
 }
 
-function readAnthropicEffort(value: unknown): NormalizedEffort | undefined {
+function readAnthropicEffort(value: unknown): NormalizedAnthropicEffort | undefined {
   if (value === undefined || value === null) return undefined;
   if (
     value === 'low'
@@ -143,21 +170,47 @@ function readAnthropicEffort(value: unknown): NormalizedEffort | undefined {
   );
 }
 
+// Anthropic task budget is token-denominated with a 20,000-token minimum. A present
+// but malformed/non-token/sub-minimum budget is rejected rather than mis-forwarded.
+const ANTHROPIC_TASK_BUDGET_MIN_TOKENS = 20_000;
+
 function readAnthropicTaskBudget(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
   const budget = asRecord(value);
-  if (!budget) return undefined;
-  const total = budget.total;
-  return typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : undefined;
+  const total = budget?.total;
+  const invalid = (message: string): never => {
+    throw new ProxyRequestError(message, 400, 'anthropic');
+  };
+  if (!budget || budget.type !== 'tokens') {
+    invalid('output_config.task_budget.type must be tokens.');
+  }
+  if (typeof total !== 'number' || !Number.isInteger(total)) {
+    invalid('output_config.task_budget.total must be an integer number of tokens.');
+  }
+  if ((total as number) < ANTHROPIC_TASK_BUDGET_MIN_TOKENS) {
+    invalid(`output_config.task_budget.total must be at least ${ANTHROPIC_TASK_BUDGET_MIN_TOKENS}.`);
+  }
+  return total as number;
 }
 
 function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
+  if (value === undefined || value === null) return undefined;
   const thinking = asRecord(value);
-  if (!thinking) return undefined;
-  if (thinking.type !== 'adaptive' && thinking.type !== 'disabled') return undefined;
-  const display = thinking.display;
+  const type = thinking?.type;
+  if (type !== 'adaptive' && type !== 'enabled' && type !== 'disabled') {
+    throw new ProxyRequestError(
+      'thinking.type must be one of adaptive, enabled, or disabled.',
+      400,
+      'anthropic',
+    );
+  }
+  const display = thinking?.display;
   return {
-    type: thinking.type,
-    display: display === 'summarized' || display === 'omitted' ? display : undefined,
+    type,
+    // display governs visibility of thinking blocks, which disabled never produces.
+    display: type !== 'disabled' && (display === 'summarized' || display === 'omitted')
+      ? display
+      : undefined,
   };
 }
 
