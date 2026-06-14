@@ -7,9 +7,11 @@ import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fakeClaude = resolve(here, 'fixtures/fake-claude.cjs');
+const echoArgvClaude = resolve(here, 'fixtures/echo-argv-claude.cjs');
 
 before(async () => {
   await chmod(fakeClaude, 0o755);
+  await chmod(echoArgvClaude, 0o755);
 });
 
 test('ClaudeCodeBackend streams persistent text deltas', async () => {
@@ -252,3 +254,76 @@ function toolRequest() {
     raw: {},
   };
 }
+
+async function spawnedArgv(request) {
+  const backend = new ClaudeCodeBackend({
+    command: echoArgvClaude,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+  try {
+    const result = await backend.generate(request);
+    return JSON.parse(result.text);
+  } finally {
+    await backend.close();
+  }
+}
+
+function anthropicTuningRequest(overrides) {
+  return {
+    shape: 'anthropic-messages',
+    model: 'claude-opus-4-8',
+    messages: [{ role: 'user', content: 'Say OK', images: [] }],
+    stream: false,
+    streamOptions: { includeUsage: false, includeObfuscation: false },
+    jsonMode: false,
+    tools: [],
+    toolChoice: { type: 'auto' },
+    raw: {},
+    ...overrides,
+  };
+}
+
+test('forwards output_config effort to claude --effort (one-shot argv)', async () => {
+  const argv = await spawnedArgv(anthropicTuningRequest({ effort: 'low' }));
+  const i = argv.indexOf('--effort');
+  assert.ok(i !== -1, `expected --effort in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], 'low');
+});
+
+test('gates effort out for Haiku models (no --effort)', async () => {
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-haiku-4-5', effort: 'high' }),
+  );
+  assert.ok(!argv.includes('--effort'), `did not expect --effort: ${argv.join(' ')}`);
+});
+
+test('forwards output_config.format schema to claude --json-schema', async () => {
+  const schema = { type: 'object', additionalProperties: false, properties: {}, required: [] };
+  const argv = await spawnedArgv(anthropicTuningRequest({ jsonMode: true, jsonSchema: schema }));
+  const i = argv.indexOf('--json-schema');
+  assert.ok(i !== -1, `expected --json-schema in argv: ${argv.join(' ')}`);
+  assert.deepEqual(JSON.parse(argv[i + 1]), schema);
+});
+
+test('forwards task_budget to claude --task-budget', async () => {
+  const argv = await spawnedArgv(anthropicTuningRequest({ taskBudgetTokens: 20000 }));
+  const i = argv.indexOf('--task-budget');
+  assert.ok(i !== -1, `expected --task-budget in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], '20000');
+});
+
+test('forwards thinking on capable models and gates adaptive on Haiku', async () => {
+  const opus = await spawnedArgv(
+    anthropicTuningRequest({ thinking: { type: 'adaptive', display: 'omitted' } }),
+  );
+  const t = opus.indexOf('--thinking');
+  assert.ok(t !== -1, `expected --thinking in argv: ${opus.join(' ')}`);
+  assert.equal(opus[t + 1], 'adaptive');
+  assert.equal(opus[opus.indexOf('--thinking-display') + 1], 'omitted');
+
+  const haiku = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-haiku-4-5', thinking: { type: 'adaptive' } }),
+  );
+  assert.ok(!haiku.includes('--thinking'), `did not expect adaptive --thinking: ${haiku.join(' ')}`);
+});

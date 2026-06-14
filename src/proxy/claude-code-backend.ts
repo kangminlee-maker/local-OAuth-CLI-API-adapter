@@ -43,6 +43,8 @@ interface ClaudeTurnResult {
   readonly text: string;
   readonly structuredOutput: unknown;
   readonly usage: unknown;
+  readonly stopReason?: string;
+  readonly stopDetails?: unknown;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -140,7 +142,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   private canUsePersistentTurn(request: NormalizedRequest): boolean {
-    return !hasImageInputs(request);
+    return !hasImageInputs(request) && !requiresPerRequestClaudeArgs(request);
   }
 
   private async runPersistentTurn(
@@ -185,6 +187,9 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       '--no-session-persistence',
       ...(this.configuredModel ? ['--model', this.configuredModel] : []),
       ...schemaArgsFor(request),
+      ...effortArgsFor(request, this.configuredModel ?? request.model),
+      ...thinkingArgsFor(request, this.configuredModel ?? request.model),
+      ...taskBudgetArgsFor(request),
       ...this.extraArgs,
       ...(useStreamJsonInput ? [] : [prompt]),
     ];
@@ -236,6 +241,8 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       toolCalls: parsed.toolCalls,
       usage,
       latencyMs: Date.now() - startedAt,
+      stopReason: turn.stopReason,
+      stopDetails: turn.stopDetails,
     };
   }
 
@@ -350,6 +357,8 @@ export class ClaudeCodeBackend implements LocalCliBackend {
           text: typeof message.result === 'string' ? message.result : waiter.text,
           structuredOutput: message.structured_output ?? waiter.structuredOutput,
           usage: message.usage ?? waiter.usage,
+          stopReason: readClaudeStopReason(message),
+          stopDetails: message.stop_details,
         });
       } else {
         waiter.reject(new Error(readErrorMessage(message)));
@@ -382,6 +391,54 @@ export class ClaudeCodeBackend implements LocalCliBackend {
 function schemaArgsFor(request: NormalizedRequest): string[] {
   const schema = outputSchemaFor(request);
   return schema ? ['--json-schema', JSON.stringify(schema)] : [];
+}
+
+// Per-request claude flags (schema/effort/thinking/task-budget) must be on the
+// spawned argv, so requests carrying any of them run as a one-shot turn rather than
+// the long-lived persistent process (whose argv is fixed at spawn time). The schema
+// case is scoped to the Anthropic shape, where `jsonSchema` comes from
+// `output_config.format` and must reach `claude --json-schema`; OpenAI-shape
+// `response_format` schemas keep their existing persistent JSON-mode path.
+function requiresPerRequestClaudeArgs(request: NormalizedRequest): boolean {
+  return (request.shape === 'anthropic-messages' && request.jsonSchema !== undefined)
+    || request.effort !== undefined
+    || request.taskBudgetTokens !== undefined
+    || request.thinking !== undefined;
+}
+
+function effortArgsFor(request: NormalizedRequest, model: string): string[] {
+  if (!request.effort) return [];
+  // Models without an effort parameter (e.g. Haiku) hard-fail when it is sent.
+  if (modelLacksEffort(model)) return [];
+  return ['--effort', request.effort];
+}
+
+function thinkingArgsFor(request: NormalizedRequest, model: string): string[] {
+  const thinking = request.thinking;
+  if (!thinking) return [];
+  // Adaptive thinking is unsupported on some models (e.g. Haiku); omit it there.
+  if (thinking.type === 'adaptive' && modelLacksAdaptiveThinking(model)) return [];
+  const args = ['--thinking', thinking.type];
+  if (thinking.display) args.push('--thinking-display', thinking.display);
+  return args;
+}
+
+function taskBudgetArgsFor(request: NormalizedRequest): string[] {
+  return request.taskBudgetTokens
+    ? ['--task-budget', String(request.taskBudgetTokens)]
+    : [];
+}
+
+function modelLacksEffort(model: string): boolean {
+  return /haiku/i.test(model);
+}
+
+function modelLacksAdaptiveThinking(model: string): boolean {
+  return /haiku/i.test(model);
+}
+
+function readClaudeStopReason(message: JsonObject): string | undefined {
+  return typeof message.stop_reason === 'string' ? message.stop_reason : undefined;
 }
 
 function claudeContextIsolationArgs(): string[] {
@@ -459,6 +516,8 @@ function runClaudeProcess(
               text: typeof message.result === 'string' ? message.result : waiter.text,
               structuredOutput: message.structured_output ?? waiter.structuredOutput,
               usage: message.usage ?? waiter.usage,
+              stopReason: readClaudeStopReason(message),
+              stopDetails: message.stop_details,
             });
           } else {
             finish(new Error(readErrorMessage(message)));

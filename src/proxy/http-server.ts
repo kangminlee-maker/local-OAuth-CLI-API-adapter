@@ -1184,23 +1184,52 @@ function openAiResponsesResponse(
 
 function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
   const hasToolCalls = result.toolCalls.length > 0;
+  const stopReason = anthropicStopReason(result, hasToolCalls);
+  const content = stopReason === 'refusal'
+    ? (result.text ? [{ type: 'text', text: result.text }] : [])
+    : hasToolCalls
+    ? result.toolCalls.map(anthropicToolUse)
+    : [
+        {
+          type: 'text',
+          text: result.text,
+        },
+      ];
   return {
     id: `msg_${result.id}`,
     type: 'message',
     role: 'assistant',
     model: result.model,
-    content: hasToolCalls
-      ? result.toolCalls.map(anthropicToolUse)
-      : [
-          {
-            type: 'text',
-            text: result.text,
-          },
-        ],
-    stop_reason: hasToolCalls ? 'tool_use' : 'end_turn',
+    content,
+    stop_reason: stopReason,
     stop_sequence: null,
+    stop_details: anthropicStopDetails(result, stopReason),
     usage: anthropicUsage(result.usage),
   };
+}
+
+// stop_reason values the proxy mirrors from the CLI verbatim; anything else (or
+// absent) falls back to the tool_use/end_turn derivation.
+const ANTHROPIC_PASSTHROUGH_STOP_REASONS = new Set([
+  'end_turn',
+  'max_tokens',
+  'stop_sequence',
+  'refusal',
+  'pause_turn',
+]);
+
+function anthropicStopReason(result: LocalCompletionResult, hasToolCalls: boolean): string {
+  if (hasToolCalls) return 'tool_use';
+  const reported = result.stopReason;
+  if (reported && ANTHROPIC_PASSTHROUGH_STOP_REASONS.has(reported)) return reported;
+  return 'end_turn';
+}
+
+function anthropicStopDetails(result: LocalCompletionResult, stopReason: string): unknown {
+  const details = result.stopDetails;
+  if (details && typeof details === 'object' && !Array.isArray(details)) return details;
+  if (stopReason === 'refusal') return { type: 'refusal', category: null };
+  return null;
 }
 
 function openAiChatUsage(usage: LocalUsage): unknown {
@@ -1955,9 +1984,10 @@ async function writeAnthropicMessagesStream(
       }
 
       const result = event.result;
+      const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
       if (result.toolCalls.length > 0) {
         await toolState.finish(result.toolCalls);
-      } else {
+      } else if (stopReason !== 'refusal') {
         await ensureTextStarted();
         if (!streamedText && result.text) {
           for (const chunk of chunkText(result.text)) {
@@ -1973,13 +2003,20 @@ async function writeAnthropicMessagesStream(
           type: 'content_block_stop',
           index: 0,
         });
+      } else if (textStarted) {
+        // Refusal after some text already streamed — close the open block, no more text.
+        await writeSseEvent(res, 'content_block_stop', {
+          type: 'content_block_stop',
+          index: 0,
+        });
       }
 
       await writeSseEvent(res, 'message_delta', {
         type: 'message_delta',
         delta: {
-          stop_reason: result.toolCalls.length > 0 ? 'tool_use' : 'end_turn',
+          stop_reason: stopReason,
           stop_sequence: null,
+          stop_details: anthropicStopDetails(result, stopReason),
         },
         usage: {
           output_tokens: result.usage.outputTokens,

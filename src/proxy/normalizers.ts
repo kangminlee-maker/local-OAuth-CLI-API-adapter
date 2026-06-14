@@ -1,10 +1,12 @@
 import { fileURLToPath } from 'node:url';
 import type {
+  NormalizedEffort,
   NormalizedImage,
   NormalizedImageDetail,
   NormalizedMessage,
   NormalizedRequest,
   NormalizedReasoningEffort,
+  NormalizedThinking,
   NormalizedTool,
   NormalizedToolChoice,
   NormalizedVerbosity,
@@ -93,18 +95,69 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const system = flattenAnthropicSystem(input.system);
   if (system) messages.push({ role: 'system', content: system, images: [] });
   messages.push(...readAnthropicMessages(input.messages));
+  const outputConfig = asRecord(input.output_config);
+  const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   return {
     shape: 'anthropic-messages',
     model: readString(input.model, 'codex-app-server'),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens),
     temperature: readOptionalNumber(input.temperature),
+    effort: readAnthropicEffort(outputConfig?.effort),
+    taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
+    thinking: readAnthropicThinking(input.thinking),
     stream: input.stream === true,
     streamOptions: readStreamOptions(undefined),
-    jsonMode: false,
+    jsonMode: outputFormat !== undefined,
+    jsonSchema: outputFormat,
     tools: readAnthropicTools(input.tools),
     toolChoice: readAnthropicToolChoice(input.tool_choice),
     raw: body,
+  };
+}
+
+// Anthropic structured outputs: `output_config.format = {type:'json_schema', schema}`
+// (accepts a nested `json_schema.schema` variant). Returns the schema or undefined.
+function readAnthropicOutputFormat(value: unknown): unknown {
+  const format = asRecord(value);
+  if (format?.type !== 'json_schema') return undefined;
+  const nested = asRecord(format.json_schema);
+  return format.schema ?? nested?.schema;
+}
+
+function readAnthropicEffort(value: unknown): NormalizedEffort | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    value === 'low'
+    || value === 'medium'
+    || value === 'high'
+    || value === 'xhigh'
+    || value === 'max'
+  ) {
+    return value;
+  }
+  throw new ProxyRequestError(
+    'output_config.effort must be one of low, medium, high, xhigh, or max.',
+    400,
+    'anthropic',
+  );
+}
+
+function readAnthropicTaskBudget(value: unknown): number | undefined {
+  const budget = asRecord(value);
+  if (!budget) return undefined;
+  const total = budget.total;
+  return typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : undefined;
+}
+
+function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
+  const thinking = asRecord(value);
+  if (!thinking) return undefined;
+  if (thinking.type !== 'adaptive' && thinking.type !== 'disabled') return undefined;
+  const display = thinking.display;
+  return {
+    type: thinking.type,
+    display: display === 'summarized' || display === 'omitted' ? display : undefined,
   };
 }
 

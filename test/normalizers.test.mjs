@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  normalizeAnthropicMessagesRequest,
   normalizeOpenAiChatRequest,
   normalizeOpenAiResponsesRequest,
 } from '../dist/proxy/normalizers.js';
@@ -70,4 +71,69 @@ test('OpenAI normalizer rejects invalid verbosity', () => {
     }),
     /verbosity must be one of/,
   );
+});
+
+test('Anthropic normalizer reads output_config.format into jsonSchema/jsonMode', () => {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['ok'],
+    properties: { ok: { type: 'boolean' } },
+  };
+  const request = normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-4-8',
+    max_tokens: 256,
+    output_config: { format: { type: 'json_schema', schema } },
+    messages: [{ role: 'user', content: 'Reply JSON' }],
+  });
+
+  assert.equal(request.jsonMode, true);
+  assert.deepEqual(request.jsonSchema, schema);
+});
+
+test('Anthropic normalizer leaves jsonMode false without output_config.format', () => {
+  const request = normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-4-8',
+    max_tokens: 256,
+    messages: [{ role: 'user', content: 'Say OK' }],
+  });
+
+  assert.equal(request.jsonMode, false);
+  assert.equal(request.jsonSchema, undefined);
+});
+
+test('Anthropic normalizer reads output_config.effort', () => {
+  const request = normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-4-8',
+    max_tokens: 256,
+    output_config: { effort: 'max' },
+    messages: [{ role: 'user', content: 'Say OK' }],
+  });
+
+  assert.equal(request.effort, 'max');
+});
+
+test('Anthropic normalizer rejects invalid output_config.effort', () => {
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest({
+      model: 'claude-opus-4-8',
+      max_tokens: 256,
+      output_config: { effort: 'minimal' },
+      messages: [{ role: 'user', content: 'Say OK' }],
+    }),
+    /output_config.effort must be one of/,
+  );
+});
+
+test('Anthropic normalizer reads output_config.task_budget and thinking', () => {
+  const request = normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-4-8',
+    max_tokens: 256,
+    output_config: { task_budget: { type: 'tokens', total: 20000 } },
+    thinking: { type: 'adaptive', display: 'omitted' },
+    messages: [{ role: 'user', content: 'Say OK' }],
+  });
+
+  assert.equal(request.taskBudgetTokens, 20000);
+  assert.deepEqual(request.thinking, { type: 'adaptive', display: 'omitted' });
 });

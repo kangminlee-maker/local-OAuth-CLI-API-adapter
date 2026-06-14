@@ -887,6 +887,125 @@ test('Anthropic messages returns tool_use for tool requests', async () => {
   assert.deepEqual(body.content[0].input, { city: 'Seoul' });
 });
 
+test('Anthropic messages response includes stop_details (null on end_turn)', async () => {
+  const res = await postJson('/v1/messages', {
+    model: 'fake-local-model',
+    max_tokens: 16,
+    messages: [{ role: 'user', content: 'Say OK' }],
+  });
+  const body = await res.json();
+
+  assert.equal(res.status, 200);
+  assert.equal(body.stop_reason, 'end_turn');
+  assert.equal(body.stop_sequence, null);
+  assert.ok('stop_details' in body);
+  assert.equal(body.stop_details, null);
+});
+
+test('Anthropic messages mirrors refusal stop_reason with empty content', async () => {
+  const server = await startProxyWithBackend({
+    name: 'refusal-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_refusal',
+        model: request.model,
+        text: '',
+        toolCalls: [],
+        usage: { inputTokens: 3, outputTokens: 0, source: 'provider' },
+        latencyMs: 1,
+        stopReason: 'refusal',
+        stopDetails: { type: 'refusal', category: 'bio' },
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'unsafe' }],
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.stop_reason, 'refusal');
+    assert.deepEqual(body.content, []);
+    assert.deepEqual(body.stop_details, { type: 'refusal', category: 'bio' });
+  } finally {
+    await server.close();
+  }
+});
+
+test('Anthropic refusal keeps assistant text when the model produced some', async () => {
+  const server = await startProxyWithBackend({
+    name: 'refusal-with-text-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_refusal_text',
+        model: request.model,
+        text: 'I can help with that, but',
+        toolCalls: [],
+        usage: { inputTokens: 3, outputTokens: 5, source: 'provider' },
+        latencyMs: 1,
+        stopReason: 'refusal',
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.stop_reason, 'refusal');
+    assert.equal(body.content[0].type, 'text');
+    assert.equal(body.content[0].text, 'I can help with that, but');
+    assert.deepEqual(body.stop_details, { type: 'refusal', category: null });
+  } finally {
+    await server.close();
+  }
+});
+
+test('Anthropic messages passes through max_tokens stop_reason', async () => {
+  const server = await startProxyWithBackend({
+    name: 'truncate-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'local_trunc',
+        model: request.model,
+        text: 'partial',
+        toolCalls: [],
+        usage: { inputTokens: 3, outputTokens: 1, source: 'provider' },
+        latencyMs: 1,
+        stopReason: 'max_tokens',
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'long' }],
+    });
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.stop_reason, 'max_tokens');
+    assert.equal(body.stop_details, null);
+    assert.equal(body.content[0].text, 'partial');
+  } finally {
+    await server.close();
+  }
+});
+
 test('Anthropic messages usage preserves provider cache token fields', async () => {
   const usageServer = await startProxyWithBackend({
     name: 'usage-backend',
