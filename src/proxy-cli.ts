@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+import { realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { ClaudeCodeBackend } from './proxy/claude-code-backend.js';
 import { CodexAppServerBackend } from './proxy/codex-app-server-backend.js';
 import { CodexBackendTransport } from './proxy/codex-backend-transport.js';
@@ -155,7 +157,7 @@ interface ParsedOptions {
   readonly acceptLlmGuide?: string;
 }
 
-function parseOptions(args: readonly string[]): ParsedOptions {
+export function parseOptions(args: readonly string[]): ParsedOptions {
   const out: Record<string, string | string[]> = { _: [] };
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i] ?? '';
@@ -167,19 +169,30 @@ function parseOptions(args: readonly string[]): ParsedOptions {
     const rawKey = arg.slice(2, eq === -1 ? undefined : eq);
     const key = rawKey.replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
     const value = eq === -1 ? args[i + 1] : arg.slice(eq + 1);
+    // `--extra-arg` forwards an arbitrary flag to the child CLI, so its space-form
+    // value may itself be `--`-prefixed (e.g. `--extra-arg --effort`); take it
+    // verbatim instead of letting the flag-like value collapse to a boolean.
+    if (key === 'extraArg') {
+      if (eq !== -1) {
+        out.extraArg = [...asExtraArgs(out.extraArg), arg.slice(eq + 1)];
+      } else if (value !== undefined) {
+        out.extraArg = [...asExtraArgs(out.extraArg), value];
+        i += 1;
+      }
+      continue;
+    }
     if (eq === -1 && (value === undefined || value.startsWith('--'))) {
       out[key] = 'true';
       continue;
     }
     if (eq === -1) i += 1;
-    if (key === 'extraArg') {
-      const current = Array.isArray(out.extraArg) ? out.extraArg : [];
-      out.extraArg = [...current, value ?? ''];
-    } else {
-      out[key] = value ?? '';
-    }
+    out[key] = value ?? '';
   }
   return out as unknown as ParsedOptions;
+}
+
+function asExtraArgs(value: string | string[] | undefined): string[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function parseProxyRuntimeName(value: string): 'codex' | 'claude' {
@@ -294,9 +307,23 @@ Native local CLI chat endpoint:
 `;
 }
 
-main(process.argv.slice(2)).then((code) => {
-  process.exitCode = code;
-}).catch((err) => {
-  process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
-  process.exitCode = 1;
-});
+// Only run the CLI when invoked directly (not when imported, e.g. by tests).
+// realpath resolves the packaged bin symlink so direct/`pnpm exec` runs still match.
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
+  main(process.argv.slice(2)).then((code) => {
+    process.exitCode = code;
+  }).catch((err) => {
+    process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+    process.exitCode = 1;
+  });
+}
