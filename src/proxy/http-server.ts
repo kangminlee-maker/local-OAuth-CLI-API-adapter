@@ -1202,7 +1202,7 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
     model: result.model,
     content,
     stop_reason: stopReason,
-    stop_sequence: null,
+    stop_sequence: result.stopSequence ?? null,
     stop_details: anthropicStopDetails(result, stopReason),
     usage: anthropicUsage(result.usage),
   };
@@ -1226,8 +1226,16 @@ function anthropicStopReason(result: LocalCompletionResult, hasToolCalls: boolea
 }
 
 function anthropicStopDetails(result: LocalCompletionResult, stopReason: string): unknown {
+  // Only surface raw CLI stop_details when the emitted stop_reason is the reason the
+  // CLI actually reported (a genuine passthrough). A downgraded/derived reason
+  // (tool_use, or end_turn standing in for an unknown reason) must not carry details
+  // that describe a different stop state.
+  const passedThrough = result.stopReason === stopReason
+    && ANTHROPIC_PASSTHROUGH_STOP_REASONS.has(stopReason);
   const details = result.stopDetails;
-  if (details && typeof details === 'object' && !Array.isArray(details)) return details;
+  if (passedThrough && details && typeof details === 'object' && !Array.isArray(details)) {
+    return details;
+  }
   if (stopReason === 'refusal') return { type: 'refusal', category: null };
   return null;
 }
@@ -1987,9 +1995,13 @@ async function writeAnthropicMessagesStream(
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
       if (result.toolCalls.length > 0) {
         await toolState.finish(result.toolCalls);
-      } else if (stopReason !== 'refusal') {
-        await ensureTextStarted();
+      } else {
+        // Flush any final text not already streamed (covers schema/refusal results
+        // where no live text_delta was emitted), then close the block. A truly empty
+        // result opens no content block, matching the non-streaming content:[] mapping
+        // — so streaming and non-streaming refusals carry the same content.
         if (!streamedText && result.text) {
+          await ensureTextStarted();
           for (const chunk of chunkText(result.text)) {
             streamedText += chunk;
             await writeSseEvent(res, 'content_block_delta', {
@@ -1999,23 +2011,19 @@ async function writeAnthropicMessagesStream(
             });
           }
         }
-        await writeSseEvent(res, 'content_block_stop', {
-          type: 'content_block_stop',
-          index: 0,
-        });
-      } else if (textStarted) {
-        // Refusal after some text already streamed — close the open block, no more text.
-        await writeSseEvent(res, 'content_block_stop', {
-          type: 'content_block_stop',
-          index: 0,
-        });
+        if (textStarted) {
+          await writeSseEvent(res, 'content_block_stop', {
+            type: 'content_block_stop',
+            index: 0,
+          });
+        }
       }
 
       await writeSseEvent(res, 'message_delta', {
         type: 'message_delta',
         delta: {
           stop_reason: stopReason,
-          stop_sequence: null,
+          stop_sequence: result.stopSequence ?? null,
           stop_details: anthropicStopDetails(result, stopReason),
         },
         usage: {
