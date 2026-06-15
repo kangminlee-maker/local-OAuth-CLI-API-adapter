@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { dirname, resolve } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { parseOptions } from '../dist/proxy-cli.js';
+
+const builtCli = resolve(dirname(fileURLToPath(import.meta.url)), '../dist/proxy-cli.js');
+
+test('built entrypoint runs main() when invoked directly (isMainModule guard)', () => {
+  const result = spawnSync(process.execPath, [builtCli, 'help'], { encoding: 'utf8' });
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /local-oauth-cli/);
+});
 
 test('parseOptions takes a dashed --extra-arg value in the space form', () => {
   const options = parseOptions(['proxy', '--extra-arg', '--effort', '--extra-arg', 'high', '--port', '8925']);

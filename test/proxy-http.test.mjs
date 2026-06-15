@@ -1146,6 +1146,48 @@ test('Anthropic stream carries max_tokens stop_reason in message_delta', async (
   }
 });
 
+test('Anthropic stream closes the text block and offsets tool_use index when both occur', async () => {
+  const server = await startProxyWithBackend({
+    name: 'text-then-tool-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return { id: 'g', model: request.model, text: '', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'provider' }, latencyMs: 1 };
+    },
+    async *stream(request) {
+      yield { type: 'text_delta', delta: 'let me check ' };
+      yield {
+        type: 'completed',
+        result: {
+          id: 'tt',
+          model: request.model,
+          text: '',
+          toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+          usage: { inputTokens: 1, outputTokens: 1, source: 'provider' },
+          latencyMs: 1,
+        },
+      };
+    },
+    async close() {},
+  });
+  try {
+    const res = await postJsonTo(server.url, '/v1/messages', {
+      model: 'fake-local-model',
+      stream: true,
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'weather?' }],
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200);
+    // text block 0 opened then closed; tool_use opens at index 1 (no index collision).
+    assert.match(text, /"type":"content_block_stop","index":0/);
+    assert.match(text, /"type":"content_block_start","index":1,"content_block":\{"type":"tool_use"/);
+    assert.match(text, /"stop_reason":"tool_use"/);
+  } finally {
+    await server.close();
+  }
+});
+
 test('Anthropic messages usage preserves provider cache token fields', async () => {
   const usageServer = await startProxyWithBackend({
     name: 'usage-backend',

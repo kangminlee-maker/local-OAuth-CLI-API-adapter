@@ -1943,6 +1943,7 @@ async function writeAnthropicMessagesStream(
 ): Promise<void> {
   writeSseHeaders(res);
   let textStarted = false;
+  let textBlockClosed = false;
   let streamedText = '';
   const toolState = new AnthropicToolUseStreamState(res);
 
@@ -1974,6 +1975,16 @@ async function writeAnthropicMessagesStream(
       });
     };
 
+    // A backend that streams text and then also returns tool calls (e.g. the codex
+    // backend transport) would otherwise open tool_use blocks at the index already
+    // held by the open text block. Close the text block and shift tool indices.
+    const closeOpenTextBlock = async (): Promise<void> => {
+      if (!textStarted || textBlockClosed) return;
+      textBlockClosed = true;
+      toolState.setBaseIndex(1);
+      await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+    };
+
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
@@ -1987,6 +1998,7 @@ async function writeAnthropicMessagesStream(
         continue;
       }
       if (event.type === 'tool_call_delta') {
+        await closeOpenTextBlock();
         await toolState.write(event);
         continue;
       }
@@ -1994,6 +2006,7 @@ async function writeAnthropicMessagesStream(
       const result = event.result;
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
       if (result.toolCalls.length > 0) {
+        await closeOpenTextBlock();
         await toolState.finish(result.toolCalls);
       } else {
         // Flush any final text not already streamed (covers schema/refusal results
@@ -2055,8 +2068,14 @@ interface AnthropicToolUseState {
 
 class AnthropicToolUseStreamState {
   private readonly states = new Map<number, AnthropicToolUseState>();
+  // Wire-level offset so tool_use blocks can follow an already-open text block.
+  private baseIndex = 0;
 
   constructor(private readonly res: ServerResponse) {}
+
+  setBaseIndex(baseIndex: number): void {
+    this.baseIndex = baseIndex;
+  }
 
   async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
     const state = await this.ensureStarted(
@@ -2074,7 +2093,7 @@ class AnthropicToolUseStreamState {
       if (rest) await this.writeArgumentsDelta(index, state, rest);
       await writeSseEvent(this.res, 'content_block_stop', {
         type: 'content_block_stop',
-        index,
+        index: this.baseIndex + index,
       });
     }
   }
@@ -2090,7 +2109,7 @@ class AnthropicToolUseStreamState {
     this.states.set(index, state);
     await writeSseEvent(this.res, 'content_block_start', {
       type: 'content_block_start',
-      index,
+      index: this.baseIndex + index,
       content_block: {
         type: 'tool_use',
         id: state.id,
@@ -2109,7 +2128,7 @@ class AnthropicToolUseStreamState {
     state.arguments += delta;
     await writeSseEvent(this.res, 'content_block_delta', {
       type: 'content_block_delta',
-      index,
+      index: this.baseIndex + index,
       delta: {
         type: 'input_json_delta',
         partial_json: delta,
