@@ -73,6 +73,32 @@ test('OpenAI normalizer rejects invalid verbosity', () => {
   );
 });
 
+test('OpenAI chat normalizer preserves json_schema name and strict (B1)', () => {
+  const request = normalizeOpenAiChatRequest({
+    model: 'codex-app-server',
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'my_review_schema', strict: false, schema: { type: 'object' } },
+    },
+    messages: [{ role: 'user', content: 'x' }],
+  });
+
+  assert.equal(request.jsonSchemaName, 'my_review_schema');
+  assert.equal(request.jsonSchemaStrict, false);
+  assert.deepEqual(request.jsonSchema, { type: 'object' });
+});
+
+test('OpenAI responses normalizer preserves json_schema name and strict (B1)', () => {
+  const request = normalizeOpenAiResponsesRequest({
+    model: 'codex-app-server',
+    text: { format: { type: 'json_schema', name: 'resp_schema', strict: true, schema: { type: 'object' } } },
+    input: 'x',
+  });
+
+  assert.equal(request.jsonSchemaName, 'resp_schema');
+  assert.equal(request.jsonSchemaStrict, true);
+});
+
 test('Anthropic normalizer reads output_config.format into jsonSchema/jsonMode', () => {
   const schema = {
     type: 'object',

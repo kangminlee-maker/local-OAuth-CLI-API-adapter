@@ -72,6 +72,10 @@ export interface NormalizedRequest {
   readonly streamOptions: NormalizedStreamOptions;
   readonly jsonMode: boolean;
   readonly jsonSchema?: unknown;
+  // Client-supplied OpenAI `response_format.json_schema` fidelity fields, preserved
+  // through to the codex runtime (enforcement is unaffected — codex is always hard).
+  readonly jsonSchemaName?: string;
+  readonly jsonSchemaStrict?: boolean;
   readonly tools: readonly NormalizedTool[];
   readonly toolChoice: NormalizedToolChoice;
   readonly raw: unknown;

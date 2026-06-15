@@ -34,6 +34,8 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: isOpenAiJsonMode(input.response_format),
     jsonSchema: readOpenAiJsonSchema(input.response_format),
+    jsonSchemaName: readOpenAiJsonSchemaName(input.response_format),
+    jsonSchemaStrict: readOpenAiJsonSchemaStrict(input.response_format),
     tools,
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
@@ -62,6 +64,8 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: format?.type === 'json_object' || format?.type === 'json_schema',
     jsonSchema: format?.schema,
+    jsonSchemaName: format?.type === 'json_schema' ? readOptionalString(format.name) : undefined,
+    jsonSchemaStrict: format?.type === 'json_schema' ? readOptionalBoolean(format.strict) : undefined,
     tools: readOpenAiTools(input.tools),
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
@@ -615,6 +619,29 @@ function readOpenAiJsonSchema(value: unknown): unknown {
   if (format?.type !== 'json_schema') return undefined;
   const jsonSchema = asRecord(format.json_schema);
   return jsonSchema?.schema;
+}
+
+// B1 fidelity: preserve the client-supplied json_schema name/strict (Chat shape
+// nests them under response_format.json_schema) so the codex runtime forwards them
+// verbatim instead of a fixed name + strict:true.
+function readOpenAiJsonSchemaName(value: unknown): string | undefined {
+  const format = asRecord(value);
+  if (format?.type !== 'json_schema') return undefined;
+  return readOptionalString(asRecord(format.json_schema)?.name);
+}
+
+function readOpenAiJsonSchemaStrict(value: unknown): boolean | undefined {
+  const format = asRecord(value);
+  if (format?.type !== 'json_schema') return undefined;
+  return readOptionalBoolean(asRecord(format.json_schema)?.strict);
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function readOptionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 function readRole(value: unknown): NormalizedMessage['role'] {
