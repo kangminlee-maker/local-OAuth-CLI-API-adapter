@@ -43,6 +43,9 @@ interface ClaudeTurnResult {
   readonly text: string;
   readonly structuredOutput: unknown;
   readonly usage: unknown;
+  readonly stopReason?: string;
+  readonly stopDetails?: unknown;
+  readonly stopSequence?: string | null;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -140,7 +143,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   private canUsePersistentTurn(request: NormalizedRequest): boolean {
-    return !hasImageInputs(request);
+    return !hasImageInputs(request) && !requiresOneShotClaudeArgs(request, this.configuredModel);
   }
 
   private async runPersistentTurn(
@@ -185,6 +188,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       '--no-session-persistence',
       ...(this.configuredModel ? ['--model', this.configuredModel] : []),
       ...schemaArgsFor(request),
+      ...claudeTuningArgs(request, this.configuredModel),
       ...this.extraArgs,
       ...(useStreamJsonInput ? [] : [prompt]),
     ];
@@ -200,7 +204,12 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       : undefined;
     let turn: ClaudeTurnResult | null = null;
     let lastError: Error | null = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    // Validate-and-retry is only safe when the whole output is buffered. When a
+    // streaming consumer is attached (onTextDelta), a mid-stream retryable error
+    // has already delivered partial deltas, so a second attempt would duplicate
+    // output downstream — do not retry in that case.
+    const maxAttempts = onTextDelta ? 1 : 2;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
         turn = await runClaudeProcess(this.command, argv, {
           cwd: this.cwd,
@@ -236,6 +245,9 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       toolCalls: parsed.toolCalls,
       usage,
       latencyMs: Date.now() - startedAt,
+      stopReason: turn.stopReason,
+      stopDetails: turn.stopDetails,
+      stopSequence: turn.stopSequence ?? null,
     };
   }
 
@@ -350,6 +362,9 @@ export class ClaudeCodeBackend implements LocalCliBackend {
           text: typeof message.result === 'string' ? message.result : waiter.text,
           structuredOutput: message.structured_output ?? waiter.structuredOutput,
           usage: message.usage ?? waiter.usage,
+          stopReason: readClaudeStopReason(message),
+          stopDetails: message.stop_details,
+          stopSequence: readClaudeStopSequence(message),
         });
       } else {
         waiter.reject(new Error(readErrorMessage(message)));
@@ -382,6 +397,55 @@ export class ClaudeCodeBackend implements LocalCliBackend {
 function schemaArgsFor(request: NormalizedRequest): string[] {
   const schema = outputSchemaFor(request);
   return schema ? ['--json-schema', JSON.stringify(schema)] : [];
+}
+
+interface ClaudeModelCapabilities {
+  readonly effort: boolean;
+  readonly adaptiveThinking: boolean;
+}
+
+// Single source of truth for per-request-argument model limits. Haiku supports
+// neither the effort parameter nor adaptive thinking; gating is keyed on the model
+// the CLI actually runs (the configured `--model`).
+function claudeModelCapabilities(model?: string): ClaudeModelCapabilities {
+  const isHaiku = /haiku/i.test(model ?? '');
+  return { effort: !isHaiku, adaptiveThinking: !isHaiku };
+}
+
+// Anthropic-only per-request tuning controls (effort/thinking/task_budget), threaded
+// to claude flags. They are only populated by the Anthropic normalizer; this is the
+// claude runtime's bounded authority over that surface. Flags gated out for the model
+// (e.g. Haiku effort/adaptive thinking) contribute nothing.
+function claudeTuningArgs(request: NormalizedRequest, model?: string): string[] {
+  const caps = claudeModelCapabilities(model);
+  const args: string[] = [];
+  if (request.effort && caps.effort) args.push('--effort', request.effort);
+  const thinking = request.thinking;
+  if (thinking && !(thinking.type === 'adaptive' && !caps.adaptiveThinking)) {
+    args.push('--thinking', thinking.type);
+    if (thinking.display) args.push('--thinking-display', thinking.display);
+  }
+  if (request.taskBudgetTokens) args.push('--task-budget', String(request.taskBudgetTokens));
+  return args;
+}
+
+// Per-request flags must be on the spawned argv, so a request that contributes any
+// of them runs one-shot rather than reusing the persistent process (whose argv is
+// fixed at spawn). The schema case is scoped to the Anthropic shape, where
+// `jsonSchema` comes from `output_config.format` and must reach `claude
+// --json-schema`; OpenAI-shape `response_format` keeps its persistent path. Tuning
+// flags only force one-shot when they actually contribute (gated-out flags do not).
+function requiresOneShotClaudeArgs(request: NormalizedRequest, model?: string): boolean {
+  const needsSchema = request.shape === 'anthropic-messages' && request.jsonSchema !== undefined;
+  return needsSchema || claudeTuningArgs(request, model).length > 0;
+}
+
+function readClaudeStopReason(message: JsonObject): string | undefined {
+  return typeof message.stop_reason === 'string' ? message.stop_reason : undefined;
+}
+
+function readClaudeStopSequence(message: JsonObject): string | null {
+  return typeof message.stop_sequence === 'string' ? message.stop_sequence : null;
 }
 
 function claudeContextIsolationArgs(): string[] {
@@ -459,6 +523,9 @@ function runClaudeProcess(
               text: typeof message.result === 'string' ? message.result : waiter.text,
               structuredOutput: message.structured_output ?? waiter.structuredOutput,
               usage: message.usage ?? waiter.usage,
+              stopReason: readClaudeStopReason(message),
+              stopDetails: message.stop_details,
+              stopSequence: readClaudeStopSequence(message),
             });
           } else {
             finish(new Error(readErrorMessage(message)));

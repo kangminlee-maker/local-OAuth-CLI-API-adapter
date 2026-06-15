@@ -651,6 +651,51 @@ function idTokenForAccount(accountId) {
   });
 }
 
+test('CodexBackendTransport preserves client json_schema name and strict (B1)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_b1', model: 'gpt-5.5', status: 'in_progress' } },
+      { type: 'response.completed', response: { id: 'resp_b1', model: 'gpt-5.5' } },
+    ]), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  await backend.generate({
+    ...textRequest(),
+    jsonMode: true,
+    jsonSchema: { type: 'object', additionalProperties: false, properties: {}, required: [] },
+    jsonSchemaName: 'my_review_schema',
+    jsonSchemaStrict: false,
+  });
+
+  const format = JSON.parse(calls[0].init.body).text.format;
+  assert.equal(format.type, 'json_schema');
+  assert.equal(format.name, 'my_review_schema');
+  assert.equal(format.strict, false);
+});
+
+test('CodexBackendTransport defaults json_schema name/strict when the client omits them', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_b1d', model: 'gpt-5.5', status: 'in_progress' } },
+      { type: 'response.completed', response: { id: 'resp_b1d', model: 'gpt-5.5' } },
+    ]), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  await backend.generate({ ...textRequest(), jsonMode: true, jsonSchema: { type: 'object' } });
+
+  const format = JSON.parse(calls[0].init.body).text.format;
+  assert.equal(format.name, 'codex_output_schema');
+  assert.equal(format.strict, true);
+});
+
 function sse(events) {
   return events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('');
 }

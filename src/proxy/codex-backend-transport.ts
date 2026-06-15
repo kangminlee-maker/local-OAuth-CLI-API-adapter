@@ -1333,11 +1333,13 @@ function responseTextControls(
     verbosity: request.verbosity ?? fallbackVerbosity,
   };
   if (request.jsonSchema) {
+    // B1: preserve the client-supplied json_schema name/strict for fidelity. codex
+    // enforcement is hard regardless, so these only affect what the caller sees echoed.
     text.format = {
       type: 'json_schema',
-      name: 'codex_output_schema',
+      name: request.jsonSchemaName ?? 'codex_output_schema',
       schema: request.jsonSchema,
-      strict: true,
+      strict: request.jsonSchemaStrict ?? true,
     };
   } else if (request.jsonMode) {
     text.format = { type: 'json_object' };

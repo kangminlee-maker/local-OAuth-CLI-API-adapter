@@ -4,3 +4,4 @@ artifacts/
 .DS_Store
 .local-oauth-cli/
 .env
+.onto/

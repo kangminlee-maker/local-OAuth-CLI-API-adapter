@@ -5,6 +5,17 @@ export type ApiShape = 'openai-chat' | 'openai-responses' | 'anthropic-messages'
 export type NormalizedReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 export type NormalizedVerbosity = 'low' | 'medium' | 'high';
 
+// Anthropic `output_config.effort` channel (distinct from the OpenAI/codex
+// `reasoning_effort` enum: includes `max`, excludes `none`/`minimal`).
+export type NormalizedAnthropicEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+// Anthropic `thinking` field, threaded to `claude --thinking`/`--thinking-display`.
+// `enabled` is the pre-adaptive extended-thinking mode (still valid on the CLI).
+export interface NormalizedThinking {
+  readonly type: 'adaptive' | 'enabled' | 'disabled';
+  readonly display?: 'summarized' | 'omitted';
+}
+
 export interface NormalizedMessage {
   readonly role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
   readonly content: string;
@@ -51,10 +62,20 @@ export interface NormalizedRequest {
   readonly temperature?: number;
   readonly reasoningEffort?: NormalizedReasoningEffort;
   readonly verbosity?: NormalizedVerbosity;
+  // Anthropic `output_config.effort`, routed to `claude --effort` (claude runtime).
+  readonly effort?: NormalizedAnthropicEffort;
+  // Anthropic `output_config.task_budget.total`, routed to `claude --task-budget`.
+  readonly taskBudgetTokens?: number;
+  // Anthropic `thinking`, routed to `claude --thinking`/`--thinking-display`.
+  readonly thinking?: NormalizedThinking;
   readonly stream: boolean;
   readonly streamOptions: NormalizedStreamOptions;
   readonly jsonMode: boolean;
   readonly jsonSchema?: unknown;
+  // Client-supplied OpenAI `response_format.json_schema` fidelity fields, preserved
+  // through to the codex runtime (enforcement is unaffected — codex is always hard).
+  readonly jsonSchemaName?: string;
+  readonly jsonSchemaStrict?: boolean;
   readonly tools: readonly NormalizedTool[];
   readonly toolChoice: NormalizedToolChoice;
   readonly raw: unknown;
@@ -85,6 +106,11 @@ export interface LocalCompletionResult {
   readonly toolCalls: readonly LocalToolCall[];
   readonly usage: LocalUsage;
   readonly latencyMs: number;
+  // CLI-reported stop reason (e.g. end_turn, max_tokens, refusal) when available;
+  // mapped onto the Anthropic response `stop_reason` / `stop_details` / `stop_sequence`.
+  readonly stopReason?: string;
+  readonly stopDetails?: unknown;
+  readonly stopSequence?: string | null;
 }
 
 export interface OpenAiImageGenerationRequest {

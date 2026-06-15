@@ -1,10 +1,12 @@
 import { fileURLToPath } from 'node:url';
 import type {
+  NormalizedAnthropicEffort,
   NormalizedImage,
   NormalizedImageDetail,
   NormalizedMessage,
   NormalizedRequest,
   NormalizedReasoningEffort,
+  NormalizedThinking,
   NormalizedTool,
   NormalizedToolChoice,
   NormalizedVerbosity,
@@ -32,6 +34,8 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: isOpenAiJsonMode(input.response_format),
     jsonSchema: readOpenAiJsonSchema(input.response_format),
+    jsonSchemaName: readOpenAiJsonSchemaName(input.response_format),
+    jsonSchemaStrict: readOpenAiJsonSchemaStrict(input.response_format),
     tools,
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
@@ -60,6 +64,8 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: format?.type === 'json_object' || format?.type === 'json_schema',
     jsonSchema: format?.schema,
+    jsonSchemaName: format?.type === 'json_schema' ? readOptionalString(format.name) : undefined,
+    jsonSchemaStrict: format?.type === 'json_schema' ? readOptionalBoolean(format.strict) : undefined,
     tools: readOpenAiTools(input.tools),
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
@@ -93,18 +99,122 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const system = flattenAnthropicSystem(input.system);
   if (system) messages.push({ role: 'system', content: system, images: [] });
   messages.push(...readAnthropicMessages(input.messages));
+  const outputConfig = asRecord(input.output_config);
+  const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
+  const tools = readAnthropicTools(input.tools);
+  if (outputFormat !== undefined && tools.length > 0) {
+    // The proxy has a single structured-output channel (claude --json-schema); a
+    // forced/decision tool schema and output_config.format would collide, so the
+    // user's format schema would be silently dropped. Reject instead.
+    throw new ProxyRequestError(
+      'output_config.format is not supported together with tools.',
+      400,
+      'anthropic',
+    );
+  }
   return {
     shape: 'anthropic-messages',
     model: readString(input.model, 'codex-app-server'),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens),
     temperature: readOptionalNumber(input.temperature),
+    effort: readAnthropicEffort(outputConfig?.effort),
+    taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
+    thinking: readAnthropicThinking(input.thinking),
     stream: input.stream === true,
     streamOptions: readStreamOptions(undefined),
-    jsonMode: false,
-    tools: readAnthropicTools(input.tools),
+    jsonMode: outputFormat !== undefined,
+    jsonSchema: outputFormat,
+    tools,
     toolChoice: readAnthropicToolChoice(input.tool_choice),
     raw: body,
+  };
+}
+
+// Anthropic structured outputs: `output_config.format = {type:'json_schema', schema}`
+// (accepts a nested `json_schema.schema` variant). A json_schema format with no
+// resolvable schema is malformed input, not absence — reject it (fail-loud).
+function readAnthropicOutputFormat(value: unknown): unknown {
+  const format = asRecord(value);
+  if (!format) return undefined;
+  if (format.type !== 'json_schema') {
+    throw new ProxyRequestError(
+      'output_config.format.type must be json_schema.',
+      400,
+      'anthropic',
+    );
+  }
+  const nested = asRecord(format.json_schema);
+  const schema = format.schema ?? nested?.schema;
+  if (schema === undefined || schema === null) {
+    throw new ProxyRequestError(
+      'output_config.format of type json_schema requires a schema.',
+      400,
+      'anthropic',
+    );
+  }
+  return schema;
+}
+
+function readAnthropicEffort(value: unknown): NormalizedAnthropicEffort | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    value === 'low'
+    || value === 'medium'
+    || value === 'high'
+    || value === 'xhigh'
+    || value === 'max'
+  ) {
+    return value;
+  }
+  throw new ProxyRequestError(
+    'output_config.effort must be one of low, medium, high, xhigh, or max.',
+    400,
+    'anthropic',
+  );
+}
+
+// Anthropic task budget is token-denominated with a 20,000-token minimum. A present
+// but malformed/non-token/sub-minimum budget is rejected rather than mis-forwarded.
+const ANTHROPIC_TASK_BUDGET_MIN_TOKENS = 20_000;
+
+function readAnthropicTaskBudget(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const budget = asRecord(value);
+  const total = budget?.total;
+  const invalid = (message: string): never => {
+    throw new ProxyRequestError(message, 400, 'anthropic');
+  };
+  if (!budget || budget.type !== 'tokens') {
+    invalid('output_config.task_budget.type must be tokens.');
+  }
+  if (typeof total !== 'number' || !Number.isInteger(total)) {
+    invalid('output_config.task_budget.total must be an integer number of tokens.');
+  }
+  if ((total as number) < ANTHROPIC_TASK_BUDGET_MIN_TOKENS) {
+    invalid(`output_config.task_budget.total must be at least ${ANTHROPIC_TASK_BUDGET_MIN_TOKENS}.`);
+  }
+  return total as number;
+}
+
+function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
+  if (value === undefined || value === null) return undefined;
+  const thinking = asRecord(value);
+  const type = thinking?.type;
+  if (type !== 'adaptive' && type !== 'enabled' && type !== 'disabled') {
+    throw new ProxyRequestError(
+      'thinking.type must be one of adaptive, enabled, or disabled.',
+      400,
+      'anthropic',
+    );
+  }
+  const display = thinking?.display;
+  return {
+    type,
+    // display governs visibility of thinking blocks, which disabled never produces.
+    display: type !== 'disabled' && (display === 'summarized' || display === 'omitted')
+      ? display
+      : undefined,
   };
 }
 
@@ -509,6 +619,29 @@ function readOpenAiJsonSchema(value: unknown): unknown {
   if (format?.type !== 'json_schema') return undefined;
   const jsonSchema = asRecord(format.json_schema);
   return jsonSchema?.schema;
+}
+
+// B1 fidelity: preserve the client-supplied json_schema name/strict (Chat shape
+// nests them under response_format.json_schema) so the codex runtime forwards them
+// verbatim instead of a fixed name + strict:true.
+function readOpenAiJsonSchemaName(value: unknown): string | undefined {
+  const format = asRecord(value);
+  if (format?.type !== 'json_schema') return undefined;
+  return readOptionalString(asRecord(format.json_schema)?.name);
+}
+
+function readOpenAiJsonSchemaStrict(value: unknown): boolean | undefined {
+  const format = asRecord(value);
+  if (format?.type !== 'json_schema') return undefined;
+  return readOptionalBoolean(asRecord(format.json_schema)?.strict);
+}
+
+function readOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function readOptionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined;
 }
 
 function readRole(value: unknown): NormalizedMessage['role'] {
