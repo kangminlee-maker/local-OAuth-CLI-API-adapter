@@ -108,6 +108,7 @@ async function proxy(args: readonly string[]): Promise<number> {
           }),
     },
   });
+  const authKey = normalizeAuthKey(options.authKey ?? process.env.LOCAL_OAUTH_PROXY_KEY);
   const started = await startLocalApiProxy({
     backend,
     imageGenerationClient,
@@ -115,10 +116,12 @@ async function proxy(args: readonly string[]): Promise<number> {
     host,
     port,
     requestTimeoutMs: timeoutMs,
+    authKey,
   });
 
   process.stdout.write(`local OAuth CLI API proxy ready\n`);
   process.stdout.write(`  backend: ${backend.name}\n`);
+  process.stdout.write(`  auth: ${authKey ? 'required (Authorization: Bearer or x-api-key)' : 'open (no key gate)'}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexTransport: ${selectedCodexTransport}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexImageTransport: ${selectedCodexImageTransport}\n`);
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
@@ -155,6 +158,7 @@ interface ParsedOptions {
   readonly codexImageTransport?: string;
   readonly transport?: string;
   readonly acceptLlmGuide?: string;
+  readonly authKey?: string;
 }
 
 export function parseOptions(args: readonly string[]): ParsedOptions {
@@ -205,6 +209,12 @@ function parseIntOption(value: string | undefined, fallback: number): number {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return parsed;
+}
+
+function normalizeAuthKey(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function parseCodexTransport(value: string | undefined): CodexProxyTransport {
@@ -295,6 +305,7 @@ Options:
   --codex-image-transport <transport>
                                      Codex Images transport: app-server or codex-backend. Default: settings.json (${codexProxyImageTransport()}).
   --image-model <model>              Codex model for image-2 via gpt-5.5 route. Default: settings.json (${codexProxyImageModel()}).
+  --auth-key <key>                   Require this key on every request via Authorization: Bearer <key> or x-api-key. Env: LOCAL_OAUTH_PROXY_KEY. Default: open (no gate).
 
 Examples:
   local-oauth-cli proxy --accept-llm-guide=${LLM_INSTALL_GUIDE_ACCEPT_VERSION} --runtime codex --port 8787 --cwd /path/to/project

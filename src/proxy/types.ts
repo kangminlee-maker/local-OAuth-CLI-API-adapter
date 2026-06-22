@@ -224,6 +224,10 @@ export interface ProxyServerOptions {
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;
+  // When set, every request must present this key via `Authorization: Bearer <key>`
+  // or `x-api-key: <key>`. The key gates proxy access only; the local CLI backend
+  // still authenticates with its own OAuth session.
+  readonly authKey?: string;
 }
 
 export class ProxyRequestError extends Error {

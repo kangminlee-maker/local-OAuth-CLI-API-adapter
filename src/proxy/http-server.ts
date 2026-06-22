@@ -4,7 +4,7 @@ import {
   type Server,
   type ServerResponse,
 } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import type {
   LocalCliBackend,
@@ -124,6 +124,7 @@ async function handleRequest(
   }
   try {
     const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    requireAuthorizedRequest(req, path, options.authKey);
     if (path === '/local/cli/sessions' || path.startsWith('/local/cli/sessions/')) {
       await handleLocalCliChatRequest(req, res, options, path);
       return;
@@ -200,6 +201,47 @@ async function handleRequest(
   } catch (err) {
     writeError(res, err, errorShape);
   }
+}
+
+// Optional access gate. When `authKey` is configured the proxy requires every
+// request (except the CORS preflight, which carries no credentials) to present
+// the key via `Authorization: Bearer <key>` or `x-api-key: <key>`. This protects
+// a tunnel-exposed personal proxy; it does not change how the local CLI backend
+// authenticates. The 401 is shaped per provider so OpenAI and Anthropic SDKs
+// surface it as an auth error.
+function requireAuthorizedRequest(
+  req: IncomingMessage,
+  path: string,
+  authKey: string | undefined,
+): void {
+  if (!authKey) return;
+  const presented = presentedAuthKey(req.headers);
+  if (presented !== undefined && safeKeyEqual(presented, authKey)) return;
+  const provider = path === '/v1/messages' ? 'anthropic' : 'openai';
+  throw new ProxyRequestError(
+    'Unauthorized: missing or invalid API key.',
+    401,
+    provider,
+    provider === 'anthropic' ? 'authentication_error' : 'invalid_request_error',
+    null,
+    provider === 'anthropic' ? null : 'invalid_api_key',
+  );
+}
+
+function presentedAuthKey(headers: IncomingMessage['headers']): string | undefined {
+  const apiKey = headerValue(headers['x-api-key']).trim();
+  if (apiKey) return apiKey;
+  const authorization = headerValue(headers.authorization).trim();
+  if (!authorization) return undefined;
+  const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
+  return (bearer ? bearer[1] : authorization).trim();
+}
+
+function safeKeyEqual(presented: string, expected: string): boolean {
+  const presentedBytes = Buffer.from(presented);
+  const expectedBytes = Buffer.from(expected);
+  if (presentedBytes.length !== expectedBytes.length) return false;
+  return timingSafeEqual(presentedBytes, expectedBytes);
 }
 
 async function handleLocalCliChatRequest(

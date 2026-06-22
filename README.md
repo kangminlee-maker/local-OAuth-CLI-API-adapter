@@ -169,6 +169,47 @@ OpenAI or Anthropic APIs.
 For the complete list of input/output rules and implementation differences, see
 [`docs/api-interface-contract.md`](docs/api-interface-contract.md).
 
+## Access Key And Remote Exposure
+
+By default the proxy binds to `127.0.0.1` and performs no inbound authentication.
+To reach it from another machine or a web service, enable a key gate and put it
+behind a tunnel.
+
+Enable the gate with `--auth-key` or the `LOCAL_OAUTH_PROXY_KEY` environment
+variable:
+
+```bash
+local-oauth-cli proxy --accept-llm-guide=v1 --runtime codex --auth-key "$MY_KEY"
+# or
+LOCAL_OAUTH_PROXY_KEY="$MY_KEY" local-oauth-cli proxy --accept-llm-guide=v1 --runtime codex
+```
+
+When set, every request except the CORS preflight must present the key via
+`Authorization: Bearer <key>` or `x-api-key: <key>`. An OpenAI or Anthropic SDK
+can therefore use the key as its API key with no code changes:
+
+```bash
+export OPENAI_BASE_URL="https://<your-tunnel-host>/v1"
+export OPENAI_API_KEY="$MY_KEY"
+```
+
+A missing or wrong key returns a provider-shaped `401` (`invalid_api_key` for
+OpenAI paths, `authentication_error` for `/v1/messages`). The key gates proxy
+access only; the local CLI backend still authenticates with its own OAuth
+session.
+
+To reach the proxy from the internet, keep it on `127.0.0.1` and front it with a
+tunnel — no router changes and your home IP stays hidden:
+
+```bash
+# example: Cloudflare Tunnel pointing at the local proxy
+cloudflared tunnel --url http://127.0.0.1:8787
+```
+
+Personal use only. Serving a web service from a personal CLI subscription may
+violate the provider's terms, and subscription session/rate limits, your
+machine's availability, and CLI latency all still apply.
+
 ## Examples
 
 OpenAI Chat Completions:

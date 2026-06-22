@@ -1478,3 +1478,143 @@ function weatherSchema() {
     required: ['city'],
   };
 }
+
+function authTextBackend() {
+  return {
+    name: 'fake-backend',
+    model: 'fake-local-model',
+    async generate() {
+      return {
+        id: 'local_test',
+        model: 'fake-local-model',
+        text: 'OK',
+        toolCalls: [],
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+          cachedInputTokens: 0,
+          reasoningOutputTokens: 0,
+          source: 'provider',
+        },
+        latencyMs: 1,
+      };
+    },
+    async close() {},
+  };
+}
+
+function startAuthProxy(authKey) {
+  return startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 10_000,
+    authKey,
+    backend: authTextBackend(),
+  });
+}
+
+const authChatBody = JSON.stringify({
+  model: 'fake-local-model',
+  messages: [{ role: 'user', content: 'hi' }],
+});
+const authMessagesBody = JSON.stringify({
+  model: 'fake-local-model',
+  max_tokens: 16,
+  messages: [{ role: 'user', content: 'hi' }],
+});
+
+test('auth-key gate: missing key returns OpenAI-shaped 401', async () => {
+  const proxy = await startAuthProxy('secret-key');
+  try {
+    const res = await fetch(`${proxy.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: authChatBody,
+    });
+    const body = await res.json();
+    assert.equal(res.status, 401);
+    assert.equal(body.error.type, 'invalid_request_error');
+    assert.equal(body.error.code, 'invalid_api_key');
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('auth-key gate: wrong key returns 401', async () => {
+  const proxy = await startAuthProxy('secret-key');
+  try {
+    const res = await fetch(`${proxy.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer nope' },
+      body: authChatBody,
+    });
+    assert.equal(res.status, 401);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('auth-key gate: correct Bearer key passes', async () => {
+  const proxy = await startAuthProxy('secret-key');
+  try {
+    const res = await fetch(`${proxy.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer secret-key' },
+      body: authChatBody,
+    });
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.choices[0].message.content, 'OK');
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('auth-key gate: x-api-key passes and anthropic 401 keeps provider error shape', async () => {
+  const proxy = await startAuthProxy('secret-key');
+  try {
+    const ok = await fetch(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'secret-key' },
+      body: authMessagesBody,
+    });
+    assert.equal(ok.status, 200);
+
+    const denied = await fetch(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'wrong' },
+      body: authMessagesBody,
+    });
+    const body = await denied.json();
+    assert.equal(denied.status, 401);
+    assert.equal(body.type, 'error');
+    assert.equal(body.error.type, 'authentication_error');
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('auth-key gate: CORS preflight bypasses the gate', async () => {
+  const proxy = await startAuthProxy('secret-key');
+  try {
+    const res = await fetch(`${proxy.url}/v1/chat/completions`, { method: 'OPTIONS' });
+    assert.equal(res.status, 204);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('auth-key gate: open proxy without a key allows unauthenticated requests', async () => {
+  const proxy = await startAuthProxy(undefined);
+  try {
+    const res = await fetch(`${proxy.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: authChatBody,
+    });
+    assert.equal(res.status, 200);
+  } finally {
+    await proxy.close();
+  }
+});
