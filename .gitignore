@@ -5,3 +5,4 @@ artifacts/
 .local-oauth-cli/
 .env
 .onto/
+bench-results/
