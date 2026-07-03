@@ -124,6 +124,36 @@ async function collectClaude() {
   ];
 
   const help = await collectHelp(binary, helpCommands);
+  // Flags registered with hideHelp() in the binary: absent from `--help` output but
+  // functional and depended on by the proxy's Anthropic parity path. Tracked here so
+  // the catalog can document them without the validity check treating them as stale.
+  // Presence is confirmed against the binary scan (see hiddenFlagsPresent), which is
+  // the deterministic authority for hideHelp() flags help scraping cannot reach.
+  const hiddenProbedFlags = [
+    {
+      item: '--thinking',
+      source: 'Binary scan + invalid-value parse probe',
+      requiredProbe: 'Passing an invalid mode is rejected with choices enabled/adaptive/disabled.',
+    },
+    {
+      item: '--thinking-display',
+      source: 'Binary scan + invalid-value parse probe',
+      requiredProbe: 'Passing an invalid display is rejected with choices summarized/omitted.',
+    },
+    {
+      item: '--task-budget',
+      source: 'Binary scan + invalid-value parse probe',
+      requiredProbe: 'Passing a non-positive value is rejected with "must be a positive integer".',
+    },
+    {
+      item: '--max-thinking-tokens',
+      source: 'Binary scan (deprecated, superseded by --thinking)',
+      requiredProbe: 'Present but deprecated; the adapter does not use it.',
+    },
+  ];
+  const binaryScan = skipBinaryScan
+    ? { skipped: true }
+    : await collectBinaryScan(binary, hiddenProbedFlags.map((flag) => flag.item));
   return {
     ...base,
     help,
@@ -150,7 +180,8 @@ async function collectClaude() {
         requiredProbe: 'Verify event shape and whether service chat UI should expose it.',
       },
     ],
-    binaryScan: skipBinaryScan ? { skipped: true } : await collectBinaryScan(binary),
+    hiddenProbedFlags,
+    binaryScan,
   };
 }
 
@@ -170,9 +201,18 @@ async function validateCatalog(data) {
   const schemaMethods = uniqueSorted(Object.values(data.codex.schema?.methodEnums ?? {}).flat());
   const documentedCodexMethods = uniqueCapture(codexSection, /`([A-Za-z][A-Za-z0-9_]*(?:\/[A-Za-z][A-Za-z0-9_]*)+)`/g);
   const documentedClaudeFlags = uniqueMatches(claudeSection, /--[A-Za-z0-9][A-Za-z0-9_-]+/g);
+  // hideHelp() flags are allowed only when the binary scan actually finds them, so a
+  // future version that drops one still surfaces as stale. When the scan is skipped or
+  // unavailable there is no binary authority, so fall back to the declared list to avoid
+  // a false stale signal in reduced-authority mode.
+  const scan = data.claude.binaryScan;
+  const scanConfirmedHiddenFlags = scan && scan.ok && Array.isArray(scan.hiddenFlagsPresent)
+    ? scan.hiddenFlagsPresent
+    : (data.claude.hiddenProbedFlags ?? []).map((item) => item.item);
   const claudeAllowedFlags = uniqueSorted([
     ...(data.claude.helpFlags ?? []),
     ...(data.claude.docsOnlyCandidates ?? []).map((item) => item.item),
+    ...scanConfirmedHiddenFlags,
   ]);
 
   const documentedVersions = {
@@ -294,7 +334,7 @@ async function collectCodexSchema(binary) {
   }
 }
 
-async function collectBinaryScan(binary) {
+async function collectBinaryScan(binary, knownHiddenFlags = []) {
   const stringsPath = await commandPath('strings');
   if (!stringsPath) return { available: false, reason: 'strings command not found' };
   const result = await run(stringsPath, [binary], {
@@ -305,6 +345,12 @@ async function collectBinaryScan(binary) {
 
   const flags = uniqueMatches(result.stdout, /--[A-Za-z0-9][A-Za-z0-9_-]+/g);
   const methodLike = uniqueMatches(result.stdout, /\b[A-Za-z][A-Za-z0-9]*(?:\/[A-Za-z][A-Za-z0-9]*)+\b/g);
+  // Presence check for hideHelp() flags that `--help` scraping cannot see. The
+  // membership test runs against the full flag set, not the truncated candidate
+  // list, so it stays authoritative regardless of alphabetical position.
+  const flagSet = new Set(flags);
+  const hiddenFlagsPresent = knownHiddenFlags.filter((flag) => flagSet.has(flag));
+  const hiddenFlagsMissing = knownHiddenFlags.filter((flag) => !flagSet.has(flag));
   return {
     available: true,
     ok: true,
@@ -313,6 +359,8 @@ async function collectBinaryScan(binary) {
     methodCandidateCount: methodLike.length,
     flagCandidates: flags.slice(0, 500),
     methodCandidates: methodLike.slice(0, 500),
+    hiddenFlagsPresent,
+    hiddenFlagsMissing,
   };
 }
 
@@ -541,6 +589,14 @@ ${renderInlineList(data.claude.helpFlags)}
 | Item | Source | Required probe |
 | --- | --- | --- |
 ${(data.claude.docsOnlyCandidates ?? []).map((item) => `| ${inline(item.item)} | ${item.source} | ${escapeMarkdown(item.requiredProbe)} |`).join('\n')}
+
+## Claude Hidden Probe-Confirmed Flags
+
+Registered with \`hideHelp()\`, so absent from \`--help\`. The \`Binary\` column marks whether the current binary scan found the flag; a \`no\` here means the flag was dropped and the catalog entry is stale.
+
+| Item | Binary | Source | Required probe |
+| --- | --- | --- | --- |
+${(data.claude.hiddenProbedFlags ?? []).map((item) => `| ${inline(item.item)} | ${yesNo((data.claude.binaryScan?.hiddenFlagsPresent ?? []).includes(item.item))} | ${escapeMarkdown(item.source)} | ${escapeMarkdown(item.requiredProbe)} |`).join('\n')}
 
 ## Binary Scan Summary
 

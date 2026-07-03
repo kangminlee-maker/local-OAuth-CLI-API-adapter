@@ -10,8 +10,8 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 
 | Runtime | Local version | Binary | Primary hot path |
 | --- | --- | --- | --- |
-| Codex CLI | `codex-cli 0.137.0` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.163` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Codex CLI | `codex-cli 0.142.5` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
+| Claude Code | `2.1.200` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
 ## 신뢰 레벨
 
@@ -112,7 +112,7 @@ Useful official references:
 
 ### App-server request methods
 
-The following methods were discovered from generated schema on local Codex `0.137.0`. They must still be covered by runtime probes before production use.
+The following methods were discovered from generated schema on local Codex `0.142.5`. They must still be covered by runtime probes before production use. The full generated method surface for the current version (including newer `thread/goal/*`, `thread/rollback`, `thread/backgroundTerminals/*`, `review/start`, `skills/*`, `hooks/*`, `plugin/*`, and `remoteControl/*` groups that are outside the chat hot path) is in `artifacts/runtime-capability-catalog/latest.json`.
 
 | Group | Methods |
 | --- | --- |
@@ -157,25 +157,37 @@ The following methods were discovered from generated schema on local Codex `0.13
 | Non-interactive | `-p`, `--print`, `--output-format text/json/stream-json`, `--input-format text/stream-json`, `--verbose` | Primary automation and streaming path |
 | Streaming | `--include-partial-messages`, `--include-hook-events`, `--replay-user-messages` | Text deltas, hook visibility, input acknowledgment |
 | Session | `--session-id`, `--resume`, `--continue`, `--fork-session`, `--no-session-persistence`, `--name` | Service session lifecycle |
-| Model/effort | `--model`, `--fallback-model`, `--effort`, `--max-budget-usd` | Per-session quality/cost policy |
+| Model/effort | `--model`, `--fallback-model`, `--effort`, `--max-budget-usd` | Per-session quality/cost policy. `--effort` accepts `low/medium/high/xhigh/max`; an unknown value is warned and ignored (default effort is used), not rejected, so the proxy validates effort upstream |
 | Output contract | `--json-schema` | Strict structured final output fallback |
 | Prompt/context | `--system-prompt`, `--append-system-prompt`, `--exclude-dynamic-system-prompt-sections`, `--setting-sources`, `--settings` | Service-specific behavior and deterministic context |
-| Tool control | `--tools`, `--allowedTools`, `--allowed-tools`, `--disallowedTools`, `--disallowed-tools`, `--mcp-config`, `--strict-mcp-config` | Service tool bridge |
-| Permission | `--permission-mode`, `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` | Scratch-only execution policy |
+| Tool control | `--tools`, `--allowedTools`, `--allowed-tools`, `--disallowedTools`, `--disallowed-tools`, `--mcp-config`, `--strict-mcp-config`, `--disable-slash-commands` | Service tool bridge and skill/slash-command isolation |
+| Permission | `--permission-mode` (`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`), `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` | Scratch-only execution policy |
 | Workspace | `--add-dir`, `--worktree`, `--tmux` | Filesystem access control. `--worktree`/`--tmux` are not hot-path chat defaults |
 | Integrations | `--chrome`, `--no-chrome`, `--ide`, `--plugin-dir`, `--plugin-url`, `--agents`, `--agent` | Usually disabled unless service opts in |
-| Minimal mode | `--bare` | Not a default for local OAuth sessions because it does not read OAuth/keychain auth |
+| Isolation/troubleshooting | `--bare`, `--safe-mode` | Neither is a local OAuth default: `--bare` does not read OAuth/keychain auth, `--safe-mode` disables all customizations |
+| Other surface | `--betas`, `--file`, `--from-pr`, `--bg`/`--background`, `--brief`, `--prompt-suggestions`, `--remote-control`, `--remote-control-session-name-prefix`, `--ax-screen-reader`, `--debug-file` | Not hot-path chat defaults. `--betas` applies to API-key users only, so it is inert under OAuth; `--prompt-suggestions` accepts `true/false/1/0/yes/no/on/off` |
 
-### Official-docs items that need local probe
+### Adapter-critical flags hidden from `--help`
 
-These appear in official docs but were not present in the observed local `claude 2.1.163 --help` output, or need behavior verification.
+These flags are registered in the installed binary but marked `hideHelp()`, so they do not appear in `claude --help`. The proxy's Anthropic parity path (`output_config`/`thinking`) depends on them, so they are tracked here even though help-scraping cannot see them. Source level is L0 binary scan plus an L4 parse probe: passing an invalid value makes the CLI reject it with the allowed choices, which confirms both that the option exists and what it accepts.
+
+| Flag | Accepts | Adapter use |
+| --- | --- | --- |
+| `--thinking` | `enabled`, `adaptive`, `disabled` | Anthropic `thinking.type` on the claude runtime |
+| `--thinking-display` | `summarized`, `omitted` | Anthropic `thinking.display` visibility |
+| `--task-budget` | positive integer tokens | Anthropic `output_config.task_budget.total` |
+
+Risk: because these are hidden, a future CLI could rename or drop them with no visible `--help` diff. When bumping the pinned Claude Code version, re-run `pnpm catalog:runtime` (binary scan) plus the invalid-value parse probe before trusting the parity path. `--max-thinking-tokens` still exists but is deprecated in favor of `--thinking`; the adapter does not use it.
+
+### Official-docs items that need behavior probe
+
+As of `claude 2.1.200` these are all registered in the installed binary (`hideHelp()`, so absent from `--help` output); the remaining work is behavior verification, not presence.
 
 | Item | Source | Required probe |
 | --- | --- | --- |
-| `--max-turns` | Official CLI reference | Verify accepted by installed binary and behavior with `-p` |
-| `--permission-prompt-tool` | Official CLI reference | Verify MCP permission prompt contract and stream-json events |
-| `--maintenance` | Official CLI reference | Verify availability and whether it affects startup latency |
-| `--prompt-suggestions` | Official CLI reference and local help | Verify stream-json event shape and whether service UI wants it |
+| `--max-turns` | Official CLI reference | Registered and accepted; verify early-exit behavior with `-p` |
+| `--permission-prompt-tool` | Official CLI reference | Registered and accepted; verify MCP permission prompt contract and stream-json events |
+| `--maintenance` | Official CLI reference | Registered; verify availability and whether it affects startup latency |
 
 ### MCP and service tools
 
@@ -195,6 +207,8 @@ Claude Code supports service tool connection through MCP configuration and `allo
 - Do not use `--bare` by default for local OAuth because it bypasses OAuth/keychain auth lookup.
 - Use `--mcp-config` plus `--strict-mcp-config` and explicit `--allowedTools` for service-provided tools.
 - Use `--json-schema` only for strict final output cases; default chat UI should prefer text stream plus tool/action events.
+- Validate per-request tuning (`--effort`, `--thinking`, `--task-budget`) in the proxy before forwarding: `--effort` silently falls back on an unknown value, and the thinking/task-budget flags are hidden, so upstream validation is the only place a bad value is caught deterministically.
+- Treat the hidden parity flags as a version-pinned contract: on every Claude Code version bump, re-run `pnpm catalog:runtime` and the invalid-value parse probe to confirm `--thinking`/`--thinking-display`/`--task-budget` still exist before shipping.
 - Keep `ANTHROPIC_API_KEY` and related direct provider variables out of the child process env unless the selected mode is explicitly direct API, which native local chat should not support.
 
 ## Service chat runtime output list
