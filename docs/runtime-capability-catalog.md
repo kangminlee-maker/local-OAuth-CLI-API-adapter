@@ -11,7 +11,7 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 | Runtime | Local version | Binary | Primary hot path |
 | --- | --- | --- | --- |
 | Codex CLI | `codex-cli 0.142.5` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.200` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Claude Code | `2.1.201` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
 ## 신뢰 레벨
 
@@ -74,6 +74,15 @@ tmpdir="$(mktemp -d /tmp/codex-schema.XXXXXX)"
 codex app-server generate-json-schema --experimental --out "$tmpdir"
 ```
 
+Hidden-surface probe (codex is clap-based; `hide = true` items never appear in `--help`):
+
+```bash
+# Enumerate candidates from the pinned tag's source, then confirm each against the installed binary.
+curl -sL "https://raw.githubusercontent.com/openai/codex/rust-v$(codex --version | awk '{print $2}')/codex-rs/cli/src/main.rs" | grep -n -B 2 "hide = true"
+codex <hidden-cmd> --help   # hidden clap items still answer --help with exit 0
+codex --no-such-flag-xyz    # negative control: must exit 2, or the probe proves nothing
+```
+
 ### Claude Code
 
 ```bash
@@ -83,6 +92,17 @@ claude agents --help
 claude project --help
 claude auth --help
 claude doctor --help
+```
+
+Hidden-surface probe (claude is a bun-compiled commander CLI; `hideHelp()` flags and hidden commands never appear in `--help`, and unknown top-level options are silently tolerated, so silence proves nothing):
+
+```bash
+# L0: extract commander option-registration strings (`--flag <value>`) from the binary.
+strings -n 6 "$(readlink -f ~/.local/bin/claude)" | grep -oE -- '--[a-z0-9-]+ (<[^>]{1,40}>|\[[^]]{1,40}\])' | sort -u
+# L4 (value-validated flags only): an invalid value is rejected naming the flag and its choices.
+claude --thinking=__bogus__ --version   # error lists enabled/adaptive/disabled → flag exists
+# Hidden subcommand probe: a real command prints its own usage; an unknown name falls back to main help.
+claude <name> --help | head -1          # "Usage: claude <name>" vs "Usage: claude [options] [command]"
 ```
 
 Useful official references:
@@ -109,6 +129,43 @@ Useful official references:
 | `codex debug prompt-input` | L1 | Inspect model-visible prompt/context for deterministic tuning |
 | `codex debug models` | L1 | Model catalog discovery |
 | `codex features list` | L1 | Feature flag discovery |
+
+### Hidden CLI surface (absent from `--help`)
+
+codex hides part of its CLI with clap `hide = true`, so `--help` scraping cannot see it. The items below were enumerated from the pinned tag's source (`codex-rs/cli/src/main.rs`, `exec/src/cli.rs`, `app-server/src/main.rs`, `arg0/src/lib.rs`) and each was confirmed live on the installed `0.142.5` binary: hidden clap items still answer `--help` with exit 0, while a bogus flag exits 2 (negative control). Source level: L0 source/binary scan plus L4 `--help`/parse probe.
+
+Hidden subcommands:
+
+| Command | Purpose | Adapter relevance |
+| --- | --- | --- |
+| `codex execpolicy check` | Check execpolicy `.rules` files against a command | None on hot path |
+| `codex responses-api-proxy` | Internal Responses API proxy | None; internal |
+| `codex stdio-to-uds` | Relay stdio to a Unix domain socket | None; internal |
+| `codex debug trace-reduce` | Replay a rollout trace bundle to reduced state JSON | Diagnostic candidate only |
+| `codex debug clear-memories` | Reset local memory state | Not needed; adapter uses isolated `CODEX_HOME` |
+| `codex app-server generate-internal-json-schema` | Internal schema artifacts | None; `generate-json-schema` is the public one |
+| `codex app-server daemon pid-update-loop` | Detached updater loop | None; internal |
+
+Hidden flags:
+
+| Flag | Behavior | Adapter relevance |
+| --- | --- | --- |
+| `codex app-server --remote-control` | Enable remote control for this process without persisting | Keep off; widens control surface |
+| `codex login --experimental_issuer <URL>` / `--experimental_client-id <ID>` | OAuth issuer/client override | None unless custom OAuth endpoint is required |
+| `codex login --api-key` | Trap: exits with guidance to pipe via `--with-api-key` | Do not use |
+| `codex exec --full-auto` | Trap for the removed legacy flag | Do not use |
+
+arg0/argv dispatch (the binary becomes a different tool based on its invocation name; invisible to any help output):
+
+| Invocation | Dispatches to |
+| --- | --- |
+| argv0 `apply_patch` or `applypatch` | Standalone apply_patch CLI |
+| argv0 `codex-linux-sandbox` | Linux sandbox helper |
+| argv0 `codex-execve-wrapper` | Shell-escalation execve wrapper |
+| argv1 `--codex-run-as-apply-patch <PATCH>` | Apply one patch and exit |
+| argv1 `--codex-run-as-fs-helper` | exec-server filesystem helper |
+
+Risk: hidden items can be renamed or dropped with no visible `--help` diff. On every Codex version bump, re-run the source `hide = true` grep against the new tag and re-probe before trusting any hidden item. None of the hidden surface is on the adapter hot path today.
 
 ### App-server request methods
 
@@ -179,9 +236,31 @@ These flags are registered in the installed binary but marked `hideHelp()`, so t
 
 Risk: because these are hidden, a future CLI could rename or drop them with no visible `--help` diff. When bumping the pinned Claude Code version, re-run `pnpm catalog:runtime` (binary scan) plus the invalid-value parse probe before trusting the parity path. `--max-thinking-tokens` still exists but is deprecated in favor of `--thinking`; the adapter does not use it.
 
+### Other hidden CLI surface (binary scan + probe)
+
+Enumerated on `2.1.201` with the hidden-surface probes from the investigation-commands section. The hidden command set and main `--help` are byte-identical between `2.1.200` and `2.1.201`.
+
+Hidden subcommands (L4: each prints its own usage):
+
+| Command | Purpose | Adapter relevance |
+| --- | --- | --- |
+| `claude remote-control` | Control local sessions from claude.ai/code or the mobile app | Keep off; widens control surface |
+| `claude daemon [run\|status\|logs\|uninstall\|stop]` | Background session supervisor | None on hot path |
+| `claude attach <id>` | Attach terminal to a background session | None on hot path |
+| `claude logs <id>` | Print a background session's recent output | Diagnostic candidate only |
+| `claude stop <id>` (alias `kill`) | Stop a background session | None on hot path |
+
+Hidden flags confirmed by invalid-value probe (L4), beyond the adapter-critical set above:
+
+| Flag | Accepts | Adapter relevance |
+| --- | --- | --- |
+| `--teammate-mode` | `auto`, `tmux`, `iterm2`, `in-process` | None; agent-team UX |
+
+L0-only candidates: the option-spec extraction yields ~85 more registered value flags absent from every collected help, including `--system-prompt-file`, `--append-system-prompt-file`, `--plan-mode-instructions`, `--max-cost-usd`, `--prefill`/`--prefill-b64`, `--parent-session-id`, `--resume-session-at`, `--sdk-url`, `--managed-settings`, and an internal eval/storybook harness family (`--storybook-config`, `--storybook-static`, `--judge-model`, `--runs`, ...). These cannot be positively confirmed at top level because the CLI silently tolerates unknown and boolean-mismatched options, and some belong to subcommands; treat them as L0 candidates and add an L4 behavior probe before any adapter use.
+
 ### Official-docs items that need behavior probe
 
-As of `claude 2.1.200` these are all registered in the installed binary (`hideHelp()`, so absent from `--help` output); the remaining work is behavior verification, not presence.
+As of `claude 2.1.201` these are all registered in the installed binary (`hideHelp()`, so absent from `--help` output); the remaining work is behavior verification, not presence.
 
 | Item | Source | Required probe |
 | --- | --- | --- |

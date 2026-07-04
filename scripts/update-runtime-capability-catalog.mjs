@@ -150,10 +150,39 @@ async function collectClaude() {
       source: 'Binary scan (deprecated, superseded by --thinking)',
       requiredProbe: 'Present but deprecated; the adapter does not use it.',
     },
+    {
+      item: '--teammate-mode',
+      source: 'Binary scan + invalid-value parse probe',
+      requiredProbe: 'Passing an invalid mode is rejected with choices auto/tmux/iterm2/in-process. Not adapter-used; tracked for drift.',
+    },
+  ];
+  // L0-only candidates named in the catalog's hidden-surface section: registered
+  // option-spec strings found in the binary but absent from every collected help,
+  // and not positively probeable because the CLI tolerates unknown options. Presence
+  // is re-checked against the binary scan so a future version that drops one
+  // surfaces as a stale catalog entry.
+  const hiddenL0CandidateFlags = [
+    '--append-system-prompt-file',
+    '--judge-model',
+    '--managed-settings',
+    '--max-cost-usd',
+    '--parent-session-id',
+    '--plan-mode-instructions',
+    '--prefill',
+    '--prefill-b64',
+    '--resume-session-at',
+    '--runs',
+    '--sdk-url',
+    '--storybook-config',
+    '--storybook-static',
+    '--system-prompt-file',
   ];
   const binaryScan = skipBinaryScan
     ? { skipped: true }
-    : await collectBinaryScan(binary, hiddenProbedFlags.map((flag) => flag.item));
+    : await collectBinaryScan(binary, [
+        ...hiddenProbedFlags.map((flag) => flag.item),
+        ...hiddenL0CandidateFlags,
+      ]);
   return {
     ...base,
     help,
@@ -181,6 +210,7 @@ async function collectClaude() {
       },
     ],
     hiddenProbedFlags,
+    hiddenL0CandidateFlags,
     binaryScan,
   };
 }
@@ -208,7 +238,10 @@ async function validateCatalog(data) {
   const scan = data.claude.binaryScan;
   const scanConfirmedHiddenFlags = scan && scan.ok && Array.isArray(scan.hiddenFlagsPresent)
     ? scan.hiddenFlagsPresent
-    : (data.claude.hiddenProbedFlags ?? []).map((item) => item.item);
+    : [
+        ...(data.claude.hiddenProbedFlags ?? []).map((item) => item.item),
+        ...(data.claude.hiddenL0CandidateFlags ?? []),
+      ];
   const claudeAllowedFlags = uniqueSorted([
     ...(data.claude.helpFlags ?? []),
     ...(data.claude.docsOnlyCandidates ?? []).map((item) => item.item),
