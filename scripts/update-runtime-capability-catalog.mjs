@@ -349,10 +349,10 @@ async function validateCatalog(data) {
   const codexCommands = await validateDocumentedCommands(data.codex, codexSection, 'codex');
   const claudeCommands = await validateDocumentedCommands(data.claude, claudeSection, 'claude');
 
-  const optionDomains = [
-    ...validateDocumentedOptionDomains(data.codex, codexSection),
-    ...validateDocumentedOptionDomains(data.claude, claudeSection),
-  ];
+  const codexDomains = validateDocumentedOptionDomains(data.codex, codexSection);
+  const claudeDomains = validateDocumentedOptionDomains(data.claude, claudeSection);
+  const optionDomains = [...codexDomains.mismatches, ...claudeDomains.mismatches];
+  const unverifiedDomains = [...codexDomains.unverified, ...claudeDomains.unverified];
 
   const staleCount = codexCommands.absent.length
     + claudeCommands.absent.length
@@ -377,6 +377,9 @@ async function validateCatalog(data) {
   }
   if ((probe?.indeterminate?.length ?? 0) > 0) {
     inconclusiveReasons.push(`indeterminate flag probes: ${probe.indeterminate.join(', ')}`);
+  }
+  if (unverifiedDomains.length > 0) {
+    inconclusiveReasons.push(`documented value domains not verified: ${unverifiedDomains.map((entry) => `${entry.runtime} ${entry.flag} (${entry.reason})`).join(', ')}`);
   }
   for (const [runtime, check] of [['codex', codexCommands], ['claude', claudeCommands]]) {
     if (check.authority === 'not_collected' && check.documentedCount > 0) {
@@ -405,6 +408,7 @@ async function validateCatalog(data) {
       claude: claudeCommands,
     },
     optionDomainMismatches: optionDomains,
+    optionDomainsUnverified: unverifiedDomains,
     codex: {
       documentedMethodCount: documentedCodexMethods.length,
       schemaMethodCount: schemaMethods.length,
@@ -509,10 +513,21 @@ function documentedCommandPaths(section, binaryName) {
 // "a positive number greater than 0" describes no value set.
 function validateDocumentedOptionDomains(runtime, section) {
   const observed = collectedOptionDomains(runtime);
+  const probe = runtime.optionValueDomains ?? {};
+  const unresolved = new Set(probe.unresolved ?? []);
   const mismatches = [];
+  const unverified = [];
   for (const [flag, documented] of documentedOptionDomains(section)) {
     const collected = observed.get(flag);
-    if (!collected || collected.size === 0) continue;
+    if (!collected || collected.size === 0) {
+      // A documented domain with no evidence is only acceptable when nothing
+      // tried to read it. If the probe ran and came back empty, or was skipped
+      // entirely, the catalog's claim went unchecked and the run must say so.
+      if (probe.skipped || unresolved.has(flag)) {
+        unverified.push({ runtime: runtime.name, flag, reason: probe.skipped ? 'probe skipped' : 'probe returned no domain' });
+      }
+      continue;
+    }
     const missing = [...documented].filter((value) => !collected.has(value));
     const unexpected = [...collected].filter((value) => !documented.has(value));
     if (missing.length > 0 || unexpected.length > 0) {
@@ -526,7 +541,7 @@ function validateDocumentedOptionDomains(runtime, section) {
       });
     }
   }
-  return mismatches;
+  return { mismatches, unverified };
 }
 
 function collectedOptionDomains(runtime) {
@@ -935,6 +950,7 @@ async function probeOptionValueDomains(binary, options, candidates) {
     .filter((flag) => (optionByFlag.get(flag)?.choices.length ?? 0) === 0)
     .slice(0, VALUE_DOMAIN_PROBE_MAX);
   const domains = {};
+  const unresolved = [];
   const cwd = await probeScratchDir();
   for (const flag of targets) {
     const result = await run(binary, [flag, FLAG_PROBE_CONTROL], {
@@ -944,8 +960,12 @@ async function probeOptionValueDomains(binary, options, candidates) {
     });
     const domain = extractValueDomain(`${result.stdout ?? ''}\n${result.stderr ?? ''}`);
     if (domain) domains[flag] = domain;
+    // A probe that timed out, failed, or whose diagnostic wording changed yields
+    // no domain. Recording the miss is what lets the validity check tell "this
+    // option has no enumerable domain" apart from "we failed to read it".
+    else unresolved.push(flag);
   }
-  return { probedCount: targets.length, domains };
+  return { probedCount: targets.length, domains, unresolved };
 }
 
 function extractValueDomain(text) {
@@ -1178,7 +1198,11 @@ async function runtimeBinaryPath(name) {
 // unknown case as native is exactly what lets a PATH wrapper be scanned as if it
 // were the binary.
 async function executableKind(binary) {
-  const result = await run('file', ['-b', binary], { timeoutMs: 10_000 });
+  // `-L` because a CLI is often installed as a symlink to the real executable
+  // (Homebrew does this for codex). GNU file does not follow symlinks unless
+  // POSIXLY_CORRECT is set, and would answer "symbolic link to ..." — which
+  // reads as "not native" and would misclassify the install as a wrapper.
+  const result = await run('file', ['-b', '-L', binary], { timeoutMs: 10_000 });
   if (!result.ok) return null;
   return /Mach-O|ELF|PE32/i.test(result.stdout);
 }
