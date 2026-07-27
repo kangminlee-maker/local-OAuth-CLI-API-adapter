@@ -13,7 +13,7 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 | Codex CLI | `codex-cli 0.145.0` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
 | Claude Code | `2.1.220` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
-PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper는 `--version`/`--help`를 그대로 전달하므로 help scraping은 정상이지만 binary string scan은 wrapper script를 읽게 되어 hidden flag 권위를 잃는다. 수집기는 PATH에서 native executable을 우선 선택하고, 가려진 경로를 report의 `Shadowed by`에 남긴다.
+PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper가 실제로 실행되는 명령이므로 version·help·schema·parse probe 같은 동작 권위는 wrapper 기준으로 수집한다. 다만 wrapper script에는 바이너리 문자열이 없으므로 string scan만 native 바이너리를 대상으로 하며, 그 후보는 wrapper와 `--version`이 일치할 때만 채택한다. 일치하는 후보가 없으면 scan은 대상 없음으로 보고한다. report의 `Command on PATH`와 `Scan target` 열이 이 둘을 구분한다.
 
 ## 신뢰 레벨
 
@@ -285,7 +285,22 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 
 ### CLI command surface
 
-`--help` 재귀 walk 기준으로 49개 명령과 200개 option이 열거된다. root subcommand는 `agents`, `auth`, `auto-mode`, `doctor`, `gateway`, `install`, `mcp`, `plugin`, `project`, `setup-token`, `ultrareview`, `update` 12개이며, 여기에 아래 hidden root command가 더해진다.
+`--help` 재귀 walk 기준으로 49개 명령과 200개 option이 열거된다. root subcommand는 아래 12개이며, 여기에 뒤의 hidden root command가 더해진다.
+
+| Root subcommand | 설명 | Adapter 관련성 |
+| --- | --- | --- |
+| `agents` | 백그라운드 agent 관리 | 없음 |
+| `auth` | 인증 관리 (`login`, `logout`, `status`) | OAuth 세션 전제 |
+| `auto-mode` | auto mode 분류기 설정 조회·초기화 | 없음 |
+| `doctor` | 설치 상태 점검 | 진단용 |
+| `gateway` | enterprise auth/telemetry gateway | 없음 |
+| `install` | native build 설치 | 없음 |
+| `mcp` | MCP 서버 설정·관리 | 서비스 tool bridge 후보 |
+| `plugin` | plugin 관리 (`marketplace`, `eval` 등) | 없음 |
+| `project` | project 상태 관리 (`purge`) | 없음 |
+| `setup-token` | 장기 인증 토큰 설정 | 없음 |
+| `ultrareview` | 클라우드 멀티 에이전트 코드 리뷰 | 없음 |
+| `update` | 업데이트 확인·설치 | 없음 |
 
 ### CLI flags from local help
 

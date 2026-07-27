@@ -57,7 +57,9 @@ await copyFile(markdownPath, join(outDir, 'latest.md'));
 
 process.stdout.write(`runtime capability report: ${jsonPath}\n`);
 process.stdout.write(`runtime capability summary: ${markdownPath}\n`);
-if (args.includes('--fail-on-stale') && report.catalogValidity?.staleCount > 0) {
+// An inconclusive run fails the gate too: "could not check" is not "passed".
+if (args.includes('--fail-on-stale')
+  && (report.catalogValidity?.staleCount > 0 || report.catalogValidity?.inconclusive)) {
   process.exitCode = 1;
 }
 
@@ -117,8 +119,8 @@ function readValueArg(name) {
 }
 
 async function collectCodex() {
-  const { path: binary, shadowedBy } = await runtimeBinaryPath('codex');
-  const base = await collectRuntimeBase('codex', binary, shadowedBy);
+  const { path: binary, scanPath, wrapper } = await runtimeBinaryPath('codex');
+  const base = await collectRuntimeBase('codex', binary, { scanPath, wrapper });
   if (!binary) return base;
 
   const helpCommands = [
@@ -146,13 +148,13 @@ async function collectCodex() {
     commandTree,
     optionValueDomains: await probeOptionValueDomains(binary, rootOptionsOf(commandTree), VALUE_DOMAIN_PROBE_CANDIDATES.codex),
     schema,
-    binaryScan: skipBinaryScan ? { skipped: true } : await collectBinaryScan(binary),
+    binaryScan: skipBinaryScan ? { skipped: true } : await collectBinaryScan(scanPath),
   };
 }
 
 async function collectClaude() {
-  const { path: binary, shadowedBy } = await runtimeBinaryPath('claude');
-  const base = await collectRuntimeBase('claude', binary, shadowedBy);
+  const { path: binary, scanPath, wrapper } = await runtimeBinaryPath('claude');
+  const base = await collectRuntimeBase('claude', binary, { scanPath, wrapper });
   if (!binary) return base;
 
   const helpCommands = [
@@ -244,14 +246,17 @@ async function collectClaude() {
     ...hiddenProbedFlags.map((flag) => flag.item),
     ...hiddenL0CandidateFlags,
   ];
-  const binaryScan = skipBinaryScan
-    ? { skipped: true }
-    : await collectBinaryScan(binary, hiddenFlags);
   // Docs-only items are probed alongside the hidden set: a flag the official
   // docs list still has to be accepted by this binary to belong in the catalog.
+  // The scan receives the same set, so the report's "strings in binary" column
+  // is answered for every probed flag instead of only the hidden ones.
+  const probedFlags = [...hiddenFlags, ...docsOnlyCandidates.map((item) => item.item)];
+  const binaryScan = skipBinaryScan
+    ? { skipped: true }
+    : await collectBinaryScan(scanPath, probedFlags);
   const flagProbe = skipFlagProbe
     ? { skipped: true }
-    : await probeFlagRegistration(binary, [...hiddenFlags, ...docsOnlyCandidates.map((item) => item.item)]);
+    : await probeFlagRegistration(binary, probedFlags);
   const commandTree = await collectCommandTree(binary);
   return {
     ...base,
@@ -339,9 +344,33 @@ async function validateCatalog(data) {
     + documentedClaudeFlagMissingFromHelpOrDocs.length;
   const updateCandidateCount = schemaCodexMethodUndocumented.length + claudeHelpFlagUndocumented.length;
 
+  // A run that could not check something must not read as a run that checked it
+  // and found nothing. Without this, skipping the probe or losing its controls
+  // makes every declared hidden flag "supported", drives stale to zero, and lets
+  // the verdict claim validity the run never established.
+  const inconclusiveReasons = [];
+  if (!probeIsAuthoritative) {
+    inconclusiveReasons.push(probe?.skipped
+      ? 'hidden flag parse probe skipped'
+      : 'hidden flag parse probe controls did not come back unregistered');
+  }
+  if ((probe?.indeterminate?.length ?? 0) > 0) {
+    inconclusiveReasons.push(`indeterminate flag probes: ${probe.indeterminate.join(', ')}`);
+  }
+  for (const [runtime, check] of [['codex', codexCommands], ['claude', claudeCommands]]) {
+    if (check.authority === 'not_collected' && check.documentedCount > 0) {
+      inconclusiveReasons.push(`${runtime} command surface not collected`);
+    }
+  }
+  const inconclusive = inconclusiveReasons.length > 0;
+
   return {
     exists: true,
-    verdict: staleCount > 0 ? 'needs_update' : 'valid_against_collected_authorities',
+    verdict: staleCount > 0
+      ? 'needs_update'
+      : (inconclusive ? 'inconclusive_reduced_authority' : 'valid_against_collected_authorities'),
+    inconclusive,
+    inconclusiveReasons,
     staleCount,
     updateCandidateCount,
     versionDrift,
@@ -379,51 +408,92 @@ async function validateDocumentedCommands(runtime, section, binaryName) {
     return { authority: 'not_collected', documentedCount: documented.length, visible: [], hiddenConfirmed: [], absent: [] };
   }
   const known = new Set((tree.commands ?? []).map((entry) => entry.command));
+  const usageOf = new Map((tree.commands ?? []).map((entry) => [entry.command, entry.usage]));
   const visible = documented.filter((command) => known.has(command));
   const hiddenConfirmed = [];
   const absent = [];
   for (const command of documented.filter((entry) => !known.has(entry))) {
-    if (await commandAnswersForItself(runtime.binary, binaryName, command)) hiddenConfirmed.push(command);
-    else absent.push(command);
+    const parent = command.split(' ').slice(0, -1).join(' ') || '(root)';
+    const parentUsage = usageOf.get(parent) ?? usageOf.get('(root)') ?? '';
+    if (await commandAnswersForItself(runtime.binary, binaryName, command, parentUsage)) {
+      hiddenConfirmed.push(command);
+    } else {
+      absent.push(command);
+    }
   }
   return { authority: 'command_tree_plus_probe', documentedCount: documented.length, visible, hiddenConfirmed, absent };
 }
 
-// The catalog writes commands as `codex app-server --listen stdio://`; keep the
-// leading non-flag words so the check runs against `app-server`.
+// Commands appear two ways in the catalog: fully qualified in prose and
+// examples (`codex app-server --listen stdio://`), and bare in the command
+// inventory tables (`exec`). Both are claims about the installed CLI, so both
+// are checked; keeping only the qualified form would let a renamed command sit
+// in the inventory table without ever failing the gate.
 function documentedCommandPaths(section, binaryName) {
   const paths = new Set();
-  for (const raw of uniqueCapture(section, new RegExp(`\`${binaryName} ([^\`]+)\``, 'g'))) {
+  const add = (raw) => {
     const words = [];
-    for (const token of raw.trim().split(/\s+/)) {
+    for (const token of String(raw).trim().split(/\s+/)) {
       if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(token)) break;
       words.push(token);
     }
+    if (words[0] === binaryName) words.shift();
     if (words.length > 0) paths.add(words.join(' '));
+  };
+  for (const raw of uniqueCapture(section, new RegExp(`\`${binaryName} ([^\`]+)\``, 'g'))) add(raw);
+  for (const cell of commandInventoryCells(section)) {
+    for (const token of uniqueCapture(cell, /`([^`]+)`/g)) add(token);
   }
   return [...paths].sort();
 }
 
-// A hidden command still prints usage naming itself; an unknown name falls back
-// to the parent help, which never does.
-async function commandAnswersForItself(binary, binaryName, commandPath) {
+// First-column cells of tables that inventory commands. Scoped by header so
+// value tables (`| Field | Domain |`) and flag tables cannot contribute names.
+function commandInventoryCells(section) {
+  const cells = [];
+  let inInventory = false;
+  for (const line of String(section).split(/\r?\n/)) {
+    if (!line.trim().startsWith('|')) {
+      inInventory = false;
+      continue;
+    }
+    const first = (line.split('|')[1] ?? '').trim();
+    if (/^(root subcommand|command)$/i.test(first)) {
+      inInventory = true;
+      continue;
+    }
+    if (/^:?-{2,}:?$/.test(first)) continue;
+    if (inInventory && first) cells.push(first);
+  }
+  return cells;
+}
+
+// A hidden command prints usage for itself; an unknown name falls back to the
+// parent's help. An alias prints the canonical command's usage instead of its
+// own name, so a usage line that differs from the parent's also counts.
+async function commandAnswersForItself(binary, binaryName, commandPath, parentUsage) {
   const result = await run(binary, [...commandPath.split(' '), '--help'], {
     timeoutMs: 20_000,
     maxBuffer: 8_000_000,
     cwd: await probeScratchDir(),
   });
   const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-  return new RegExp(`(^|\\s)${escapeRegExp(binaryName)}\\s+${escapeRegExp(commandPath)}(\\s|$)`, 'im').test(text);
+  if (new RegExp(`(^|\\s)${escapeRegExp(binaryName)}\\s+${escapeRegExp(commandPath)}(\\s|$)`, 'im').test(text)) {
+    return true;
+  }
+  const usage = parseHelpText(text).usage;
+  return Boolean(usage) && Boolean(parentUsage) && usage !== parentUsage;
 }
 
-async function collectRuntimeBase(name, binary, shadowedBy = null) {
+async function collectRuntimeBase(name, binary, { scanPath = binary, wrapper = null } = {}) {
   const version = binary ? await run(binary, ['--version'], { timeoutMs: 10_000 }) : null;
   const readlink = binary ? await run('readlink', [binary], { timeoutMs: 10_000 }) : null;
   const file = binary ? await run('file', [binary], { timeoutMs: 10_000 }) : null;
   return {
     name,
     binary,
-    shadowedBy,
+    wrapper,
+    scanBinary: scanPath,
     exists: Boolean(binary),
     version: summarizeCommand(version),
     symlinkTarget: summarizeCommand(readlink),
@@ -686,16 +756,20 @@ async function probeFlagRegistration(binary, flags) {
       maxBuffer: 4_000_000,
       cwd,
     });
-    results[flag] = classifyFlagProbe(`${result.stdout ?? ''}\n${result.stderr ?? ''}`, flag);
+    results[flag] = classifyFlagProbe(`${result.stdout ?? ''}\n${result.stderr ?? ''}`, flag, result);
   }
   const controlsOk = FLAG_PROBE_CONTROLS.every((flag) => results[flag] === 'unregistered');
   const probed = flags.filter((flag) => results[flag]);
+  const indeterminate = probed.filter((flag) => results[flag] === 'indeterminate');
   return {
     controls: Object.fromEntries(FLAG_PROBE_CONTROLS.map((flag) => [flag, results[flag]])),
     controlsOk,
     results: Object.fromEntries(probed.map((flag) => [flag, results[flag]])),
-    registered: controlsOk ? probed.filter((flag) => results[flag] !== 'unregistered') : [],
+    registered: controlsOk
+      ? probed.filter((flag) => results[flag] !== 'unregistered' && results[flag] !== 'indeterminate')
+      : [],
     unregistered: controlsOk ? probed.filter((flag) => results[flag] === 'unregistered') : [],
+    indeterminate,
   };
 }
 
@@ -746,11 +820,15 @@ function extractValueDomain(text) {
   return match[1].trim().replace(/\s+/g, ' ').slice(0, 160);
 }
 
-function classifyFlagProbe(text, flag) {
+function classifyFlagProbe(text, flag, result) {
   if (new RegExp(`(unknown option|unexpected argument|unrecognized (option|argument))[^\\n]*${escapeRegExp(flag)}`, 'i').test(text)) {
     return 'unregistered';
   }
   if (/is invalid|allowed choices|valid values|valid options|must be/i.test(text)) return 'registered_value_validated';
+  // A probe that was killed, timed out, or said nothing recognisable carries no
+  // parser evidence. Falling through to "registered" here would let a failed
+  // invocation vouch for a flag the CLI may have dropped.
+  if (result?.signal || result?.code === null || text.trim() === '') return 'indeterminate';
   // The parser reached the control instead of consuming it, so the probed flag
   // is registered and takes no value there (boolean, or an optional-value form).
   if (new RegExp(`unknown option[^\\n]*${escapeRegExp(FLAG_PROBE_CONTROL)}`, 'i').test(text)) {
@@ -760,6 +838,9 @@ function classifyFlagProbe(text, flag) {
 }
 
 async function collectBinaryScan(binary, knownHiddenFlags = []) {
+  if (!binary) {
+    return { available: false, reason: 'no native binary confirmed for the PATH-selected command' };
+  }
   const stringsPath = await commandPath('strings');
   if (!stringsPath) return { available: false, reason: 'strings command not found' };
   // Scanning a wrapper script yields an empty flag set that looks exactly like a
@@ -921,20 +1002,33 @@ async function commandPath(name) {
 }
 
 // A PATH entry can be a shell wrapper that re-dispatches to the real CLI. The
-// wrapper answers `--version` and `--help` correctly, so help scraping stays
-// valid, but it carries none of the real binary's strings: scanning it would
-// report an empty flag set as if the binary had dropped every hidden flag.
-// Prefer the first native executable on PATH and record what shadowed it.
+// wrapper is what actually runs, so every behavioural authority — version, help,
+// schema, parse probes — must keep using it. It carries none of the real
+// binary's strings though, so the string scan needs the native target instead.
+//
+// The native target is not simply "the next same-named file on PATH": a wrapper
+// can pin a different installation or select per-account binaries, and scanning
+// an unrelated build would describe a runtime nobody is running. A candidate is
+// accepted only when it reports the same version as the wrapper; otherwise the
+// scan is left without a target and reports itself unavailable.
 async function runtimeBinaryPath(name) {
   const primary = await commandPath(name);
-  if (!primary || await executableKind(primary) !== false) return { path: primary, shadowedBy: null };
+  if (!primary) return { path: null, scanPath: null, wrapper: null };
+  if (await executableKind(primary) !== false) {
+    return { path: primary, scanPath: primary, wrapper: null };
+  }
+  const wrapperVersion = firstLine((await run(primary, ['--version'], { timeoutMs: 10_000 })).stdout);
   for (const dir of String(process.env.PATH ?? '').split(':')) {
     if (!dir) continue;
     const candidate = join(dir, name);
     if (candidate === primary || !existsSync(candidate)) continue;
-    if (await executableKind(candidate) === true) return { path: candidate, shadowedBy: primary };
+    if (await executableKind(candidate) !== true) continue;
+    const candidateVersion = firstLine((await run(candidate, ['--version'], { timeoutMs: 10_000 })).stdout);
+    if (wrapperVersion && candidateVersion === wrapperVersion) {
+      return { path: primary, scanPath: candidate, wrapper: primary };
+    }
   }
-  return { path: primary, shadowedBy: null };
+  return { path: primary, scanPath: null, wrapper: primary };
 }
 
 // Returns true (native), false (not native), or null (undeterminable). Null is
@@ -1005,10 +1099,10 @@ Platform: \`${data.platform.os}/${data.platform.arch} ${data.platform.release}\`
 
 ## Local Runtime Summary
 
-| Runtime | Exists | Version | Binary | Shadowed by |
+| Runtime | Exists | Version | Command on PATH | Scan target |
 | --- | --- | --- | --- | --- |
-| Codex CLI | ${yesNo(data.codex.exists)} | ${inline(firstLine(data.codex.version?.stdout))} | ${inline(data.codex.binary)} | ${data.codex.shadowedBy ? inline(data.codex.shadowedBy) : 'none' } |
-| Claude Code | ${yesNo(data.claude.exists)} | ${inline(firstLine(data.claude.version?.stdout))} | ${inline(data.claude.binary)} | ${data.claude.shadowedBy ? inline(data.claude.shadowedBy) : 'none'} |
+| Codex CLI | ${yesNo(data.codex.exists)} | ${inline(firstLine(data.codex.version?.stdout))} | ${inline(data.codex.binary)} | ${data.codex.scanBinary ? inline(data.codex.scanBinary) : 'none confirmed'} |
+| Claude Code | ${yesNo(data.claude.exists)} | ${inline(firstLine(data.claude.version?.stdout))} | ${inline(data.claude.binary)} | ${data.claude.scanBinary ? inline(data.claude.scanBinary) : 'none confirmed'} |
 
 ## Catalog Validity
 
