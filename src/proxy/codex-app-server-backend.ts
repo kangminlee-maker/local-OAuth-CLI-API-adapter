@@ -641,6 +641,12 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     apiRequestInstructions = '',
   ): Promise<string> {
     const cwd = this.isolation?.workDir ?? this.cwd;
+    // Only fields the app-server protocol declares for `thread/start` are sent.
+    // The server ignores unknown params silently, so an undeclared field would
+    // read as configuration that is doing work when it is not. The declared set
+    // is the one from `generate-json-schema --experimental`, because the client
+    // opts into the experimental API during `initialize`; several of these
+    // fields exist only in that mode.
     const thread = await this.send('thread/start', {
       cwd,
       runtimeWorkspaceRoots: [cwd],
@@ -652,7 +658,6 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       ...threadInstructionParams(this.proxyMode, mode, apiRequestInstructions),
       ...threadPersonalityParams(this.proxyMode),
       experimentalRawEvents: false,
-      persistExtendedHistory: false,
       config: {
         model_reasoning_effort: reasoningEffort,
         model_reasoning_summary: 'none',

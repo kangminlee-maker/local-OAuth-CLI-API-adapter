@@ -175,8 +175,9 @@ async function runExactSmoke(baseUrl, model) {
       model,
       input: exactPrompt(token),
     });
-    assertEqual(body.output_text, token, 'responses output_text');
-    return { totalMs, text: body.output_text };
+    const text = responsesOutputText(body);
+    assertEqual(text, token, 'responses output text');
+    return { totalMs, text };
   });
 
   await run('openai_responses_stream_exact', async () => {
@@ -284,8 +285,9 @@ async function runOpenAiResponsesImageColor(baseUrl, model, visionImage) {
         ],
       }],
     });
-    assertEqual(body.output_text, 'RED', 'responses image color text');
-    return { totalMs, text: body.output_text };
+    const text = responsesOutputText(body);
+    assertEqual(text, 'RED', 'responses image color text');
+    return { totalMs, text };
   });
 }
 
@@ -464,6 +466,18 @@ async function postSse(baseUrl, path, body, collectText) {
     text,
     done,
   };
+}
+
+// `/v1/responses` carries assistant text in the message item's `output_text`
+// content parts. There is no top-level `output_text` convenience field; that is
+// an SDK-side helper in the real API, and the proxy keeps parity by omitting it
+// (see the contract in docs/api-interface-contract.md).
+function responsesOutputText(body) {
+  const message = (body?.output ?? []).find((item) => item?.type === 'message');
+  return (message?.content ?? [])
+    .filter((part) => part?.type === 'output_text')
+    .map((part) => part?.text ?? '')
+    .join('');
 }
 
 function exactPrompt(token) {

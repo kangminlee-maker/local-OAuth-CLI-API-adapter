@@ -64,7 +64,9 @@ live model smoke는 1m token을 넘을 것으로 추정되면 warning을 출력�
 1. 신규 항목 추가보다 기존 항목 validity 확인을 먼저 한다.
 2. 원본 catalog에는 현재 유효한 runtime 사실, source level, production 사용 규칙만 남긴다.
 3. 삭제, rename, drift, 이전 버전 설명, backward-compatibility 메모는 report artifact에 남기고 원본 catalog에는 남기지 않는다.
-4. L0 binary scan 결과는 후보일 뿐이다. 단독으로 원본 catalog에 production capability로 쓰지 않는다.
+4. L0 binary scan 결과는 후보일 뿐이다. 단독으로 원본 catalog에 production capability로 쓰지 않는다. flag 수용 여부의 권위는 parse probe이며, binary에 문자열이 남아 있어도 parser가 거부하면 catalog에 넣지 않는다.
+4-1. report의 `hiddenFlagAuthority`가 `declared_fallback`이면 hidden flag drift가 검증되지 않은 상태다. 이 상태의 report로는 hidden 항목의 유효성을 판단하지 않는다.
+4-2. flag probe는 값 대신 bogus control flag를 붙이는 형태만 쓴다. 값을 주면 boolean flag에서 그 값이 prompt가 되어 실제 모델 호출이 발생한다.
 5. L1 help, L2 generated schema, L3 official docs는 discovery authority다. 기본 runtime path로 승격하려면 L4 runtime probe가 필요하다.
 6. Codex app-server method는 generated schema 기준으로 삭제/rename 여부를 먼저 확인한다.
 7. Claude flag는 local help와 official docs-only 후보를 분리한다.
