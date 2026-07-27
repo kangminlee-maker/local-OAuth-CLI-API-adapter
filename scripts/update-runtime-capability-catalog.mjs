@@ -35,7 +35,19 @@ const VALUE_DOMAIN_PROBE_MAX = 40;
 // parser. Anything absent from the installed surface is simply skipped.
 const VALUE_DOMAIN_PROBE_CANDIDATES = {
   codex: ['--ask-for-approval', '--sandbox'],
-  claude: ['--effort', '--setting-sources', '--max-budget-usd', '--session-id', '--permission-mode'],
+  claude: [
+    '--effort',
+    '--setting-sources',
+    '--max-budget-usd',
+    '--session-id',
+    '--permission-mode',
+    // Hidden but validated, and the adapter's Anthropic parity path depends on
+    // their domains, so they are probed even though help never lists them.
+    '--thinking',
+    '--thinking-display',
+    '--task-budget',
+    '--teammate-mode',
+  ],
 };
 const FLAG_PROBE_CONTROL = '--zzz-catalog-probe-control';
 const FLAG_PROBE_CONTROLS = ['--zzz-not-a-real-flag', '--zzz-catalog-probe-absent'];
@@ -337,12 +349,21 @@ async function validateCatalog(data) {
   const codexCommands = await validateDocumentedCommands(data.codex, codexSection, 'codex');
   const claudeCommands = await validateDocumentedCommands(data.claude, claudeSection, 'claude');
 
+  const optionDomains = [
+    ...validateDocumentedOptionDomains(data.codex, codexSection),
+    ...validateDocumentedOptionDomains(data.claude, claudeSection),
+  ];
+
   const staleCount = codexCommands.absent.length
     + claudeCommands.absent.length
+    + optionDomains.length
     + versionDrift.length
     + documentedCodexMethodMissingFromSchema.length
     + documentedClaudeFlagMissingFromHelpOrDocs.length;
-  const updateCandidateCount = schemaCodexMethodUndocumented.length + claudeHelpFlagUndocumented.length;
+  const updateCandidateCount = schemaCodexMethodUndocumented.length
+    + claudeHelpFlagUndocumented.length
+    + codexCommands.undocumented.length
+    + claudeCommands.undocumented.length;
 
   // A run that could not check something must not read as a run that checked it
   // and found nothing. Without this, skipping the probe or losing its controls
@@ -361,6 +382,11 @@ async function validateCatalog(data) {
     if (check.authority === 'not_collected' && check.documentedCount > 0) {
       inconclusiveReasons.push(`${runtime} command surface not collected`);
     }
+    // A walk that stopped at a cap inspected only part of the surface, so it
+    // cannot support a "nothing changed" verdict for the part it never saw.
+    if (data[runtime]?.commandTree?.truncated) {
+      inconclusiveReasons.push(`${runtime} command walk truncated at the collection cap`);
+    }
   }
   const inconclusive = inconclusiveReasons.length > 0;
 
@@ -378,6 +404,7 @@ async function validateCatalog(data) {
       codex: codexCommands,
       claude: claudeCommands,
     },
+    optionDomainMismatches: optionDomains,
     codex: {
       documentedMethodCount: documentedCodexMethods.length,
       schemaMethodCount: schemaMethods.length,
@@ -405,7 +432,14 @@ async function validateDocumentedCommands(runtime, section, binaryName) {
   const documented = documentedCommandPaths(section, binaryName);
   const tree = runtime.commandTree;
   if (!runtime.binary || !tree || tree.skipped) {
-    return { authority: 'not_collected', documentedCount: documented.length, visible: [], hiddenConfirmed: [], absent: [] };
+    return {
+      authority: 'not_collected',
+      documentedCount: documented.length,
+      visible: [],
+      hiddenConfirmed: [],
+      absent: [],
+      undocumented: [],
+    };
   }
   const known = new Set((tree.commands ?? []).map((entry) => entry.command));
   const usageOf = new Map((tree.commands ?? []).map((entry) => [entry.command, entry.usage]));
@@ -413,15 +447,36 @@ async function validateDocumentedCommands(runtime, section, binaryName) {
   const hiddenConfirmed = [];
   const absent = [];
   for (const command of documented.filter((entry) => !known.has(entry))) {
-    const parent = command.split(' ').slice(0, -1).join(' ') || '(root)';
-    const parentUsage = usageOf.get(parent) ?? usageOf.get('(root)') ?? '';
+    const parent = command.split(' ').slice(0, -1).join(' ');
+    // The parent of a hidden command is often hidden too, so it is absent from
+    // the tree. Falling back to the root usage there would accept a removed
+    // child whose invocation lands on its still-present parent's help, since
+    // that help differs from the root's. Probe the real parent instead.
+    let parentUsage = usageOf.get(parent || '(root)');
+    if (parentUsage === undefined) {
+      parentUsage = await commandUsage(runtime.binary, parent);
+      usageOf.set(parent || '(root)', parentUsage);
+    }
     if (await commandAnswersForItself(runtime.binary, binaryName, command, parentUsage)) {
       hiddenConfirmed.push(command);
     } else {
       absent.push(command);
     }
   }
-  return { authority: 'command_tree_plus_probe', documentedCount: documented.length, visible, hiddenConfirmed, absent };
+  // Commands the installed CLI has but the catalog never mentions are additive
+  // candidates: not stale, but the only signal that the surface grew.
+  const documentedSet = new Set(documented);
+  const undocumented = (tree.commands ?? [])
+    .map((entry) => entry.command)
+    .filter((command) => command !== '(root)' && !documentedSet.has(command));
+  return {
+    authority: 'command_tree_plus_probe',
+    documentedCount: documented.length,
+    visible,
+    hiddenConfirmed,
+    absent,
+    undocumented,
+  };
 }
 
 // Commands appear two ways in the catalog: fully qualified in prose and
@@ -447,6 +502,76 @@ function documentedCommandPaths(section, binaryName) {
   return [...paths].sort();
 }
 
+// The catalog states value domains for options. Collected evidence — help
+// choice lists and probe replies — is compared against them, so a CLI that
+// changes an accepted value set makes the catalog stale instead of quietly
+// disagreeing with it. Only enumerable domains are compared; prose like
+// "a positive number greater than 0" describes no value set.
+function validateDocumentedOptionDomains(runtime, section) {
+  const observed = collectedOptionDomains(runtime);
+  const mismatches = [];
+  for (const [flag, documented] of documentedOptionDomains(section)) {
+    const collected = observed.get(flag);
+    if (!collected || collected.size === 0) continue;
+    const missing = [...documented].filter((value) => !collected.has(value));
+    const unexpected = [...collected].filter((value) => !documented.has(value));
+    if (missing.length > 0 || unexpected.length > 0) {
+      mismatches.push({
+        runtime: runtime.name,
+        flag,
+        documented: [...documented],
+        observed: [...collected],
+        documentedButNotAccepted: missing,
+        acceptedButNotDocumented: unexpected,
+      });
+    }
+  }
+  return mismatches;
+}
+
+function collectedOptionDomains(runtime) {
+  const domains = new Map();
+  for (const option of rootOptionsOf(runtime.commandTree)) {
+    if (!option.choices?.length) continue;
+    const values = new Set(option.choices.map(normalizeDomainValue).filter(Boolean));
+    for (const flag of option.flags) domains.set(flag, values);
+  }
+  for (const [flag, domain] of Object.entries(runtime.optionValueDomains?.domains ?? {})) {
+    const values = String(domain).split(',').map(normalizeDomainValue).filter(Boolean);
+    if (values.length > 1) domains.set(flag, new Set(values));
+  }
+  return domains;
+}
+
+function documentedOptionDomains(section) {
+  const rows = new Map();
+  let inFlagTable = false;
+  for (const line of String(section).split(/\r?\n/)) {
+    if (!line.trim().startsWith('|')) {
+      inFlagTable = false;
+      continue;
+    }
+    const columns = line.split('|').slice(1, -1).map((value) => value.trim());
+    const first = columns[0] ?? '';
+    if (/^flag$/i.test(first)) {
+      inFlagTable = true;
+      continue;
+    }
+    if (/^:?-{2,}:?$/.test(first)) continue;
+    if (!inFlagTable) continue;
+    const flag = uniqueCapture(first, /`(--[A-Za-z0-9][A-Za-z0-9-]*)`/g)[0];
+    const domain = uniqueCapture(columns[1] ?? '', /`([^`]+)`/g)
+      .map(normalizeDomainValue)
+      .filter(Boolean);
+    if (flag && domain.length > 1) rows.set(flag, new Set(domain));
+  }
+  return rows;
+}
+
+function normalizeDomainValue(value) {
+  return String(value).trim().replace(/^["'`]+|["'`.]+$/g, '').toLowerCase();
+}
+
 // First-column cells of tables that inventory commands. Scoped by header so
 // value tables (`| Field | Domain |`) and flag tables cannot contribute names.
 function commandInventoryCells(section) {
@@ -466,6 +591,16 @@ function commandInventoryCells(section) {
     if (inInventory && first) cells.push(first);
   }
   return cells;
+}
+
+async function commandUsage(binary, commandPath) {
+  const argv = commandPath ? [...commandPath.split(' '), '--help'] : ['--help'];
+  const result = await run(binary, argv, {
+    timeoutMs: 20_000,
+    maxBuffer: 8_000_000,
+    cwd: await probeScratchDir(),
+  });
+  return parseHelpText(`${result.stdout ?? ''}\n${result.stderr ?? ''}`).usage;
 }
 
 // A hidden command prints usage for itself; an unknown name falls back to the
@@ -686,10 +821,13 @@ function extractChoices(text) {
   const raw = /\(choices:\s*([^)]+)\)/i.exec(text)?.[1]
     ?? /\[possible values:\s*([^\]]+)\]/i.exec(text)?.[1];
   if (!raw) return [];
+  // commander can append annotations inside the same parentheses, e.g.
+  // `(choices: "true", "false", preset: "true")`. Those carry a colon and are
+  // not accepted values.
   return raw
     .split(',')
     .map((value) => value.trim().replace(/^["']|["']$/g, ''))
-    .filter(Boolean);
+    .filter((value) => value && !value.includes(':'));
 }
 
 async function collectCodexSchema(binary) {
@@ -786,11 +924,15 @@ async function probeFlagRegistration(binary, flags) {
 // stays exhaustive; only this execution step is bounded.
 async function probeOptionValueDomains(binary, options, candidates) {
   if (skipFlagProbe) return { skipped: true };
-  const allowed = new Set(candidates);
-  const targets = options
-    .filter((option) => option.takesValue && option.choices.length === 0)
-    .map((option) => option.flags[0])
-    .filter((flag) => flag && allowed.has(flag))
+  const optionByFlag = new Map();
+  for (const option of options) {
+    for (const flag of option.flags) optionByFlag.set(flag, option);
+  }
+  // Candidates absent from help are hidden flags, which is exactly where a probe
+  // is the only way to learn the domain. Candidates whose help already lists
+  // choices need no probe.
+  const targets = candidates
+    .filter((flag) => (optionByFlag.get(flag)?.choices.length ?? 0) === 0)
     .slice(0, VALUE_DOMAIN_PROBE_MAX);
   const domains = {};
   const cwd = await probeScratchDir();
@@ -1117,6 +1259,8 @@ Verdict: \`${data.catalogValidity?.verdict ?? 'not_checked'}\`
 | Claude documented flags missing from help/docs-only list | ${data.catalogValidity?.claude?.documentedFlagsMissingFromHelpOrDocs?.length ?? 0} |
 | Claude help flags undocumented in catalog | ${data.catalogValidity?.claude?.helpFlagsUndocumentedInCatalog?.length ?? 0} |
 | Documented commands the CLI no longer has | ${(data.catalogValidity?.commands?.codex?.absent?.length ?? 0) + (data.catalogValidity?.commands?.claude?.absent?.length ?? 0)} |
+| Documented option domains that disagree with the CLI | ${data.catalogValidity?.optionDomainMismatches?.length ?? 0} |
+| Commands present but undocumented | ${(data.catalogValidity?.commands?.codex?.undocumented?.length ?? 0) + (data.catalogValidity?.commands?.claude?.undocumented?.length ?? 0)} |
 
 ### Documented Commands
 
