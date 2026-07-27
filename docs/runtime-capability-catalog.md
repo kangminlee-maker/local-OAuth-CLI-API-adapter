@@ -169,10 +169,14 @@ hot path에서 쓰는 항목:
 | `codex app-server generate-json-schema --experimental` | L1/L2 | protocol 발견 및 버전 diff |
 | `codex exec --json` | L1 | one-shot fallback, smoke |
 | `codex exec --output-schema <file>` | L1 | strict final output fallback |
-| `codex exec --ephemeral` / `--ignore-user-config` / `--ignore-rules` | L1 | 결정적 context 제어 |
+| `codex exec --ephemeral` / `codex exec --ignore-user-config` / `codex exec --ignore-rules` | L1 | 결정적 context 제어 |
 | `codex debug prompt-input` / `debug models` / `features list` | L1 | 진단·발견 |
 
-`codex exec --sandbox`와 root `--sandbox`는 `read-only`, `workspace-write`, `danger-full-access`를 받는다(help의 possible values).
+CLI option 값 도메인:
+
+| Flag | Domain | 권위 |
+| --- | --- | --- |
+| `--sandbox` | `read-only`, `workspace-write`, `danger-full-access` | L1 help choices (root 및 `codex exec`) |
 
 ### Hidden CLI surface (absent from `--help`)
 
@@ -254,19 +258,19 @@ Notification 주요 그룹:
 
 ### App-server 요청 파라미터 계약
 
-adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 schema, `codex app-server generate-json-schema --experimental`).
+adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 schema). 기준은 `codex app-server generate-json-schema --experimental` 출력이다. adapter는 `initialize`에서 `capabilities.experimentalApi: true`를 선언하므로 experimental 모드가 적용되며, `--experimental` 없이 생성한 schema는 이 필드들을 빼고 출력하므로 계약 확인에 쓰면 안 된다.
 
 | Request | Required | Optional |
 | --- | --- | --- |
-| `thread/start` | 없음 | `cwd`, `approvalPolicy`, `approvalsReviewer`, `sandbox`, `ephemeral`, `baseInstructions`, `developerInstructions`, `personality`, `config`, `model`, `modelProvider`, `serviceName`, `serviceTier`, `threadSource`, `sessionStartSource` |
-| `turn/start` | `threadId`, `input` | `cwd`, `model`, `effort`, `summary`, `personality`, `outputSchema`, `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy`, `serviceTier`, `clientUserMessageId` |
+| `thread/start` | 없음 | `allowProviderModelFallback`, `approvalPolicy`, `approvalsReviewer`, `baseInstructions`, `config`, `cwd`, `developerInstructions`, `dynamicTools`, `environments`, `ephemeral`, `experimentalRawEvents`, `historyMode`, `mockExperimentalField`, `model`, `modelProvider`, `multiAgentMode`, `permissions`, `personality`, `runtimeWorkspaceRoots`, `sandbox`, `selectedCapabilityRoots`, `serviceName`, `serviceTier`, `sessionStartSource`, `threadSource` |
+| `turn/start` | `input`, `threadId` | `additionalContext`, `approvalPolicy`, `approvalsReviewer`, `clientUserMessageId`, `collaborationMode`, `cwd`, `effort`, `environments`, `model`, `multiAgentMode`, `outputSchema`, `permissions`, `personality`, `responsesapiClientMetadata`, `runtimeWorkspaceRoots`, `sandboxPolicy`, `serviceTier`, `summary` |
 
 값 도메인:
 
 | Field | Domain |
 | --- | --- |
 | `sandbox` (`SandboxMode`) | `read-only`, `workspace-write`, `danger-full-access` |
-| `approvalPolicy` (`AskForApproval`) | `untrusted`, `on-request`, `never`, 또는 `granular` 객체 |
+| `approvalPolicy` (`AskForApproval`) | `untrusted`, `on-request`, `never`, 또는 granular 객체 |
 | `personality` | `none`, `friendly`, `pragmatic` |
 | `effort` (`ReasoningEffort`) | 모델이 광고하는 비어있지 않은 문자열 (enum 아님) |
 
@@ -277,7 +281,8 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 - 서비스가 저지연 streaming, interrupt, tool event, 멀티턴 연속성을 필요로 하면 `exec --json`이 아니라 app-server를 쓴다.
 - package build나 명시적 probe 시 `generate-json-schema --experimental`로 protocol drift를 감지한다.
 - `thread/start`·`turn/start`에는 schema에 선언된 필드만 보낸다. 미선언 필드는 무시되므로 있으나 마나이며, 읽는 사람에게는 동작하는 설정으로 오해된다.
-- workspace 격리는 요청 파라미터가 아니라 `CODEX_HOME`과 `cwd` 격리로 얻는다.
+- 선언 여부는 반드시 `--experimental` schema로 판단한다. adapter가 experimental API를 opt-in하므로, 축소된 schema로 확인하면 실제로 유효한 필드를 미선언으로 오판한다.
+- workspace 격리는 `CODEX_HOME`·`cwd` 격리에 더해 `runtimeWorkspaceRoots`로 명시한다.
 - 자식 프로세스 env에서 직접 provider 자격증명을 제거한다.
 - realtime, filesystem/process method는 명시적 권한 정책과 probe 이후에만 후보로 취급한다.
 

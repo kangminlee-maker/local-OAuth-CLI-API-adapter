@@ -31,6 +31,7 @@ const COMMAND_TREE_MAX_DEPTH = 4;
 const COMMAND_TREE_MAX_COMMANDS = 300;
 const OPTION_ENTRY_MAX_INDENT = 6;
 const VALUE_DOMAIN_PROBE_MAX = 40;
+const HOT_PATH_REQUEST_METHODS = ['thread/start', 'turn/start'];
 // Options whose argument the CLI is known to validate, so the probe ends at the
 // parser. Anything absent from the installed surface is simply skipped.
 const VALUE_DOMAIN_PROBE_CANDIDATES = {
@@ -349,6 +350,11 @@ async function validateCatalog(data) {
   const codexCommands = await validateDocumentedCommands(data.codex, codexSection, 'codex');
   const claudeCommands = await validateDocumentedCommands(data.claude, claudeSection, 'claude');
   const codexFlags = await validateDocumentedFlagUses(data.codex, codexSection, 'codex');
+  const requestContracts = validateDocumentedRequestContracts(data.codex, codexSection);
+  const undocumentedOptions = {
+    codex: undocumentedTreeOptions(data.codex, codexSection),
+    claude: undocumentedTreeOptions(data.claude, claudeSection),
+  };
 
   const codexDomains = validateDocumentedOptionDomains(data.codex, codexSection);
   const claudeDomains = validateDocumentedOptionDomains(data.claude, claudeSection);
@@ -358,14 +364,19 @@ async function validateCatalog(data) {
   const staleCount = codexCommands.absent.length
     + claudeCommands.absent.length
     + codexFlags.absent.length
+    + requestContracts.mismatches.length
     + optionDomains.length
     + versionDrift.length
     + documentedCodexMethodMissingFromSchema.length
     + documentedClaudeFlagMissingFromHelpOrDocs.length;
+  // Options discovered anywhere in the walked tree count as additive candidates.
+  // The claude help-flag term is a subset of its tree options, so counting both
+  // would double-report the same drift.
   const updateCandidateCount = schemaCodexMethodUndocumented.length
-    + claudeHelpFlagUndocumented.length
     + codexCommands.undocumented.length
-    + claudeCommands.undocumented.length;
+    + claudeCommands.undocumented.length
+    + undocumentedOptions.codex.length
+    + undocumentedOptions.claude.length;
 
   // A run that could not check something must not read as a run that checked it
   // and found nothing. Without this, skipping the probe or losing its controls
@@ -382,6 +393,9 @@ async function validateCatalog(data) {
   }
   if (codexFlags.indeterminate.length > 0) {
     inconclusiveReasons.push(`indeterminate codex option probes: ${codexFlags.indeterminate.join(', ')}`);
+  }
+  if (requestContracts.unverified.length > 0) {
+    inconclusiveReasons.push(`request contracts not verified: ${requestContracts.unverified.map((entry) => `${entry.method} (${entry.reason})`).join(', ')}`);
   }
   if (unverifiedDomains.length > 0) {
     inconclusiveReasons.push(`documented value domains not verified: ${unverifiedDomains.map((entry) => `${entry.runtime} ${entry.flag} (${entry.reason})`).join(', ')}`);
@@ -413,6 +427,13 @@ async function validateCatalog(data) {
       claude: claudeCommands,
     },
     codexOptionUses: codexFlags,
+    requestContractMismatches: requestContracts.mismatches,
+    undocumentedOptions: {
+      codex: undocumentedOptions.codex.slice(0, 40),
+      claude: undocumentedOptions.claude.slice(0, 40),
+      codexCount: undocumentedOptions.codex.length,
+      claudeCount: undocumentedOptions.claude.length,
+    },
     optionDomainMismatches: optionDomains,
     optionDomainsUnverified: unverifiedDomains,
     codex: {
@@ -512,6 +533,59 @@ function documentedCommandPaths(section, binaryName) {
   return [...paths].sort();
 }
 
+// The catalog's request parameter table is the authority the adapter relies on
+// when it sends only declared fields. Compare it with the generated schema so a
+// changed contract shows up here instead of in a silent runtime behaviour change.
+function validateDocumentedRequestContracts(codex, section) {
+  const contracts = codex.schema?.requestContracts ?? {};
+  const mismatches = [];
+  const unverified = [];
+  for (const [method, documented] of documentedRequestContracts(section)) {
+    const observed = contracts[method];
+    if (!observed) {
+      unverified.push({ method, reason: 'no schema contract collected' });
+      continue;
+    }
+    const diff = (documentedList, observedList) => ({
+      documentedButAbsent: documentedList.filter((name) => !observedList.includes(name)),
+      presentButUndocumented: observedList.filter((name) => !documentedList.includes(name)),
+    });
+    const required = diff(documented.required, observed.required);
+    const optional = diff(documented.optional, observed.optional);
+    if (required.documentedButAbsent.length || required.presentButUndocumented.length
+      || optional.documentedButAbsent.length || optional.presentButUndocumented.length) {
+      mismatches.push({ method, required, optional });
+    }
+  }
+  return { mismatches, unverified };
+}
+
+function documentedRequestContracts(section) {
+  const rows = new Map();
+  let inTable = false;
+  for (const line of String(section).split(/\r?\n/)) {
+    if (!line.trim().startsWith('|')) {
+      inTable = false;
+      continue;
+    }
+    const columns = line.split('|').slice(1, -1).map((value) => value.trim());
+    const first = columns[0] ?? '';
+    if (/^request$/i.test(first)) {
+      inTable = true;
+      continue;
+    }
+    if (/^:?-{2,}:?$/.test(first)) continue;
+    if (!inTable) continue;
+    const method = uniqueCapture(first, /`([a-z][A-Za-z0-9]*\/[A-Za-z0-9/_]+)`/g)[0];
+    if (!method) continue;
+    rows.set(method, {
+      required: uniqueCapture(columns[1] ?? '', /`([A-Za-z][A-Za-z0-9_]*)`/g).sort(),
+      optional: uniqueCapture(columns[2] ?? '', /`([A-Za-z][A-Za-z0-9_]*)`/g).sort(),
+    });
+  }
+  return rows;
+}
+
 // Documented options need a presence authority too. The claude flags have one
 // through help plus the parse probe; codex options had none, so removing a
 // documented option such as `codex exec --ephemeral` left every stale term at
@@ -554,7 +628,9 @@ function documentedFlagUses(section, binaryName) {
     for (const token of raw.trim().split(/\s+/)) {
       if (token.startsWith('--')) {
         const name = token.split('=')[0];
-        if (/^--[A-Za-z0-9][A-Za-z0-9-]*$/.test(name)) flags.push(name);
+        // Codex ships underscore-bearing flags (`--experimental_issuer`), so
+        // the extractor accepts the same syntax the CLI does.
+        if (/^--[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) flags.push(name);
         continue;
       }
       if (flags.length === 0 && /^[A-Za-z][A-Za-z0-9-]*$/.test(token)) command.push(token);
@@ -880,6 +956,21 @@ function parseHelpText(text) {
   return out;
 }
 
+// Options the installed CLI advertises anywhere in the tree but the catalog
+// never mentions. Additive candidates, not staleness.
+function undocumentedTreeOptions(runtime, section) {
+  const mentioned = new Set(uniqueMatches(section, /--[A-Za-z0-9][A-Za-z0-9_-]*/g));
+  const flags = new Set();
+  for (const command of runtime.commandTree?.commands ?? []) {
+    for (const option of command.options ?? []) {
+      for (const flag of option.flags) {
+        if (flag !== '--help' && flag !== '--version' && !mentioned.has(flag)) flags.add(flag);
+      }
+    }
+  }
+  return [...flags].sort();
+}
+
 function rootOptionsOf(commandTree) {
   return commandTree?.commands?.find((entry) => entry.command === '(root)')?.options ?? [];
 }
@@ -962,10 +1053,43 @@ async function collectCodexSchema(binary) {
       generated: summarizeCommand(generated),
       files: files.map((filePath) => relative(tmp, filePath)).sort(),
       methodEnums,
+      requestContracts: await collectRequestContracts(tmp, HOT_PATH_REQUEST_METHODS),
     };
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
+}
+
+// Method names alone do not describe what a request accepts. The catalog
+// documents the parameter contract for the hot-path requests, and that contract
+// is what justifies sending only declared fields, so it needs to be collected
+// and compared rather than trusted.
+async function collectRequestContracts(schemaDir, methods) {
+  const filePath = join(schemaDir, 'ClientRequest.json');
+  if (!existsSync(filePath)) return {};
+  const schema = JSON.parse(await readFile(filePath, 'utf8'));
+  const definitions = schema.definitions ?? {};
+  const contracts = {};
+  for (const method of methods) {
+    let paramsRef = null;
+    walkJson(schema, (node) => {
+      if (node?.properties?.method?.enum?.length === 1
+        && node.properties.method.enum[0] === method
+        && node.properties?.params?.$ref) {
+        paramsRef = node.properties.params.$ref;
+      }
+    });
+    if (!paramsRef) continue;
+    const definition = definitions[paramsRef.split('/').pop()];
+    if (!definition) continue;
+    const properties = Object.keys(definition.properties ?? {}).sort();
+    const required = [...(definition.required ?? [])].sort();
+    contracts[method] = {
+      required,
+      optional: properties.filter((name) => !required.includes(name)),
+    };
+  }
+  return contracts;
 }
 
 // Parse probe: the only authority that answers "does the installed CLI accept
@@ -1366,6 +1490,8 @@ Verdict: \`${data.catalogValidity?.verdict ?? 'not_checked'}\`
 | Documented commands the CLI no longer has | ${(data.catalogValidity?.commands?.codex?.absent?.length ?? 0) + (data.catalogValidity?.commands?.claude?.absent?.length ?? 0)} |
 | Documented option domains that disagree with the CLI | ${data.catalogValidity?.optionDomainMismatches?.length ?? 0} |
 | Documented codex options the CLI no longer accepts | ${data.catalogValidity?.codexOptionUses?.absent?.length ?? 0} |
+| Request contracts that disagree with the schema | ${data.catalogValidity?.requestContractMismatches?.length ?? 0} |
+| Options present but undocumented | ${(data.catalogValidity?.undocumentedOptions?.codexCount ?? 0) + (data.catalogValidity?.undocumentedOptions?.claudeCount ?? 0)} |
 | Commands present but undocumented | ${(data.catalogValidity?.commands?.codex?.undocumented?.length ?? 0) + (data.catalogValidity?.commands?.claude?.undocumented?.length ?? 0)} |
 
 ### Documented Commands

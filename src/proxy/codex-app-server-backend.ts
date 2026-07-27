@@ -405,6 +405,8 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       const turn = await this.send('turn/start', {
         threadId,
         cwd,
+        runtimeWorkspaceRoots: [cwd],
+        environments: [],
         input: preparedInput.input,
         model: this.modelOverrideForCodexImage(),
         effort: reasoningEffort,
@@ -504,6 +506,8 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       const turn = await this.send('turn/start', {
         threadId,
         cwd,
+        runtimeWorkspaceRoots: [cwd],
+        environments: [],
         input: preparedInput.input,
         model: this.modelOverrideFor(request.model),
         effort: reasoningEffort,
@@ -638,15 +642,22 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   ): Promise<string> {
     const cwd = this.isolation?.workDir ?? this.cwd;
     // Only fields the app-server protocol declares for `thread/start` are sent.
-    // The server ignores unknown params silently, so anything extra is inert and
-    // would read as configuration that is doing work when it is not.
+    // The server ignores unknown params silently, so an undeclared field would
+    // read as configuration that is doing work when it is not. The declared set
+    // is the one from `generate-json-schema --experimental`, because the client
+    // opts into the experimental API during `initialize`; several of these
+    // fields exist only in that mode.
     const thread = await this.send('thread/start', {
       cwd,
+      runtimeWorkspaceRoots: [cwd],
       approvalPolicy: 'never',
       sandbox: 'read-only',
+      environments: [],
+      dynamicTools: [],
       ephemeral: true,
       ...threadInstructionParams(this.proxyMode, mode, apiRequestInstructions),
       ...threadPersonalityParams(this.proxyMode),
+      experimentalRawEvents: false,
       config: {
         model_reasoning_effort: reasoningEffort,
         model_reasoning_summary: 'none',
