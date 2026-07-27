@@ -391,6 +391,9 @@ async function validateCatalog(data) {
   if ((probe?.indeterminate?.length ?? 0) > 0) {
     inconclusiveReasons.push(`indeterminate flag probes: ${probe.indeterminate.join(', ')}`);
   }
+  if ((codexFlags.unprobed ?? []).length > 0) {
+    inconclusiveReasons.push(`codex options left unprobed: ${codexFlags.unprobed.join(', ')}`);
+  }
   if (codexFlags.indeterminate.length > 0) {
     inconclusiveReasons.push(`indeterminate codex option probes: ${codexFlags.indeterminate.join(', ')}`);
   }
@@ -408,6 +411,9 @@ async function validateCatalog(data) {
     // cannot support a "nothing changed" verdict for the part it never saw.
     if (data[runtime]?.commandTree?.truncated) {
       inconclusiveReasons.push(`${runtime} command walk truncated at the collection cap`);
+    }
+    if ((check.failedHelp ?? []).length > 0) {
+      inconclusiveReasons.push(`${runtime} help failed for: ${check.failedHelp.join(', ')}`);
     }
   }
   const inconclusive = inconclusiveReasons.length > 0;
@@ -470,10 +476,17 @@ async function validateDocumentedCommands(runtime, section, binaryName) {
       hiddenConfirmed: [],
       absent: [],
       undocumented: [],
+      failedHelp: [],
     };
   }
-  const known = new Set((tree.commands ?? []).map((entry) => entry.command));
-  const usageOf = new Map((tree.commands ?? []).map((entry) => [entry.command, entry.usage]));
+  // A help invocation that failed may still have printed something parseable.
+  // Counting it as proof the command exists would let a partial or errored walk
+  // certify the catalog, so those entries are excluded from the evidence set and
+  // reported instead.
+  const failedHelp = (tree.commands ?? []).filter((entry) => entry.ok === false).map((entry) => entry.command);
+  const collected = (tree.commands ?? []).filter((entry) => entry.ok !== false);
+  const known = new Set(collected.map((entry) => entry.command));
+  const usageOf = new Map(collected.map((entry) => [entry.command, entry.usage]));
   const visible = documented.filter((command) => known.has(command));
   const hiddenConfirmed = [];
   const absent = [];
@@ -507,6 +520,7 @@ async function validateDocumentedCommands(runtime, section, binaryName) {
     hiddenConfirmed,
     absent,
     undocumented,
+    failedHelp,
   };
 }
 
@@ -595,16 +609,16 @@ async function validateDocumentedFlagUses(runtime, section, binaryName) {
   const uses = documentedFlagUses(section, binaryName);
   const tree = runtime.commandTree;
   if (!runtime.binary || !tree || tree.skipped) {
-    return { authority: 'not_collected', count: uses.length, visible: [], hiddenConfirmed: [], absent: [], indeterminate: [] };
+    return { authority: 'not_collected', count: uses.length, visible: [], hiddenConfirmed: [], absent: [], indeterminate: [], unprobed: [] };
   }
-  const optionsOf = new Map((tree.commands ?? []).map((entry) => [
-    entry.command,
-    new Set((entry.options ?? []).flatMap((option) => option.flags)),
-  ]));
+  const optionsOf = new Map((tree.commands ?? [])
+    .filter((entry) => entry.ok !== false)
+    .map((entry) => [entry.command, new Set((entry.options ?? []).flatMap((option) => option.flags))]));
   const visible = [];
   const hiddenConfirmed = [];
   const absent = [];
   const indeterminate = [];
+  const unprobed = [];
   for (const use of uses) {
     const key = use.command || '(root)';
     const label = `${use.command} ${use.flag}`.trim();
@@ -612,31 +626,61 @@ async function validateDocumentedFlagUses(runtime, section, binaryName) {
       visible.push(label);
       continue;
     }
+    // `--skip-flag-probe` opts out of launching the CLI. Honouring it here means
+    // the hidden options go unchecked, which is reported rather than assumed.
+    if (skipFlagProbe) {
+      unprobed.push(label);
+      continue;
+    }
     const verdict = await probeFlagInCommand(runtime.binary, use.command, use.flag);
     if (verdict === 'unregistered') absent.push(label);
     else if (verdict === 'indeterminate') indeterminate.push(label);
     else hiddenConfirmed.push(label);
   }
-  return { authority: 'command_tree_plus_probe', count: uses.length, visible, hiddenConfirmed, absent, indeterminate };
+  return {
+    authority: skipFlagProbe ? 'command_tree_only' : 'command_tree_plus_probe',
+    count: uses.length,
+    visible,
+    hiddenConfirmed,
+    absent,
+    indeterminate,
+    unprobed,
+  };
 }
 
 function documentedFlagUses(section, binaryName) {
   const uses = new Map();
-  for (const raw of uniqueCapture(section, new RegExp(`\`${binaryName} ([^\`]+)\``, 'g'))) {
-    const command = [];
-    const flags = [];
-    for (const token of raw.trim().split(/\s+/)) {
-      if (token.startsWith('--')) {
-        const name = token.split('=')[0];
-        // Codex ships underscore-bearing flags (`--experimental_issuer`), so
-        // the extractor accepts the same syntax the CLI does.
-        if (/^--[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) flags.push(name);
-        continue;
+  // Walk line by line so a row that qualifies its first invocation and then
+  // lists sibling flags in shorthand still binds those flags to the same
+  // command. Reading each backticked span in isolation would drop them.
+  for (const line of String(section).split(/\r?\n/)) {
+    let currentCommand = null;
+    for (const raw of String(line).matchAll(/`([^`]+)`/g)) {
+      const command = [];
+      const flags = [];
+      let qualified = false;
+      for (const token of raw[1].trim().split(/\s+/)) {
+        if (token.startsWith('--')) {
+          const name = token.split('=')[0];
+          // Codex ships underscore-bearing flags (`--experimental_issuer`), so
+          // the extractor accepts the same syntax the CLI does.
+          if (/^--[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) flags.push(name);
+          continue;
+        }
+        if (flags.length > 0) continue;
+        if (command.length === 0 && token === binaryName) {
+          qualified = true;
+          continue;
+        }
+        if (/^[A-Za-z][A-Za-z0-9-]*$/.test(token)) command.push(token);
       }
-      if (flags.length === 0 && /^[A-Za-z][A-Za-z0-9-]*$/.test(token)) command.push(token);
-    }
-    for (const flag of flags) {
-      uses.set(`${command.join(' ')} ${flag}`, { command: command.join(' '), flag });
+      if (flags.length === 0) continue;
+      if (qualified) currentCommand = command.join(' ');
+      else if (currentCommand === null) continue;
+      const target = qualified ? command.join(' ') : currentCommand;
+      for (const flag of flags) {
+        uses.set(`${target} ${flag}`, { command: target, flag });
+      }
     }
   }
   return [...uses.values()];

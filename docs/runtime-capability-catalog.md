@@ -199,7 +199,7 @@ Hidden flags:
 | Flag | Behavior | Adapter relevance |
 | --- | --- | --- |
 | `codex app-server --remote-control` | 영속화 없이 이 프로세스에 remote control 활성 | 끄고 유지; 제어면 확대 |
-| `codex login --experimental_issuer <URL>` / `--experimental_client-id <ID>` | OAuth issuer/client 재정의 | custom OAuth endpoint가 필요할 때만 |
+| `codex login --experimental_issuer <URL>` / `codex login --experimental_client-id <ID>` | OAuth issuer/client 재정의 | custom OAuth endpoint가 필요할 때만 |
 | `codex login --api-key` | trap: `--with-api-key`로 파이프하라는 안내 후 종료 | 사용 금지 |
 | `codex exec --full-auto` | 제거된 legacy flag의 trap | 사용 금지 |
 
