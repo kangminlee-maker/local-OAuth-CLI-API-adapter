@@ -31,6 +31,12 @@ const COMMAND_TREE_MAX_DEPTH = 4;
 const COMMAND_TREE_MAX_COMMANDS = 300;
 const OPTION_ENTRY_MAX_INDENT = 6;
 const VALUE_DOMAIN_PROBE_MAX = 40;
+// Options whose argument the CLI is known to validate, so the probe ends at the
+// parser. Anything absent from the installed surface is simply skipped.
+const VALUE_DOMAIN_PROBE_CANDIDATES = {
+  codex: ['--ask-for-approval', '--sandbox'],
+  claude: ['--effort', '--setting-sources', '--max-budget-usd', '--session-id', '--permission-mode'],
+};
 const FLAG_PROBE_CONTROL = '--zzz-catalog-probe-control';
 const FLAG_PROBE_CONTROLS = ['--zzz-not-a-real-flag', '--zzz-catalog-probe-absent'];
 // Probes run outside the repository. Some options treat their argument as an
@@ -39,34 +45,7 @@ const FLAG_PROBE_CONTROLS = ['--zzz-not-a-real-flag', '--zzz-catalog-probe-absen
 let probeScratchPromise = null;
 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
 
-const codex = await collectCodex();
-const claude = await collectClaude();
-const report = {
-  generatedAt: new Date().toISOString(),
-  repoRoot,
-  catalogPath,
-  platform: {
-    os: platform(),
-    arch: arch(),
-    release: release(),
-    node: process.version,
-  },
-  trustLevels: {
-    L0: 'Binary string scan candidate only',
-    L1: 'Local --help or version output',
-    L2: 'Generated protocol schema',
-    L3: 'Official docs review required',
-    L4: 'Runtime probe required',
-  },
-  codex,
-  claude,
-  catalogValidity: await validateCatalog({ codex, claude }),
-  updateGuidance: {
-    catalog: 'docs/runtime-capability-catalog.md',
-    playbook: 'docs/runtime-capability-update-playbook.md',
-    rule: 'Validate existing catalog entries first. Treat stale/changed entries as higher priority than additive candidates.',
-  },
-};
+const report = await collectReport();
 
 await mkdir(outDir, { recursive: true });
 const jsonPath = join(outDir, `runtime-capability-report.${timestamp}.json`);
@@ -80,6 +59,51 @@ process.stdout.write(`runtime capability report: ${jsonPath}\n`);
 process.stdout.write(`runtime capability summary: ${markdownPath}\n`);
 if (args.includes('--fail-on-stale') && report.catalogValidity?.staleCount > 0) {
   process.exitCode = 1;
+}
+
+async function collectReport() {
+  try {
+    const codex = await collectCodex();
+    const claude = await collectClaude();
+    return {
+      generatedAt: new Date().toISOString(),
+      repoRoot,
+      catalogPath,
+      platform: {
+        os: platform(),
+        arch: arch(),
+        release: release(),
+        node: process.version,
+      },
+      trustLevels: {
+        L0: 'Binary string scan candidate only',
+        L1: 'Local --help or version output',
+        L2: 'Generated protocol schema',
+        L3: 'Official docs review required',
+        L4: 'Runtime probe required',
+      },
+      codex,
+      claude,
+      catalogValidity: await validateCatalog({ codex, claude }),
+      updateGuidance: {
+        catalog: 'docs/runtime-capability-catalog.md',
+        playbook: 'docs/runtime-capability-update-playbook.md',
+        rule: 'Validate existing catalog entries first. Treat stale/changed entries as higher priority than additive candidates.',
+      },
+    };
+  } finally {
+    // Probed options can write into the scratch cwd, so it is removed on every
+    // exit path rather than accumulating one directory per run under /tmp.
+    await cleanupProbeScratch();
+  }
+}
+
+async function cleanupProbeScratch() {
+  const pending = probeScratchPromise;
+  probeScratchPromise = null;
+  if (!pending) return;
+  const dir = await pending.catch(() => null);
+  if (dir) await rm(dir, { recursive: true, force: true, maxRetries: 3 });
 }
 
 function readValueArg(name) {
@@ -120,7 +144,7 @@ async function collectCodex() {
     help,
     helpFlags: extractHelpFlags(help),
     commandTree,
-    optionValueDomains: await probeOptionValueDomains(binary, rootOptionsOf(commandTree)),
+    optionValueDomains: await probeOptionValueDomains(binary, rootOptionsOf(commandTree), VALUE_DOMAIN_PROBE_CANDIDATES.codex),
     schema,
     binaryScan: skipBinaryScan ? { skipped: true } : await collectBinaryScan(binary),
   };
@@ -234,7 +258,7 @@ async function collectClaude() {
     help,
     helpFlags: extractHelpFlags(help),
     commandTree,
-    optionValueDomains: await probeOptionValueDomains(binary, rootOptionsOf(commandTree)),
+    optionValueDomains: await probeOptionValueDomains(binary, rootOptionsOf(commandTree), VALUE_DOMAIN_PROBE_CANDIDATES.claude),
     flagProbe,
     docsOnlyCandidates,
     hiddenProbedFlags,
@@ -305,7 +329,12 @@ async function validateCatalog(data) {
   const documentedClaudeFlagMissingFromHelpOrDocs = difference(documentedClaudeFlags, claudeAllowedFlags);
   const claudeHelpFlagUndocumented = difference(data.claude.helpFlags ?? [], documentedClaudeFlags);
 
-  const staleCount = versionDrift.length
+  const codexCommands = await validateDocumentedCommands(data.codex, codexSection, 'codex');
+  const claudeCommands = await validateDocumentedCommands(data.claude, claudeSection, 'claude');
+
+  const staleCount = codexCommands.absent.length
+    + claudeCommands.absent.length
+    + versionDrift.length
     + documentedCodexMethodMissingFromSchema.length
     + documentedClaudeFlagMissingFromHelpOrDocs.length;
   const updateCandidateCount = schemaCodexMethodUndocumented.length + claudeHelpFlagUndocumented.length;
@@ -316,6 +345,10 @@ async function validateCatalog(data) {
     staleCount,
     updateCandidateCount,
     versionDrift,
+    commands: {
+      codex: codexCommands,
+      claude: claudeCommands,
+    },
     codex: {
       documentedMethodCount: documentedCodexMethods.length,
       schemaMethodCount: schemaMethods.length,
@@ -333,6 +366,54 @@ async function validateCatalog(data) {
       helpFlagsUndocumentedInCatalog: claudeHelpFlagUndocumented,
     },
   };
+}
+
+// The command tree is only an authority if the validity check consumes it.
+// Every command the catalog names is required to be either in the walked tree
+// or, for the documented hidden ones, to answer `--help` for itself; anything
+// else is a catalog entry the installed CLI no longer has.
+async function validateDocumentedCommands(runtime, section, binaryName) {
+  const documented = documentedCommandPaths(section, binaryName);
+  const tree = runtime.commandTree;
+  if (!runtime.binary || !tree || tree.skipped) {
+    return { authority: 'not_collected', documentedCount: documented.length, visible: [], hiddenConfirmed: [], absent: [] };
+  }
+  const known = new Set((tree.commands ?? []).map((entry) => entry.command));
+  const visible = documented.filter((command) => known.has(command));
+  const hiddenConfirmed = [];
+  const absent = [];
+  for (const command of documented.filter((entry) => !known.has(entry))) {
+    if (await commandAnswersForItself(runtime.binary, binaryName, command)) hiddenConfirmed.push(command);
+    else absent.push(command);
+  }
+  return { authority: 'command_tree_plus_probe', documentedCount: documented.length, visible, hiddenConfirmed, absent };
+}
+
+// The catalog writes commands as `codex app-server --listen stdio://`; keep the
+// leading non-flag words so the check runs against `app-server`.
+function documentedCommandPaths(section, binaryName) {
+  const paths = new Set();
+  for (const raw of uniqueCapture(section, new RegExp(`\`${binaryName} ([^\`]+)\``, 'g'))) {
+    const words = [];
+    for (const token of raw.trim().split(/\s+/)) {
+      if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(token)) break;
+      words.push(token);
+    }
+    if (words.length > 0) paths.add(words.join(' '));
+  }
+  return [...paths].sort();
+}
+
+// A hidden command still prints usage naming itself; an unknown name falls back
+// to the parent help, which never does.
+async function commandAnswersForItself(binary, binaryName, commandPath) {
+  const result = await run(binary, [...commandPath.split(' '), '--help'], {
+    timeoutMs: 20_000,
+    maxBuffer: 8_000_000,
+    cwd: await probeScratchDir(),
+  });
+  const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+  return new RegExp(`(^|\\s)${escapeRegExp(binaryName)}\\s+${escapeRegExp(commandPath)}(\\s|$)`, 'im').test(text);
 }
 
 async function collectRuntimeBase(name, binary, shadowedBy = null) {
@@ -409,11 +490,14 @@ async function collectCommandTree(binary) {
       options: parsed.options,
       subcommands: parsed.subcommands.map((entry) => entry.name),
     });
-    if (path.length >= COMMAND_TREE_MAX_DEPTH) continue;
-    for (const entry of parsed.subcommands) {
-      if (entry.name === 'help') continue;
-      queue.push([...path, entry.name]);
+    const children = parsed.subcommands.filter((entry) => entry.name !== 'help');
+    if (path.length >= COMMAND_TREE_MAX_DEPTH) {
+      // Stopping at the cap while still reporting a complete surface would hide
+      // every command below it.
+      if (children.length > 0) truncated = true;
+      continue;
     }
+    for (const entry of children) queue.push([...path, entry.name]);
   }
   return {
     maxDepth: COMMAND_TREE_MAX_DEPTH,
@@ -620,12 +704,19 @@ async function probeFlagRegistration(binary, flags) {
 // is still observable — hand the option an argument it cannot accept and read
 // what the CLI says it wanted. Uses the same control-flag form as the
 // registration probe so no argument can be mistaken for a prompt.
-async function probeOptionValueDomains(binary, options) {
+//
+// Only options known to validate their argument are probed. For an unrestricted
+// option (`--system-prompt`, `--settings`, `--debug-file`) the control flag is a
+// perfectly good value, so the CLI parses it and proceeds into startup: real
+// side effects, and one timeout's wait per option. Enumeration of the surface
+// stays exhaustive; only this execution step is bounded.
+async function probeOptionValueDomains(binary, options, candidates) {
   if (skipFlagProbe) return { skipped: true };
+  const allowed = new Set(candidates);
   const targets = options
     .filter((option) => option.takesValue && option.choices.length === 0)
     .map((option) => option.flags[0])
-    .filter((flag) => flag && flag !== '--help' && flag !== '--version')
+    .filter((flag) => flag && allowed.has(flag))
     .slice(0, VALUE_DOMAIN_PROBE_MAX);
   const domains = {};
   const cwd = await probeScratchDir();
@@ -672,9 +763,16 @@ async function collectBinaryScan(binary, knownHiddenFlags = []) {
   const stringsPath = await commandPath('strings');
   if (!stringsPath) return { available: false, reason: 'strings command not found' };
   // Scanning a wrapper script yields an empty flag set that looks exactly like a
-  // binary that dropped every hidden flag. Refuse instead of reporting nothing.
-  if (!await isNativeExecutable(binary)) {
-    return { available: true, ok: false, reason: 'target is not a native executable', binary };
+  // binary that dropped every hidden flag. Refuse unless the target is known to
+  // be native; an undeterminable type is not evidence that it is.
+  const kind = await executableKind(binary);
+  if (kind !== true) {
+    return {
+      available: true,
+      ok: false,
+      reason: kind === false ? 'target is not a native executable' : 'executable type could not be determined',
+      binary,
+    };
   }
   // The buffer has to hold the whole `strings` dump; Claude Code's bundle alone
   // is ~38MB of strings and grows with every release. A too-small buffer fails
@@ -829,21 +927,23 @@ async function commandPath(name) {
 // Prefer the first native executable on PATH and record what shadowed it.
 async function runtimeBinaryPath(name) {
   const primary = await commandPath(name);
-  if (!primary || await isNativeExecutable(primary)) return { path: primary, shadowedBy: null };
+  if (!primary || await executableKind(primary) !== false) return { path: primary, shadowedBy: null };
   for (const dir of String(process.env.PATH ?? '').split(':')) {
     if (!dir) continue;
     const candidate = join(dir, name);
     if (candidate === primary || !existsSync(candidate)) continue;
-    if (await isNativeExecutable(candidate)) return { path: candidate, shadowedBy: primary };
+    if (await executableKind(candidate) === true) return { path: candidate, shadowedBy: primary };
   }
   return { path: primary, shadowedBy: null };
 }
 
-async function isNativeExecutable(binary) {
+// Returns true (native), false (not native), or null (undeterminable). Null is
+// not "native": without `file` there is no evidence either way, and treating the
+// unknown case as native is exactly what lets a PATH wrapper be scanned as if it
+// were the binary.
+async function executableKind(binary) {
   const result = await run('file', ['-b', binary], { timeoutMs: 10_000 });
-  // No `file` command means no authority to reject; assume native so the scan
-  // still runs rather than silently downgrading itself.
-  if (!result.ok) return true;
+  if (!result.ok) return null;
   return /Mach-O|ELF|PE32/i.test(result.stdout);
 }
 
@@ -922,6 +1022,17 @@ Verdict: \`${data.catalogValidity?.verdict ?? 'not_checked'}\`
 | Codex schema methods undocumented in catalog | ${data.catalogValidity?.codex?.schemaMethodsUndocumentedInCatalog?.length ?? 0} |
 | Claude documented flags missing from help/docs-only list | ${data.catalogValidity?.claude?.documentedFlagsMissingFromHelpOrDocs?.length ?? 0} |
 | Claude help flags undocumented in catalog | ${data.catalogValidity?.claude?.helpFlagsUndocumentedInCatalog?.length ?? 0} |
+| Documented commands the CLI no longer has | ${(data.catalogValidity?.commands?.codex?.absent?.length ?? 0) + (data.catalogValidity?.commands?.claude?.absent?.length ?? 0)} |
+
+### Documented Commands
+
+| Runtime | Authority | Documented | In command tree | Hidden, probe-confirmed | Absent |
+| --- | --- | ---: | ---: | ---: | --- |
+${['codex', 'claude'].map((runtime) => {
+  const check = data.catalogValidity?.commands?.[runtime];
+  const absent = check?.absent ?? [];
+  return `| ${runtime} | \`${check?.authority ?? 'not_checked'}\` | ${check?.documentedCount ?? 0} | ${check?.visible?.length ?? 0} | ${check?.hiddenConfirmed?.length ?? 0} | ${absent.length > 0 ? absent.map((value) => inline(value)).join(', ') : 'none'} |`;
+}).join('\n')}
 
 ### Version Drift
 

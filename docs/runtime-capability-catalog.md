@@ -46,11 +46,15 @@ pnpm catalog:runtime
 | Command surface | root에서 `--help`를 재귀적으로 walk하여 모든 subcommand/option/value placeholder/choice/default를 열거 | report의 `Command Surface` |
 | Protocol schema | `codex app-server generate-json-schema --experimental` | report의 `Codex Schema Methods` |
 | Flag parse probe | flag에 값 대신 bogus control flag를 붙여 parser 응답을 분류 | report의 `Claude Hidden Flag Parse Probe` |
-| Value domain probe | help가 choice를 노출하지 않는 root option에 수용 불가 인자를 주고 CLI가 알려주는 도메인을 기록 | report의 `Probed Option Value Domains` |
+| Value domain probe | help가 choice를 노출하지 않으면서 인자를 검증하는 것으로 알려진 root option에만 수용 불가 인자를 주고 CLI가 알려주는 도메인을 기록 | report의 `Probed Option Value Domains` |
 
 probe에 값 문자열이 아니라 flag 모양 인자를 쓰는 이유는, 값을 주면 boolean flag에서 그 값이 prompt로 해석되어 실제 모델 turn이 실행되기 때문이다. flag 모양 인자는 prompt가 될 수 없고, parser가 어느 option을 해석하지 못했는지에 따라 미등록/boolean 등록/값 등록이 모두 구분된다.
 
 parse probe는 negative control이 `unregistered`로 나올 때만 권위를 갖는다. control이 깨지면 report는 선언 목록으로 물러서고 `hiddenFlagAuthority: declared_fallback`으로 표시한다. 이 표시가 있는 report는 hidden flag drift를 검증하지 못한 상태다.
+
+값 도메인 probe는 인자를 검증하는 것이 확인된 option에만 건다. `--system-prompt`처럼 아무 값이나 받는 option에는 control flag가 정상 값이 되어 CLI가 그대로 기동하므로, parser 단계에서 끝나지 않고 부작용과 대기가 생긴다. 열거는 전수로 유지하고 실행 단계만 제한한다.
+
+카탈로그가 이름을 적은 명령은 command tree에 있거나, hidden이라면 자기 `--help`를 출력해야 한다. 둘 다 아니면 stale로 집계된다. 즉 hidden 명령 목록도 매 수집 때 재확인된다.
 
 출력 report는 `artifacts/runtime-capability-catalog/latest.md`와 `latest.json`에 생성된다. report의 `Catalog Validity`를 기준으로 기존 항목의 삭제/변경 여부를 먼저 반영한 뒤, 신규 후보를 source level에 맞게 추가한다. 세부 절차는 `docs/runtime-capability-update-playbook.md`를 따른다.
 
