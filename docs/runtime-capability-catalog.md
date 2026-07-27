@@ -10,8 +10,10 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 
 | Runtime | Local version | Binary | Primary hot path |
 | --- | --- | --- | --- |
-| Codex CLI | `codex-cli 0.142.5` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.201` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Codex CLI | `codex-cli 0.145.0` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
+| Claude Code | `2.1.220` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+
+PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper는 `--version`/`--help`를 그대로 전달하므로 help scraping은 정상이지만 binary string scan은 wrapper script를 읽게 되어 hidden flag 권위를 잃는다. 수집기는 PATH에서 native executable을 우선 선택하고, 가려진 경로를 report의 `Shadowed by`에 남긴다.
 
 ## 신뢰 레벨
 
@@ -25,6 +27,8 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 
 운영 규칙: catalog에는 L0-L3도 기록할 수 있지만, 기본 runtime path는 L4를 통과한 항목만 사용한다.
 
+L0과 L4의 관계에 주의한다. binary에 문자열이 남아 있다는 사실은 그 token이 compile되어 있다는 뜻일 뿐, parser가 그 flag를 받는다는 뜻이 아니다. 실제로 현재 Claude Code binary에는 CLI가 `unknown option`으로 거부하는 flag의 문자열도 남아 있다. flag 수용 여부의 권위는 항상 parse probe(L4)다.
+
 ## 갱신 방식
 
 이 문서는 current-state catalog다. 삭제된 항목, rename 이력, backward-compatibility 설명, 과거 버전 차이는 이 문서에 남기지 않는다. 해당 내용은 update report artifact에만 남긴다.
@@ -34,6 +38,19 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 ```bash
 pnpm catalog:runtime
 ```
+
+수집기가 만드는 권위는 네 가지다.
+
+| 권위 | 수집 방식 | 산출물 |
+| --- | --- | --- |
+| Command surface | root에서 `--help`를 재귀적으로 walk하여 모든 subcommand/option/value placeholder/choice/default를 열거 | report의 `Command Surface` |
+| Protocol schema | `codex app-server generate-json-schema --experimental` | report의 `Codex Schema Methods` |
+| Flag parse probe | flag에 값 대신 bogus control flag를 붙여 parser 응답을 분류 | report의 `Claude Hidden Flag Parse Probe` |
+| Value domain probe | help가 choice를 노출하지 않는 root option에 수용 불가 인자를 주고 CLI가 알려주는 도메인을 기록 | report의 `Probed Option Value Domains` |
+
+probe에 값 문자열이 아니라 flag 모양 인자를 쓰는 이유는, 값을 주면 boolean flag에서 그 값이 prompt로 해석되어 실제 모델 turn이 실행되기 때문이다. flag 모양 인자는 prompt가 될 수 없고, parser가 어느 option을 해석하지 못했는지에 따라 미등록/boolean 등록/값 등록이 모두 구분된다.
+
+parse probe는 negative control이 `unregistered`로 나올 때만 권위를 갖는다. control이 깨지면 report는 선언 목록으로 물러서고 `hiddenFlagAuthority: declared_fallback`으로 표시한다. 이 표시가 있는 report는 hidden flag drift를 검증하지 못한 상태다.
 
 출력 report는 `artifacts/runtime-capability-catalog/latest.md`와 `latest.json`에 생성된다. report의 `Catalog Validity`를 기준으로 기존 항목의 삭제/변경 여부를 먼저 반영한 뒤, 신규 후보를 source level에 맞게 추가한다. 세부 절차는 `docs/runtime-capability-update-playbook.md`를 따른다.
 
@@ -74,13 +91,13 @@ tmpdir="$(mktemp -d /tmp/codex-schema.XXXXXX)"
 codex app-server generate-json-schema --experimental --out "$tmpdir"
 ```
 
-Hidden-surface probe (codex is clap-based; `hide = true` items never appear in `--help`):
+Hidden-surface probe (codex는 clap 기반이라 `hide = true` 항목이 `--help`에 나오지 않는다):
 
 ```bash
-# Enumerate candidates from the pinned tag's source, then confirm each against the installed binary.
+# pinned tag 소스에서 후보를 뽑고, 설치된 binary에서 각각 확인한다.
 curl -sL "https://raw.githubusercontent.com/openai/codex/rust-v$(codex --version | awk '{print $2}')/codex-rs/cli/src/main.rs" | grep -n -B 2 "hide = true"
-codex <hidden-cmd> --help   # hidden clap items still answer --help with exit 0
-codex --no-such-flag-xyz    # negative control: must exit 2, or the probe proves nothing
+codex <hidden-cmd> --help        # hidden clap 항목은 자기 help를 exit 0으로 출력
+codex app-server --zzz-bogus --help  # negative control: exit 2 + "unexpected argument"
 ```
 
 ### Claude Code
@@ -94,16 +111,21 @@ claude auth --help
 claude doctor --help
 ```
 
-Hidden-surface probe (claude is a bun-compiled commander CLI; `hideHelp()` flags and hidden commands never appear in `--help`, and unknown top-level options are silently tolerated, so silence proves nothing):
+Hidden-surface probe (claude는 bun-compiled commander CLI다. `hideHelp()` flag와 hidden command는 `--help`에 나오지 않는다):
 
 ```bash
-# L0: extract commander option-registration strings (`--flag <value>`) from the binary.
+# L0: binary에서 commander option 등록 문자열을 추출한다. 후보 발견용이며 수용 근거가 아니다.
 strings -n 6 "$(readlink -f ~/.local/bin/claude)" | grep -oE -- '--[a-z0-9-]+ (<[^>]{1,40}>|\[[^]]{1,40}\])' | sort -u
-# L4 (value-validated flags only): an invalid value is rejected naming the flag and its choices.
-claude --thinking=__bogus__ --version   # error lists enabled/adaptive/disabled → flag exists
-# Hidden subcommand probe: a real command prints its own usage; an unknown name falls back to main help.
-claude <name> --help | head -1          # "Usage: claude <name>" vs "Usage: claude [options] [command]"
+# L4: flag에 bogus control flag를 붙여 parser 응답을 읽는다. 값이 아니라 flag를 주는 것이 핵심이다.
+claude --thinking --zzz-control          # "argument '--zzz-control' is invalid. Allowed choices ..." → 값 flag로 등록됨
+claude --maintenance --zzz-control       # "unknown option '--zzz-control'"                          → boolean으로 등록됨
+claude --judge-model --zzz-control       # "unknown option '--judge-model'"                          → 미등록
+claude --zzz-absent --zzz-control        # negative control: 반드시 미등록으로 나와야 probe가 유효
+# Hidden subcommand probe: 실제 명령은 자기 usage를, 없는 이름은 main help를 출력한다.
+claude <name> --help | head -1           # "Usage: claude <name>" vs "Usage: claude [options] [command]"
 ```
+
+주의: `claude <flag> <value>` 형태로 probe하면 boolean flag에서 값이 prompt로 해석되어 실제 모델 호출이 발생한다. probe에는 항상 flag 모양 인자를 쓴다.
 
 Useful official references:
 
@@ -113,78 +135,106 @@ Useful official references:
 
 ## Codex capability list
 
-### CLI commands
+### CLI command surface
+
+`--help` 재귀 walk 기준으로 68개 명령과 502개 option이 열거된다. root subcommand는 아래 24개이며(그 외 `help`), 전체 option 목록은 `artifacts/runtime-capability-catalog/latest.md`의 `Command Surface`에 있다.
+
+| Root subcommand | 설명 | Adapter 관련성 |
+| --- | --- | --- |
+| `exec` | non-interactive 실행 (`resume`, `review` 하위 명령 보유) | one-shot fallback |
+| `app-server` | app server 및 관련 도구 (`daemon`, `proxy`, `generate-ts`, `generate-json-schema`) | **primary hot path** |
+| `review` | non-interactive 코드 리뷰 | 없음 |
+| `login` / `logout` | 인증 관리 (`login status`) | OAuth 세션 전제 |
+| `mcp` / `mcp-server` | 외부 MCP 서버 관리 / Codex를 MCP 서버로 실행 | 서비스 tool bridge 후보 |
+| `plugin` | plugin 관리 (`add`, `list`, `remove`, `marketplace`) | 없음 |
+| `remote-control` | remote control 활성 daemon 관리 | 끄고 유지 |
+| `app`, `completion`, `update`, `doctor` | 데스크톱 앱, 셸 보완, 업데이트, 진단 | 없음 |
+| `sandbox` | Codex 제공 sandbox 안에서 명령 실행 | 없음 |
+| `debug` | 디버깅 도구 (`models`, `app-server`, `prompt-input`) | 진단용 |
+| `apply` | 마지막 diff를 `git apply` | 없음 |
+| `resume`, `fork`, `archive`, `unarchive`, `delete` | 세션 수명주기 | 없음 (adapter는 ephemeral thread 사용) |
+| `cloud` | Codex Cloud task 브라우징 | 없음 |
+| `exec-server` | standalone exec-server | 없음 |
+| `features` | feature flag 조회 (`list`, `enable`, `disable`) | 진단용 |
+
+hot path에서 쓰는 항목:
 
 | Command | Source | Chat runtime use |
 | --- | --- | --- |
-| `codex exec --json` | L1 | One-shot fallback, smoke tests, simple automation |
-| `codex exec resume <session>` | L1 | One-shot continuation fallback when app-server is unavailable |
-| `codex exec --output-schema <file>` | L1 | Strict final output fallback. Not preferred for chat UI hot path |
-| `codex exec --ephemeral` | L1 | Isolated one-shot runs without persisted session files |
-| `codex exec --ignore-user-config` | L1 | Deterministic context control for one-shot fallback |
-| `codex exec --ignore-rules` | L1 | Avoid user/project execpolicy drift when service requires strict isolation |
-| `codex app-server --listen stdio://` | L1 | Primary native session runtime |
-| `codex app-server generate-json-schema --experimental` | L1/L2 | Protocol discovery and version diff |
-| `codex app-server generate-ts` | L1 | Type-level protocol discovery |
-| `codex debug prompt-input` | L1 | Inspect model-visible prompt/context for deterministic tuning |
-| `codex debug models` | L1 | Model catalog discovery |
-| `codex features list` | L1 | Feature flag discovery |
+| `codex app-server --listen stdio://` | L1/L4 | native session runtime |
+| `codex app-server generate-json-schema --experimental` | L1/L2 | protocol 발견 및 버전 diff |
+| `codex exec --json` | L1 | one-shot fallback, smoke |
+| `codex exec --output-schema <file>` | L1 | strict final output fallback |
+| `codex exec --ephemeral` / `--ignore-user-config` / `--ignore-rules` | L1 | 결정적 context 제어 |
+| `codex debug prompt-input` / `debug models` / `features list` | L1 | 진단·발견 |
+
+`codex exec --sandbox`와 root `--sandbox`는 `read-only`, `workspace-write`, `danger-full-access`를 받는다(help의 possible values).
 
 ### Hidden CLI surface (absent from `--help`)
 
-codex hides part of its CLI with clap `hide = true`, so `--help` scraping cannot see it. The items below were enumerated from the pinned tag's source (`codex-rs/cli/src/main.rs`, `exec/src/cli.rs`, `app-server/src/main.rs`, `arg0/src/lib.rs`) and each was confirmed live on the installed `0.142.5` binary: hidden clap items still answer `--help` with exit 0, while a bogus flag exits 2 (negative control). Source level: L0 source/binary scan plus L4 `--help`/parse probe.
+codex는 clap `hide = true`로 일부 CLI를 감춘다. 아래 항목은 설치된 `0.145.0` binary에서 각각 확인했다. hidden 항목은 자기 `--help`를 exit 0으로 출력하고, bogus flag는 exit 2 + `unexpected argument`로 끝난다(negative control). Source level: L0 소스/binary scan + L4 `--help`/parse probe.
 
 Hidden subcommands:
 
 | Command | Purpose | Adapter relevance |
 | --- | --- | --- |
-| `codex execpolicy check` | Check execpolicy `.rules` files against a command | None on hot path |
-| `codex responses-api-proxy` | Internal Responses API proxy | None; internal |
-| `codex stdio-to-uds` | Relay stdio to a Unix domain socket | None; internal |
-| `codex debug trace-reduce` | Replay a rollout trace bundle to reduced state JSON | Diagnostic candidate only |
-| `codex debug clear-memories` | Reset local memory state | Not needed; adapter uses isolated `CODEX_HOME` |
-| `codex app-server generate-internal-json-schema` | Internal schema artifacts | None; `generate-json-schema` is the public one |
-| `codex app-server daemon pid-update-loop` | Detached updater loop | None; internal |
+| `codex execpolicy check` | execpolicy `.rules` 파일 검사 | hot path 없음 |
+| `codex responses-api-proxy` | 내부 Responses API proxy | 없음; 내부용 |
+| `codex stdio-to-uds` | stdio를 Unix domain socket으로 중계 | 없음; 내부용 |
+| `codex debug trace-reduce` | rollout trace 번들 재생 후 축약 상태 JSON 출력 | 진단 후보 |
+| `codex debug clear-memories` | 로컬 memory 상태 초기화 | 불필요; adapter는 격리된 `CODEX_HOME` 사용 |
+| `codex app-server generate-internal-json-schema` | 내부 schema artifact | 없음; public은 `generate-json-schema` |
+| `codex app-server daemon pid-update-loop` | 분리형 updater loop | 없음; 내부용 |
 
 Hidden flags:
 
 | Flag | Behavior | Adapter relevance |
 | --- | --- | --- |
-| `codex app-server --remote-control` | Enable remote control for this process without persisting | Keep off; widens control surface |
-| `codex login --experimental_issuer <URL>` / `--experimental_client-id <ID>` | OAuth issuer/client override | None unless custom OAuth endpoint is required |
-| `codex login --api-key` | Trap: exits with guidance to pipe via `--with-api-key` | Do not use |
-| `codex exec --full-auto` | Trap for the removed legacy flag | Do not use |
+| `codex app-server --remote-control` | 영속화 없이 이 프로세스에 remote control 활성 | 끄고 유지; 제어면 확대 |
+| `codex login --experimental_issuer <URL>` / `--experimental_client-id <ID>` | OAuth issuer/client 재정의 | custom OAuth endpoint가 필요할 때만 |
+| `codex login --api-key` | trap: `--with-api-key`로 파이프하라는 안내 후 종료 | 사용 금지 |
+| `codex exec --full-auto` | 제거된 legacy flag의 trap | 사용 금지 |
 
-arg0/argv dispatch (the binary becomes a different tool based on its invocation name; invisible to any help output):
+arg0/argv dispatch (binary가 호출 이름에 따라 다른 도구가 된다. 어떤 help에도 나오지 않으며, 현재 binary의 string scan에서 각 token 존재를 확인했다. L0):
 
 | Invocation | Dispatches to |
 | --- | --- |
-| argv0 `apply_patch` or `applypatch` | Standalone apply_patch CLI |
+| argv0 `apply_patch` 또는 `applypatch` | 독립 apply_patch CLI |
 | argv0 `codex-linux-sandbox` | Linux sandbox helper |
-| argv0 `codex-execve-wrapper` | Shell-escalation execve wrapper |
-| argv1 `--codex-run-as-apply-patch <PATCH>` | Apply one patch and exit |
+| argv0 `codex-execve-wrapper` | shell-escalation execve wrapper |
+| argv1 `--codex-run-as-apply-patch <PATCH>` | 패치 1건 적용 후 종료 |
 | argv1 `--codex-run-as-fs-helper` | exec-server filesystem helper |
 
-Risk: hidden items can be renamed or dropped with no visible `--help` diff. On every Codex version bump, re-run the source `hide = true` grep against the new tag and re-probe before trusting any hidden item. None of the hidden surface is on the adapter hot path today.
+Risk: hidden 항목은 `--help` diff 없이 rename/삭제될 수 있다. Codex 버전이 올라갈 때마다 새 tag의 `hide = true` grep과 재probe를 먼저 수행한다. 현재 hidden surface 중 adapter hot path에 있는 것은 없다.
 
-### App-server request methods
+### App-server protocol surface
 
-The following methods were discovered from generated schema on local Codex `0.142.5`. They must still be covered by runtime probes before production use. The full generated method surface for the current version (including newer `thread/goal/*`, `thread/rollback`, `thread/backgroundTerminals/*`, `review/start`, `skills/*`, `hooks/*`, `plugin/*`, and `remoteControl/*` groups that are outside the chat hot path) is in `artifacts/runtime-capability-catalog/latest.json`.
+생성 schema 기준 현재 method 수는 209개다.
+
+| Category | Count | 비고 |
+| --- | ---: | --- |
+| ClientRequest | 126 | client → server 요청 |
+| ClientNotification | 1 | `initialized` |
+| ServerRequest | 12 | server → client 요청 (승인, tool call, form 등) |
+| ServerNotification | 70 | server → client 알림 |
+
+전체 목록은 `artifacts/runtime-capability-catalog/latest.json`의 `codex.schema.methodEnums`에 있다. 주요 그룹:
 
 | Group | Methods |
 | --- | --- |
-| Session/thread | `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unarchive`, `thread/unsubscribe`, `thread/read`, `thread/list`, `thread/search`, `thread/loaded/list` |
-| Turn control | `turn/start`, `turn/interrupt`, `turn/steer`, `thread/turns/list`, `thread/turns/items/list` |
-| Context and settings | `thread/settings/update`, `thread/metadata/update`, `thread/name/set`, `thread/memoryMode/set`, `thread/compact/start`, `thread/inject_items` |
+| Session/thread | `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unarchive`, `thread/delete`, `thread/unsubscribe`, `thread/read`, `thread/list`, `thread/search`, `thread/searchOccurrences`, `thread/loaded/list` |
+| Turn control | `turn/start`, `turn/interrupt`, `turn/steer`, `thread/turns/list`, `thread/items/list`, `thread/rollback` |
+| Context and settings | `thread/settings/update`, `thread/metadata/update`, `thread/name/set`, `thread/memoryMode/set`, `thread/compact/start`, `thread/inject_items`, `thread/goal/set`, `thread/goal/get`, `thread/goal/clear` |
 | Filesystem | `fs/readFile`, `fs/writeFile`, `fs/readDirectory`, `fs/createDirectory`, `fs/copy`, `fs/remove`, `fs/getMetadata`, `fs/watch`, `fs/unwatch` |
-| Process/terminal | `process/spawn`, `process/writeStdin`, `process/resizePty`, `process/kill`, `command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate` |
-| Tools/MCP | `mcpServer/tool/call`, `mcpServer/resource/read`, `mcpServer/oauth/login`, `mcpServerStatus/list` |
-| Dynamic tools | `item/tool/call` server request, `item/tool/requestUserInput` server request |
-| Permissions | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `applyPatchApproval`, `execCommandApproval` |
-| Models/features | `model/list`, `modelProvider/capabilities/read`, `experimentalFeature/list`, `experimentalFeature/enablement/set` |
-| Realtime | `thread/realtime/start`, `thread/realtime/appendText`, `thread/realtime/appendAudio`, `thread/realtime/stop`, `thread/realtime/listVoices` |
+| Process/terminal | `process/spawn`, `process/writeStdin`, `process/resizePty`, `process/kill`, `command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`, `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, `thread/backgroundTerminals/clean` |
+| Tools/MCP | `mcpServer/tool/call`, `mcpServer/resource/read`, `mcpServer/oauth/login`, `mcpServerStatus/list`, `skills/list`, `hooks/list` |
+| Server requests | `item/tool/call`, `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `applyPatchApproval`, `execCommandApproval`, `mcpServer/elicitation/request`, `attestation/generate`, `account/chatgptAuthTokens/refresh`, `currentTime/read`, `openai/form` |
+| Models/features | `model/list`, `modelProvider/capabilities/read`, `experimentalFeature/list`, `experimentalFeature/enablement/set`, `collaborationMode/list`, `permissionProfile/list` |
+| Account/config | `account/read`, `account/usage/read`, `account/rateLimits/read`, `config/read`, `config/value/write`, `config/batchWrite`, `configRequirements/read` |
+| Environments | `environment/add`, `environment/info`, `environment/status` |
+| Realtime | `thread/realtime/start`, `thread/realtime/appendText`, `thread/realtime/appendAudio`, `thread/realtime/appendSpeech`, `thread/realtime/stop`, `thread/realtime/listVoices` |
 
-### App-server notification methods
+Notification 주요 그룹:
 
 | Group | Methods |
 | --- | --- |
@@ -193,102 +243,147 @@ The following methods were discovered from generated schema on local Codex `0.14
 | Tool/process stream | `item/started`, `item/mcpToolCall/progress`, `item/commandExecution/outputDelta`, `item/commandExecution/terminalInteraction`, `command/exec/outputDelta`, `process/outputDelta`, `process/exited` |
 | File changes | `item/fileChange/outputDelta`, `item/fileChange/patchUpdated`, `turn/diff/updated`, `fs/changed` |
 | Usage | `thread/tokenUsage/updated` |
-| Thread lifecycle | `thread/started`, `thread/status/changed`, `thread/closed`, `thread/archived`, `thread/unarchived`, `thread/compacted`, `thread/name/updated` |
-| Realtime | `thread/realtime/started`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/closed`, `thread/realtime/error` |
-| Runtime/system | `error`, `warning`, `guardianWarning`, `model/rerouted`, `model/verification`, `mcpServer/startupStatus/updated`, `serverRequest/resolved` |
+| Thread lifecycle | `thread/started`, `thread/status/changed`, `thread/closed`, `thread/archived`, `thread/unarchived`, `thread/deleted`, `thread/compacted`, `thread/name/updated`, `thread/settings/updated`, `thread/environment/connected`, `thread/environment/disconnected` |
+| Hooks/skills/plugins | `hook/started`, `hook/completed`, `skills/changed`, `app/list/updated` |
+| Realtime | `thread/realtime/started`, `thread/realtime/transcript/delta`, `thread/realtime/transcript/done`, `thread/realtime/outputAudio/delta`, `thread/realtime/itemAdded`, `thread/realtime/sdp`, `thread/realtime/closed`, `thread/realtime/error` |
+| Runtime/system | `error`, `warning`, `guardianWarning`, `configWarning`, `deprecationNotice`, `model/rerouted`, `model/verification`, `model/safetyBuffering/updated`, `mcpServer/startupStatus/updated`, `serverRequest/resolved`, `turn/moderationMetadata` |
+
+### App-server 요청 파라미터 계약
+
+adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 schema, `codex app-server generate-json-schema --experimental`).
+
+| Request | Required | Optional |
+| --- | --- | --- |
+| `thread/start` | 없음 | `cwd`, `approvalPolicy`, `approvalsReviewer`, `sandbox`, `ephemeral`, `baseInstructions`, `developerInstructions`, `personality`, `config`, `model`, `modelProvider`, `serviceName`, `serviceTier`, `threadSource`, `sessionStartSource` |
+| `turn/start` | `threadId`, `input` | `cwd`, `model`, `effort`, `summary`, `personality`, `outputSchema`, `approvalPolicy`, `approvalsReviewer`, `sandboxPolicy`, `serviceTier`, `clientUserMessageId` |
+
+값 도메인:
+
+| Field | Domain |
+| --- | --- |
+| `sandbox` (`SandboxMode`) | `read-only`, `workspace-write`, `danger-full-access` |
+| `approvalPolicy` (`AskForApproval`) | `untrusted`, `on-request`, `never`, 또는 `granular` 객체 |
+| `personality` | `none`, `friendly`, `pragmatic` |
+| `effort` (`ReasoningEffort`) | 모델이 광고하는 비어있지 않은 문자열 (enum 아님) |
+
+중요: app-server는 **선언되지 않은 파라미터를 조용히 무시한다**(bogus 파라미터를 넣은 negative control로 확인). 따라서 스키마에 없는 필드를 보내도 오류가 나지 않고, 설정이 동작하는 것처럼 보이지만 실제로는 아무 일도 하지 않는다. adapter는 선언된 필드만 전송한다.
 
 ### Codex design implications
 
-- Use app-server for native chat sessions, not `exec --json`, when the service needs low-latency streaming, interrupt, tool events, or multi-turn continuity.
-- Use `generate-json-schema --experimental` during package build or explicit probe to detect protocol drift.
-- Prefer scratch workspace roots and explicit `runtimeWorkspaceRoots` for service chat UI sessions.
-- Keep direct provider credentials out of child env.
-- Treat realtime and filesystem/process methods as available candidates only after explicit service permission policy and probes.
+- 서비스가 저지연 streaming, interrupt, tool event, 멀티턴 연속성을 필요로 하면 `exec --json`이 아니라 app-server를 쓴다.
+- package build나 명시적 probe 시 `generate-json-schema --experimental`로 protocol drift를 감지한다.
+- `thread/start`·`turn/start`에는 schema에 선언된 필드만 보낸다. 미선언 필드는 무시되므로 있으나 마나이며, 읽는 사람에게는 동작하는 설정으로 오해된다.
+- workspace 격리는 요청 파라미터가 아니라 `CODEX_HOME`과 `cwd` 격리로 얻는다.
+- 자식 프로세스 env에서 직접 provider 자격증명을 제거한다.
+- realtime, filesystem/process method는 명시적 권한 정책과 probe 이후에만 후보로 취급한다.
 
 ## Claude Code capability list
 
+### CLI command surface
+
+`--help` 재귀 walk 기준으로 49개 명령과 200개 option이 열거된다. root subcommand는 `agents`, `auth`, `auto-mode`, `doctor`, `gateway`, `install`, `mcp`, `plugin`, `project`, `setup-token`, `ultrareview`, `update` 12개이며, 여기에 아래 hidden root command가 더해진다.
+
 ### CLI flags from local help
+
+root command는 58개 option 항목(장문 flag 61개)을 광고한다. 그룹별 요약:
 
 | Group | Flags | Chat runtime use |
 | --- | --- | --- |
-| Non-interactive | `-p`, `--print`, `--output-format text/json/stream-json`, `--input-format text/stream-json`, `--verbose` | Primary automation and streaming path |
-| Streaming | `--include-partial-messages`, `--include-hook-events`, `--replay-user-messages` | Text deltas, hook visibility, input acknowledgment |
-| Session | `--session-id`, `--resume`, `--continue`, `--fork-session`, `--no-session-persistence`, `--name` | Service session lifecycle |
-| Model/effort | `--model`, `--fallback-model`, `--effort`, `--max-budget-usd` | Per-session quality/cost policy. `--effort` accepts `low/medium/high/xhigh/max`; an unknown value is warned and ignored (default effort is used), not rejected, so the proxy validates effort upstream |
-| Output contract | `--json-schema` | Strict structured final output fallback |
-| Prompt/context | `--system-prompt`, `--append-system-prompt`, `--exclude-dynamic-system-prompt-sections`, `--setting-sources`, `--settings` | Service-specific behavior and deterministic context |
-| Tool control | `--tools`, `--allowedTools`, `--allowed-tools`, `--disallowedTools`, `--disallowed-tools`, `--mcp-config`, `--strict-mcp-config`, `--disable-slash-commands` | Service tool bridge and skill/slash-command isolation |
-| Permission | `--permission-mode` (`acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`), `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` | Scratch-only execution policy |
-| Workspace | `--add-dir`, `--worktree`, `--tmux` | Filesystem access control. `--worktree`/`--tmux` are not hot-path chat defaults |
-| Integrations | `--chrome`, `--no-chrome`, `--ide`, `--plugin-dir`, `--plugin-url`, `--agents`, `--agent` | Usually disabled unless service opts in |
-| Isolation/troubleshooting | `--bare`, `--safe-mode` | Neither is a local OAuth default: `--bare` does not read OAuth/keychain auth, `--safe-mode` disables all customizations |
-| Other surface | `--betas`, `--file`, `--from-pr`, `--bg`/`--background`, `--brief`, `--prompt-suggestions`, `--remote-control`, `--remote-control-session-name-prefix`, `--ax-screen-reader`, `--debug-file` | Not hot-path chat defaults. `--betas` applies to API-key users only, so it is inert under OAuth; `--prompt-suggestions` accepts `true/false/1/0/yes/no/on/off` |
+| Non-interactive | `-p`, `--print`, `--output-format`, `--input-format`, `--verbose` | 기본 자동화·streaming 경로 |
+| Streaming | `--include-partial-messages`, `--include-hook-events`, `--replay-user-messages`, `--forward-subagent-text` | text delta, hook 가시성, 입력 확인, subagent text 전달 |
+| Session | `--session-id`, `--resume`, `--continue`, `--fork-session`, `--no-session-persistence`, `--name` | 서비스 세션 수명주기 |
+| Model/effort | `--model`, `--fallback-model`, `--effort`, `--max-budget-usd` | 세션 품질·비용 정책 |
+| Output contract | `--json-schema` | strict 구조화 최종 출력 |
+| Prompt/context | `--system-prompt`, `--append-system-prompt`, `--exclude-dynamic-system-prompt-sections`, `--setting-sources`, `--settings` | 서비스 고유 동작과 결정적 context |
+| Tool control | `--tools`, `--allowedTools`, `--allowed-tools`, `--disallowedTools`, `--disallowed-tools`, `--mcp-config`, `--strict-mcp-config`, `--disable-slash-commands` | 서비스 tool bridge와 skill/slash 격리 |
+| Permission | `--permission-mode`, `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` | scratch 전용 실행 정책 |
+| Workspace | `--add-dir`, `--worktree`, `--tmux` | 파일 접근 제어. hot path 기본값 아님 |
+| Integrations | `--chrome`, `--no-chrome`, `--ide`, `--plugin-dir`, `--plugin-url`, `--agents`, `--agent` | 서비스가 명시적으로 켤 때만 |
+| Isolation/troubleshooting | `--bare`, `--safe-mode` | 둘 다 local OAuth 기본값 아님: `--bare`는 OAuth/keychain 인증을 읽지 않고, `--safe-mode`는 모든 커스터마이즈를 끈다 |
+| Other surface | `--betas`, `--file`, `--from-pr`, `--bg`/`--background`, `--brief`, `--prompt-suggestions`, `--remote-control`, `--remote-control-session-name-prefix`, `--ax-screen-reader`, `--debug`, `--debug-file` | hot path 기본값 아님. `--betas`는 API key 사용자에게만 적용되어 OAuth에서는 무효 |
+
+측정된 값 도메인:
+
+| Flag | Domain | 권위 |
+| --- | --- | --- |
+| `--output-format` | `text`, `json`, `stream-json` | L1 help choices |
+| `--input-format` | `text`, `stream-json` | L1 help choices |
+| `--permission-mode` | `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan` | L1 help choices |
+| `--prompt-suggestions` | `true`, `false`, `1`, `0`, `yes`, `no`, `on`, `off` | L1 help choices |
+| `--effort` | `low`, `medium`, `high`, `xhigh`, `max` | L4 probe. 알 수 없는 값은 **거부되지 않고 경고 후 기본값으로 무시**되므로 proxy가 상류에서 검증해야 한다 |
+| `--setting-sources` | `user`, `project`, `local` | L4 probe |
+| `--max-budget-usd` | 0보다 큰 수 | L4 probe |
+| `--session-id` | 유효한 UUID | L4 probe |
 
 ### Adapter-critical flags hidden from `--help`
 
-These flags are registered in the installed binary but marked `hideHelp()`, so they do not appear in `claude --help`. The proxy's Anthropic parity path (`output_config`/`thinking`) depends on them, so they are tracked here even though help-scraping cannot see them. Source level is L0 binary scan plus an L4 parse probe: passing an invalid value makes the CLI reject it with the allowed choices, which confirms both that the option exists and what it accepts.
+`hideHelp()`로 등록되어 `claude --help`에 나오지 않지만 proxy의 Anthropic parity 경로(`output_config`/`thinking`)가 의존하는 flag다. 권위는 L4 parse probe이며, 잘못된 값을 주면 CLI가 허용값과 함께 거부한다.
 
 | Flag | Accepts | Adapter use |
 | --- | --- | --- |
-| `--thinking` | `enabled`, `adaptive`, `disabled` | Anthropic `thinking.type` on the claude runtime |
-| `--thinking-display` | `summarized`, `omitted` | Anthropic `thinking.display` visibility |
-| `--task-budget` | positive integer tokens | Anthropic `output_config.task_budget.total` |
+| `--thinking` | `enabled`, `adaptive`, `disabled` | Anthropic `thinking.type` |
+| `--thinking-display` | `summarized`, `omitted` | Anthropic `thinking.display` |
+| `--task-budget` | 양의 정수 토큰 | Anthropic `output_config.task_budget.total` |
 
-Risk: because these are hidden, a future CLI could rename or drop them with no visible `--help` diff. When bumping the pinned Claude Code version, re-run `pnpm catalog:runtime` (binary scan) plus the invalid-value parse probe before trusting the parity path. `--max-thinking-tokens` still exists but is deprecated in favor of `--thinking`; the adapter does not use it.
+Risk: hidden이므로 `--help` diff 없이 rename/삭제될 수 있다. Claude Code 버전을 올릴 때마다 `pnpm catalog:runtime`의 parse probe로 세 flag의 등록을 확인한 뒤 parity 경로를 배포한다.
 
-### Other hidden CLI surface (binary scan + probe)
+### Other hidden CLI surface (parse probe 기준)
 
-Enumerated on `2.1.201` with the hidden-surface probes from the investigation-commands section. The hidden command set and main `--help` are byte-identical between `2.1.200` and `2.1.201`.
-
-Hidden subcommands (L4: each prints its own usage):
+Hidden subcommands (L4: 각자 자기 usage를 출력하며, 없는 이름은 main help로 떨어진다):
 
 | Command | Purpose | Adapter relevance |
 | --- | --- | --- |
-| `claude remote-control` | Control local sessions from claude.ai/code or the mobile app | Keep off; widens control surface |
-| `claude daemon [run\|status\|logs\|uninstall\|stop]` | Background session supervisor | None on hot path |
-| `claude attach <id>` | Attach terminal to a background session | None on hot path |
-| `claude logs <id>` | Print a background session's recent output | Diagnostic candidate only |
-| `claude stop <id>` (alias `kill`) | Stop a background session | None on hot path |
+| `claude remote-control` | claude.ai/code·모바일 앱에서 로컬 세션 제어 | 끄고 유지; 제어면 확대 |
+| `claude daemon` | 백그라운드 세션 supervisor | hot path 없음 |
+| `claude attach <id>` | 백그라운드 세션에 터미널 연결 | hot path 없음 |
+| `claude logs <id>` | 백그라운드 세션 최근 출력 | 진단 후보 |
+| `claude stop <id>` (alias `kill`) | 백그라운드 세션 종료 | hot path 없음 |
 
-Hidden flags confirmed by invalid-value probe (L4), beyond the adapter-critical set above:
+주의: `claude remote-control`을 인자 없이 실행하면 즉시 claude.ai로 원격 제어 세션을 연다. 조사 목적이면 반드시 `--help`만 붙인다.
+
+parse probe로 등록이 확인된 그 밖의 hidden flag:
 
 | Flag | Accepts | Adapter relevance |
 | --- | --- | --- |
-| `--teammate-mode` | `auto`, `tmux`, `iterm2`, `in-process` | None; agent-team UX |
+| `--teammate-mode` | `auto`, `tmux`, `iterm2`, `in-process` | 없음; agent-team UX |
+| `--max-thinking-tokens` | 수 | 없음; `--thinking`으로 대체됨 |
+| `--managed-settings`, `--parent-session-id`, `--plan-mode-instructions`, `--prefill`, `--prefill-b64` | 값 flag | 없음; drift 추적용 |
+| `--system-prompt-file`, `--append-system-prompt-file` | 파일 경로 | 없음; adapter는 인라인 `--system-prompt` 사용 |
+| `--resume-session-at` | `--resume`와 함께만 유효 | 없음 |
+| `--sdk-url` | URL (Remote Control 전용) | 없음 |
 
-L0-only candidates: the option-spec extraction yields ~85 more registered value flags absent from every collected help, including `--system-prompt-file`, `--append-system-prompt-file`, `--plan-mode-instructions`, `--max-cost-usd`, `--prefill`/`--prefill-b64`, `--parent-session-id`, `--resume-session-at`, `--sdk-url`, `--managed-settings`, and an internal eval/storybook harness family (`--storybook-config`, `--storybook-static`, `--judge-model`, `--runs`, ...). These cannot be positively confirmed at top level because the CLI silently tolerates unknown and boolean-mismatched options, and some belong to subcommands; treat them as L0 candidates and add an L4 behavior probe before any adapter use.
+binary string scan은 위 목록보다 많은 option 등록 문자열을 뱉지만, 그중 일부는 현재 parser가 `unknown option`으로 거부한다(root와 `ultrareview` 양쪽에서 확인). 문자열이 남아 있다는 이유로 CLI surface에 넣지 않는다. 거부된 항목의 목록은 report의 `Claude Hidden Flag Parse Probe` 표에 있다.
 
-### Official-docs items that need behavior probe
+### Official-docs items (parse probe로 확인됨)
 
-As of `claude 2.1.201` these are all registered in the installed binary (`hideHelp()`, so absent from `--help` output); the remaining work is behavior verification, not presence.
-
-| Item | Source | Required probe |
+| Item | Parse probe | 남은 확인 |
 | --- | --- | --- |
-| `--max-turns` | Official CLI reference | Registered and accepted; verify early-exit behavior with `-p` |
-| `--permission-prompt-tool` | Official CLI reference | Registered and accepted; verify MCP permission prompt contract and stream-json events |
-| `--maintenance` | Official CLI reference | Registered; verify availability and whether it affects startup latency |
+| `--max-turns` | 값 flag로 등록 (수를 요구) | `-p`에서 조기 종료 동작 |
+| `--permission-prompt-tool` | 값 flag로 등록 | MCP permission prompt 계약과 stream-json 이벤트 |
+| `--maintenance` | boolean으로 등록 | 가용성과 시작 지연 영향 |
+| `--prompt-suggestions` | 등록 (help가 choices 노출) | 이벤트 shape과 서비스 노출 여부 |
 
 ### MCP and service tools
 
-Claude Code supports service tool connection through MCP configuration and `allowedTools`.
+Claude Code는 MCP 설정과 `allowedTools`로 서비스 tool 연결을 지원한다.
 
 | Capability | Source | Design implication |
 | --- | --- | --- |
-| Stdio MCP servers | L1/L3 | Good fit for local service tool bridge |
-| HTTP/SSE/streamable HTTP MCP | L3 | Useful for remote service APIs, but requires explicit credential policy |
-| `allowedTools` wildcard | L1/L3 | Prefer this over broad bypass permissions |
-| `--strict-mcp-config` | L1 | Prevent project/user MCP servers from leaking into service chat |
-| `--tools ""` | L1 | Disable built-in tools when service only wants custom tools |
+| Stdio MCP servers | L1/L3 | 로컬 서비스 tool bridge에 적합 |
+| HTTP/SSE/streamable HTTP MCP | L3 | 원격 서비스 API에 유용하나 명시적 자격증명 정책 필요 |
+| `allowedTools` wildcard | L1/L3 | 광범위한 bypass permission보다 우선 |
+| `--strict-mcp-config` | L1 | project/user MCP 서버가 서비스 chat에 새는 것을 차단 |
+| `--tools ""` | L1 | 서비스가 custom tool만 원할 때 내장 tool 비활성화 |
 
 ### Claude design implications
 
-- Use persistent `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages` for native chat when attachments and per-turn-only flags do not force one-shot mode.
-- Do not use `--bare` by default for local OAuth because it bypasses OAuth/keychain auth lookup.
-- Use `--mcp-config` plus `--strict-mcp-config` and explicit `--allowedTools` for service-provided tools.
-- Use `--json-schema` only for strict final output cases; default chat UI should prefer text stream plus tool/action events.
-- Validate per-request tuning (`--effort`, `--thinking`, `--task-budget`) in the proxy before forwarding: `--effort` silently falls back on an unknown value, and the thinking/task-budget flags are hidden, so upstream validation is the only place a bad value is caught deterministically.
-- Treat the hidden parity flags as a version-pinned contract: on every Claude Code version bump, re-run `pnpm catalog:runtime` and the invalid-value parse probe to confirm `--thinking`/`--thinking-display`/`--task-budget` still exist before shipping.
-- Keep `ANTHROPIC_API_KEY` and related direct provider variables out of the child process env unless the selected mode is explicitly direct API, which native local chat should not support.
+- 첨부와 per-turn flag가 one-shot을 강제하지 않는 한, native chat은 지속 프로세스 `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages`를 쓴다.
+- local OAuth에서 `--bare`를 기본값으로 쓰지 않는다. OAuth/keychain 인증 조회를 우회한다.
+- 서비스 제공 tool에는 `--mcp-config` + `--strict-mcp-config` + 명시적 `--allowedTools`를 쓴다.
+- `--json-schema`는 strict 최종 출력에만 쓰고, 기본 chat UI는 text stream + tool/action 이벤트를 우선한다.
+- per-request tuning(`--effort`, `--thinking`, `--task-budget`)은 proxy에서 먼저 검증한다. `--effort`는 잘못된 값을 조용히 무시하고 hidden flag는 help에 없으므로, 상류 검증만이 결정적으로 잡아내는 지점이다.
+- hidden parity flag는 버전 고정 계약으로 취급한다. Claude Code 버전을 올릴 때마다 `pnpm catalog:runtime`의 parse probe를 재실행한다.
+- native chat에서는 `ANTHROPIC_API_KEY` 등 직접 provider 변수를 자식 env에서 제거한다.
 
 ## Service chat runtime output list
 
