@@ -119,8 +119,6 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       const response = await this.send('turn/start', {
         threadId: this.threadId,
         cwd: this.cwd,
-        runtimeWorkspaceRoots: [this.cwd],
-        environments: [],
         input: preparedInput.input,
         model: this.model,
         effort: this.reasoningEffort,
@@ -226,16 +224,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       },
     });
     this.notify('initialized', {});
+    // Only protocol-declared `thread/start` fields are sent; see the same note in
+    // the proxy backend. Raw CLI events reach the caller because every
+    // notification is forwarded verbatim, not because of a thread/start flag.
     const thread = await this.send('thread/start', {
       cwd: this.cwd,
-      runtimeWorkspaceRoots: [this.cwd],
       approvalPolicy: 'never',
       sandbox: 'read-only',
-      environments: [],
-      dynamicTools: [],
       ephemeral: true,
-      experimentalRawEvents: true,
-      persistExtendedHistory: false,
       config: {
         model_reasoning_effort: this.reasoningEffort,
         model_reasoning_summary: 'none',
