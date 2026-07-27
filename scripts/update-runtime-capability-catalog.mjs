@@ -348,6 +348,7 @@ async function validateCatalog(data) {
 
   const codexCommands = await validateDocumentedCommands(data.codex, codexSection, 'codex');
   const claudeCommands = await validateDocumentedCommands(data.claude, claudeSection, 'claude');
+  const codexFlags = await validateDocumentedFlagUses(data.codex, codexSection, 'codex');
 
   const codexDomains = validateDocumentedOptionDomains(data.codex, codexSection);
   const claudeDomains = validateDocumentedOptionDomains(data.claude, claudeSection);
@@ -356,6 +357,7 @@ async function validateCatalog(data) {
 
   const staleCount = codexCommands.absent.length
     + claudeCommands.absent.length
+    + codexFlags.absent.length
     + optionDomains.length
     + versionDrift.length
     + documentedCodexMethodMissingFromSchema.length
@@ -377,6 +379,9 @@ async function validateCatalog(data) {
   }
   if ((probe?.indeterminate?.length ?? 0) > 0) {
     inconclusiveReasons.push(`indeterminate flag probes: ${probe.indeterminate.join(', ')}`);
+  }
+  if (codexFlags.indeterminate.length > 0) {
+    inconclusiveReasons.push(`indeterminate codex option probes: ${codexFlags.indeterminate.join(', ')}`);
   }
   if (unverifiedDomains.length > 0) {
     inconclusiveReasons.push(`documented value domains not verified: ${unverifiedDomains.map((entry) => `${entry.runtime} ${entry.flag} (${entry.reason})`).join(', ')}`);
@@ -407,6 +412,7 @@ async function validateCatalog(data) {
       codex: codexCommands,
       claude: claudeCommands,
     },
+    codexOptionUses: codexFlags,
     optionDomainMismatches: optionDomains,
     optionDomainsUnverified: unverifiedDomains,
     codex: {
@@ -506,6 +512,69 @@ function documentedCommandPaths(section, binaryName) {
   return [...paths].sort();
 }
 
+// Documented options need a presence authority too. The claude flags have one
+// through help plus the parse probe; codex options had none, so removing a
+// documented option such as `codex exec --ephemeral` left every stale term at
+// zero. Each documented use is checked in the command it is documented under,
+// since an option only exists relative to its command.
+async function validateDocumentedFlagUses(runtime, section, binaryName) {
+  const uses = documentedFlagUses(section, binaryName);
+  const tree = runtime.commandTree;
+  if (!runtime.binary || !tree || tree.skipped) {
+    return { authority: 'not_collected', count: uses.length, visible: [], hiddenConfirmed: [], absent: [], indeterminate: [] };
+  }
+  const optionsOf = new Map((tree.commands ?? []).map((entry) => [
+    entry.command,
+    new Set((entry.options ?? []).flatMap((option) => option.flags)),
+  ]));
+  const visible = [];
+  const hiddenConfirmed = [];
+  const absent = [];
+  const indeterminate = [];
+  for (const use of uses) {
+    const key = use.command || '(root)';
+    const label = `${use.command} ${use.flag}`.trim();
+    if (optionsOf.get(key)?.has(use.flag)) {
+      visible.push(label);
+      continue;
+    }
+    const verdict = await probeFlagInCommand(runtime.binary, use.command, use.flag);
+    if (verdict === 'unregistered') absent.push(label);
+    else if (verdict === 'indeterminate') indeterminate.push(label);
+    else hiddenConfirmed.push(label);
+  }
+  return { authority: 'command_tree_plus_probe', count: uses.length, visible, hiddenConfirmed, absent, indeterminate };
+}
+
+function documentedFlagUses(section, binaryName) {
+  const uses = new Map();
+  for (const raw of uniqueCapture(section, new RegExp(`\`${binaryName} ([^\`]+)\``, 'g'))) {
+    const command = [];
+    const flags = [];
+    for (const token of raw.trim().split(/\s+/)) {
+      if (token.startsWith('--')) {
+        const name = token.split('=')[0];
+        if (/^--[A-Za-z0-9][A-Za-z0-9-]*$/.test(name)) flags.push(name);
+        continue;
+      }
+      if (flags.length === 0 && /^[A-Za-z][A-Za-z0-9-]*$/.test(token)) command.push(token);
+    }
+    for (const flag of flags) {
+      uses.set(`${command.join(' ')} ${flag}`, { command: command.join(' '), flag });
+    }
+  }
+  return [...uses.values()];
+}
+
+async function probeFlagInCommand(binary, command, flag) {
+  const result = await run(binary, [...(command ? command.split(' ') : []), flag, FLAG_PROBE_CONTROL], {
+    timeoutMs: 12_000,
+    maxBuffer: 4_000_000,
+    cwd: await probeScratchDir(),
+  });
+  return classifyFlagProbe(`${result.stdout ?? ''}\n${result.stderr ?? ''}`, flag, result);
+}
+
 // The catalog states value domains for options. Collected evidence — help
 // choice lists and probe replies — is compared against them, so a CLI that
 // changes an accepted value set makes the catalog stale instead of quietly
@@ -520,12 +589,17 @@ function validateDocumentedOptionDomains(runtime, section) {
   for (const [flag, documented] of documentedOptionDomains(section)) {
     const collected = observed.get(flag);
     if (!collected || collected.size === 0) {
-      // A documented domain with no evidence is only acceptable when nothing
-      // tried to read it. If the probe ran and came back empty, or was skipped
-      // entirely, the catalog's claim went unchecked and the run must say so.
-      if (probe.skipped || unresolved.has(flag)) {
-        unverified.push({ runtime: runtime.name, flag, reason: probe.skipped ? 'probe skipped' : 'probe returned no domain' });
-      }
+      // A documented domain with no evidence went unchecked, whatever the
+      // reason. Restricting this to probe targets would let a flag whose help
+      // stopped enumerating its choices keep its old documented domain: no
+      // collected values, not a probe target, and therefore silently accepted.
+      unverified.push({
+        runtime: runtime.name,
+        flag,
+        reason: probe.skipped
+          ? 'probe skipped'
+          : (unresolved.has(flag) ? 'probe returned no domain' : 'no help choices and not probed'),
+      });
       continue;
     }
     const missing = [...documented].filter((value) => !collected.has(value));
@@ -587,8 +661,12 @@ function normalizeDomainValue(value) {
   return String(value).trim().replace(/^["'`]+|["'`.]+$/g, '').toLowerCase();
 }
 
-// First-column cells of tables that inventory commands. Scoped by header so
-// value tables (`| Field | Domain |`) and flag tables cannot contribute names.
+// Name and description cells of tables that inventory commands. Scoped by
+// header so value tables (`| Field | Domain |`) and flag tables cannot
+// contribute names. The description cell counts because inventory rows name
+// their children there (`app-server daemon`, `auth login`); reading only the
+// first cell would leave those documented commands unchecked while reporting
+// the live ones as undocumented forever.
 function commandInventoryCells(section) {
   const cells = [];
   let inInventory = false;
@@ -597,13 +675,16 @@ function commandInventoryCells(section) {
       inInventory = false;
       continue;
     }
-    const first = (line.split('|')[1] ?? '').trim();
+    const columns = line.split('|').slice(1, -1).map((value) => value.trim());
+    const first = columns[0] ?? '';
     if (/^(root subcommand|command)$/i.test(first)) {
       inInventory = true;
       continue;
     }
     if (/^:?-{2,}:?$/.test(first)) continue;
-    if (inInventory && first) cells.push(first);
+    if (!inInventory) continue;
+    if (first) cells.push(first);
+    if (columns[1]) cells.push(columns[1]);
   }
   return cells;
 }
@@ -1284,6 +1365,7 @@ Verdict: \`${data.catalogValidity?.verdict ?? 'not_checked'}\`
 | Claude help flags undocumented in catalog | ${data.catalogValidity?.claude?.helpFlagsUndocumentedInCatalog?.length ?? 0} |
 | Documented commands the CLI no longer has | ${(data.catalogValidity?.commands?.codex?.absent?.length ?? 0) + (data.catalogValidity?.commands?.claude?.absent?.length ?? 0)} |
 | Documented option domains that disagree with the CLI | ${data.catalogValidity?.optionDomainMismatches?.length ?? 0} |
+| Documented codex options the CLI no longer accepts | ${data.catalogValidity?.codexOptionUses?.absent?.length ?? 0} |
 | Commands present but undocumented | ${(data.catalogValidity?.commands?.codex?.undocumented?.length ?? 0) + (data.catalogValidity?.commands?.claude?.undocumented?.length ?? 0)} |
 
 ### Documented Commands

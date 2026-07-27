@@ -145,21 +145,21 @@ Useful official references:
 
 | Root subcommand | 설명 | Adapter 관련성 |
 | --- | --- | --- |
-| `exec` | non-interactive 실행 (`resume`, `review` 하위 명령 보유) | one-shot fallback |
-| `app-server` | app server 및 관련 도구 (`daemon`, `proxy`, `generate-ts`, `generate-json-schema`) | **primary hot path** |
+| `exec` | non-interactive 실행 (`exec resume`, `exec review` 하위 명령 보유) | one-shot fallback |
+| `app-server` | app server 및 관련 도구 (`app-server daemon`, `app-server proxy`, `app-server generate-ts`, `app-server generate-json-schema`) | **primary hot path** |
 | `review` | non-interactive 코드 리뷰 | 없음 |
 | `login` / `logout` | 인증 관리 (`login status`) | OAuth 세션 전제 |
-| `mcp` / `mcp-server` | 외부 MCP 서버 관리 / Codex를 MCP 서버로 실행 | 서비스 tool bridge 후보 |
-| `plugin` | plugin 관리 (`add`, `list`, `remove`, `marketplace`) | 없음 |
-| `remote-control` | remote control 활성 daemon 관리 | 끄고 유지 |
+| `mcp` / `mcp-server` | 외부 MCP 서버 관리 (`mcp list`, `mcp get`, `mcp add`, `mcp remove`, `mcp login`, `mcp logout`) / Codex를 MCP 서버로 실행 | 서비스 tool bridge 후보 |
+| `plugin` | plugin 관리 (`plugin add`, `plugin list`, `plugin remove`, `plugin marketplace`) | 없음 |
+| `remote-control` | remote control 활성 daemon 관리 (`remote-control start`, `remote-control stop`, `remote-control pair`) | 끄고 유지 |
 | `app`, `completion`, `update`, `doctor` | 데스크톱 앱, 셸 보완, 업데이트, 진단 | 없음 |
 | `sandbox` | Codex 제공 sandbox 안에서 명령 실행 | 없음 |
-| `debug` | 디버깅 도구 (`models`, `app-server`, `prompt-input`) | 진단용 |
-| `apply` | 마지막 diff를 `git apply` | 없음 |
+| `debug` | 디버깅 도구 (`debug models`, `debug app-server`, `debug prompt-input`) | 진단용 |
+| `apply` | 마지막 diff를 git apply로 적용 | 없음 |
 | `resume`, `fork`, `archive`, `unarchive`, `delete` | 세션 수명주기 | 없음 (adapter는 ephemeral thread 사용) |
-| `cloud` | Codex Cloud task 브라우징 | 없음 |
+| `cloud` | Codex Cloud task 브라우징 (`cloud exec`, `cloud list`, `cloud status`, `cloud apply`, `cloud diff`) | 없음 |
 | `exec-server` | standalone exec-server | 없음 |
-| `features` | feature flag 조회 (`list`, `enable`, `disable`) | 진단용 |
+| `features` | feature flag 조회 (`features list`, `features enable`, `features disable`) | 진단용 |
 
 hot path에서 쓰는 항목:
 
@@ -290,14 +290,14 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 | Root subcommand | 설명 | Adapter 관련성 |
 | --- | --- | --- |
 | `agents` | 백그라운드 agent 관리 | 없음 |
-| `auth` | 인증 관리 (`login`, `logout`, `status`) | OAuth 세션 전제 |
+| `auth` | 인증 관리 (`auth login`, `auth logout`, `auth status`) | OAuth 세션 전제 |
 | `auto-mode` | auto mode 분류기 설정 조회·초기화 | 없음 |
 | `doctor` | 설치 상태 점검 | 진단용 |
 | `gateway` | enterprise auth/telemetry gateway | 없음 |
 | `install` | native build 설치 | 없음 |
-| `mcp` | MCP 서버 설정·관리 | 서비스 tool bridge 후보 |
-| `plugin` | plugin 관리 (`marketplace`, `eval` 등) | 없음 |
-| `project` | project 상태 관리 (`purge`) | 없음 |
+| `mcp` | MCP 서버 설정·관리 (`mcp add`, `mcp add-json`, `mcp get`, `mcp list`, `mcp login`, `mcp logout`, `mcp remove`, `mcp serve`) | 서비스 tool bridge 후보 |
+| `plugin` | plugin 관리 (`plugin marketplace`, `plugin eval` 등) | 없음 |
+| `project` | project 상태 관리 (`project purge`) | 없음 |
 | `setup-token` | 장기 인증 토큰 설정 | 없음 |
 | `ultrareview` | 클라우드 멀티 에이전트 코드 리뷰 | 없음 |
 | `update` | 업데이트 확인·설치 | 없음 |
