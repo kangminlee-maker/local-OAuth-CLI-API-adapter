@@ -356,7 +356,7 @@ test('honorRequestModel on: a supported request model wins over the configured o
   }
 });
 
-test('honorRequestModel on: an omitted request model falls back to the configured one', async () => {
+test('honorRequestModel on: a request carrying no model falls back to the configured one', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   resetCodexModelCatalogCache();
   const backend = new CodexAppServerBackend({
@@ -367,9 +367,9 @@ test('honorRequestModel on: an omitted request model falls back to the configure
     honorRequestModel: true,
   });
   try {
-    // `codex-app-server` is what the normalizers put in `model` when the request
-    // body omits it, so this is the shape a real model-less request arrives in.
-    const payload = await debugAppServerPayload(backend, { model: 'codex-app-server' });
+    // Normalization rejects a model-less body; the backend keeps a defensive
+    // fallback for direct callers.
+    const payload = await debugAppServerPayload(backend, { model: '' });
     assert.equal(payload.turnStart.model, 'fixture-only-model');
   } finally {
     await backend.close();
@@ -388,7 +388,7 @@ test('honorRequestModel on: an omitted model still validates the configured fall
   });
   try {
     await assert.rejects(
-      () => debugAppServerPayload(backend, { model: 'codex-app-server' }),
+      () => debugAppServerPayload(backend, { model: '' }),
       (err) => {
         assert.equal(err.statusCode, 404);
         assert.equal(err.code, 'model_not_found');

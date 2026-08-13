@@ -11,7 +11,7 @@ import type {
   NormalizedToolChoice,
   NormalizedVerbosity,
 } from './types.js';
-import { OMITTED_MODEL, ProxyRequestError } from './types.js';
+import { ProxyRequestError } from './types.js';
 
 interface NormalizedContent {
   readonly text: string;
@@ -24,7 +24,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const tools = readOpenAiTools(input.tools);
   return {
     shape: 'openai-chat',
-    model: readString(input.model, OMITTED_MODEL),
+    model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
     temperature: readOptionalNumber(input.temperature),
@@ -54,7 +54,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const reasoning = asRecord(input.reasoning);
   return {
     shape: 'openai-responses',
-    model: readString(input.model, OMITTED_MODEL),
+    model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_output_tokens),
     temperature: readOptionalNumber(input.temperature),
@@ -114,7 +114,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   }
   return {
     shape: 'anthropic-messages',
-    model: readString(input.model, OMITTED_MODEL),
+    model: readRequiredModel(input.model, 'anthropic'),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens),
     temperature: readOptionalNumber(input.temperature),
@@ -655,6 +655,27 @@ function readRole(value: unknown): NormalizedMessage['role'] {
     return value;
   }
   return 'user';
+}
+
+/**
+ * `model` is required on every provider surface, so an absent or empty value is
+ * a client error rather than something to substitute a default for. Matching the
+ * providers here keeps the proxy's input contract identical to theirs: a request
+ * that direct APIs reject must not quietly succeed against the proxy.
+ */
+function readRequiredModel(value: unknown, provider: 'openai' | 'anthropic'): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  const message = value === undefined || value === null
+    ? 'model is required.'
+    : 'model must be a non-empty string.';
+  throw new ProxyRequestError(
+    message,
+    400,
+    provider,
+    'invalid_request_error',
+    'model',
+    provider === 'openai' ? 'missing_required_parameter' : null,
+  );
 }
 
 function readString(value: unknown, fallback: string): string {

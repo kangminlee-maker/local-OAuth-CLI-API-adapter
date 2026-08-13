@@ -7,7 +7,6 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
 import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js';
 import { resetCodexModelCatalogCache } from '../dist/proxy/codex-model-catalog.js';
-import { OMITTED_MODEL } from '../dist/proxy/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fakeCodexModelsOk = resolve(here, 'fixtures/fake-codex-models-ok.cjs');
@@ -57,22 +56,24 @@ test('default transport, honorRequestModel off: the request model still wins (un
   assert.equal(body.model, 'gpt-5.6-sol');
 });
 
-test('default transport, honorRequestModel off: an omitted model uses the configured one', async () => {
-  // `codex-app-server` is what every normalizer puts in `model` when the body
-  // omits it, so this is the production representation of an omitted model.
+test('default transport, honorRequestModel off: an empty model uses the configured one', async () => {
+  // Normalization rejects an empty model before this point; the backend keeps a
+  // defensive fallback for direct callers.
   const body = await transportBody(
-    { ...textRequest(), model: OMITTED_MODEL },
+    { ...textRequest(), model: '' },
     { model: 'gpt-5.5' },
   );
   assert.equal(body.model, 'gpt-5.5');
 });
 
-test('default transport, honorRequestModel off: the backend alias also uses the configured one', async () => {
+test('default transport: the backend identifier is now a model name, not an omission', async () => {
+  // It is no longer special-cased, so it is forwarded like any other value —
+  // and `GET /v1/models` no longer advertises it.
   const body = await transportBody(
     { ...textRequest(), model: 'codex-backend' },
     { model: 'gpt-5.5' },
   );
-  assert.equal(body.model, 'gpt-5.5');
+  assert.equal(body.model, 'codex-backend');
 });
 
 test('default transport, honorRequestModel off: no catalogue lookup happens at all', async () => {
@@ -120,7 +121,7 @@ test('default transport, honorRequestModel on: an omitted model validates the co
   await assert.rejects(
     () => transportBody(
       // `codex-app-server` is the omitted-model sentinel the normalizers insert.
-      { ...textRequest(), model: OMITTED_MODEL },
+      { ...textRequest(), model: '' },
       { model: 'retired-model', honorRequestModel: true, codexCommand: fakeCodexModelsOk },
     ),
     (err) => {
@@ -134,7 +135,7 @@ test('default transport, honorRequestModel on: an omitted model validates the co
 test('default transport, honorRequestModel on: an omitted model uses a supported configured fallback', async () => {
   resetCodexModelCatalogCache();
   const body = await transportBody(
-    { ...textRequest(), model: OMITTED_MODEL },
+    { ...textRequest(), model: '' },
     { model: 'fixture-model-a', honorRequestModel: true, codexCommand: fakeCodexModelsOk },
   );
   assert.equal(body.model, 'fixture-model-a');

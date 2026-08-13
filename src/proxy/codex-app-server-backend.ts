@@ -42,7 +42,7 @@ import type {
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { OMITTED_MODEL, ProxyRequestError, unsupportedModelError } from './types.js';
+import { ProxyRequestError, unsupportedModelError } from './types.js';
 import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface CodexAppServerBackendOptions {
@@ -1162,8 +1162,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
    * served catalogue has since dropped.
    */
   private explicitRequestModel(requestModel: string): string | undefined {
-    if (!requestModel || requestModel === OMITTED_MODEL) return undefined;
-    return requestModel;
+    // Normalization guarantees a non-empty model, and the backend's own name is
+    // no longer treated as "no choice": it is not a model a client can run.
+    return requestModel || undefined;
   }
 
   private async assertModelSupported(

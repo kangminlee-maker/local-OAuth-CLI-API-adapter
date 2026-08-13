@@ -33,7 +33,7 @@ import type {
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { OMITTED_MODEL, ProxyRequestError } from './types.js';
+import { ProxyRequestError } from './types.js';
 
 const CHATGPT_CODEX_BACKEND_URL = 'https://chatgpt.com/backend-api/codex';
 const CODEX_REFRESH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
@@ -834,10 +834,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
   }
 
   private explicitRequestModel(requestModel: string): string | undefined {
-    if (!requestModel || requestModel === OMITTED_MODEL || requestModel === 'codex-backend') {
-      return undefined;
-    }
-    return requestModel;
+    return requestModel || undefined;
   }
 
   private reportImageAttempt(diagnostic: CodexBackendImageAttemptDiagnostic): void {

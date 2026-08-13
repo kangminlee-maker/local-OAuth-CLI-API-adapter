@@ -339,17 +339,17 @@ test('honorRequestModel on: a request without a model falls back to the configur
   assert.equal(argv[i + 1], 'claude-opus-4-8');
 });
 
-test('honorRequestModel on: an omitted model is not forwarded as the sentinel', async () => {
-  // A model-less request arrives normalized as `codex-app-server`. Treating that
-  // as a model name would hand the Claude CLI `--model codex-app-server`, which
-  // it would refuse — turning an omitted model into a 404.
+test('honorRequestModel on: the backend identifier is treated as a model name', async () => {
+  // No longer special-cased. `GET /v1/models` stopped advertising it, so a
+  // client has no reason to send it, and if one does the CLI validates it.
   const argv = await spawnedArgv(
-    anthropicTuningRequest({ model: 'codex-app-server', effort: 'low' }),
+    anthropicTuningRequest({ model: 'claude-code-cli', effort: 'low' }),
     'claude-opus-4-8',
     { honorRequestModel: true },
   );
-  assert.equal(argv[argv.indexOf('--model') + 1], 'claude-opus-4-8');
+  assert.equal(argv[argv.indexOf('--model') + 1], 'claude-code-cli');
 });
+
 
 test('honorRequestModel on: an extra --model cannot override the requested model', async () => {
   // Operator extra arguments are appended after the resolved model, so leaving

@@ -43,9 +43,10 @@ test('GET /v1/models returns the configured model, not the backend alias', async
   assert.equal(payload.data[0].object, 'model');
 });
 
-test('GET /v1/models returns the alias only when nothing is configured', async () => {
+test('GET /v1/models never advertises a backend identifier', async () => {
+  // Advertising it would hand clients a value the proxy now rejects.
   const payload = await modelsFor('claude-code-cli');
-  assert.deepEqual(payload.data.map((m) => m.id), ['claude-code-cli']);
+  assert.deepEqual(payload.data.map((m) => m.id), []);
 });
 
 const execFileAsync = promisify(execFile);

@@ -24,7 +24,7 @@ import type {
   ProxyServerOptions,
 } from './types.js';
 import { honorRequestModel } from '../settings.js';
-import { ProxyRequestError } from './types.js';
+import { BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { missingToolCallArgumentDelta } from './tool-call-stream.js';
@@ -1157,7 +1157,9 @@ async function openAiModelsResponse(backend: LocalCliBackend): Promise<unknown> 
   // Only advertise a choice the client can actually make. With honouring off the
   // request model does not select anything, so listing alternatives would invite
   // a selection the proxy then ignores.
-  const ids = honorRequestModel() ? await advertisedModels(backend) : [backend.model];
+  const ids = honorRequestModel()
+    ? await advertisedModels(backend)
+    : (BACKEND_IDENTIFIERS.includes(backend.model) ? [] : [backend.model]);
   return {
     object: 'list',
     data: ids.map((id) => ({
@@ -1171,9 +1173,12 @@ async function openAiModelsResponse(backend: LocalCliBackend): Promise<unknown> 
 
 async function advertisedModels(backend: LocalCliBackend): Promise<readonly string[]> {
   const listed = await backend.availableModels?.().catch(() => null) ?? null;
-  if (!listed || listed.length === 0) return [backend.model];
-  // The executed default first, then the rest, without duplicating it.
-  return [backend.model, ...listed.filter((id) => id !== backend.model)];
+  // A backend identifier is not a selectable model, so it is never advertised —
+  // a client that echoed one back would now be rejected.
+  const configured = BACKEND_IDENTIFIERS.includes(backend.model) ? null : backend.model;
+  const rest = (listed ?? []).filter((id) => id !== configured && !BACKEND_IDENTIFIERS.includes(id));
+  const ids = configured ? [configured, ...rest] : rest;
+  return ids;
 }
 
 function openAiImagesGenerationResponse(

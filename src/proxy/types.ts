@@ -248,12 +248,16 @@ export interface ProxyServerOptions {
 }
 
 /**
- * What the normalizers put in `model` when the request body omits it, on every
- * surface including `/v1/messages`. Backends must treat it as "no model chosen"
- * rather than as a model name — otherwise an omitted model would be forwarded to
- * a CLI as a literal `--model codex-app-server` and rejected.
+ * Names a backend uses to identify itself when no model is configured. They are
+ * not models a client can select, so `GET /v1/models` must not advertise them —
+ * advertising a value the proxy would then reject is a contract the client
+ * cannot follow.
  */
-export const OMITTED_MODEL = 'codex-app-server';
+export const BACKEND_IDENTIFIERS: readonly string[] = [
+  'codex-app-server',
+  'codex-backend',
+  'claude-code-cli',
+];
 
 export class ProxyRequestError extends Error {
   constructor(

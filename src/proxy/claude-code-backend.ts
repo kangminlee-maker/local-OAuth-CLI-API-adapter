@@ -21,7 +21,7 @@ import type {
   LocalUsage,
   NormalizedRequest,
 } from './types.js';
-import { OMITTED_MODEL, unsupportedModelError } from './types.js';
+import { unsupportedModelError } from './types.js';
 import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface ClaudeCodeBackendOptions {
@@ -100,10 +100,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
    * backend's own alias that clients echo back from `/v1/models`.
    */
   private explicitRequestModel(requestModel: string): string | undefined {
-    if (!requestModel || requestModel === OMITTED_MODEL || requestModel === 'claude-code-cli') {
-      return undefined;
-    }
-    return requestModel;
+    return requestModel || undefined;
   }
 
   /**
@@ -472,7 +469,9 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     if (message.type === 'result') {
       const waiter = this.waiter;
       this.waiter = null;
-      if (message.subtype === 'success') {
+      if (message.subtype === 'success' && isClaudeModelRejectionResult(message)) {
+        waiter.reject(new Error(typeof message.result === 'string' ? message.result : 'model rejected'));
+      } else if (message.subtype === 'success') {
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
           structuredOutput: message.structured_output ?? waiter.structuredOutput,
@@ -633,7 +632,9 @@ function runClaudeProcess(
         if (!message) continue;
         consumeClaudeMessage(waiter, message);
         if (message.type === 'result') {
-          if (message.subtype === 'success') {
+          if (message.subtype === 'success' && isClaudeModelRejectionResult(message)) {
+            finish(new Error(typeof message.result === 'string' ? message.result : 'model rejected'));
+          } else if (message.subtype === 'success') {
             finish(undefined, {
               text: typeof message.result === 'string' ? message.result : waiter.text,
               structuredOutput: message.structured_output ?? waiter.structuredOutput,
@@ -728,6 +729,19 @@ function isRetryableClaudeStructuredOutputError(err: Error): boolean {
  */
 function isClaudeModelRejection(err: Error): boolean {
   return /issue with the selected model/i.test(err.message);
+}
+
+/**
+ * The same refusal as it arrives under `--output-format stream-json`: the process
+ * exits 0 and reports the failure inside the result event. Nothing reaches stderr,
+ * so an exit-code or stderr check never sees it — which is why the text used to
+ * surface as an ordinary assistant reply.
+ */
+function isClaudeModelRejectionResult(message: JsonObject): boolean {
+  if (message.error === 'model_not_found') return true;
+  if (message.api_error_status !== 404) return false;
+  const text = typeof message.result === 'string' ? message.result : '';
+  return /issue with the selected model/i.test(text);
 }
 
 // Flags that decide which model actually runs. `--fallback-model` counts: in
