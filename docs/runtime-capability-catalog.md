@@ -10,8 +10,8 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 
 | Runtime | Local version | Binary | Primary hot path |
 | --- | --- | --- | --- |
-| Codex CLI | `codex-cli 0.145.0` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.220` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Codex CLI | `codex-cli 0.146.0` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
+| Claude Code | `2.1.228` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
 PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper가 실제로 실행되는 명령이므로 version·help·schema·parse probe 같은 동작 권위는 wrapper 기준으로 수집한다. 다만 wrapper script에는 바이너리 문자열이 없으므로 string scan만 native 바이너리를 대상으로 하며, 그 후보는 wrapper와 `--version`이 일치할 때만 채택한다. 일치하는 후보가 없으면 scan은 대상 없음으로 보고한다. report의 `Command on PATH`와 `Scan target` 열이 이 둘을 구분한다.
 
@@ -141,7 +141,7 @@ Useful official references:
 
 ### CLI command surface
 
-`--help` 재귀 walk 기준으로 68개 명령과 502개 option이 열거된다. root subcommand는 아래 24개이며(그 외 `help`), 전체 option 목록은 `artifacts/runtime-capability-catalog/latest.md`의 `Command Surface`에 있다.
+`--help` 재귀 walk 기준으로 68개 명령과 503개 option이 열거된다. root subcommand는 아래 24개이며(그 외 `help`), 전체 option 목록은 `artifacts/runtime-capability-catalog/latest.md`의 `Command Surface`에 있다.
 
 | Root subcommand | 설명 | Adapter 관련성 |
 | --- | --- | --- |
@@ -178,9 +178,15 @@ CLI option 값 도메인:
 | --- | --- | --- |
 | `--sandbox` | `read-only`, `workspace-write`, `danger-full-access` | L1 help choices (root 및 `codex exec`) |
 
+`--model`의 값 도메인은 고정 enum이 아니라 서버가 정하는 목록이므로 위 표에 넣지 않는다. 모델 목록의 권위는 `codex debug models`이며, 각 항목은 `slug`, `supported_reasoning_levels`, `supported_in_api`, `visibility`, `priority`를 노출한다. CLI는 미지원 `--model` 값을 거부하지 않고 그대로 실행하다 요청 단계에서 실패하므로, 모델 검증은 proxy가 상류에서 수행해야 한다.
+
+proxy가 실제로 강제하는 것은 `slug` 존재 여부뿐이다. `supported_in_api`와 `visibility`가 local OAuth 경로에서 무엇을 막는지는 아직 probe로 확인하지 않았으므로, 이 필드로 모델을 거부하지 않는다. 확인되지 않은 필드를 근거로 차단하면 실제로는 동작하는 모델을 막게 된다. `supported_reasoning_levels`도 같은 이유로 effort 검증에 쓰지 않으며, 현재 effort 도메인은 아래 app-server 계약(모델이 광고하는 문자열)을 따른다.
+
+`codex app-server --code-mode-host <WS_URL>`는 로컬 host를 띄우는 대신 원격 code-mode host에 접속한다(L1). hot path는 로컬 stdio app-server이므로 기본값으로 쓰지 않는다.
+
 ### Hidden CLI surface (absent from `--help`)
 
-codex는 clap `hide = true`로 일부 CLI를 감춘다. 아래 항목은 설치된 `0.145.0` binary에서 각각 확인했다. hidden 항목은 자기 `--help`를 exit 0으로 출력하고, bogus flag는 exit 2 + `unexpected argument`로 끝난다(negative control). Source level: L0 소스/binary scan + L4 `--help`/parse probe.
+codex는 clap `hide = true`로 일부 CLI를 감춘다. 아래 항목은 설치된 `0.146.0` binary에서 각각 확인했다. hidden 항목은 자기 `--help`를 exit 0으로 출력하고, bogus flag는 exit 2 + `unexpected argument`로 끝난다(negative control). Source level: L0 소스/binary scan + L4 `--help`/parse probe.
 
 Hidden subcommands:
 
@@ -217,11 +223,11 @@ Risk: hidden 항목은 `--help` diff 없이 rename/삭제될 수 있다. Codex �
 
 ### App-server protocol surface
 
-생성 schema 기준 현재 method 수는 209개다.
+생성 schema 기준 현재 method 수는 210개다.
 
 | Category | Count | 비고 |
 | --- | ---: | --- |
-| ClientRequest | 126 | client → server 요청 |
+| ClientRequest | 127 | client → server 요청 |
 | ClientNotification | 1 | `initialized` |
 | ServerRequest | 12 | server → client 요청 (승인, tool call, form 등) |
 | ServerNotification | 70 | server → client 알림 |
@@ -290,7 +296,7 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 
 ### CLI command surface
 
-`--help` 재귀 walk 기준으로 49개 명령과 200개 option이 열거된다. root subcommand는 아래 12개이며, 여기에 뒤의 hidden root command가 더해진다.
+`--help` 재귀 walk 기준으로 50개 명령과 214개 option이 열거된다. root subcommand는 아래 13개이며, 여기에 뒤의 hidden root command가 더해진다.
 
 | Root subcommand | 설명 | Adapter 관련성 |
 | --- | --- | --- |
@@ -299,6 +305,7 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 | `auto-mode` | auto mode 분류기 설정 조회·초기화 | 없음 |
 | `doctor` | 설치 상태 점검 | 진단용 |
 | `gateway` | enterprise auth/telemetry gateway | 없음 |
+| `import` | 다른 AI coding agent의 설정을 Claude Code로 가져오기 | 없음 |
 | `install` | native build 설치 | 없음 |
 | `mcp` | MCP 서버 설정·관리 (`mcp add`, `mcp add-json`, `mcp get`, `mcp list`, `mcp login`, `mcp logout`, `mcp remove`, `mcp serve`) | 서비스 tool bridge 후보 |
 | `plugin` | plugin 관리 (`plugin marketplace`, `plugin eval` 등) | 없음 |
@@ -309,7 +316,7 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 
 ### CLI flags from local help
 
-root command는 58개 option 항목(장문 flag 61개)을 광고한다. 그룹별 요약:
+root command는 62개 option 항목(장문 flag 65개)을 광고한다. 그룹별 요약:
 
 | Group | Flags | Chat runtime use |
 | --- | --- | --- |
@@ -318,13 +325,14 @@ root command는 58개 option 항목(장문 flag 61개)을 광고한다. 그룹�
 | Session | `--session-id`, `--resume`, `--continue`, `--fork-session`, `--no-session-persistence`, `--name` | 서비스 세션 수명주기 |
 | Model/effort | `--model`, `--fallback-model`, `--effort`, `--max-budget-usd` | 세션 품질·비용 정책 |
 | Output contract | `--json-schema` | strict 구조화 최종 출력 |
-| Prompt/context | `--system-prompt`, `--append-system-prompt`, `--exclude-dynamic-system-prompt-sections`, `--setting-sources`, `--settings` | 서비스 고유 동작과 결정적 context |
+| Prompt/context | `--system-prompt`, `--append-system-prompt`, `--exclude-dynamic-system-prompt-sections`, `--setting-sources`, `--settings`, `--autocompact` | 서비스 고유 동작과 결정적 context |
 | Tool control | `--tools`, `--allowedTools`, `--allowed-tools`, `--disallowedTools`, `--disallowed-tools`, `--mcp-config`, `--strict-mcp-config`, `--disable-slash-commands` | 서비스 tool bridge와 skill/slash 격리 |
 | Permission | `--permission-mode`, `--dangerously-skip-permissions`, `--allow-dangerously-skip-permissions` | scratch 전용 실행 정책 |
 | Workspace | `--add-dir`, `--worktree`, `--tmux` | 파일 접근 제어. hot path 기본값 아님 |
 | Integrations | `--chrome`, `--no-chrome`, `--ide`, `--plugin-dir`, `--plugin-url`, `--agents`, `--agent` | 서비스가 명시적으로 켤 때만 |
 | Isolation/troubleshooting | `--bare`, `--safe-mode` | 둘 다 local OAuth 기본값 아님: `--bare`는 OAuth/keychain 인증을 읽지 않고, `--safe-mode`는 모든 커스터마이즈를 끈다 |
-| Other surface | `--betas`, `--file`, `--from-pr`, `--bg`/`--background`, `--brief`, `--prompt-suggestions`, `--remote-control`, `--remote-control-session-name-prefix`, `--ax-screen-reader`, `--debug`, `--debug-file` | hot path 기본값 아님. `--betas`는 API key 사용자에게만 적용되어 OAuth에서는 무효 |
+| Cloud/remote session | `--cloud`, `--environment`, `--teleport`, `--remote-control`, `--remote-control-session-name-prefix` | 끄고 유지. 세션을 로컬 밖(claude.ai/code, self-hosted environment)에서 만들거나 제어면을 넓힌다 |
+| Other surface | `--betas`, `--file`, `--from-pr`, `--bg`/`--background`, `--brief`, `--prompt-suggestions`, `--ax-screen-reader`, `--debug`, `--debug-file` | hot path 기본값 아님. `--betas`는 API key 사용자에게만 적용되어 OAuth에서는 무효 |
 
 측정된 값 도메인:
 
@@ -338,6 +346,8 @@ root command는 58개 option 항목(장문 flag 61개)을 광고한다. 그룹�
 | `--setting-sources` | `user`, `project`, `local` | L4 probe |
 | `--max-budget-usd` | 0보다 큰 수 | L4 probe |
 | `--session-id` | 유효한 UUID | L4 probe |
+
+`--model`은 고정 enum이 아니므로 위 표에 넣지 않는다. help는 최신 모델 alias(`fable`, `opus`, `sonnet`)와 full name(예: `claude-fable-5`)을 받는다고 안내하며, 미지원 값은 세션 시작 단계에서 거부되어 모델 호출에 도달하지 않는다(L4 probe). 즉 Claude 쪽 모델 유효성 판정은 CLI에 위임할 수 있고, Codex 쪽은 위임할 수 없다.
 
 ### Adapter-critical flags hidden from `--help`
 

@@ -11,7 +11,7 @@ import type {
   NormalizedToolChoice,
   NormalizedVerbosity,
 } from './types.js';
-import { ProxyRequestError } from './types.js';
+import { OMITTED_MODEL, ProxyRequestError } from './types.js';
 
 interface NormalizedContent {
   readonly text: string;
@@ -24,7 +24,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const tools = readOpenAiTools(input.tools);
   return {
     shape: 'openai-chat',
-    model: readString(input.model, 'codex-app-server'),
+    model: readString(input.model, OMITTED_MODEL),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
     temperature: readOptionalNumber(input.temperature),
@@ -54,7 +54,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const reasoning = asRecord(input.reasoning);
   return {
     shape: 'openai-responses',
-    model: readString(input.model, 'codex-app-server'),
+    model: readString(input.model, OMITTED_MODEL),
     messages,
     maxTokens: readOptionalNumber(input.max_output_tokens),
     temperature: readOptionalNumber(input.temperature),
@@ -114,7 +114,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   }
   return {
     shape: 'anthropic-messages',
-    model: readString(input.model, 'codex-app-server'),
+    model: readString(input.model, OMITTED_MODEL),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens),
     temperature: readOptionalNumber(input.temperature),

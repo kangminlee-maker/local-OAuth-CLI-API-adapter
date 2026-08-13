@@ -2,12 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { extname, join } from 'node:path';
+import { honorRequestModel } from '../settings.js';
 import {
   baseInstructions,
   developerInstructions,
   requestInstructionText,
   usageFor,
 } from './backend-contract.js';
+import { assertCodexModelSupported, codexModels } from './codex-model-catalog.js';
 import {
   image2QualityToGpt55ReasoningEffort,
   image2ViaGpt55PromptFromRequest,
@@ -31,7 +33,7 @@ import type {
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { ProxyRequestError } from './types.js';
+import { OMITTED_MODEL, ProxyRequestError } from './types.js';
 
 const CHATGPT_CODEX_BACKEND_URL = 'https://chatgpt.com/backend-api/codex';
 const CODEX_REFRESH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
@@ -54,6 +56,14 @@ export interface CodexBackendTransportOptions {
   readonly verbosity?: NormalizedVerbosity;
   readonly codexHome?: string;
   readonly onImageAttempt?: (diagnostic: CodexBackendImageAttemptDiagnostic) => void;
+  readonly honorRequestModel?: boolean;
+  readonly codexCommand?: string;
+  /**
+   * The directory the operator selected for this runtime. Used to resolve a
+   * path-like `codexCommand`, so the catalogue queries the same executable the
+   * turn will run. Not the directory the lookup executes in — that is private.
+   */
+  readonly cwd?: string;
 }
 
 export interface CodexBackendImageAttemptDiagnostic {
@@ -424,6 +434,9 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
   private readonly verbosity: NormalizedVerbosity;
   private readonly codexHome: string;
   private readonly onImageAttempt?: (diagnostic: CodexBackendImageAttemptDiagnostic) => void;
+  private readonly honorRequestModel: boolean;
+  private readonly codexCommand?: string;
+  private readonly runtimeCwd?: string;
 
   constructor(options: CodexBackendTransportOptions) {
     this.model = options.model ?? DEFAULT_CODEX_BACKEND_MODEL;
@@ -432,6 +445,9 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     this.verbosity = options.verbosity ?? 'medium';
     this.codexHome = options.codexHome ?? sourceCodexHome();
     this.onImageAttempt = options.onImageAttempt;
+    this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
+    this.codexCommand = options.codexCommand;
+    this.runtimeCwd = options.cwd;
   }
 
   async generate(
@@ -605,7 +621,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     request: NormalizedRequest,
     signal?: AbortSignal,
   ): AsyncIterable<CodexBackendEvent> {
-    yield* this.responseEventsForBody(JSON.stringify(await this.requestBody(request)), signal);
+    yield* this.responseEventsForBody(JSON.stringify(await this.requestBody(request, signal)), signal);
   }
 
   private async *responseEventsForBody(
@@ -720,10 +736,13 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     }
   }
 
-  private async requestBody(request: NormalizedRequest): Promise<Record<string, unknown>> {
+  private async requestBody(
+    request: NormalizedRequest,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown>> {
     const effort = request.reasoningEffort ?? this.reasoningEffort;
     return {
-      model: this.modelFor(request.model),
+      model: await this.modelFor(request, signal),
       instructions: [
         baseInstructions(),
         developerInstructions(),
@@ -771,9 +790,52 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     };
   }
 
-  private modelFor(requestModel: string): string {
-    if (!requestModel || requestModel === 'codex-app-server' || requestModel === 'codex-backend') {
-      return this.model;
+  /**
+   * This transport has always let the request model win, with the configured
+   * model as the fallback for requests that name none. `honorRequestModel` does
+   * not change that precedence here — it adds the validation that was missing,
+   * because the Codex backend accepts any model string and only fails once the
+   * request reaches the server.
+   */
+  /** The Codex catalogue, so new model generations appear without a code change. */
+  async availableModels(): Promise<readonly string[] | null> {
+    const models = await codexModels({
+      command: this.codexCommand,
+      codexHome: this.codexHome,
+      commandCwd: this.runtimeCwd,
+    });
+    return models?.map((entry) => entry.slug) ?? null;
+  }
+
+  async resolvedModel(request: NormalizedRequest): Promise<string | null> {
+    return this.explicitRequestModel(request.model) ?? this.model;
+  }
+
+  private async modelFor(request: NormalizedRequest, signal?: AbortSignal): Promise<string> {
+    // Resolve first, then validate what will actually run. Validating only the
+    // requested value would let a configured-but-retired model reach the server
+    // unchecked whenever a request names no model.
+    const requested = this.explicitRequestModel(request.model);
+    const effective = requested ?? this.model;
+    if (this.honorRequestModel) {
+      await assertCodexModelSupported(
+        effective,
+        request.shape,
+        {
+          command: this.codexCommand,
+          codexHome: this.codexHome,
+          commandCwd: this.runtimeCwd,
+          signal,
+        },
+        requested !== undefined,
+      );
+    }
+    return effective;
+  }
+
+  private explicitRequestModel(requestModel: string): string | undefined {
+    if (!requestModel || requestModel === OMITTED_MODEL || requestModel === 'codex-backend') {
+      return undefined;
     }
     return requestModel;
   }

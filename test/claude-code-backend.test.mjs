@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { chmod } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { chmod, mkdtemp, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { before, test } from 'node:test';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
@@ -8,10 +9,12 @@ import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 const here = dirname(fileURLToPath(import.meta.url));
 const fakeClaude = resolve(here, 'fixtures/fake-claude.cjs');
 const echoArgvClaude = resolve(here, 'fixtures/echo-argv-claude.cjs');
+const rejectModelClaude = resolve(here, 'fixtures/reject-model-claude.cjs');
 
 before(async () => {
   await chmod(fakeClaude, 0o755);
   await chmod(echoArgvClaude, 0o755);
+  await chmod(rejectModelClaude, 0o755);
 });
 
 test('ClaudeCodeBackend streams persistent text deltas', async () => {
@@ -255,12 +258,13 @@ function toolRequest() {
   };
 }
 
-async function spawnedArgv(request, model) {
+async function spawnedArgv(request, model, options = {}) {
   const backend = new ClaudeCodeBackend({
     command: echoArgvClaude,
     cwd: process.cwd(),
     model,
     timeoutMs: 30_000,
+    ...options,
   });
   try {
     const result = await backend.generate(request);
@@ -289,6 +293,258 @@ function anthropicTuningRequest(overrides) {
     ...overrides,
   };
 }
+
+test('honorRequestModel off: the request model never reaches --model', async () => {
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+  );
+  const i = argv.indexOf('--model');
+  assert.ok(i !== -1, `expected --model in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], 'claude-opus-4-8');
+});
+
+test('honorRequestModel off with nothing configured: no --model is forwarded at all', async () => {
+  // Claude's pre-existing behaviour, kept exactly: with honouring off the request
+  // model is never forwarded, even when there is no configured model to prefer.
+  // The CLI's own default runs. This is where Claude differs from the Codex
+  // transports, and the contract documents the difference rather than papering
+  // over it.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    undefined,
+  );
+  assert.ok(!argv.includes('--model'), `did not expect --model in argv: ${argv.join(' ')}`);
+});
+
+test('honorRequestModel on: the request model wins over the configured one', async () => {
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true },
+  );
+  const i = argv.indexOf('--model');
+  assert.ok(i !== -1, `expected --model in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], 'claude-sonnet-5');
+});
+
+test('honorRequestModel on: a request without a model falls back to the configured one', async () => {
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: '', effort: 'low' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true },
+  );
+  const i = argv.indexOf('--model');
+  assert.ok(i !== -1, `expected --model in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], 'claude-opus-4-8');
+});
+
+test('honorRequestModel on: an omitted model is not forwarded as the sentinel', async () => {
+  // A model-less request arrives normalized as `codex-app-server`. Treating that
+  // as a model name would hand the Claude CLI `--model codex-app-server`, which
+  // it would refuse — turning an omitted model into a 404.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'codex-app-server', effort: 'low' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true },
+  );
+  assert.equal(argv[argv.indexOf('--model') + 1], 'claude-opus-4-8');
+});
+
+test('honorRequestModel on: an extra --model cannot override the requested model', async () => {
+  // Operator extra arguments are appended after the resolved model, so leaving
+  // one in would win on a last-value-wins parser.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true, extraArgs: ['--model', 'claude-haiku-4-5', '--debug'] },
+  );
+  const models = argv.filter((arg, i) => argv[i - 1] === '--model');
+  assert.deepEqual(models, ['claude-sonnet-5'], `expected exactly one model: ${argv.join(' ')}`);
+  assert.ok(argv.includes('--debug'), 'other extra args must survive');
+});
+
+test('honorRequestModel on: an extra --fallback-model cannot substitute the requested model', async () => {
+  // In print mode Claude switches to the fallback when the primary is
+  // overloaded, which would run a model other than the one the response echoes.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true, extraArgs: ['--fallback-model=claude-opus-4-8', '--debug'] },
+  );
+  assert.ok(!argv.some((arg) => arg.startsWith('--fallback-model')), `argv: ${argv.join(' ')}`);
+  assert.ok(argv.includes('--debug'), 'other extra args must survive');
+});
+
+test('honorRequestModel on: a model string that cannot be an argument is a 404, not a spawn failure', async () => {
+  // A raw client can send a JSON string containing NUL. Node refuses that argv
+  // element before the CLI starts, which must not surface as a server fault.
+  // Run against the ordinary echo fixture, not the refusing one: without the
+  // guard this fails inside spawn with ERR_INVALID_ARG_VALUE, so the fixture
+  // cannot manufacture the 404.
+  const backend = new ClaudeCodeBackend({
+    command: echoArgvClaude,
+    cwd: process.cwd(),
+    model: 'claude-opus-4-8',
+    timeoutMs: 30_000,
+    honorRequestModel: true,
+  });
+  try {
+    await assert.rejects(
+      () => backend.generate(anthropicTuningRequest({ model: 'bad\u0000model', effort: 'low' })),
+      (err) => {
+        assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+        assert.equal(err.type, 'not_found_error');
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
+  }
+});
+
+
+test('honorRequestModel off: extra args are left exactly as the operator gave them', async () => {
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+    { extraArgs: ['--model', 'claude-haiku-4-5'] },
+  );
+  const models = argv.filter((arg, i) => argv[i - 1] === '--model');
+  assert.deepEqual(models, ['claude-opus-4-8', 'claude-haiku-4-5']);
+});
+
+test('honorRequestModel on: an option-shaped model stays model data and cannot re-open tools', async () => {
+  // Verified against the real CLI: the token after `--model` is consumed as its
+  // value (`--help`, `--version`, `-p`, `--tools=Read,Glob,Grep` all produce the
+  // model-refusal diagnostic). This pins our side of that contract: the value is
+  // passed as the model argument and the tool isolation flags stay intact.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: '--tools=Read,Glob,Grep', effort: 'low' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true },
+  );
+  const modelIndex = argv.indexOf('--model');
+  assert.notEqual(modelIndex, -1);
+  assert.equal(argv[modelIndex + 1], '--tools=Read,Glob,Grep');
+  // The isolation flag is still present, and still empty.
+  const toolsIndex = argv.indexOf('--tools');
+  assert.notEqual(toolsIndex, -1, `expected --tools isolation: ${argv.join(' ')}`);
+  assert.equal(argv[toolsIndex + 1], '');
+  // And it is applied before the model value, so the hostile token cannot be a
+  // later override of an earlier isolation flag.
+  assert.ok(toolsIndex < modelIndex, `expected --tools before --model: ${argv.join(' ')}`);
+});
+
+test('honorRequestModel on: tuning flags gate on the requested model, not the configured one', async () => {
+  // Haiku supports neither effort nor adaptive thinking. With the request model
+  // honoured it is the model the CLI actually runs, so the gate has to follow it
+  // even though the configured model is Opus.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-haiku-4-5', effort: 'high' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true },
+  );
+  assert.equal(argv[argv.indexOf('--model') + 1], 'claude-haiku-4-5');
+  assert.ok(!argv.includes('--effort'), `did not expect --effort for Haiku: ${argv.join(' ')}`);
+});
+
+async function runAgainstRejectingClaude(request, model, options = {}) {
+  const backend = new ClaudeCodeBackend({
+    command: rejectModelClaude,
+    cwd: process.cwd(),
+    model,
+    timeoutMs: 30_000,
+    ...options,
+  });
+  try {
+    return await backend.generate(request);
+  } finally {
+    await backend.close();
+  }
+}
+
+test('honorRequestModel on: the CLI refusing the model becomes a 404 on OpenAI surfaces', async () => {
+  await assert.rejects(
+    () => runAgainstRejectingClaude(
+      { ...anthropicTuningRequest({ model: 'claude-not-a-model', effort: 'low' }), shape: 'openai-chat' },
+      'claude-opus-4-8',
+      { honorRequestModel: true },
+    ),
+    (err) => {
+      assert.equal(err.statusCode, 404);
+      assert.equal(err.provider, 'openai');
+      assert.equal(err.type, 'invalid_request_error');
+      assert.equal(err.code, 'model_not_found');
+      assert.equal(err.param, 'model');
+      return true;
+    },
+  );
+});
+
+test('honorRequestModel on: the same refusal takes the anthropic error shape', async () => {
+  await assert.rejects(
+    () => runAgainstRejectingClaude(
+      anthropicTuningRequest({ model: 'claude-not-a-model', effort: 'low' }),
+      'claude-opus-4-8',
+      { honorRequestModel: true },
+    ),
+    (err) => {
+      assert.equal(err.statusCode, 404);
+      assert.equal(err.provider, 'anthropic');
+      assert.equal(err.type, 'not_found_error');
+      return true;
+    },
+  );
+});
+
+test('honorRequestModel on: a refusal on the persistent path is a 404 too', async () => {
+  // No tuning flags and a request naming the configured model, so this takes the
+  // persistent route rather than one-shot. The same model must produce the same
+  // status on either route.
+  const argvLog = join(await mkdtemp(join(tmpdir(), 'claude-argv-')), 'argv.log');
+  process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+  try {
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        anthropicTuningRequest({ model: 'claude-retired' }),
+        'claude-retired',
+        { honorRequestModel: true },
+      ),
+      (err) => {
+        assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+        assert.equal(err.type, 'not_found_error');
+        return true;
+      },
+    );
+    // Confirms the route: the one-shot path passes the prompt as an argument.
+    // Without this the test would pass even if the request had silently fallen
+    // back to one-shot, which the other tests already cover.
+    const argv = JSON.parse((await readFile(argvLog, 'utf8')).trim().split('\n')[0]);
+    assert.ok(
+      !argv.some((arg) => arg.includes('Say OK')),
+      `expected the persistent route (no prompt argument): ${argv.join(' ')}`,
+    );
+  } finally {
+    delete process.env.CLAUDE_TEST_ARGV_LOG;
+  }
+});
+
+test('honorRequestModel off: a CLI model refusal stays a server-side failure', async () => {
+  // With honouring off the model came from local configuration, not the client,
+  // so it must not be reported as a client-side not-found.
+  await assert.rejects(
+    () => runAgainstRejectingClaude(
+      anthropicTuningRequest({ model: 'claude-not-a-model', effort: 'low' }),
+      'claude-opus-4-8',
+    ),
+    (err) => {
+      assert.equal(err.statusCode, undefined, 'expected a plain Error, not a ProxyRequestError');
+      assert.match(err.message, /issue with the selected model/);
+      return true;
+    },
+  );
+});
 
 test('forwards output_config effort to claude --effort (one-shot argv)', async () => {
   const argv = await spawnedArgv(anthropicTuningRequest({ effort: 'low' }));
@@ -369,4 +625,31 @@ test('forced tool + per-request effort: one-shot still returns the tool call', a
   } finally {
     await backend.close();
   }
+});
+
+test('honorRequestModel on: a model override does not put the prompt in argv', async () => {
+  // The override forces the one-shot path. Without stream-JSON input the prompt
+  // would become a command-line argument, readable by anything that can list
+  // process arguments on this machine.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true },
+  );
+  assert.ok(
+    !argv.some((arg) => arg.includes('Say OK')),
+    `prompt must not appear in argv: ${argv.join(' ')}`,
+  );
+  assert.ok(argv.includes('--input-format'), `expected stdin input: ${argv.join(' ')}`);
+  assert.equal(argv[argv.indexOf('--input-format') + 1], 'stream-json');
+});
+
+test('honorRequestModel off: the one-shot argv is unchanged', async () => {
+  // Control: the pre-existing behaviour for a request that reaches one-shot for
+  // other reasons is preserved exactly.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+  );
+  assert.ok(argv.some((arg) => arg.includes('Say OK')), `argv: ${argv.join(' ')}`);
 });

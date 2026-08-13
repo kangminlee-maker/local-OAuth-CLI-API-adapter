@@ -3,6 +3,22 @@ const readline = require('node:readline');
 
 assertNoDirectProviderEnv();
 
+// `codex debug models` is the proxy's authority for which models exist, so the
+// fake answers it with a fixed catalogue instead of contacting a server.
+if (process.argv.includes('debug') && process.argv.includes('models')) {
+  require('./record-models-call.cjs')();
+  // `fixture-only-model` exists nowhere but here, so a test that accepts it
+  // proves the list was fetched from this CLI rather than hard-coded anywhere.
+  process.stdout.write(`${JSON.stringify({
+    models: [
+      { slug: 'gpt-5.5', supported_in_api: true, supported_reasoning_levels: [{ effort: 'medium' }] },
+      { slug: 'gpt-5.6-sol', supported_in_api: true, supported_reasoning_levels: [{ effort: 'low' }] },
+      { slug: 'fixture-only-model', supported_in_api: true, supported_reasoning_levels: [{ effort: 'low' }] },
+    ],
+  })}\n`);
+  process.exit(0);
+}
+
 let threadSeq = 0;
 let turnSeq = 0;
 let lastThreadStartParams = null;
@@ -319,6 +335,7 @@ function debugPayload() {
       'personality',
       'outputSchema',
       'input',
+      'model',
     ]),
   };
 }

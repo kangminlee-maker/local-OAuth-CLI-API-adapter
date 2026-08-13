@@ -23,6 +23,7 @@ import type {
   OpenAiImageProxyRoute,
   ProxyServerOptions,
 } from './types.js';
+import { honorRequestModel } from '../settings.js';
 import { ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
@@ -130,7 +131,7 @@ async function handleRequest(
       return;
     }
     if (req.method === 'GET' && path === '/v1/models') {
-      writeJson(res, 200, openAiModelsResponse(backend));
+      writeJson(res, 200, await openAiModelsResponse(backend));
       return;
     }
     if (req.method === 'GET' && path.startsWith('/v1/images/generated/')) {
@@ -165,7 +166,11 @@ async function handleRequest(
       const normalized = normalizeOpenAiChatRequest(body);
       rejectDeferredFeatures(normalized);
       if (normalized.stream) {
-        await writeOpenAiChatStream(res, runStreamWithTimeout(backend, normalized, requestTimeoutMs), normalized);
+        await writeOpenAiChatStream(
+          res,
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await requestReportingExecutedModel(backend, normalized),
+        );
       } else {
         const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
         writeJson(res, 200, openAiChatResponse(result));
@@ -177,7 +182,11 @@ async function handleRequest(
       const normalized = normalizeOpenAiResponsesRequest(body);
       rejectDeferredFeatures(normalized);
       if (normalized.stream) {
-        await writeOpenAiResponsesStream(res, runStreamWithTimeout(backend, normalized, requestTimeoutMs), normalized);
+        await writeOpenAiResponsesStream(
+          res,
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await requestReportingExecutedModel(backend, normalized),
+        );
       } else {
         const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
         writeJson(res, 200, openAiResponsesResponse(result, normalized));
@@ -189,7 +198,11 @@ async function handleRequest(
       const normalized = normalizeAnthropicMessagesRequest(body);
       rejectDeferredFeatures(normalized, 'anthropic');
       if (normalized.stream) {
-        await writeAnthropicMessagesStream(res, runStreamWithTimeout(backend, normalized, requestTimeoutMs), normalized);
+        await writeAnthropicMessagesStream(
+          res,
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await requestReportingExecutedModel(backend, normalized),
+        );
       } else {
         const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
         writeJson(res, 200, anthropicMessagesResponse(result));
@@ -785,13 +798,103 @@ async function runWithTimeout(
   }
 }
 
+/**
+ * Pulls the first event before the caller writes SSE headers.
+ *
+ * Model validation happens inside the backend — for Claude it cannot happen
+ * earlier, since only the CLI knows which models exist. Streaming responses
+ * commit a 200 the moment headers are written, so without this the contracted
+ * 404 would arrive after the response was already committed and the client would
+ * see a truncated 200 instead.
+ *
+ * Only used when the request model can be rejected at all; otherwise the stream
+ * is passed through untouched so first-byte latency is unchanged.
+ */
+export async function withFirstEventSettled(
+  events: AsyncIterable<LocalStreamEvent>,
+): Promise<AsyncIterable<LocalStreamEvent>> {
+  const iterator = events[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  return {
+    async *[Symbol.asyncIterator]() {
+      try {
+        if (first.done) return;
+        yield first.value;
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) return;
+          yield next.value;
+        }
+      } finally {
+        // The wrapper drives the backend iterator by hand, so closing early —
+        // a client disconnect after the first event — would otherwise never
+        // reach the source generator's own cleanup, leaving its timeout, CLI
+        // process, or backend lock alive.
+        await iterator.return?.();
+      }
+    },
+  };
+}
+
+/**
+ * The request, with `model` replaced by the model that will actually run.
+ *
+ * Streaming chunks carry the request's model, which is only the executed one by
+ * coincidence. With honouring on the proxy knows the real answer before the
+ * stream starts, so it reports that instead of echoing the client back to
+ * itself. With honouring off the historical echo is preserved.
+ */
+async function requestReportingExecutedModel(
+  backend: LocalCliBackend,
+  request: NormalizedRequest,
+): Promise<NormalizedRequest> {
+  if (!honorRequestModel()) return request;
+  const resolved = await backend.resolvedModel?.(request).catch(() => null) ?? null;
+  if (!resolved || resolved === request.model) return request;
+  return { ...request, model: resolved };
+}
+
+function streamEvents(
+  backend: LocalCliBackend,
+  request: NormalizedRequest,
+  requestTimeoutMs: number,
+  res: ServerResponse,
+): Promise<AsyncIterable<LocalStreamEvent>> {
+  if (!honorRequestModel()) {
+    // Untouched default: headers go out first and the writer's own iteration
+    // owns cancellation, exactly as before this setting existed.
+    return Promise.resolve(runStreamWithTimeout(backend, request, requestTimeoutMs));
+  }
+  // The RESPONSE's close, not the request's: `IncomingMessage` closes as soon as
+  // the body has been consumed, which is every normal request. Aborting on that
+  // would kill healthy streams. `writableEnded` separates an orderly finish from
+  // a client that walked away.
+  const clientGone = new AbortController();
+  const onResponseClose = (): void => {
+    if (!res.writableEnded) clientGone.abort();
+  };
+  res.once('close', onResponseClose);
+  const events = runStreamWithTimeout(backend, request, requestTimeoutMs, clientGone.signal);
+  return withFirstEventSettled(events).finally(() => {
+    // Only the prefetch needs this listener; the response writer owns
+    // cancellation from here on.
+    res.removeListener('close', onResponseClose);
+  });
+}
+
 async function* runStreamWithTimeout(
   backend: LocalCliBackend,
   request: NormalizedRequest,
   requestTimeoutMs: number,
+  clientGone?: AbortSignal,
 ): AsyncIterable<LocalStreamEvent> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  // A client that disconnects while the first event is still pending — during
+  // model validation or CLI startup — has no response writer yet to notice, so
+  // the abort has to reach the backend from here.
+  const onClientGone = () => controller.abort();
+  clientGone?.addEventListener('abort', onClientGone, { once: true });
   try {
     if (backend.stream) {
       for await (const event of backend.stream(request, controller.signal)) {
@@ -803,6 +906,7 @@ async function* runStreamWithTimeout(
     yield { type: 'completed', result };
   } finally {
     clearTimeout(timer);
+    clientGone?.removeEventListener('abort', onClientGone);
   }
 }
 
@@ -1049,18 +1153,27 @@ function headerValue(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
 }
 
-function openAiModelsResponse(backend: LocalCliBackend): unknown {
+async function openAiModelsResponse(backend: LocalCliBackend): Promise<unknown> {
+  // Only advertise a choice the client can actually make. With honouring off the
+  // request model does not select anything, so listing alternatives would invite
+  // a selection the proxy then ignores.
+  const ids = honorRequestModel() ? await advertisedModels(backend) : [backend.model];
   return {
     object: 'list',
-    data: [
-      {
-        id: backend.model,
-        object: 'model',
-        created: 0,
-        owned_by: 'local-oauth-cli',
-      },
-    ],
+    data: ids.map((id) => ({
+      id,
+      object: 'model',
+      created: 0,
+      owned_by: 'local-oauth-cli',
+    })),
   };
+}
+
+async function advertisedModels(backend: LocalCliBackend): Promise<readonly string[]> {
+  const listed = await backend.availableModels?.().catch(() => null) ?? null;
+  if (!listed || listed.length === 0) return [backend.model];
+  // The executed default first, then the rest, without duplicating it.
+  return [backend.model, ...listed.filter((id) => id !== backend.model)];
 }
 
 function openAiImagesGenerationResponse(

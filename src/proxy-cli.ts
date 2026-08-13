@@ -237,19 +237,27 @@ function parseReasoningEffort(
   throw new Error('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.');
 }
 
-function createCodexBackend(options: {
+export function createCodexBackend(options: {
   readonly transport: CodexProxyTransport;
   readonly command?: string;
   readonly cwd: string;
   readonly model?: string;
   readonly timeoutMs: number;
   readonly reasoningEffort?: NormalizedReasoningEffort;
+  // Left undefined in production so the backend reads settings.json; tests pass
+  // it explicitly to exercise the honour-on path without rewriting settings.
+  readonly honorRequestModel?: boolean;
 }): LocalCliBackend {
   if (options.transport === 'codex-backend') {
     return new CodexBackendTransport({
       model: options.model,
+      // The catalogue lookup must query the same Codex executable the operator
+      // selected, not whichever `codex` happens to be on PATH.
+      codexCommand: options.command,
+      cwd: options.cwd,
       timeoutMs: options.timeoutMs,
       reasoningEffort: options.reasoningEffort,
+      honorRequestModel: options.honorRequestModel,
     });
   }
   return new CodexAppServerBackend({
@@ -258,6 +266,7 @@ function createCodexBackend(options: {
     model: options.model,
     timeoutMs: options.timeoutMs,
     reasoningEffort: options.reasoningEffort,
+    honorRequestModel: options.honorRequestModel,
   });
 }
 
@@ -268,10 +277,18 @@ function createCodexImageGenerationClient(options: {
   readonly model?: string;
   readonly timeoutMs: number;
 }): OpenAiImageGenerationClient {
+  // Images are out of scope for `modelSelection.honorRequestModel`: an Images API
+  // `model` is a route selector (`image-2`, `dall-e-2`, `gpt-image-*`), not a
+  // Codex slug, and the Codex model for an image turn comes from
+  // `codexProxy.imageModel`. The image paths do not consult request models today;
+  // pinning the flag off keeps that true if they ever come to share more code.
   if (options.transport === 'codex-backend') {
     return new CodexBackendTransport({
       model: options.model,
+      codexCommand: options.command,
+      cwd: options.cwd,
       timeoutMs: options.timeoutMs,
+      honorRequestModel: false,
     });
   }
   return new CodexAppServerBackend({
@@ -280,6 +297,7 @@ function createCodexImageGenerationClient(options: {
     model: options.model,
     timeoutMs: options.timeoutMs,
     imageGeneration: true,
+    honorRequestModel: false,
   });
 }
 

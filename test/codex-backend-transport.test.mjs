@@ -1,9 +1,22 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, test } from 'node:test';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterEach, before, test } from 'node:test';
 import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js';
+import { resetCodexModelCatalogCache } from '../dist/proxy/codex-model-catalog.js';
+import { OMITTED_MODEL } from '../dist/proxy/types.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const fakeCodexModelsOk = resolve(here, 'fixtures/fake-codex-models-ok.cjs');
+const fakeCodexModelsFail = resolve(here, 'fixtures/fake-codex-models-fail.cjs');
+
+before(async () => {
+  await chmod(fakeCodexModelsOk, 0o755);
+  await chmod(fakeCodexModelsFail, 0o755);
+});
 
 const originalFetch = globalThis.fetch;
 const tempDirs = [];
@@ -11,6 +24,145 @@ const tempDirs = [];
 afterEach(async () => {
   globalThis.fetch = originalFetch;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+// This is the DEFAULT Codex transport (`codexProxy.transport: codex-backend`),
+// so the model-selection contract has to hold here, not only on the diagnostic
+// app-server path.
+function okSse() {
+  return sse([
+    { type: 'response.created', response: { id: 'resp_m', model: 'x', status: 'in_progress' } },
+    { type: 'response.output_text.delta', delta: 'OK' },
+    { type: 'response.completed', response: { id: 'resp_m', model: 'x' } },
+  ]);
+}
+
+async function transportBody(request, options) {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(okSse(), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, ...options });
+  await backend.generate(request);
+  return JSON.parse(calls[0].init.body);
+}
+
+test('default transport, honorRequestModel off: the request model still wins (unchanged behaviour)', async () => {
+  const body = await transportBody(
+    { ...textRequest(), model: 'gpt-5.6-sol' },
+    { model: 'gpt-5.5' },
+  );
+  assert.equal(body.model, 'gpt-5.6-sol');
+});
+
+test('default transport, honorRequestModel off: an omitted model uses the configured one', async () => {
+  // `codex-app-server` is what every normalizer puts in `model` when the body
+  // omits it, so this is the production representation of an omitted model.
+  const body = await transportBody(
+    { ...textRequest(), model: OMITTED_MODEL },
+    { model: 'gpt-5.5' },
+  );
+  assert.equal(body.model, 'gpt-5.5');
+});
+
+test('default transport, honorRequestModel off: the backend alias also uses the configured one', async () => {
+  const body = await transportBody(
+    { ...textRequest(), model: 'codex-backend' },
+    { model: 'gpt-5.5' },
+  );
+  assert.equal(body.model, 'gpt-5.5');
+});
+
+test('default transport, honorRequestModel off: no catalogue lookup happens at all', async () => {
+  // Removing the honour guard around validation would still let the other
+  // off-mode tests pass whenever the lookup fails open or happens to advertise
+  // the tested slug. This pins the stronger property: off mode does not consult
+  // the catalogue, and an unadvertised model goes straight through.
+  resetCodexModelCatalogCache();
+  const callLog = join(await mkdtemp(join(tmpdir(), 'codex-models-call-')), 'calls.log');
+  process.env.CODEX_MODELS_CALL_LOG = callLog;
+  try {
+    const body = await transportBody(
+      { ...textRequest(), model: 'zzz-never-advertised' },
+      { model: 'gpt-5.5', codexCommand: fakeCodexModelsOk },
+    );
+    assert.equal(body.model, 'zzz-never-advertised');
+    assert.equal(existsSync(callLog), false, 'off mode must not run debug models');
+  } finally {
+    delete process.env.CODEX_MODELS_CALL_LOG;
+  }
+});
+
+test('default transport, honorRequestModel on: an advertised model is accepted', async () => {
+  resetCodexModelCatalogCache();
+  const callLog = join(await mkdtemp(join(tmpdir(), 'codex-models-call-')), 'calls.log');
+  process.env.CODEX_MODELS_CALL_LOG = callLog;
+  try {
+    const body = await transportBody(
+      { ...textRequest(), model: 'fixture-model-a' },
+      { model: 'gpt-5.5', honorRequestModel: true, codexCommand: fakeCodexModelsOk },
+    );
+    // `fixture-model-a` is advertised only by the fake catalogue CLI. Acceptance
+    // alone would also pass with no lookup at all, since an uncollectable
+    // catalogue fails open — so assert the lookup actually ran.
+    assert.equal(body.model, 'fixture-model-a');
+    assert.equal(existsSync(callLog), true, 'expected debug models to have been invoked');
+    assert.equal((await readFile(callLog, 'utf8')).trim(), 'debug models');
+  } finally {
+    delete process.env.CODEX_MODELS_CALL_LOG;
+  }
+});
+
+test('default transport, honorRequestModel on: an omitted model validates the configured fallback', async () => {
+  resetCodexModelCatalogCache();
+  await assert.rejects(
+    () => transportBody(
+      // `codex-app-server` is the omitted-model sentinel the normalizers insert.
+      { ...textRequest(), model: OMITTED_MODEL },
+      { model: 'retired-model', honorRequestModel: true, codexCommand: fakeCodexModelsOk },
+    ),
+    (err) => {
+      assert.equal(err.statusCode, 404);
+      assert.equal(err.code, 'model_not_found');
+      return true;
+    },
+  );
+});
+
+test('default transport, honorRequestModel on: an omitted model uses a supported configured fallback', async () => {
+  resetCodexModelCatalogCache();
+  const body = await transportBody(
+    { ...textRequest(), model: OMITTED_MODEL },
+    { model: 'fixture-model-a', honorRequestModel: true, codexCommand: fakeCodexModelsOk },
+  );
+  assert.equal(body.model, 'fixture-model-a');
+});
+
+test('default transport, honorRequestModel on: an unadvertised model is rejected as not found', async () => {
+  resetCodexModelCatalogCache();
+  await assert.rejects(
+    () => transportBody(
+      { ...textRequest(), model: 'zzz-not-a-model' },
+      { model: 'gpt-5.5', honorRequestModel: true, codexCommand: fakeCodexModelsOk },
+    ),
+    (err) => {
+      assert.equal(err.statusCode, 404);
+      assert.equal(err.code, 'model_not_found');
+      assert.equal(err.param, 'model');
+      return true;
+    },
+  );
+});
+
+test('default transport, honorRequestModel on: an uncollectable catalogue passes the model through', async () => {
+  resetCodexModelCatalogCache();
+  const body = await transportBody(
+    { ...textRequest(), model: 'unknown-to-a-broken-lookup' },
+    { model: 'gpt-5.5', honorRequestModel: true, codexCommand: fakeCodexModelsFail },
+  );
+  assert.equal(body.model, 'unknown-to-a-broken-lookup');
 });
 
 test('CodexBackendTransport posts to ChatGPT Codex backend with OAuth auth and maps text usage', async () => {

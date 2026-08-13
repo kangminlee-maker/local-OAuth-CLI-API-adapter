@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
 import { CodexAppServerBackend } from '../dist/proxy/codex-app-server-backend.js';
+import { resetCodexModelCatalogCache } from '../dist/proxy/codex-model-catalog.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fakeCodex = resolve(here, 'fixtures/fake-codex.cjs');
@@ -289,6 +291,188 @@ test('CodexAppServerBackend can probe alternate proxy mode surfaces', async () =
     } finally {
       await backend.close();
     }
+  }
+});
+
+test('honorRequestModel off with nothing configured: the request model applies unvalidated', async () => {
+  // The other half of app-server's preserved default-off behaviour: with no
+  // configured model the request model is used, and nothing is checked against
+  // the catalogue — `zzz-unadvertised-model` is absent from the fake's list.
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+  try {
+    const payload = await debugAppServerPayload(backend, { model: 'zzz-unadvertised-model' });
+    assert.equal(payload.turnStart.model, 'zzz-unadvertised-model');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('honorRequestModel off: the request model never reaches turn/start', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'gpt-5.5',
+  });
+  try {
+    const payload = await debugAppServerPayload(backend, { model: 'gpt-5.6-sol' });
+    assert.equal(payload.turnStart.model, 'gpt-5.5');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('honorRequestModel on: a supported request model wins over the configured one', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'gpt-5.5',
+    honorRequestModel: true,
+  });
+  const callLog = join(await mkdtemp(join(tmpdir(), 'codex-models-call-')), 'calls.log');
+  process.env.CODEX_MODELS_CALL_LOG = callLog;
+  try {
+    // `fixture-only-model` is advertised solely by the fake CLI, so accepting it
+    // can only happen if the catalogue was actually collected from it. Because
+    // an uncollectable catalogue deliberately fails open, acceptance alone would
+    // also pass with no lookup at all — so assert the lookup happened.
+    const payload = await debugAppServerPayload(backend, { model: 'fixture-only-model' });
+    assert.equal(payload.turnStart.model, 'fixture-only-model');
+    assert.equal(existsSync(callLog), true, 'expected debug models to have been invoked');
+    assert.equal((await readFile(callLog, 'utf8')).trim(), 'debug models');
+  } finally {
+    delete process.env.CODEX_MODELS_CALL_LOG;
+    await backend.close();
+  }
+});
+
+test('honorRequestModel on: an omitted request model falls back to the configured one', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'fixture-only-model',
+    honorRequestModel: true,
+  });
+  try {
+    // `codex-app-server` is what the normalizers put in `model` when the request
+    // body omits it, so this is the shape a real model-less request arrives in.
+    const payload = await debugAppServerPayload(backend, { model: 'codex-app-server' });
+    assert.equal(payload.turnStart.model, 'fixture-only-model');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('honorRequestModel on: an omitted model still validates the configured fallback', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'retired-model',
+    honorRequestModel: true,
+  });
+  try {
+    await assert.rejects(
+      () => debugAppServerPayload(backend, { model: 'codex-app-server' }),
+      (err) => {
+        assert.equal(err.statusCode, 404);
+        assert.equal(err.code, 'model_not_found');
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
+  }
+});
+
+test('honorRequestModel on: a request naming the configured model is still validated', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    // Configured to a model the served catalogue does not list, as happens when
+    // a slug is retired. Naming it explicitly must not skip validation.
+    model: 'retired-model',
+    honorRequestModel: true,
+  });
+  try {
+    await assert.rejects(
+      () => debugAppServerPayload(backend, { model: 'retired-model' }),
+      (err) => {
+        assert.equal(err.statusCode, 404);
+        assert.equal(err.code, 'model_not_found');
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
+  }
+});
+
+test('honorRequestModel on: a model the CLI does not advertise is rejected as not found', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'gpt-5.5',
+    honorRequestModel: true,
+  });
+  try {
+    await assert.rejects(
+      () => debugAppServerPayload(backend, { model: 'zzz-not-a-model' }),
+      (err) => {
+        assert.equal(err.statusCode, 404);
+        assert.equal(err.code, 'model_not_found');
+        assert.equal(err.param, 'model');
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
+  }
+});
+
+test('honorRequestModel on: an anthropic-shaped request is rejected in the anthropic error shape', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'gpt-5.5',
+    honorRequestModel: true,
+  });
+  try {
+    await assert.rejects(
+      () => debugAppServerPayload(backend, { model: 'zzz-not-a-model', shape: 'anthropic-messages' }),
+      (err) => {
+        assert.equal(err.statusCode, 404);
+        assert.equal(err.provider, 'anthropic');
+        assert.equal(err.type, 'not_found_error');
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
   }
 });
 

@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
+import { honorRequestModel } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
 import {
   buildPrompt,
@@ -20,6 +21,7 @@ import type {
   LocalUsage,
   NormalizedRequest,
 } from './types.js';
+import { OMITTED_MODEL, unsupportedModelError } from './types.js';
 import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface ClaudeCodeBackendOptions {
@@ -28,6 +30,7 @@ interface ClaudeCodeBackendOptions {
   readonly model?: string;
   readonly timeoutMs: number;
   readonly extraArgs?: readonly string[];
+  readonly honorRequestModel?: boolean;
 }
 
 interface ClaudeWaiter {
@@ -57,6 +60,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   private readonly command: string;
   private readonly cwd: string;
   private readonly configuredModel?: string;
+  private readonly honorRequestModel: boolean;
   private readonly timeoutMs: number;
   private readonly extraArgs: readonly string[];
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -71,8 +75,78 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.cwd = options.cwd;
     this.model = options.model ?? 'claude-code-cli';
     this.configuredModel = options.model;
+    this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
     this.timeoutMs = options.timeoutMs;
     this.extraArgs = options.extraArgs ?? [];
+  }
+
+  /**
+   * Resolves which model the CLI runs. With `modelSelection.honorRequestModel`
+   * off this is always the configured model, which is what the proxy has always
+   * done. With it on the request wins and the configured model is the default.
+   *
+   * Claude Code validates `--model` itself and refuses an unknown one before any
+   * model call, so the CLI stays the authority on which models exist.
+   */
+  private effectiveModel(request: NormalizedRequest): string | undefined {
+    const requested = this.explicitRequestModel(request.model);
+    if (this.honorRequestModel && requested) return requested;
+    return this.configuredModel;
+  }
+
+  /**
+   * The request model, or undefined when it carries no model choice: an empty
+   * value, the sentinel the normalizers substitute for an omitted `model`, or the
+   * backend's own alias that clients echo back from `/v1/models`.
+   */
+  private explicitRequestModel(requestModel: string): string | undefined {
+    if (!requestModel || requestModel === OMITTED_MODEL || requestModel === 'claude-code-cli') {
+      return undefined;
+    }
+    return requestModel;
+  }
+
+  /**
+   * A model string that cannot become a process argument is a bad request, not a
+   * server fault. Node rejects a NUL-bearing argv element before the CLI starts,
+   * which would otherwise surface as an opaque spawn failure instead of the
+   * surface's own model error.
+   */
+  private assertModelIsSpawnable(model: string, request: NormalizedRequest): void {
+    const fromRequest = this.explicitRequestModel(request.model) !== undefined;
+    // NUL cannot appear in an argv element, and an oversized one exceeds the
+    // host's argument limit (E2BIG). Both fail inside spawn with an error that
+    // says nothing about models, so they are answered here instead.
+    if (model.includes('\0') || Buffer.byteLength(model, 'utf8') > MAX_MODEL_ARG_BYTES) {
+      throw unsupportedModelError(model, request.shape, fromRequest);
+    }
+  }
+
+  /**
+   * Operator-supplied extra arguments, minus any model selection, when the
+   * request is the authority on the model. They are appended after the resolved
+   * `--model`, so leaving one in would let it win on a last-value-wins parser and
+   * silently run a different model than the one the request asked for — and than
+   * the one a rejection would be reported against.
+   */
+  private extraArgsFor(): readonly string[] {
+    if (!this.honorRequestModel) return this.extraArgs;
+    return stripModelSelectionArgs(this.extraArgs);
+  }
+
+  /**
+   * The aliases `claude --model` documents, which always resolve to the current
+   * generation, plus the configured model. Full version-pinned names are not
+   * listed: the CLI does not enumerate them, and hard-coding a generation is
+   * exactly the drift this avoids. A client may still name one — the CLI
+   * validates it.
+   */
+  async resolvedModel(request: NormalizedRequest): Promise<string | null> {
+    return this.effectiveModel(request) ?? null;
+  }
+
+  async availableModels(): Promise<readonly string[] | null> {
+    return CLAUDE_MODEL_ALIASES;
   }
 
   async generate(
@@ -127,15 +201,41 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.initialized = null;
   }
 
-  private runRequest(
+  private async runRequest(
     request: NormalizedRequest,
     signal?: AbortSignal,
     onTextDelta?: (delta: string) => void,
   ): Promise<LocalCompletionResult> {
-    if (this.canUsePersistentTurn(request)) {
-      return this.withLock(() => this.runPersistentTurn(request, signal, onTextDelta));
+    const chosen = this.effectiveModel(request);
+    if (this.honorRequestModel && chosen) this.assertModelIsSpawnable(chosen, request);
+    try {
+      if (this.canUsePersistentTurn(request)) {
+        return await this.withLock(() => this.runPersistentTurn(request, signal, onTextDelta));
+      }
+      return await this.runOneShotTurn(request, signal, onTextDelta);
+    } catch (err) {
+      // The CLI is the authority on which models exist, so its refusal becomes
+      // the surface's own not-found error. Mapped here rather than inside one
+      // path so the same model produces the same status whether the request took
+      // the persistent or the one-shot route.
+      //
+      // Only when the request chose the model: with honouring off the model came
+      // from local configuration, and that stays a server-side fault.
+      const model = this.effectiveModel(request);
+      if (
+        this.honorRequestModel
+        && model
+        && err instanceof Error
+        && isClaudeModelRejection(err)
+      ) {
+        throw unsupportedModelError(
+          model,
+          request.shape,
+          this.explicitRequestModel(request.model) !== undefined,
+        );
+      }
+      throw err;
     }
-    return this.runOneShotTurn(request, signal, onTextDelta);
   }
 
   private canStreamTextDeltas(request: NormalizedRequest): boolean {
@@ -143,6 +243,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   private canUsePersistentTurn(request: NormalizedRequest): boolean {
+    // The persistent process fixes its model at spawn time, so a request that
+    // asks for a different one has to take the one-shot path that can pass its
+    // own `--model`.
+    if (this.effectiveModel(request) !== this.configuredModel) return false;
     return !hasImageInputs(request) && !requiresOneShotClaudeArgs(request, this.configuredModel);
   }
 
@@ -173,8 +277,17 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   ): Promise<LocalCompletionResult> {
     const startedAt = Date.now();
     const prompt = buildPrompt(request);
-    const useStreamJsonInput = hasImageInputs(request);
+    // Honouring a request model forces this path for requests that would
+    // otherwise run on the persistent process, which feeds the prompt over
+    // stdin. Passing it as an argument instead would publish system and user
+    // content in the child's command line, visible to anything that can read
+    // process arguments. Stream-JSON input keeps it off argv.
+    const modelForcedOneShot = this.effectiveModel(request) !== this.configuredModel;
+    const useStreamJsonInput = hasImageInputs(request) || modelForcedOneShot;
     const includePartialMessages = Boolean(onTextDelta);
+    // Which model this one-shot runs on, and the model the per-request tuning
+    // flags are gated against — they must be the same one.
+    const requestModel = this.effectiveModel(request);
     const argv = [
       '-p',
       ...(useStreamJsonInput ? ['--input-format', 'stream-json'] : []),
@@ -186,10 +299,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       '--tools',
       '',
       '--no-session-persistence',
-      ...(this.configuredModel ? ['--model', this.configuredModel] : []),
+      ...(requestModel ? ['--model', requestModel] : []),
       ...schemaArgsFor(request),
-      ...claudeTuningArgs(request, this.configuredModel),
-      ...this.extraArgs,
+      ...claudeTuningArgs(request, requestModel),
+      ...this.extraArgsFor(),
       ...(useStreamJsonInput ? [] : [prompt]),
     ];
     const stdinMessage = useStreamJsonInput
@@ -221,6 +334,8 @@ export class ClaudeCodeBackend implements LocalCliBackend {
         break;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
+        // Model refusals are mapped once in runRequest, which covers this path
+        // and the persistent one alike.
         if (!isRetryableClaudeStructuredOutputError(lastError) || signal?.aborted) throw lastError;
       }
     }
@@ -271,7 +386,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       '',
       '--no-session-persistence',
       ...(this.configuredModel ? ['--model', this.configuredModel] : []),
-      ...this.extraArgs,
+      ...this.extraArgsFor(),
     ], {
       cwd: this.cwd,
       shell: false,
@@ -604,6 +719,41 @@ function readErrorMessage(message: JsonObject): string {
 function isRetryableClaudeStructuredOutputError(err: Error): boolean {
   return err.message.includes('error_during_execution')
     || err.message.includes('[ede_diagnostic]');
+}
+
+/**
+ * Claude Code refuses an unknown `--model` before it starts a session, reporting
+ * "There's an issue with the selected model (<name>)". Matched on the stable part
+ * of that sentence rather than the whole wording.
+ */
+function isClaudeModelRejection(err: Error): boolean {
+  return /issue with the selected model/i.test(err.message);
+}
+
+// Flags that decide which model actually runs. `--fallback-model` counts: in
+// print mode Claude switches to it when the primary is overloaded, which would
+// silently run a model other than the one the request asked for and the response
+// echoes.
+const CLAUDE_MODEL_SELECTION_FLAGS = ['--model', '--fallback-model'];
+// Far above any real model name, far below every platform's argv limit.
+const MAX_MODEL_ARG_BYTES = 4096;
+// Documented by `claude --model`: "an alias for the latest model (e.g. 'fable',
+// 'opus', or 'sonnet')". Aliases track generations; version-pinned names do not.
+const CLAUDE_MODEL_ALIASES: readonly string[] = ['fable', 'opus', 'sonnet'];
+
+/** Drops `--flag <value>` and `--flag=<value>` pairs for model-selection flags. */
+function stripModelSelectionArgs(args: readonly string[]): string[] {
+  const kept: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (CLAUDE_MODEL_SELECTION_FLAGS.includes(arg)) {
+      index += 1;
+      continue;
+    }
+    if (CLAUDE_MODEL_SELECTION_FLAGS.some((flag) => arg.startsWith(`${flag}=`))) continue;
+    kept.push(arg);
+  }
+  return kept;
 }
 
 function parseJsonObject(line: string): JsonObject | null {

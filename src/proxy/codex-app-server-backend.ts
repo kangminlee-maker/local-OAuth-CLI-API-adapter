@@ -7,8 +7,10 @@ import readline from 'node:readline';
 import {
   codexProxyFallbackReasoningEffort,
   codexProxyFallbackVerbosity,
+  honorRequestModel,
 } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
+import { assertCodexModelSupported, codexModels } from './codex-model-catalog.js';
 import {
   baseInstructions,
   buildPrompt,
@@ -40,7 +42,7 @@ import type {
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { ProxyRequestError } from './types.js';
+import { OMITTED_MODEL, ProxyRequestError, unsupportedModelError } from './types.js';
 import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface CodexAppServerBackendOptions {
@@ -53,6 +55,7 @@ interface CodexAppServerBackendOptions {
   readonly imageGeneration?: boolean;
   readonly proxyMode?: CodexAppServerProxyMode;
   readonly onTiming?: (timing: CodexTurnTiming) => void;
+  readonly honorRequestModel?: boolean;
 }
 
 interface PendingRequest {
@@ -177,6 +180,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   private readonly command: string;
   private readonly cwd: string;
   private readonly configuredModel?: string;
+  private readonly honorRequestModel: boolean;
   private readonly timeoutMs: number;
   private readonly reasoningEffort: CodexReasoningEffort;
   private readonly verbosity: CodexVerbosity;
@@ -199,6 +203,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     this.cwd = options.cwd;
     this.model = options.model ?? 'codex-app-server';
     this.configuredModel = options.model;
+    this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
     this.timeoutMs = options.timeoutMs;
     this.reasoningEffort = options.reasoningEffort ?? codexProxyFallbackReasoningEffort();
     this.verbosity = options.verbosity ?? codexProxyFallbackVerbosity();
@@ -502,6 +507,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     try {
       [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
       const cwd = this.isolation?.workDir ?? this.cwd;
+      const modelOverride = await this.modelOverrideFor(request, signal);
       phaseStartedAt = Date.now();
       const turn = await this.send('turn/start', {
         threadId,
@@ -509,7 +515,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
         runtimeWorkspaceRoots: [cwd],
         environments: [],
         input: preparedInput.input,
-        model: this.modelOverrideFor(request.model),
+        model: modelOverride,
         effort: reasoningEffort,
         summary: 'none',
         ...turnPersonalityParams(this.proxyMode),
@@ -1104,12 +1110,77 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     this.clearBufferedTurnStates();
   }
 
-  private modelOverrideFor(requestModel: string): string | undefined {
-    if (this.configuredModel) return this.configuredModel;
-    if (!requestModel || requestModel === this.model || requestModel === 'codex-app-server') {
-      return undefined;
+  /**
+   * Resolves which model the turn runs on. With `modelSelection.honorRequestModel`
+   * off this keeps the historical precedence — a configured model always wins and
+   * the request model is only a fallback. With it on the request wins and the
+   * configured model becomes the default for requests that name none.
+   */
+  /** The Codex catalogue, so new model generations appear without a code change. */
+  async availableModels(): Promise<readonly string[] | null> {
+    const models = await codexModels({
+      command: this.command,
+      codexHome: this.isolation?.homeDir,
+      cwd: this.isolation?.workDir ?? this.cwd,
+      commandCwd: this.cwd,
+    });
+    return models?.map((entry) => entry.slug) ?? null;
+  }
+
+  async resolvedModel(request: NormalizedRequest): Promise<string | null> {
+    const requested = this.explicitRequestModel(request.model);
+    if (this.honorRequestModel) return requested ?? this.configuredModel ?? null;
+    return this.configuredModel ?? requested ?? null;
+  }
+
+  private async modelOverrideFor(
+    request: NormalizedRequest,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const requested = this.explicitRequestModel(request.model);
+    if (this.honorRequestModel) {
+      // Resolve first, then validate what will actually run — including the
+      // configured model when the request names none. `undefined` means no model
+      // is named at all and the CLI's own default applies, so there is nothing to
+      // check against the catalogue.
+      const effective = requested ?? this.configuredModel;
+      if (effective) {
+        await this.assertModelSupported(effective, request, requested !== undefined, signal);
+      }
+      return effective;
     }
+    if (this.configuredModel) return this.configuredModel;
+    return requested;
+  }
+
+  /**
+   * The request model, or undefined when it carries no model choice: an empty
+   * value, or the backend's own alias that clients echo back from `/v1/models`.
+   *
+   * A request naming the same model as the configured one is still a choice, not
+   * an omission — otherwise it would skip validation and keep running a model the
+   * served catalogue has since dropped.
+   */
+  private explicitRequestModel(requestModel: string): string | undefined {
+    if (!requestModel || requestModel === OMITTED_MODEL) return undefined;
     return requestModel;
+  }
+
+  private async assertModelSupported(
+    model: string,
+    request: NormalizedRequest,
+    fromRequest: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await assertCodexModelSupported(model, request.shape, {
+      command: this.command,
+      codexHome: this.isolation?.homeDir,
+      // The same workspace the app-server turn runs in, so the lookup sees the
+      // configuration the turn will actually use.
+      cwd: this.isolation?.workDir ?? this.cwd,
+      commandCwd: this.cwd,
+      signal,
+    }, fromRequest);
   }
 
   private modelOverrideForCodexImage(): string | undefined {

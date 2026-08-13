@@ -13,7 +13,7 @@ import { escapeRegExp } from './text.mjs';
 
 // Parse probe: the only authority that answers "does the installed CLI accept
 // this flag today". A string in the binary proves the token is compiled in, not
-// that the parser is wired to it — Claude Code 2.1.220 still ships strings for
+// that the parser is wired to it — Claude Code 2.1.228 still ships strings for
 // flags it now rejects.
 //
 // The probe pairs the flag with a bogus control flag rather than a plain value.

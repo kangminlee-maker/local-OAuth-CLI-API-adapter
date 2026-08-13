@@ -209,6 +209,23 @@ export type LocalStreamEvent =
 export interface LocalCliBackend {
   readonly name: string;
   readonly model: string;
+  /**
+   * Models this runtime can currently run, for `GET /v1/models`.
+   *
+   * Optional and best-effort: a backend that cannot enumerate returns null and
+   * the endpoint falls back to its single exposed model. Never a hard-coded
+   * list — the runtimes advertise their own, so new generations appear without
+   * a code change.
+   */
+  availableModels?(): Promise<readonly string[] | null>;
+  /**
+   * The model this request will actually run on, resolvable before execution.
+   *
+   * Lets the response report the executed model instead of echoing the request.
+   * Returns null when the runtime's own default applies and its name is unknown
+   * to the proxy.
+   */
+  resolvedModel?(request: NormalizedRequest): Promise<string | null>;
   generate(request: NormalizedRequest, signal?: AbortSignal): Promise<LocalCompletionResult>;
   stream?(
     request: NormalizedRequest,
@@ -230,6 +247,14 @@ export interface ProxyServerOptions {
   readonly authKey?: string;
 }
 
+/**
+ * What the normalizers put in `model` when the request body omits it, on every
+ * surface including `/v1/messages`. Backends must treat it as "no model chosen"
+ * rather than as a model name — otherwise an omitted model would be forwarded to
+ * a CLI as a literal `--model codex-app-server` and rejected.
+ */
+export const OMITTED_MODEL = 'codex-app-server';
+
 export class ProxyRequestError extends Error {
   constructor(
     message: string,
@@ -241,6 +266,34 @@ export class ProxyRequestError extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * The request named a model this runtime cannot run. Reported in the error shape
+ * of the surface the client called, so an OpenAI client sees `model_not_found`
+ * and an Anthropic client sees `not_found_error`.
+ */
+export function unsupportedModelError(
+  model: string,
+  shape: ApiShape,
+  // Echo the client's own value back; never the locally configured default,
+  // which the client did not supply and should not learn about from an error.
+  fromRequest = true,
+): ProxyRequestError {
+  const message = fromRequest
+    ? `Model \`${model}\` is not available through this local CLI runtime.`
+    : 'The model configured for this local CLI runtime is not available.';
+  if (shape === 'anthropic-messages') {
+    return new ProxyRequestError(message, 404, 'anthropic', 'not_found_error');
+  }
+  return new ProxyRequestError(
+    message,
+    404,
+    'openai',
+    'invalid_request_error',
+    'model',
+    'model_not_found',
+  );
 }
 
 export function estimateTokens(text: string): number {
