@@ -246,7 +246,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
         // the model at all — the CLI reports a gateway 404 with these same
         // fields — so put them on the proxy's stderr before they are dropped.
         // Only the CLI's message: no prompt, no argv, no environment.
-        process.stderr.write(`claude model rejection (reported as 404): ${err.message}\n`);
+        process.stderr.write(`claude model rejection (reported as 404): ${asLogLine(err.message)}\n`);
         throw unsupportedModelError(
           model,
           request.shape,
@@ -736,10 +736,36 @@ function readNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
+/**
+ * The runtime's own words for a failed turn, or nothing. Deliberately not a
+ * serialization of the event: this string becomes an HTTP 500's `message`, and a
+ * result event carries `session_id`, cost, usage and whatever fields a future
+ * version adds. Two named string fields are read; anything else is answered with
+ * a fixed sentence rather than by handing the client the event.
+ */
+/**
+ * One log line, and only a log line. The runtime's message contains the model
+ * string a client chose, so it can carry newlines that forge a second entry or
+ * escape sequences a terminal would act on. Control characters become escapes
+ * and the result is bounded — an operator lead, not a channel.
+ */
+function asLogLine(message: string): string {
+  const flattened = message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, (ch) => (
+    `\\x${ch.codePointAt(0)?.toString(16).padStart(2, '0')}`
+  ));
+  return flattened.length > MAX_LOG_LINE_CHARS
+    ? `${flattened.slice(0, MAX_LOG_LINE_CHARS)}...[truncated]`
+    : flattened;
+}
+
+// Long enough for the CLI's refusal sentence and a model name; short enough that
+// a hostile value cannot flood an operator's log from one request.
+const MAX_LOG_LINE_CHARS = 500;
+
 function readErrorMessage(message: JsonObject): string {
   if (typeof message.result === 'string' && message.result.trim()) return message.result;
   if (typeof message.error === 'string' && message.error.trim()) return message.error;
-  return JSON.stringify(message);
+  return 'claude code reported a failed turn without a diagnostic message';
 }
 
 function isRetryableClaudeStructuredOutputError(err: Error): boolean {

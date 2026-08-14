@@ -695,9 +695,15 @@ test('honorRequestModel on: the assistant-event refusal is a 404 on the persiste
         },
       );
     }
-    const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean);
+    // The log carries one line per spawn plus one per real user turn (the fixture
+    // does not count the `/clear` the backend sends between turns). One spawn and
+    // two turns is the persistent route; two spawns would be one-shot.
+    const lines = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const spawns = lines.filter((l) => l[0] !== '#turn');
+    const turns = lines.filter((l) => l[0] === '#turn');
     assert.equal(spawns.length, 1, `two turns must reuse one process, saw ${spawns.length} spawns`);
-    const argv = JSON.parse(spawns[0]);
+    assert.equal(turns.length, 2, `expected two answered user turns, saw ${turns.length}`);
+    const argv = spawns[0];
     assert.equal(argv[argv.indexOf('--model') + 1], 'claude-retired');
   } finally {
     await backend.close();
@@ -733,6 +739,67 @@ test('honorRequestModel on: a bare 404 on the persistent route is not a model er
     );
   } finally {
     await backend.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('honorRequestModel on: the operator gets the runtime message, flattened to one line', async () => {
+  // The mapped 404 carries a fixed sentence, so this write is the operator's only
+  // record of what the runtime actually said. It is also the only place a
+  // client-chosen string reaches a log, so it must not be able to forge a second
+  // entry: the model here contains a newline and an ANSI escape.
+  const hostileModel = 'evil\u001b[31m\nclaude model rejection (reported as 404): forged entry';
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => {
+    written.push(String(chunk));
+    return originalWrite(chunk, ...rest);
+  };
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = 'assistant_only';
+  try {
+    await assert.rejects(() => runAgainstRejectingClaude(
+      openAiRefusalRequest({ model: hostileModel, effort: 'low' }),
+      'claude-opus-4-8',
+      { honorRequestModel: true, command: resultShapes },
+    ));
+    const lines = written.filter((line) => line.includes('claude model rejection'));
+    assert.equal(lines.length, 1, `expected exactly one diagnostic, got ${lines.length}`);
+    assert.match(lines[0], /^claude model rejection \(reported as 404\): /);
+    assert.match(lines[0], /localized refusal text the proxy does not parse/);
+    // One trailing newline and no other line break: a forged second entry is the
+    // whole point of escaping, and a raw ESC would be acted on by a terminal.
+    assert.equal(lines[0].split('\n').length, 2, `diagnostic must be one line: ${JSON.stringify(lines[0])}`);
+    assert.ok(!lines[0].includes('\u001b'), 'escape sequences must not survive');
+    assert.ok(!lines[0].includes('Say OK'), 'the prompt must not be logged');
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('an errored result with no diagnostic field does not hand the client the event', async () => {
+  // `readErrorMessage` used to serialize the whole result event, which carries
+  // `session_id`, cost and usage — and that string becomes an HTTP 500 message.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = 'error_no_text';
+  try {
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-not-a-model', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.ok(!err.message.includes('sentinel-session'), `session id leaked: ${err.message}`);
+        assert.ok(!err.message.includes('total_cost_usd'), `event serialized: ${err.message}`);
+        assert.match(err.message, /without a diagnostic message/);
+        return true;
+      },
+    );
+  } finally {
     if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
     else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
   }
