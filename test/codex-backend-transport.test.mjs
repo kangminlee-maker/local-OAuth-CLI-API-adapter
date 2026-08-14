@@ -198,10 +198,18 @@ test('default transport, honorRequestModel on: what runs and what is reported ag
     honorRequestModel: true,
     codexCommand: fakeCodexModelsFail,
   });
-  const request = { ...textRequest(), model: 'codex-backend' };
-  await backend.generate(request);
-  assert.equal(JSON.parse(calls[0].init.body).model, 'codex-backend', 'executed model');
-  assert.equal(await backend.resolvedModel(request), 'codex-backend', 'reported model');
+  try {
+    const request = { ...textRequest(), model: 'codex-backend' };
+    // Resolve BEFORE generating, which is the production order — the streaming
+    // path resolves the echoed model before the turn starts. Asking afterwards
+    // would let a refactor that simply returns the last model `generate` used
+    // pass, while a fresh backend still reported the configured one.
+    assert.equal(await backend.resolvedModel(request), 'codex-backend', 'reported model');
+    await backend.generate(request);
+    assert.equal(JSON.parse(calls[0].init.body).model, 'codex-backend', 'executed model');
+  } finally {
+    await backend.close?.();
+  }
 });
 
 test('default transport, honorRequestModel on: an uncollectable catalogue passes the model through', async () => {

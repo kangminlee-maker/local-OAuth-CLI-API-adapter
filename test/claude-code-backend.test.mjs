@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -277,6 +277,12 @@ async function spawnedArgv(request, model, options = {}) {
   }
 }
 
+// Every value the CLI would read as a model selection, in argv order. The parser
+// is last-value-wins, so only the whole sequence says which model actually runs.
+function modelArgsIn(argv) {
+  return argv.flatMap((arg, i) => (arg === '--model' ? [argv[i + 1]] : []));
+}
+
 const PROBE_SCHEMA = { type: 'object', additionalProperties: false, properties: {}, required: [] };
 
 function anthropicTuningRequest(overrides) {
@@ -367,12 +373,11 @@ test('honorRequestModel on, nothing configured: the identifier still reaches --m
     { honorRequestModel: true },
   );
   assert.ok(argv.includes('-p'), `expected the one-shot path: ${argv.join(' ')}`);
-  // Assert the flag exists before reading past it: `indexOf(...) + 1` is 0 when
-  // the flag is absent, so a regression that passed the model as a bare
-  // positional argument would otherwise be read as a pass.
-  const i = argv.indexOf('--model');
-  assert.ok(i !== -1, `expected --model in argv: ${argv.join(' ')}`);
-  assert.equal(argv[i + 1], 'claude-code-cli');
+  // Every `--model` value, not the first: the CLI is last-value-wins, so an argv
+  // carrying `--model claude-code-cli --model sonnet` would run `sonnet` while a
+  // first-occurrence check called it a pass. An exact array also fails when the
+  // flag is absent entirely, which `indexOf(...) + 1` (0) would not.
+  assert.deepEqual(modelArgsIn(argv), ['claude-code-cli']);
 });
 
 test('honorRequestModel on, nothing configured: the CLI refusing the identifier is a 404', async () => {
@@ -382,7 +387,9 @@ test('honorRequestModel on, nothing configured: the CLI refusing the identifier 
   //
   // The fixture refuses whatever it is given, including nothing, so the status
   // alone would not prove the model was forwarded. Assert the recorded argv too.
-  const argvLog = join(await mkdtemp(join(tmpdir(), 'claude-argv-')), 'argv.log');
+  const argvDir = await mkdtemp(join(tmpdir(), 'claude-argv-'));
+  const argvLog = join(argvDir, 'argv.log');
+  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
   process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
   try {
     await assert.rejects(
@@ -398,12 +405,16 @@ test('honorRequestModel on, nothing configured: the CLI refusing the identifier 
         return true;
       },
     );
-    const argv = JSON.parse((await readFile(argvLog, 'utf8')).trim().split('\n')[0]);
-    const i = argv.indexOf('--model');
-    assert.ok(i !== -1, `expected --model in argv: ${argv.join(' ')}`);
-    assert.equal(argv[i + 1], 'claude-code-cli');
+    // Validate every recorded spawn, not just the first line: a second spawn
+    // with different argv would otherwise be invisible, and so would a repeated
+    // `--model` within one spawn.
+    const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(spawns.length, 1, `expected exactly one spawn, got ${spawns.length}`);
+    for (const argv of spawns) assert.deepEqual(modelArgsIn(argv), ['claude-code-cli']);
   } finally {
-    delete process.env.CLAUDE_TEST_ARGV_LOG;
+    if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
+    else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
+    await rm(argvDir, { recursive: true, force: true });
   }
 });
 

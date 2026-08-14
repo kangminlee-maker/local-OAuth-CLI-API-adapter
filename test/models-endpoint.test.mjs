@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { BACKEND_IDENTIFIERS } from '../dist/proxy/types.js';
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -49,12 +50,19 @@ test('GET /v1/models returns the configured model, not the backend alias', async
   assert.equal(payload.data[0].object, 'model');
 });
 
-// Every value the proxy would reject as a model. Kept as a literal list rather
-// than imported from the source so that dropping one from BACKEND_IDENTIFIERS
-// fails here instead of silently narrowing what both sides check.
-const BACKEND_IDENTIFIERS = ['codex-app-server', 'codex-backend', 'claude-code-cli'];
+// The transport names that must never be advertised as models. Pinned as a
+// literal so that narrowing the production list fails here instead of silently
+// narrowing what the loops below cover — and compared against the production
+// constant so that GROWING it fails too. Without that comparison, adding a
+// genuinely selectable name (`fable`) to the production list would drop it from
+// every `/v1/models` response while every test here stayed green.
+const PINNED_IDENTIFIERS = ['codex-app-server', 'codex-backend', 'claude-code-cli'];
 
-for (const identifier of BACKEND_IDENTIFIERS) {
+test('the pinned identifier list is exactly the production one', () => {
+  assert.deepEqual([...BACKEND_IDENTIFIERS], PINNED_IDENTIFIERS);
+});
+
+for (const identifier of PINNED_IDENTIFIERS) {
   test(`GET /v1/models never advertises the backend identifier ${identifier}`, async () => {
     // An identifier names a transport, not a model a client can select, so it
     // is never offered as a choice. What a request naming one actually gets is
@@ -75,8 +83,8 @@ after(async () => {
 
 // With honouring on, `GET /v1/models` advertises what the runtime says it can
 // run, so a new model generation shows up without a code change. With it off the
-// request model selects nothing, so advertising alternatives would invite a
-// choice the proxy ignores.
+// request model is not the proxy's choice to offer, so alternatives are not
+// advertised — what an off-mode request model actually does is per-runtime.
 async function modelsWithSetting(honorRequestModel, listed, backendModel = 'configured-model') {
   const root = await mkdtemp(join(tmpdir(), 'models-endpoint-'));
   trees.push(root);
@@ -112,7 +120,10 @@ test('honour-on: the runtime catalogue is advertised, configured model first', a
   assert.deepEqual(payload.data.map((m) => m.id), ['configured-model', 'gpt-5.6-sol', 'gpt-5.6-terra']);
 });
 
-test('honour-off: only the executed model is advertised', async () => {
+// Not "the executed model": with honouring off `codex-backend` runs the request
+// model while the list still shows what is configured. The list is about
+// configuration, not about what any particular request will run.
+test('honour-off: only the configured model is advertised', async () => {
   const payload = await modelsWithSetting(false, ['gpt-5.6-sol', 'gpt-5.6-terra']);
   assert.deepEqual(payload.data.map((m) => m.id), ['configured-model']);
 });
@@ -122,7 +133,7 @@ test('a runtime that cannot enumerate falls back to its single model', async () 
   assert.deepEqual(payload.data.map((m) => m.id), ['configured-model']);
 });
 
-for (const identifier of BACKEND_IDENTIFIERS) {
+for (const identifier of PINNED_IDENTIFIERS) {
   // The identifier can reach the list from two independent places, and they are
   // kept in separate tests on purpose. Exercising both at once lets a filter
   // that only de-duplicates against `backend.model` look like identifier
