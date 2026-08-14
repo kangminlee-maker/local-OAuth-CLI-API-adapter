@@ -125,6 +125,24 @@ test('an uncollectable list passes any model through rather than rejecting it', 
   await assertCodexModelSupported('anything-at-all', 'openai-chat', { command: failCommand, codexHome });
 });
 
+test('fail-open survives the failure window: a retry that also fails still passes models through', async () => {
+  // The retry is a different branch from the first lookup. If it ever produced
+  // an empty list instead of `null`, the proxy would serve every model for 30
+  // seconds and then start 404-ing all of them — with nothing in the request to
+  // explain the change. The retry-count test above stays green either way.
+  const codexHome = await newHome();
+  let now = 1_000_000;
+  const clock = () => now;
+  const options = { command: failCommand, codexHome, now: clock };
+
+  await assertCodexModelSupported('anything-at-all', 'openai-chat', options);
+  now += 31_000;
+  await assertCodexModelSupported('anything-at-all', 'openai-chat', options);
+  assert.equal(await callCount(codexHome), 2, 'the window must have elapsed for this to prove anything');
+  now += 31_000;
+  await assertCodexModelSupported('a-different-model', 'openai-chat', options);
+});
+
 test('a successfully collected empty catalogue is authoritative, not unknown', async () => {
   // An account entitled to nothing is a conclusive answer. Reporting it as
   // unknown would let every model through instead of rejecting it here.

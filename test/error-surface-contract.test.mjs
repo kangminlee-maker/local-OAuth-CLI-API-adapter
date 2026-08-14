@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import http from 'node:http';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { unsupportedModelError } from '../dist/proxy/types.js';
 
@@ -80,6 +81,77 @@ test('/v1/chat/completions: a refused model is a 404 in the OpenAI envelope', as
   assert.equal(body.error.param, 'model');
 });
 
+test('/v1/responses: a refused model is a 404 in the OpenAI envelope', async () => {
+  const { status, text } = await call(
+    backendThat({ fail: () => unsupportedModelError('a-model', 'openai-chat', true) }),
+    '/v1/responses',
+    { model: 'a-model', input: 'hi' },
+  );
+  const body = JSON.parse(text);
+  assert.equal(status, 404);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.equal(body.error.code, 'model_not_found');
+  assert.equal(body.error.param, 'model');
+});
+
+// The failure envelopes are pinned above; the SUCCESS envelopes were asserted
+// only where a test happened to touch a field. A client parses a fixed set of
+// them, and dropping or renaming any one is a one-line edit.
+test('/v1/chat/completions: the success envelope carries the fields a client reads', async () => {
+  const { status, text } = await call(backendThat({}), '/v1/chat/completions', CHAT);
+  assert.equal(status, 200);
+  const body = JSON.parse(text);
+  assert.equal(body.object, 'chat.completion');
+  assert.match(body.id, /^chatcmpl-/);
+  assert.equal(typeof body.created, 'number');
+  assert.equal(body.choices.length, 1);
+  assert.equal(body.choices[0].index, 0);
+  assert.equal(body.choices[0].message.role, 'assistant');
+  assert.equal(body.choices[0].message.content, 'OK');
+  assert.equal(body.choices[0].finish_reason, 'stop');
+  assert.equal(body.usage.prompt_tokens, 1);
+  assert.equal(body.usage.completion_tokens, 1);
+  assert.equal(body.usage.total_tokens, 2);
+});
+
+test('/v1/responses: the success envelope carries the fields a client reads', async () => {
+  const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input: 'hi' });
+  assert.equal(status, 200);
+  const body = JSON.parse(text);
+  assert.equal(body.object, 'response');
+  assert.equal(body.status, 'completed');
+  assert.equal(body.error, null);
+  assert.equal(typeof body.created_at, 'number');
+
+  const message = body.output.find((item) => item.type === 'message');
+  assert.ok(message, `expected a message item: ${JSON.stringify(body.output)}`);
+  assert.equal(message.role, 'assistant');
+  assert.equal(message.status, 'completed');
+  assert.equal(message.content[0].type, 'output_text');
+  assert.equal(message.content[0].text, 'OK');
+
+  assert.equal(body.usage.input_tokens, 1);
+  assert.equal(body.usage.output_tokens, 1);
+  assert.equal(body.usage.total_tokens, 2);
+});
+
+test('/v1/messages: the success envelope carries the fields a client reads', async () => {
+  const { status, text } = await call(backendThat({}), '/v1/messages', MESSAGES);
+  assert.equal(status, 200);
+  const body = JSON.parse(text);
+  assert.equal(body.type, 'message');
+  assert.equal(body.role, 'assistant');
+  assert.equal(body.content[0].type, 'text');
+  assert.equal(body.content[0].text, 'OK');
+  assert.equal(body.stop_reason, 'end_turn');
+  assert.equal(body.stop_sequence, null);
+  assert.equal(body.usage.input_tokens, 1);
+  assert.equal(body.usage.output_tokens, 1);
+  // Anthropic reports the two counts only; a total_tokens here is an OpenAI
+  // field leaking into the wrong envelope.
+  assert.equal(body.usage.total_tokens, undefined);
+});
+
 test('/v1/messages: a failure with no provider mapping still uses the Anthropic envelope', async () => {
   // The generic fallback used to answer every surface in the OpenAI shape.
   const { status, text } = await call(
@@ -116,6 +188,34 @@ for (const [path, body, shape] of [
     assert.ok(message.endsWith('...[truncated]'), `expected the marker: ${message.slice(-20)}`);
   });
 }
+
+// Every bound test above asserts the truncating side. The other side — a message
+// that already fits arrives whole — was pinned by nothing, so a bound that
+// truncated unconditionally passed them all.
+for (const [label, length] of [['just under', 499], ['exactly at', 500]]) {
+  test(`a message ${label} the bound is delivered untouched`, async () => {
+    const fits = 'M'.repeat(length);
+    const { text } = await call(
+      backendThat({ fail: () => new Error(fits) }),
+      '/v1/chat/completions',
+      CHAT,
+    );
+    const message = JSON.parse(text).error.message;
+    assert.equal(message.length, length, `a fitting message must not be truncated`);
+    assert.equal(message, fits);
+  });
+}
+
+test('a message one character over the bound is truncated to the bound', async () => {
+  const { text } = await call(
+    backendThat({ fail: () => new Error('M'.repeat(501)) }),
+    '/v1/chat/completions',
+    CHAT,
+  );
+  const message = JSON.parse(text).error.message;
+  assert.equal(message.length, 500);
+  assert.ok(message.endsWith('...[truncated]'));
+});
 
 test('a mid-stream model refusal is bounded in the SSE error frame', async () => {
   // A refusal after the first chunk is serialized by the streaming error writer,
@@ -516,21 +616,50 @@ test('an empty authKey is a configuration error, not an open proxy', async () =>
   }
 });
 
-test('repeated x-api-key headers: one valid value is enough', async () => {
-  // Node folds duplicates into one comma-joined value, which made a stale
-  // duplicate veto a valid one — the same bug the two-header rule fixed.
+// `fetch` folds repeated headers into one comma-joined value, so it cannot send
+// what this and the next test are about. `node:http` with an array value writes
+// one physical line per element, which is the distinction the gate now reads.
+async function getWithRawHeaders(url, headers) {
+  const target = new URL(`${url}/v1/models`);
+  return await new Promise((resolve, reject) => {
+    const req = http.request(
+      { host: target.hostname, port: target.port, path: target.pathname, method: 'GET', headers },
+      (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function withRawKeyHeaders(headers, authKey = 'secret-key') {
   const started = await startLocalApiProxy({
     backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-    authKey: 'secret-key',
+    authKey,
   });
   try {
-    const res = await fetch(`${started.url}/v1/models`, {
-      headers: { 'x-api-key': 'stale, secret-key' },
-    });
-    assert.equal(res.status, 200);
+    return await getWithRawHeaders(started.url, headers);
   } finally {
     await started.close();
   }
+}
+
+test('repeated x-api-key headers: one valid value is enough', async () => {
+  // Two physical lines. A stale duplicate must not veto a valid credential —
+  // the same alternatives rule the two DIFFERENT headers follow.
+  assert.equal(await withRawKeyHeaders({ 'x-api-key': ['stale', 'secret-key'] }), 200);
+});
+
+test('a key containing a comma is one key, not two', async () => {
+  // The contract puts no character restriction on the key. Splitting the folded
+  // value on commas — the shape a duplicate arrives in — turned this single
+  // valid credential into two invalid fragments and answered 401.
+  const key = 'a,b';
+  assert.equal(await withRawKeyHeaders({ 'x-api-key': key }, key), 200);
+  assert.equal(await withRawKeyHeaders({ authorization: `Bearer ${key}` }, key), 200);
+});
+
+test('a comma-containing key is not satisfied by one of its fragments', async () => {
+  assert.equal(await withRawKeyHeaders({ 'x-api-key': 'a' }, 'a,b'), 401);
 });
 
 test('/v1/responses: a successful stream ends with completed then [DONE]', async () => {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { startLocalApiProxy, GeneratedImageStore } from '../dist/proxy/http-server.js';
 
 // The Images surface has a documented input contract and almost none of its
 // REJECTIONS were pinned: the successful paths were tested, so a widened bound or
@@ -154,6 +154,23 @@ test('generations: compression below 100 needs jpeg or webp', async () => {
   assert.equal(payload.error.code, 'invalid_png_output_compression');
 });
 
+test('generations: png with compression 100 is accepted, because 100 is no compression', async () => {
+  // The guard names compression LESS THAN 100. Written as a bare presence check
+  // it rejected the documented maximum, which is the value that asks for none.
+  const { status } = await postImages(GEN, {
+    model: 'gpt-image-1', prompt: 'a dot', output_format: 'png', output_compression: 100,
+  });
+  assert.equal(status, 200);
+});
+
+test('generations: png with compression 99 is still rejected', async () => {
+  const { status, payload } = await postImages(GEN, {
+    model: 'gpt-image-1', prompt: 'a dot', output_format: 'png', output_compression: 99,
+  });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_png_output_compression');
+});
+
 test('generations: input_fidelity belongs to edits', async () => {
   const { status, payload } = await postImages(GEN, {
     model: 'gpt-image-1', prompt: 'a dot', input_fidelity: 'high',
@@ -294,4 +311,144 @@ test('each generated image gets its own id, and each URL keeps its own bytes', a
   } finally {
     await started.close();
   }
+});
+
+// The store's two remaining promises — entries expire, and the store does not
+// grow without limit — were pinned by nothing. An infinite TTL and an unbounded
+// map both passed every test above.
+test('store: an expired entry is gone, and reads as a miss', () => {
+  const store = new GeneratedImageStore(0);
+  const id = store.put('iVBORw0KGgo=', 'png');
+  assert.equal(store.get(id), null, 'a zero lifetime must not be servable');
+});
+
+test('store: an unexpired entry is served', () => {
+  const store = new GeneratedImageStore(60_000);
+  const id = store.put('iVBORw0KGgo=', 'png');
+  assert.ok(store.get(id), 'a live entry must be servable');
+});
+
+test('store: the byte bound evicts the oldest, never the entry just stored', () => {
+  const oneKiB = Buffer.alloc(1024, 7).toString('base64');
+  const store = new GeneratedImageStore(60_000, 3 * 1024);
+  const ids = Array.from({ length: 5 }, () => store.put(oneKiB, 'png'));
+
+  assert.ok(store.get(ids.at(-1)), 'the newest entry must survive its own insertion');
+  assert.equal(store.get(ids[0]), null, 'the oldest must be evicted first');
+  assert.equal(store.get(ids[1]), null);
+
+  const live = ids.filter((id) => store.get(id));
+  assert.equal(live.length, 3, `the bound holds 3 KiB, got ${live.length} entries`);
+});
+
+test('store: an image larger than the whole bound is still served once', () => {
+  // Eviction that does not stop at the new entry deletes the image the client
+  // was just handed a URL for, so the URL 404s on its first fetch. Only a single
+  // oversized image reaches this branch — several small ones stop earlier.
+  const store = new GeneratedImageStore(60_000, 1024);
+  const id = store.put(Buffer.alloc(4096, 7).toString('base64'), 'png');
+  const image = store.get(id);
+  assert.ok(image, 'the URL the client was handed must serve its image at least once');
+  assert.equal(image.bytes.byteLength, 4096);
+});
+
+test('store: eviction accounting survives expiry, so the bound does not drift', () => {
+  // Dropping an expired entry must return its bytes to the budget. If it does
+  // not, the store silently shrinks to nothing over a long-running session.
+  const oneKiB = Buffer.alloc(1024, 7).toString('base64');
+  const store = new GeneratedImageStore(60_000, 3 * 1024);
+  const expiring = new GeneratedImageStore(0);
+  expiring.put(oneKiB, 'png');
+
+  const ids = Array.from({ length: 3 }, () => store.put(oneKiB, 'png'));
+  assert.equal(ids.filter((id) => store.get(id)).length, 3);
+});
+
+test('the generated image URL is a v4 UUID and serves exactly the bytes it was given', async () => {
+  // `randomUUID` is v4; asserting only the hex shape would accept a counter
+  // formatted to look like one, which is guessable across callers.
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() {
+      return {
+        created: 0,
+        images: [{ b64Json: png.toString('base64'), revisedPrompt: null }],
+        usage: { inputTokens: 1, outputTokens: 1, source: 'provider' },
+      };
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
+    });
+    const url = (await res.json()).data[0].url;
+    const id = url.split('/').pop();
+    assert.match(
+      id,
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      `expected a v4 UUID (version nibble 4, variant 8..b): ${id}`,
+    );
+
+    const fetched = await fetch(url);
+    assert.equal(fetched.status, 200);
+    const served = Buffer.from(await fetched.arrayBuffer());
+    assert.ok(served.equals(png), `served bytes must be the generated bytes: ${served.toString('hex')}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('the access gate covers the generated image route', async () => {
+  // The contract says the gate applies here "like any other" route, and this is
+  // the one route whose URL the proxy itself hands out.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000, authKey: 'secret-key',
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer secret-key' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
+    });
+    const url = (await res.json()).data[0].url;
+
+    assert.equal((await fetch(url)).status, 401, 'an unauthenticated fetch must not get the bytes');
+    assert.equal(
+      (await fetch(url, { headers: { authorization: 'Bearer secret-key' } })).status,
+      200,
+    );
+  } finally {
+    await started.close();
+  }
+});
+
+// The guards below are shared across operations but were only ever exercised on
+// one of them, so an operation check added to any of them would go unnoticed.
+test('variations: n is validated there too', async () => {
+  const { status } = await postForm('/v1/images/variations', { model: 'dall-e-2', n: '11' });
+  assert.equal(status, 400);
+});
+
+test('variations: an image-2 transparent background is rejected there too', async () => {
+  const { status, payload } = await postForm('/v1/images/variations', {
+    model: 'image-2', background: 'transparent',
+  });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_value');
+});
+
+test('variations: input_fidelity is rejected there too', async () => {
+  const { status, payload } = await postForm('/v1/images/variations', {
+    model: 'dall-e-2', input_fidelity: 'high',
+  });
+  assert.equal(status, 400);
+  assert.match(payload.error.message, /only supported for image edits/);
 });

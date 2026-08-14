@@ -40,7 +40,7 @@ interface ClaudeWaiter {
   sawModelOutput?: boolean;
   /**
    * The `error` of the last assistant message flagged `is_api_error_message`.
-   * Claude Code 2.1.232 reports a refused model there — `"model_not_found"` —
+   * Claude Code 2.1.232 and 2.1.233 report a refused model there — `"model_not_found"` —
    * and leaves the field off the result event, where 2.1.231 had put it. The
    * result event is what settles the turn, so the kind has to be carried across.
    */
@@ -1146,7 +1146,7 @@ function isClaudeModelRejection(err: Error): boolean {
  * The refusal arrives inside the event stream, not on stderr, and not as a
  * non-zero exit — which is why it used to surface as an ordinary assistant reply.
  * Where the structured kind sits moved between patch releases: 2.1.231 put
- * `error: "model_not_found"` on the result event, 2.1.232 puts it on the
+ * `error: "model_not_found"` on the result event, 2.1.232 and later put it on the
  * assistant message (`is_api_error_message: true`) and omits it from the result,
  * so `consumeClaudeMessage` carries it across on the waiter.
  *
@@ -1155,7 +1155,7 @@ function isClaudeModelRejection(err: Error): boolean {
  * and catches it there, so testing the sentence twice would duplicate one rule
  * rather than add a signal.
  *
- * KNOWN AMBIGUITY, measured rather than assumed. Claude Code 2.1.232 reports a
+ * KNOWN AMBIGUITY, measured rather than assumed. Claude Code 2.1.232+ reports a
  * plain HTTP 404 from whatever endpoint it talked to using these same fields.
  * Probed directly: a VALID model (`haiku`) against an endpoint answering 404 to
  * everything produced `error: "model_not_found"`, `api_error_status: 404`, and
@@ -1168,7 +1168,7 @@ function isClaudeModelRejection(err: Error): boolean {
  * text is written to the proxy's own stderr so the operator can see the real one.
  */
 function isClaudeModelRejectionResult(message: JsonObject, waiter: ClaudeWaiter): boolean {
-  // 2.1.232: on the assistant message, carried here by `consumeClaudeMessage`.
+  // 2.1.232 and later: on the assistant message, carried here by `consumeClaudeMessage`.
   if (waiter.apiErrorKind === 'model_not_found') return true;
   // 2.1.231: on the result event itself.
   if (message.error === 'model_not_found') return true;

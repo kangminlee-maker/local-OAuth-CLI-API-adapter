@@ -54,6 +54,9 @@ const DEFAULT_IMAGE_GENERATION_QUALITY = 'auto';
 const DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT = 'png';
 const DEFAULT_IMAGE_GENERATION_BACKGROUND = 'auto';
 const GENERATED_IMAGE_TTL_MS = 60 * 60 * 1000;
+// Expiry alone bounds nothing: a client generating images for an hour grows the
+// store without limit. Bytes, not entries, are what runs the machine out.
+const GENERATED_IMAGE_MAX_BYTES = 128 * 1024 * 1024;
 const IMAGE_PROXY_VISUAL_CLASSES = [
   'primitive_flat_shape',
   'geometric_icon',
@@ -231,7 +234,7 @@ function requireAuthorizedRequest(
   // it as off silently opens a proxy its operator believed was closed.
   if (authKey === undefined) return;
   if (!authKey) throw new Error('authKey is configured but empty; refusing to serve unauthenticated');
-  if (presentedAuthKeys(req.headers).some((candidate) => safeKeyEqual(candidate, authKey))) return;
+  if (presentedAuthKeys(req).some((candidate) => safeKeyEqual(candidate, authKey))) return;
   const provider = path === '/v1/messages' ? 'anthropic' : 'openai';
   throw new ProxyRequestError(
     'Unauthorized: missing or invalid API key.',
@@ -251,16 +254,20 @@ function requireAuthorizedRequest(
  * A bare `Authorization: <key>` is NOT a credential. The contract names the
  * Bearer form, and accepting the raw value silently widened what counts.
  */
-function presentedAuthKeys(headers: IncomingMessage['headers']): string[] {
+function presentedAuthKeys(req: IncomingMessage): string[] {
   const presented: string[] = [];
-  // Node folds repeated `x-api-key` lines into one comma-joined value. Splitting
-  // is what makes the any-valid rule hold for them too; without it a stale
-  // duplicate silently vetoes a valid one, which is the bug this rule fixed for
-  // the two DIFFERENT headers.
-  for (const candidate of headerValue(headers['x-api-key']).split(',')) {
-    const trimmed = candidate.trim();
+  // From `rawHeaders`, which keeps each physical header line. Node folds repeated
+  // `x-api-key` lines into one comma-joined value, and splitting THAT on commas
+  // cannot tell two headers apart from one key that contains a comma — a key the
+  // contract puts no character restriction on. Reading the raw lines answers both
+  // without guessing.
+  const raw = req.rawHeaders;
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    if (raw[i].toLowerCase() !== 'x-api-key') continue;
+    const trimmed = raw[i + 1].trim();
     if (trimmed) presented.push(trimmed);
   }
+  const headers = req.headers;
   const authorization = headerValue(headers.authorization).trim();
   const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
   if (bearer) presented.push(bearer[1].trim());
@@ -452,8 +459,12 @@ function openAiGptImageModelPattern(): RegExp {
 }
 
 function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void {
+  // Only compression BELOW 100 needs a lossy format — 100 is "no compression",
+  // which PNG can express. The guard rejected every defined value, including the
+  // one its own message says is fine.
   if (
     request.outputCompression !== undefined
+    && request.outputCompression < 100
     && request.outputFormat !== 'jpeg'
     && request.outputFormat !== 'webp'
   ) {
@@ -949,29 +960,52 @@ interface MultipartFilePart {
   readonly data: string;
 }
 
-class GeneratedImageStore {
+export class GeneratedImageStore {
   private readonly images = new Map<string, {
     readonly bytes: Buffer;
     readonly contentType: string;
     readonly expiresAt: number;
   }>();
 
+  private heldBytes = 0;
+
+  constructor(
+    private readonly ttlMs: number = GENERATED_IMAGE_TTL_MS,
+    private readonly maxBytes: number = GENERATED_IMAGE_MAX_BYTES,
+  ) {}
+
   put(b64Json: string, outputFormat: string): string {
     this.cleanupExpired();
     const id = randomUUID();
+    const bytes = Buffer.from(b64Json, 'base64');
     this.images.set(id, {
-      bytes: Buffer.from(b64Json, 'base64'),
+      bytes,
       contentType: imageContentType(outputFormat),
-      expiresAt: Date.now() + GENERATED_IMAGE_TTL_MS,
+      expiresAt: Date.now() + this.ttlMs,
     });
+    this.heldBytes += bytes.byteLength;
+    // Map preserves insertion order, so the first key is the oldest entry. The
+    // image just stored is never the one evicted: a client that asked for it is
+    // about to fetch it.
+    for (const [oldest] of this.images) {
+      if (this.heldBytes <= this.maxBytes || oldest === id) break;
+      this.drop(oldest);
+    }
     return id;
+  }
+
+  private drop(id: string): void {
+    const image = this.images.get(id);
+    if (!image) return;
+    this.heldBytes -= image.bytes.byteLength;
+    this.images.delete(id);
   }
 
   get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null {
     const image = this.images.get(id);
     if (!image) return null;
     if (image.expiresAt <= Date.now()) {
-      this.images.delete(id);
+      this.drop(id);
       return null;
     }
     return image;
@@ -979,12 +1013,13 @@ class GeneratedImageStore {
 
   clear(): void {
     this.images.clear();
+    this.heldBytes = 0;
   }
 
   private cleanupExpired(): void {
     const now = Date.now();
     for (const [id, image] of this.images.entries()) {
-      if (image.expiresAt <= now) this.images.delete(id);
+      if (image.expiresAt <= now) this.drop(id);
     }
   }
 }
@@ -2505,13 +2540,18 @@ const MAX_ERROR_MESSAGE_CHARS = 500;
 const ERROR_TRUNCATION_MARKER = '...[truncated]';
 
 function boundedErrorMessage(message: string): string {
+  // A message that already fits is returned untouched. Reserving the marker
+  // unconditionally shortened messages that were never too long: anything over
+  // the budget but under the limit lost its tail to make room for a marker it
+  // did not need.
+  if (message.length <= MAX_ERROR_MESSAGE_CHARS) return message;
   const budget = MAX_ERROR_MESSAGE_CHARS - ERROR_TRUNCATION_MARKER.length;
   let out = '';
   for (const ch of message) {
-    if (out.length + ch.length > budget) return `${out}${ERROR_TRUNCATION_MARKER}`;
+    if (out.length + ch.length > budget) break;
     out += ch;
   }
-  return out;
+  return `${out}${ERROR_TRUNCATION_MARKER}`;
 }
 
 function writeError(
