@@ -244,40 +244,13 @@ export class ClaudeCodeBackend implements LocalCliBackend {
 
   private async closeOnce(): Promise<void> {
     this.shuttingDown = true;
-    // Retire the generation FIRST. Whatever this child emits from here on belongs
-    // to a backend that has moved on, so its handlers must not touch state a
-    // replacement may already own.
-    this.childGeneration += 1;
     this.waiter?.reject(new Error('claude code backend closed'));
     this.waiter = null;
-    this.lineReader?.close();
-    const child = this.child;
-    this.child = null;
-    this.lineReader = null;
-    this.initialized = null;
+    const child = this.detachChild();
     if (!child) return;
-    // Always wait for `close`, never short-circuit on `exitCode`: Node can set
-    // that on `exit` and emit `close` only once the stdio pipes are done, and
-    // returning in between is what lets a late event land on the next child.
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const done = (): void => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(sigkillTimer);
-        clearTimeout(giveUpTimer);
-        child.removeListener('close', done);
-        resolve();
-      };
-      const sigkillTimer = setTimeout(() => child.kill('SIGKILL'), CHILD_SHUTDOWN_GRACE_MS);
-      // A descendant holding the pipes open can keep `close` from ever arriving,
-      // even after SIGKILL. The backend has already let go of this child, so stop
-      // waiting rather than hanging the caller.
-      const giveUpTimer = setTimeout(done, CHILD_SHUTDOWN_GRACE_MS * 2);
-      child.once('close', done);
-      child.kill('SIGTERM');
-    });
+    await terminateChild(child);
   }
+
 
 
 
@@ -343,17 +316,59 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   ): Promise<LocalCompletionResult> {
     const startedAt = Date.now();
     await this.ensureStarted();
-    const turn = await this.sendPersistentMessage(
-      await claudeMessageContentFor(request, buildPrompt(request)),
-      signal,
-      onTextDelta,
-    );
-    await this.clearPersistentSession(signal);
+    // In a `finally`: a turn that FAILS has still put its content into the
+    // child's conversation, and leaving that child alive hands it to the next
+    // request. Retirement is about isolation, not about success.
+    let turn: ClaudeTurnResult;
+    try {
+      turn = await this.sendPersistentMessage(
+        await claudeMessageContentFor(request, buildPrompt(request)),
+        signal,
+        onTextDelta,
+      );
+    } finally {
+      await this.clearPersistentSession();
+    }
     return this.resultFromTurn(request, turn, startedAt);
   }
 
-  private async clearPersistentSession(signal?: AbortSignal): Promise<void> {
-    await this.sendPersistentMessage('/clear', signal).catch(() => undefined);
+  /**
+   * End the conversation between requests, by ending the process that holds it.
+   *
+   * This used to send `/clear`. It never worked: the same spawn carries
+   * `--disable-slash-commands`, and the CLI answers `/clear isn't available in
+   * this environment` — measured against 2.1.232. So the reset was inert from
+   * the day that flag was added, and every request after the first was another
+   * turn of the previous request's conversation. A caller could read back a value
+   * that appeared only in an earlier caller's body; that was verified end to end
+   * before this change and again after it.
+   *
+   * Dropping the flag would make `/clear` work and would also let a client's own
+   * prompt text invoke slash commands, which is the thing the flag exists to
+   * stop. Retiring the child is the isolation the persistent path claimed to have
+   * — the next request starts a fresh one — and it costs a spawn per request,
+   * which is what the one-shot path already pays.
+   */
+  private async clearPersistentSession(): Promise<void> {
+    const child = this.detachChild();
+    if (!child) return;
+    // Not awaited: isolation is established the moment the backend lets go of
+    // this child — the next request cannot reach it. Waiting for it to die would
+    // put teardown on every response's critical path. The reaping is still
+    // bounded and escalating, it just happens alongside.
+    void terminateChild(child);
+  }
+
+  /** Let go of the current child and retire its generation, returning it. */
+  private detachChild(): ChildProcessWithoutNullStreams | null {
+    const child = this.child;
+    if (!child) return null;
+    this.childGeneration += 1;
+    this.child = null;
+    this.lineReader?.close();
+    this.lineReader = null;
+    this.initialized = null;
+    return child;
   }
 
   private async runOneShotTurn(
@@ -928,6 +943,38 @@ function readNumber(value: unknown): number {
  * caller needs from those bytes. Everything else goes to the proxy's own stderr,
  * and the returned error carries the fixed description the caller passed.
  */
+/**
+ * End a child and wait for it, escalating if it will not go. A child that
+ * ignores SIGTERM — or a descendant holding its stdio open — would otherwise
+ * keep the pipes alive after the backend has let go of it, and nothing would
+ * ever close them.
+ */
+async function terminateChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(sigkillTimer);
+      clearTimeout(giveUpTimer);
+      child.removeListener('close', done);
+      resolve();
+    };
+    const sigkillTimer = setTimeout(() => child.kill('SIGKILL'), CHILD_SHUTDOWN_GRACE_MS);
+    const giveUpTimer = setTimeout(() => {
+      // Nothing is coming. Stop holding the loop open for it.
+      child.unref();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      child.stdin?.destroy();
+      done();
+    }, CHILD_SHUTDOWN_GRACE_MS * 2);
+    child.once('close', done);
+    child.kill('SIGTERM');
+  });
+}
+
 function claudeProcessFailure(
   err: Error,
   childStderr: string,

@@ -21,6 +21,8 @@
 //   plaintext_refusal : the refusal on stderr with no structured event at all.
 //   delta_then_hang : streams a delta, never finishes; dies on the next input.
 //   ignores_sigterm : answers turns, ignores SIGTERM so close() hits its deadline.
+//   echo_history   : replies with every text it has been sent, so a test can see
+//                    whether a later request is a fresh conversation.
 //   stale_sentence : turn 1 answers but leaves the refusal sentence on stderr;
 //                    turn 2 dies for an unrelated reason.
 //   exit_after_answer : answers, then dies while idle (no waiter).
@@ -240,6 +242,25 @@ if (shape === 'ignores_sigterm') {
     } catch { text = line; }
     if (text.trim() !== '/clear') assistant({}, 'OK');
     write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
+  });
+  return;
+}
+
+if (shape === 'echo_history') {
+  // Answers with everything it has been sent so far, so a test can see whether a
+  // second request is a fresh conversation or another turn of the first.
+  const seenTexts = [];
+  const rlHist = readline.createInterface({ input: process.stdin });
+  rlHist.on('line', (line) => {
+    if (!line.trim()) return;
+    let text = '';
+    try {
+      const content = JSON.parse(line)?.message?.content;
+      text = Array.isArray(content) ? content.map((b) => (b && b.type === 'text' ? b.text : '')).join('') : '';
+    } catch { text = line; }
+    seenTexts.push(text);
+    assistant({}, seenTexts.join(' | '));
+    write({ type: 'result', subtype: 'success', is_error: false, result: seenTexts.join(' | '), usage: { input_tokens: 1, output_tokens: 1 } });
   });
   return;
 }

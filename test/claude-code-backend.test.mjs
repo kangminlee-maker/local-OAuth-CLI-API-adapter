@@ -708,20 +708,20 @@ test('honorRequestModel on: the assistant-event refusal is a 404 on the persiste
         },
       );
     }
-    // The log carries one line per spawn plus one per real user turn (the fixture
-    // does not count the `/clear` the backend sends between turns). One spawn and
-    // two turns is the persistent route; two spawns would be one-shot.
+    // One child per request, by design: the conversation lives in the process, so
+    // the process is retired with the request. Each spawn answers exactly one
+    // turn, and the model reaches each of them.
     const lines = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
     const spawns = lines.filter((l) => l[0] !== '#turn');
     const turns = lines.filter((l) => l[0] === '#turn');
-    assert.equal(spawns.length, 1, `two turns must reuse one process, saw ${spawns.length} spawns`);
+    assert.equal(spawns.length, 2, `each request gets its own child, saw ${spawns.length} spawns`);
     assert.equal(turns.length, 2, `expected two answered user turns, saw ${turns.length}`);
     const argv = spawns[0];
     assert.equal(argv[argv.indexOf('--model') + 1], 'claude-retired');
-    // Which result settled which waiter. The fixture tags every answer with its
-    // turn number, so a late duplicate of turn 1 cannot impersonate turn 2 — the
-    // count alone could not tell those apart.
-    assert.deepEqual(diagnostics.map((d) => /\[turn-(\d+)\]/.exec(d)?.[1]), ['1', '2']);
+    // Which result settled which waiter. Each child counts its own turns, so a
+    // fresh child answers `turn-1` again — the point is that each diagnostic
+    // comes from its own request rather than one answering twice.
+    assert.deepEqual(diagnostics.map((d) => /\[turn-(\d+)\]/.exec(d)?.[1]), ['1', '1']);
     // And the operator diagnostic fires on this route too, not only on one-shot.
     assert.equal(diagnostics.length, 2, `expected one diagnostic per turn, saw ${diagnostics.length}`);
   } finally {
@@ -998,72 +998,6 @@ test('a persistent child dying mid-turn keeps its stderr operator-side', async (
       written.some((l) => l.includes('claude process failure') && l.includes('SENTINEL_STDERR')),
       `the operator must still see it: ${JSON.stringify(written)}`,
     );
-  } finally {
-    process.stderr.write = originalWrite;
-    await backend?.close();
-    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
-    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
-  }
-});
-
-test('an earlier turn\'s stderr does not classify a later failure', async () => {
-  // The child's stderr buffer spans its lifetime. Turn 1 leaves the refusal
-  // sentence there and succeeds; turn 2 dies of something unrelated. Without
-  // per-turn attribution the stale sentence makes turn 2 a 404 model error and
-  // sends the client to change a model that is fine.
-  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
-  const originalWrite = process.stderr.write.bind(process.stderr);
-  let backend = null;
-  try {
-    process.stderr.write = () => true;
-    process.env.CLAUDE_TEST_RESULT_SHAPE = 'stale_sentence';
-    backend = new ClaudeCodeBackend({
-      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
-      timeoutMs: 30_000, honorRequestModel: true,
-    });
-    const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
-    const first = await backend.generate(request);
-    assert.equal(first.text, 'OK');
-    await assert.rejects(
-      () => backend.generate(request),
-      (err) => {
-        assert.notEqual(err.statusCode, 404, `an unrelated failure must not become a model error: ${err.message}`);
-        assert.match(err.message, /the local claude runtime exited/);
-        return true;
-      },
-    );
-  } finally {
-    process.stderr.write = originalWrite;
-    await backend?.close();
-    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
-    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
-  }
-});
-
-test('a persistent child dying while idle still tells the operator', async () => {
-  // No waiter to reject, so the diagnostic is the only record. Written as
-  // `this.waiter?.reject(f(...))`, the call would be skipped entirely.
-  const originalWrite = process.stderr.write.bind(process.stderr);
-  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
-  let backend = null;
-  let observed;
-  const seen = new Promise((resolve) => { observed = resolve; });
-  try {
-    process.stderr.write = (chunk) => {
-      const line = String(chunk);
-      if (line.includes('claude process failure') && line.includes('IDLE_EXIT_SENTINEL')) observed();
-      return true;
-    };
-    process.env.CLAUDE_TEST_RESULT_SHAPE = 'exit_after_answer';
-    backend = new ClaudeCodeBackend({
-      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
-      timeoutMs: 30_000, honorRequestModel: true,
-    });
-    const result = await backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' });
-    assert.equal(result.text, 'OK');
-    // Waiting on the observation, not on a fixed sleep: the child's exit timer
-    // runs in another process, so any fixed margin is a race on a loaded machine.
-    await seen;
   } finally {
     process.stderr.write = originalWrite;
     await backend?.close();
@@ -1607,13 +1541,86 @@ test('a retired child cannot disturb its replacement', async () => {
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal((await backend.generate(request)).text, 'OK');
 
-    // Two children, not three. An unscoped handler would have cleared child 2's
-    // state on its way out, and the third turn would quietly have spawned another
-    // — same answer, different fact. The count is what makes the difference
-    // visible.
+    // One child per request, and every request answered. An unscoped handler from
+    // a retired child would have torn down a live one, which shows up as a turn
+    // that fails rather than answers.
     const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean)
       .map((l) => JSON.parse(l)).filter((l) => l[0] !== '#turn');
-    assert.equal(spawns.length, 2, `expected two children, saw ${spawns.length}`);
+    assert.equal(spawns.length, 3, `one child per request, saw ${spawns.length}`);
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+    if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
+    else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
+    await rm(argvDir, { recursive: true, force: true });
+  }
+});
+
+test('one request\'s conversation does not reach the next', async () => {
+  // The persistent child holds a conversation, and the reset between requests
+  // used to be `/clear` — which the same spawn disables with
+  // `--disable-slash-commands`, so it never happened. Measured against the real
+  // CLI: a second request could read back a value that appeared only in the
+  // first request's body. The fixture answers with everything it has been sent,
+  // so a leak shows up as the first request's text in the second's answer.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'echo_history';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired', timeoutMs: 30_000,
+    });
+    const ask = (content) => backend.generate({
+      ...anthropicTuningRequest({ model: 'claude-retired' }),
+      shape: 'openai-chat',
+      messages: [{ role: 'user', content, images: [] }],
+    });
+    const first = await ask('CANARY-FIRST-REQUEST');
+    assert.match(first.text, /CANARY-FIRST-REQUEST/, 'the fixture echoes what it was sent');
+    const second = await ask('SECOND-REQUEST');
+    assert.ok(
+      !second.text.includes('CANARY-FIRST-REQUEST'),
+      `a later request must not see an earlier one: ${second.text}`,
+    );
+    assert.match(second.text, /SECOND-REQUEST/);
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a failed request does not leave its conversation for the next one', async () => {
+  // Retirement runs in a `finally`. A turn that fails has still put its content
+  // into the child's conversation, so leaving that child alive would hand it to
+  // whoever asks next — the same leak as before, on the failure path.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
+  const argvDir = await mkdtemp(join(tmpdir(), 'claude-argv-'));
+  const argvLog = join(argvDir, 'argv.log');
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'bare_404';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
+    await assert.rejects(() => backend.generate(request));
+    await assert.rejects(() => backend.generate(request));
+    // Two requests, two children. One would mean the failed request's child was
+    // reused, conversation and all.
+    const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean)
+      .map((l) => JSON.parse(l)).filter((l) => l[0] !== '#turn');
+    assert.equal(spawns.length, 2, `each request needs its own child, saw ${spawns.length}`);
   } finally {
     process.stderr.write = originalWrite;
     await backend?.close();

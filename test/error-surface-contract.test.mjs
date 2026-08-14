@@ -354,3 +354,143 @@ test('/v1/responses: the non-streaming body reports the model the backend ran', 
   const { text } = await call(echoBackend(), '/v1/responses', { model: 'client-model', input: 'hi' });
   assert.equal(JSON.parse(text).model, 'executed-model');
 });
+
+// The two credential forms are alternatives, and only the documented forms
+// count. Each of these was accepted or rejected wrongly before.
+async function withKey(headers, path = '/v1/chat/completions', body = CHAT) {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: 'secret-key',
+  });
+  try {
+    const res = await fetch(`${started.url}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+    });
+    return res.status;
+  } finally {
+    await started.close();
+  }
+}
+
+test('a valid Bearer is accepted even beside a stale x-api-key', async () => {
+  // They are alternatives. Reading only the first non-empty header let a stale
+  // one veto a credential the contract accepts.
+  assert.equal(await withKey({ 'x-api-key': 'stale', authorization: 'Bearer secret-key' }), 200);
+});
+
+test('a valid x-api-key is accepted even beside a wrong Bearer', async () => {
+  assert.equal(await withKey({ 'x-api-key': 'secret-key', authorization: 'Bearer wrong' }), 200);
+});
+
+test('a bare Authorization value is not a credential', async () => {
+  // The contract names the Bearer form. Accepting the raw value widened the gate
+  // beyond what was documented.
+  assert.equal(await withKey({ authorization: 'secret-key' }), 401);
+});
+
+test('a Bearer with no token is rejected', async () => {
+  assert.equal(await withKey({ authorization: 'Bearer' }), 401);
+});
+
+test('the access gate covers GET routes too', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: 'secret-key',
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/models`);
+    assert.equal(res.status, 401);
+    const ok = await fetch(`${started.url}/v1/models`, { headers: { 'x-api-key': 'secret-key' } });
+    assert.equal(ok.status, 200);
+  } finally {
+    await started.close();
+  }
+});
+
+// The failure sequences are pinned; the NORMAL ones were not. Deleting a
+// terminal frame is a one-line edit that a failure test cannot see.
+function usageBackend() {
+  const result = {
+    id: 'x', model: 'configured-model', text: 'hello', toolCalls: [],
+    usage: { inputTokens: 11, outputTokens: 22, totalTokens: 33, source: 'provider' },
+    latencyMs: 1,
+  };
+  return {
+    name: 'test', model: 'configured-model',
+    async generate() { return result; },
+    async *stream() {
+      yield { type: 'text_delta', delta: 'hello' };
+      yield { type: 'completed', result };
+    },
+    async close() {},
+  };
+}
+
+test('/v1/messages: a successful stream runs message_start through message_stop', async () => {
+  const { text } = await call(usageBackend(), '/v1/messages', { ...MESSAGES, stream: true });
+  const events = text.split('\n').filter((l) => l.startsWith('event: ')).map((l) => l.slice(7).trim());
+  assert.deepEqual(events, [
+    'message_start', 'content_block_start', 'content_block_delta',
+    'content_block_stop', 'message_delta', 'message_stop',
+  ]);
+});
+
+test('/v1/chat/completions: a non-streaming response carries the promised usage', async () => {
+  const { text } = await call(usageBackend(), '/v1/chat/completions', CHAT);
+  const usage = JSON.parse(text).usage;
+  assert.equal(usage.prompt_tokens, 11);
+  assert.equal(usage.completion_tokens, 22);
+  assert.equal(usage.total_tokens, 33);
+});
+
+test('/v1/messages: a non-streaming response carries the promised usage', async () => {
+  const { text } = await call(usageBackend(), '/v1/messages', MESSAGES);
+  const usage = JSON.parse(text).usage;
+  assert.equal(usage.input_tokens, 11);
+  assert.equal(usage.output_tokens, 22);
+});
+
+test('/v1/messages: a streaming response reports usage in message_delta', async () => {
+  const { text } = await call(usageBackend(), '/v1/messages', { ...MESSAGES, stream: true });
+  const frame = text.split('\n').find((l) => l.startsWith('data: ') && l.includes('"message_delta"'));
+  assert.ok(frame, `expected a message_delta: ${text}`);
+  assert.equal(JSON.parse(frame.slice(6)).usage.output_tokens, 22);
+});
+
+test('/v1/responses: a non-streaming response carries the promised usage', async () => {
+  const { text } = await call(usageBackend(), '/v1/responses', { model: 'a-model', input: 'hi' });
+  const usage = JSON.parse(text).usage;
+  assert.equal(usage.input_tokens, 11);
+  assert.equal(usage.output_tokens, 22);
+  assert.equal(usage.total_tokens, 33);
+});
+
+test('/v1/chat/completions: include_usage adds a final usage chunk', async () => {
+  const { text } = await call(usageBackend(), '/v1/chat/completions', {
+    ...CHAT, stream: true, stream_options: { include_usage: true },
+  });
+  const frames = text.split('\n').filter((l) => l.startsWith('data: ') && !l.includes('[DONE]'))
+    .map((l) => JSON.parse(l.slice(6)));
+  const usageFrame = frames.find((f) => f.usage);
+  assert.ok(usageFrame, `expected a usage chunk: ${text}`);
+  assert.deepEqual(usageFrame.choices, []);
+  assert.equal(usageFrame.usage.total_tokens, 33);
+});
+
+test('/v1/messages: a mid-stream provider error keeps its mapping and bound', async () => {
+  // The Anthropic stream catch used to hard-code `api_error` and serialize the
+  // raw throw — which, since a provider error travels as JSON inside the
+  // message, handed the client a truncated fragment of it.
+  const { text } = await call(
+    backendThat({ delta: true, fail: providerError(429, LONG_PROVIDER_MESSAGE) }),
+    '/v1/messages',
+    { ...MESSAGES, stream: true },
+  );
+  const frame = text.split('\n').find((l) => l.startsWith('data: ') && l.includes('"error"'));
+  const payload = JSON.parse(frame.slice(6)).error;
+  assert.equal(payload.type, 'rate_limit_error', 'the provider type must survive');
+  assert.ok(payload.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
+  assert.ok(payload.message.length <= 500, `bounded, got ${payload.message.length}`);
+});

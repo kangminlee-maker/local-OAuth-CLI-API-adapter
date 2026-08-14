@@ -227,9 +227,11 @@ function requireAuthorizedRequest(
   path: string,
   authKey: string | undefined,
 ): void {
-  if (!authKey) return;
-  const presented = presentedAuthKey(req.headers);
-  if (presented !== undefined && safeKeyEqual(presented, authKey)) return;
+  // An empty configured key is a configuration mistake, not "no gate": treating
+  // it as off silently opens a proxy its operator believed was closed.
+  if (authKey === undefined) return;
+  if (!authKey) throw new Error('authKey is configured but empty; refusing to serve unauthenticated');
+  if (presentedAuthKeys(req.headers).some((candidate) => safeKeyEqual(candidate, authKey))) return;
   const provider = path === '/v1/messages' ? 'anthropic' : 'openai';
   throw new ProxyRequestError(
     'Unauthorized: missing or invalid API key.',
@@ -241,13 +243,22 @@ function requireAuthorizedRequest(
   );
 }
 
-function presentedAuthKey(headers: IncomingMessage['headers']): string | undefined {
+/**
+ * The credentials a request presents, in the two documented forms. Both are
+ * returned, not the first non-empty one: they are alternatives, so a stale
+ * `x-api-key` beside a valid `Authorization: Bearer` must not decide the answer.
+ *
+ * A bare `Authorization: <key>` is NOT a credential. The contract names the
+ * Bearer form, and accepting the raw value silently widened what counts.
+ */
+function presentedAuthKeys(headers: IncomingMessage['headers']): string[] {
+  const presented: string[] = [];
   const apiKey = headerValue(headers['x-api-key']).trim();
-  if (apiKey) return apiKey;
+  if (apiKey) presented.push(apiKey);
   const authorization = headerValue(headers.authorization).trim();
-  if (!authorization) return undefined;
   const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
-  return (bearer ? bearer[1] : authorization).trim();
+  if (bearer) presented.push(bearer[1].trim());
+  return presented;
 }
 
 function safeKeyEqual(presented: string, expected: string): boolean {
@@ -2211,16 +2222,27 @@ async function writeAnthropicMessagesStream(
       });
     }
   } catch (err) {
-    await writeSseEvent(res, 'error', {
-      type: 'error',
-      error: {
-        type: 'api_error',
-        message: errorMessage(err),
-      },
-    });
+    // Map the provider error the way every other surface does. Hard-coding
+    // `api_error` and serializing the raw throw loses the runtime's status and
+    // type, and — because the JSON travels inside the message — hands the client
+    // a truncated fragment of it instead of the diagnostic.
+    await writeSseEvent(res, 'error', anthropicStreamErrorPayload(err));
   } finally {
     res.end();
   }
+}
+
+function anthropicStreamErrorPayload(err: unknown): Record<string, unknown> {
+  const provider = err instanceof ProxyRequestError
+    ? { type: err.type, message: err.message }
+    : providerErrorFromBackendError(err);
+  return {
+    type: 'error',
+    error: {
+      type: provider?.type ?? 'api_error',
+      message: boundedErrorMessage(provider?.message ?? rawErrorMessage(err)),
+    },
+  };
 }
 
 interface AnthropicToolUseState {
