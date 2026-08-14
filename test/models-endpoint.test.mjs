@@ -147,6 +147,29 @@ test('a runtime that cannot enumerate falls back to its single model', async () 
   assert.deepEqual(payload.data.map((m) => m.id), ['configured-model']);
 });
 
+test('honour-on: an empty runtime catalogue still lists the configured model', async () => {
+  // `[]` is a collected-and-empty catalogue, which is not the same as `null`
+  // (uncollectable). The configured model is still a model.
+  const payload = await modelsWithSetting(true, []);
+  assert.deepEqual(payload.data.map((m) => m.id), ['configured-model']);
+});
+
+test('honour-on: the configured model is not repeated when the runtime also lists it', async () => {
+  const payload = await modelsWithSetting(true, ['gpt-5.6-sol', 'configured-model']);
+  assert.deepEqual(payload.data.map((m) => m.id), ['configured-model', 'gpt-5.6-sol']);
+});
+
+test('honour-on: identifiers are removed from every position, order otherwise kept', async () => {
+  // First, middle and last, all at once — the contract says every position, and
+  // a filter that only de-duplicates against the configured model would pass a
+  // one-identifier case.
+  const payload = await modelsWithSetting(
+    true,
+    ['codex-backend', 'gpt-a', 'codex-app-server', 'gpt-b', 'claude-code-cli'],
+  );
+  assert.deepEqual(payload.data.map((m) => m.id), ['configured-model', 'gpt-a', 'gpt-b']);
+});
+
 for (const identifier of PINNED_IDENTIFIERS) {
   // The identifier can reach the list from two independent places, and they are
   // kept in separate tests on purpose. Exercising both at once lets a filter
@@ -175,3 +198,20 @@ for (const identifier of PINNED_IDENTIFIERS) {
     assert.deepEqual(payload.data.map((m) => m.id), []);
   });
 }
+
+// The Claude runtime's advertised catalogue is a production value, not a stub:
+// the contract names the aliases and says version-pinned names are excluded.
+test('honour-on: the Claude runtime advertises exactly the documented aliases', async () => {
+  const { ClaudeCodeBackend } = await import('../dist/proxy/claude-code-backend.js');
+  const backend = new ClaudeCodeBackend({ cwd: process.cwd(), timeoutMs: 30_000 });
+  try {
+    const listed = await backend.availableModels();
+    assert.deepEqual([...listed], ['fable', 'opus', 'sonnet']);
+    assert.ok(
+      !listed.some((id) => /^claude-/.test(id)),
+      `version-pinned names are not enumerable and must not be advertised: ${listed.join(',')}`,
+    );
+  } finally {
+    await backend.close();
+  }
+});

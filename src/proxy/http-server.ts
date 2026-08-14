@@ -2343,7 +2343,7 @@ function streamErrorPayload(err: unknown): unknown {
   if (err instanceof ProxyRequestError) {
     return {
       error: {
-        message: err.message,
+        message: boundedErrorMessage(err.message),
         type: err.type,
         param: err.param,
         code: err.code,
@@ -2354,7 +2354,7 @@ function streamErrorPayload(err: unknown): unknown {
   if (providerError) {
     return {
       error: {
-        message: providerError.message,
+        message: boundedErrorMessage(providerError.message),
         type: providerError.type,
         param: providerError.param,
         code: providerError.code,
@@ -2371,8 +2371,14 @@ function streamErrorPayload(err: unknown): unknown {
   };
 }
 
+/**
+ * An error as a client-visible string, bounded. Both the JSON writer and every
+ * SSE error producer come through here, which is the point: the ceiling belongs
+ * where the text becomes a response, not at each of the places that can raise
+ * one.
+ */
 function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return boundedErrorMessage(err instanceof Error ? err.message : String(err));
 }
 
 function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -2445,6 +2451,24 @@ function isAddressInfo(value: string | AddressInfo | null): value is AddressInfo
   return Boolean(value) && typeof value === 'object';
 }
 
+// Every client-visible error message passes through here, so this is where the
+// documented ceiling belongs: one place rather than one per producer. A model
+// name a client chose, a runtime diagnostic, an upstream's prose — each reaches a
+// response through some branch below, and bounding at each source has already
+// been missed once.
+const MAX_ERROR_MESSAGE_CHARS = 500;
+const ERROR_TRUNCATION_MARKER = '...[truncated]';
+
+function boundedErrorMessage(message: string): string {
+  const budget = MAX_ERROR_MESSAGE_CHARS - ERROR_TRUNCATION_MARKER.length;
+  let out = '';
+  for (const ch of message) {
+    if (out.length + ch.length > budget) return `${out}${ERROR_TRUNCATION_MARKER}`;
+    out += ch;
+  }
+  return out;
+}
+
 function writeError(
   res: ServerResponse,
   err: unknown,
@@ -2453,7 +2477,7 @@ function writeError(
   if (err instanceof LocalCliChatError) {
     writeJson(res, err.statusCode, {
       error: {
-        message: err.message,
+        message: boundedErrorMessage(err.message),
         type: 'local_cli_chat_error',
         param: null,
         code: err.code,
@@ -2467,14 +2491,14 @@ function writeError(
         type: 'error',
         error: {
           type: err.type,
-          message: err.message,
+          message: boundedErrorMessage(err.message),
         },
       });
       return;
     }
     writeJson(res, err.statusCode, {
       error: {
-        message: err.message,
+        message: boundedErrorMessage(err.message),
         type: err.type,
         param: err.param,
         code: err.code,
@@ -2489,14 +2513,14 @@ function writeError(
         type: 'error',
         error: {
           type: providerError.type,
-          message: providerError.message,
+          message: boundedErrorMessage(providerError.message),
         },
       });
       return;
     }
     writeJson(res, providerError.statusCode, {
       error: {
-        message: providerError.message,
+        message: boundedErrorMessage(providerError.message),
         type: providerError.type,
         param: providerErrorParamForShape(providerError.param, shape),
         code: providerError.code,
@@ -2504,9 +2528,17 @@ function writeError(
     });
     return;
   }
+  // A failure with no provider mapping is still answered in the shape the caller
+  // asked in. `/v1/messages` has its own envelope and no `param`/`code`; sending
+  // the OpenAI body there hands an Anthropic client something it cannot parse.
+  const message = boundedErrorMessage(err instanceof Error ? err.message : String(err));
+  if (shape === 'anthropic') {
+    writeJson(res, 500, { type: 'error', error: { type: 'api_error', message } });
+    return;
+  }
   writeJson(res, 500, {
     error: {
-      message: err instanceof Error ? err.message : String(err),
+      message,
       type: 'server_error',
       param: null,
       code: null,
