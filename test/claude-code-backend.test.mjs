@@ -1367,6 +1367,98 @@ test('a backend used again after close still reports its new child\'s failures',
   }
 });
 
+test('honorRequestModel off: a refusal message is bounded even though nothing maps it', async () => {
+  // With honouring on, the mapping site replaces this message with a fixed
+  // sentence, so its size never mattered. With honouring off nothing replaces it
+  // and it reaches the client as-is — which is where the bound has to already be.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'huge_refusal';
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+        'claude-opus-4-8',
+        { command: resultShapes },
+      ),
+      (err) => {
+        assert.equal(err.statusCode, undefined, 'honour-off keeps this a server-side failure');
+        assert.ok(err.message.length <= 500, `refusal message must be bounded, got ${err.message.length}`);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('pre-answer stderr that merely mentions the words is not a refusal', async () => {
+  // The matcher used to accept the phrase anywhere in a lifetime buffer, so a
+  // hook echoing those words turned an unrelated exit into a client-facing 404.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'unrelated_prefix';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    await assert.rejects(
+      () => backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' }),
+      (err) => {
+        assert.notEqual(err.statusCode, 404, `not a refusal: ${err.message}`);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a persistent child failing asynchronously is reported exactly once', async () => {
+  // `error` and `close` both fire for a failed spawn. Counting with `some` would
+  // not notice a second line.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    backend = new ClaudeCodeBackend({
+      command: '/nonexistent/operator/path/claude-binary',
+      cwd: process.cwd(), model: 'claude-retired', timeoutMs: 30_000, honorRequestModel: true,
+    });
+    await assert.rejects(
+      () => backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' }),
+      (err) => {
+        assert.match(err.message, /the local claude runtime failed to start/);
+        return true;
+      },
+    );
+    // `close` arrives after `error` and after the turn has already rejected, so
+    // counting immediately would miss a duplicate rather than prove its absence.
+    // Watch until one shows up — failing fast if it does — or until the window a
+    // spawn failure needs has comfortably passed.
+    const countLines = () => written.filter((l) => l.includes('claude process failure')).length;
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline && countLines() < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const lines = written.filter((l) => l.includes('claude process failure'));
+    assert.equal(lines.length, 1, `expected exactly one diagnostic: ${JSON.stringify(lines)}`);
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+  }
+});
+
 test('honorRequestModel off: a CLI model refusal stays a server-side failure', async () => {
   // With honouring off the model came from local configuration, not the client,
   // so it must not be reported as a client-side not-found.

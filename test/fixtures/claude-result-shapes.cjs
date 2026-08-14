@@ -25,6 +25,8 @@
 //   huge_errors    : an oversized `errors[]` entry.
 //   huge_subtype   : an oversized `subtype`.
 //   huge_both      : both `subtype` and detail oversized.
+//   huge_refusal   : a model rejection whose result text is oversized.
+//   unrelated_prefix : pre-answer stderr containing the words but not the form.
 //   multiline_detail : a legitimate multi-line diagnostic.
 //   max_turns_mentioning_ede : an authoritative subtype whose text mentions EDE.
 //   persistent_stderr : accepts a persistent turn, then dies with sentinel stderr.
@@ -107,6 +109,20 @@ function emit() {
     write({ type: 'result', subtype: 'success', is_error: true, result: 'first line\nsecond line' });
     return;
   }
+  if (shape === 'unrelated_prefix') {
+    // Pre-answer stderr that merely contains the words, without the canonical
+    // parenthesised form. Not a refusal report.
+    process.stderr.write('hook log: user asked about an issue with the selected model earlier today\n');
+    process.exit(6);
+  }
+  if (shape === 'huge_refusal') {
+    // A structured model rejection whose result text is oversized. With honouring
+    // OFF nothing replaces this message downstream, so the bound must be applied
+    // where it is built.
+    assistant({ error: 'model_not_found', is_api_error_message: true }, 'R'.repeat(9000));
+    write({ type: 'result', subtype: 'success', is_error: true, api_error_status: 404, result: 'R'.repeat(9000) });
+    return;
+  }
   if (shape === 'huge_both') {
     // Both halves oversized: bounding each component separately and composing
     // afterwards would exceed the limit even though neither half did.
@@ -186,16 +202,18 @@ if (shape === 'stale_sentence') {
       // proves the configured model ran.
       assistant({}, 'OK');
       write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
-      setTimeout(() => {
-        process.stderr.write("There's an issue with the selected model (earlier-turn). Run --model to pick a different model.\n");
-      }, 40);
+      // Turn 1's stderr is HELD until turn 2 actually arrives, below. A timer
+      // would only make the adverse ordering likely; this makes it certain, which
+      // is the whole point of the case.
       return;
     }
-    // Give the delayed stderr above time to land in the parent's buffer first.
+    // Turn 2 has been admitted. NOW emit turn 1's stderr — the parent has already
+    // moved on, so any buffer it cleared at dispatch cannot contain this.
+    process.stderr.write("There's an issue with the selected model (earlier-turn). Run --model to pick a different model.\n");
     setTimeout(() => {
       process.stderr.write('UNRELATED_FAILURE disk full\n');
       process.exit(7);
-    }, 60);
+    }, 40);
   });
   return;
 }

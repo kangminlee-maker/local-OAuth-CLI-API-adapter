@@ -552,7 +552,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       this.waiter = null;
       if (waiter.sawModelOutput) this.childAnswered = true;
       if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
-        waiter.reject(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
+        waiter.reject(claudeModelRejection(message));
       } else if (message.subtype === 'success' && message.is_error !== true) {
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
@@ -743,7 +743,7 @@ function runClaudeProcess(
         consumeClaudeMessage(waiter, message);
         if (message.type === 'result') {
           if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
-            finish(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
+            finish(claudeModelRejection(message));
           } else if (message.subtype === 'success' && message.is_error !== true) {
             finish(undefined, {
               text: typeof message.result === 'string' ? message.result : waiter.text,
@@ -863,7 +863,7 @@ function claudeProcessFailure(
     const operatorLine = detail ? `${err.message} :: ${detail}` : err.message;
     process.stderr.write(`claude process failure: ${asLogLine(operatorLine)}\n`);
   }
-  if (options.allowRefusal && /issue with the selected model/i.test(detail)) {
+  if (options.allowRefusal && CLAUDE_REFUSAL_DIAGNOSTIC.test(detail)) {
     return new ClaudeModelRejectionError(publicMessage);
   }
   return new Error(publicMessage);
@@ -896,6 +896,11 @@ function asLogLine(message: string): string {
   return out;
 }
 
+// The CLI's refusal diagnostic, matched as the whole sentence it is rather than
+// as a phrase appearing anywhere in a buffer. The parenthesised model name is
+// what makes it a refusal report and not, say, a hook echoing the words back.
+const CLAUDE_REFUSAL_DIAGNOSTIC = /issue with the selected model\s*\([^)]*\)/i;
+
 // C0, DEL and C1, plus the two Unicode line separators.
 const NON_PRINTING = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const TRUNCATION_MARKER = '...[truncated]';
@@ -918,6 +923,19 @@ const CHILD_SHUTDOWN_GRACE_MS = 2_000;
  * the same limit, not in full: one line per failed request is a channel a
  * client can drive, so no length here is the operator's to choose either.
  */
+/**
+ * A refused model, carrying the runtime's own words under the same bound as every
+ * other client-visible diagnostic. With honouring ON this message is replaced at
+ * the mapping site; with it OFF nothing replaces it, so the bound has to be here
+ * rather than there.
+ */
+function claudeModelRejection(message: JsonObject): ClaudeModelRejectionError {
+  const detail = typeof message.result === 'string' && message.result.trim()
+    ? boundedText(message.result)
+    : 'model rejected';
+  return new ClaudeModelRejectionError(detail);
+}
+
 function claudeTurnFailure(message: JsonObject): ClaudeTurnError {
   const subtype = typeof message.subtype === 'string' && message.subtype !== 'success'
     ? message.subtype
