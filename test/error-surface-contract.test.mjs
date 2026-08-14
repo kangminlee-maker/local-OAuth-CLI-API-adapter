@@ -676,3 +676,240 @@ test('/v1/responses: a successful stream ends with completed then [DONE]', async
   // error EVENT rather than the substring.
   assert.ok(!events.includes('error'), `a successful stream carries no error event: ${events.join(',')}`);
 });
+
+// --- round 38: HTTP dispatch, the gate's configuration edge, and input parity ---
+
+test('an unknown path is a 404 whatever method it arrives with', async () => {
+  // Method was checked before path, so `GET /v1/nope` answered 405 "Unsupported
+  // method" — about a method this server does serve, on a path it does not have.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    for (const method of ['GET', 'POST', 'DELETE', 'PUT']) {
+      const res = await fetch(`${started.url}/v1/nope`, { method });
+      assert.equal(res.status, 404, `${method} /v1/nope must be a 404`);
+      const body = await res.json();
+      assert.match(body.error.message, /Unknown endpoint/);
+    }
+  } finally {
+    await started.close();
+  }
+});
+
+test('a known endpoint with the wrong method is still a 405', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    for (const method of ['GET', 'DELETE']) {
+      const res = await fetch(`${started.url}/v1/chat/completions`, { method });
+      assert.equal(res.status, 405, `${method} on a real POST endpoint is a method problem`);
+      assert.match((await res.json()).error.message, /Unsupported method/);
+    }
+  } finally {
+    await started.close();
+  }
+});
+
+for (const [label, key] of [['trailing', 'secret '], ['leading', ' secret'], ['tab', 'secret\t']]) {
+  test(`an authKey with ${label} whitespace is a configuration error, not a locked-out proxy`, async () => {
+    // Presented values are trimmed, so such a key can never be presented — the
+    // proxy answered 401 to every request including its operator's, with nothing
+    // saying why.
+    const started = await startLocalApiProxy({
+      backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+      authKey: key,
+    });
+    try {
+      const res = await fetch(`${started.url}/v1/models`, { headers: { 'x-api-key': key } });
+      assert.ok(res.status >= 500, `expected a configuration error, got ${res.status}`);
+    } finally {
+      await started.close();
+    }
+  });
+}
+
+test('a mixed-case x-api-key header line still authenticates', async () => {
+  // Header names are case-insensitive, and the gate reads raw header lines now,
+  // where the original casing survives.
+  assert.equal(await withRawKeyHeaders({ 'X-API-Key': 'secret-key' }), 200);
+});
+
+test('/v1/messages: max_tokens is required, as on the direct API', async () => {
+  const { status, text } = await call(
+    backendThat({}),
+    '/v1/messages',
+    { model: 'a-model', messages: [{ role: 'user', content: 'hi' }] },
+  );
+  assert.equal(status, 400);
+  const body = JSON.parse(text);
+  assert.equal(body.type, 'error');
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.match(body.error.message, /max_tokens is required/);
+});
+
+for (const [label, value] of [
+  ['a string', 'x'],
+  ['fractional', 1.5],
+  ['negative', -1],
+  ['null', null],
+]) {
+  test(`/v1/messages: max_tokens ${label} is rejected`, async () => {
+    const { status } = await call(
+      backendThat({}),
+      '/v1/messages',
+      { model: 'a-model', max_tokens: value, messages: [{ role: 'user', content: 'hi' }] },
+    );
+    assert.equal(status, 400, `max_tokens=${JSON.stringify(value)} is not an integer >= 0`);
+  });
+}
+
+test('/v1/messages: max_tokens 0 is accepted, because the direct API accepts it', async () => {
+  // Documented there as pre-warming the prompt cache without generating. A floor
+  // of 1 would reject a request the direct API answers.
+  const { status } = await call(
+    backendThat({}),
+    '/v1/messages',
+    { model: 'a-model', max_tokens: 0, messages: [{ role: 'user', content: 'hi' }] },
+  );
+  assert.equal(status, 200);
+});
+
+for (const [path, body] of [
+  ['/v1/chat/completions', { model: 'a-model', messages: [] }],
+  ['/v1/messages', { model: 'a-model', max_tokens: 16, messages: [] }],
+]) {
+  test(`${path}: an empty messages array is rejected`, async () => {
+    // `minItems: 1` on both direct APIs. An empty conversation was reaching the
+    // runtime as a turn with nothing in it.
+    const { status, text } = await call(backendThat({}), path, body);
+    assert.equal(status, 400);
+    const payload = JSON.parse(text);
+    const message = payload.error.message;
+    assert.match(message, /at least one message/);
+  });
+}
+
+for (const [path, body] of [
+  ['/v1/chat/completions', { model: 'a-model', messages: [7] }],
+  ['/v1/messages', { model: 'a-model', max_tokens: 16, messages: [7] }],
+]) {
+  test(`${path}: a non-object message item is rejected`, async () => {
+    const { status } = await call(backendThat({}), path, body);
+    assert.equal(status, 400);
+  });
+}
+
+for (const [path, body] of [
+  ['/v1/chat/completions', { model: 'a-model', messages: null }],
+  ['/v1/chat/completions', { model: 'a-model', messages: {} }],
+  ['/v1/messages', { model: 'a-model', max_tokens: 16, messages: 'hi' }],
+]) {
+  test(`${path}: messages ${JSON.stringify(body.messages)} is rejected`, async () => {
+    const { status } = await call(backendThat({}), path, body);
+    assert.equal(status, 400);
+  });
+}
+
+test('an unknown role is normalized to user rather than rejected', async () => {
+  // A documented, deliberate divergence from the direct APIs: the normalizer is
+  // permissive so local tools with their own role vocabularies still work. A
+  // one-line throw in the normalizer would turn this promise into a 400.
+  const { status } = await call(
+    backendThat({}),
+    '/v1/chat/completions',
+    { model: 'a-model', messages: [{ role: 'future_role', content: 'hello' }] },
+  );
+  assert.equal(status, 200);
+});
+
+// --- round 38: promises the inventory showed nothing would catch breaking ---
+
+function usageBackendReporting(usage) {
+  const result = () => ({
+    id: 'x', model: 'configured-model', text: 'OK', toolCalls: [], usage, latencyMs: 1,
+  });
+  return {
+    name: 'test', model: 'configured-model',
+    async generate() { return result(); },
+    async *stream() {
+      yield { type: 'text_delta', delta: 'OK' };
+      yield { type: 'completed', result: result() };
+    },
+    async close() {},
+  };
+}
+
+test('estimated usage is reported when the runtime reports none of its own', async () => {
+  // The contract prefers provider usage and falls back to estimated. Dropping
+  // the fallback would leave a response with no usage at all, and every existing
+  // usage test supplies provider counts.
+  const { status, text } = await call(
+    usageBackendReporting({ inputTokens: 5, outputTokens: 6, source: 'estimated' }),
+    '/v1/chat/completions',
+    CHAT,
+  );
+  assert.equal(status, 200);
+  const usage = JSON.parse(text).usage;
+  assert.equal(usage.prompt_tokens, 5);
+  assert.equal(usage.completion_tokens, 6);
+  assert.equal(usage.total_tokens, 11);
+});
+
+test('/v1/responses: a streaming response reports usage in the completed event', async () => {
+  // Usage was asserted only on the non-streaming Responses path; a streaming
+  // client reads it from `response.completed`.
+  const { status, text } = await call(
+    usageBackendReporting({ inputTokens: 5, outputTokens: 6, source: 'provider' }),
+    '/v1/responses',
+    { model: 'a-model', input: 'hi', stream: true },
+  );
+  assert.equal(status, 200);
+  const completed = text.split('\n')
+    .filter((line) => line.startsWith('data: ') && line.includes('"response.completed"'))
+    .map((line) => JSON.parse(line.slice(6)))
+    .at(-1);
+  assert.ok(completed, `expected a response.completed frame: ${text.slice(0, 300)}`);
+  assert.equal(completed.response.usage.input_tokens, 5);
+  assert.equal(completed.response.usage.output_tokens, 6);
+  assert.equal(completed.response.usage.total_tokens, 11);
+});
+
+test('/v1/messages: a streaming response reports the cache tokens, not only the output count', async () => {
+  // `message_start` is written before the runtime reports anything, so its
+  // counts are zeros. `message_delta` is the first event that knows them, and it
+  // used to carry `output_tokens` alone — leaving a streaming client with no way
+  // to learn the input or cache tokens the contract lists.
+  const { status, text } = await call(
+    usageBackendReporting({
+      inputTokens: 5, outputTokens: 6, source: 'provider',
+      cacheCreationInputTokens: 7, cacheReadInputTokens: 8,
+    }),
+    '/v1/messages',
+    { ...MESSAGES, stream: true },
+  );
+  assert.equal(status, 200);
+  const delta = text.split('\n')
+    .filter((line) => line.startsWith('data: ') && line.includes('"message_delta"'))
+    .map((line) => JSON.parse(line.slice(6)))
+    .at(-1);
+  assert.ok(delta, `expected a message_delta frame: ${text.slice(0, 300)}`);
+  assert.equal(delta.usage.output_tokens, 6);
+  assert.equal(delta.usage.input_tokens, 5);
+  assert.equal(delta.usage.cache_creation_input_tokens, 7);
+  assert.equal(delta.usage.cache_read_input_tokens, 8);
+});
+
+test('stream_options.include_obfuscation defaults to on and is turned off explicitly', async () => {
+  // Promised in the input table and named by no test, so the defaulting
+  // expression could be inverted without anything failing.
+  const backend = usageBackendReporting({ inputTokens: 1, outputTokens: 1, source: 'provider' });
+  const withDefault = await call(backend, '/v1/chat/completions', { ...CHAT, stream: true });
+  assert.match(withDefault.text, /obfuscation/, 'obfuscation is on unless turned off');
+
+  const turnedOff = await call(backend, '/v1/chat/completions', {
+    ...CHAT, stream: true, stream_options: { include_obfuscation: false },
+  });
+  assert.doesNotMatch(turnedOff.text, /obfuscation/, 'an explicit false must turn it off');
+});

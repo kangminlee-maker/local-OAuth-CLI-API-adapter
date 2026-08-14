@@ -17,12 +17,13 @@ const failCommand = resolve(here, 'fixtures/fake-codex-models-fail.cjs');
 const malformedCommand = resolve(here, 'fixtures/fake-codex-models-malformed.cjs');
 const partialCommand = resolve(here, 'fixtures/fake-codex-models-partial.cjs');
 const emptyCommand = resolve(here, 'fixtures/fake-codex-models-empty.cjs');
+const mutableCommand = resolve(here, 'fixtures/fake-codex-models-mutable.cjs');
 
 before(async () => {
   // Without this a non-executable fixture would make execFile fail, production
   // code would return null, and the malformed/partial tests would pass without
   // ever exercising the parser.
-  for (const command of [okCommand, failCommand, malformedCommand, partialCommand, emptyCommand]) {
+  for (const command of [okCommand, failCommand, malformedCommand, partialCommand, emptyCommand, mutableCommand]) {
     await chmod(command, 0o755);
   }
 });
@@ -259,4 +260,40 @@ test('a successful catalogue is refreshed once its TTL elapses', async () => {
   now += 2 * 60 * 1000;
   await codexModels({ command: okCommand, codexHome, now: clock });
   assert.equal(await callCount(codexHome), 2, 'past ten minutes the list is re-collected');
+});
+
+test('a slug added to the runtime inside the cache window is rejected until the entry expires', async () => {
+  // The contract states this as a client-observable consequence of caching: one
+  // request's collection decides what a later one may name. Nothing tested it —
+  // the existing cache tests keep the advertised list fixed, so a lookup that
+  // silently refreshed on a miss would have stayed green while this promise
+  // stopped holding.
+  const codexHome = await newHome();
+  const advertised = join(codexHome, 'advertised.json');
+  await writeFile(advertised, JSON.stringify(['old-slug']));
+  let now = 5_000_000;
+  const options = { command: mutableCommand, codexHome, now: () => now };
+
+  await assertCodexModelSupported('old-slug', 'openai-chat', options);
+  await assert.rejects(
+    () => assertCodexModelSupported('new-slug', 'openai-chat', options),
+    (err) => {
+      assert.equal(err.statusCode, 404);
+      return true;
+    },
+  );
+
+  await writeFile(advertised, JSON.stringify(['old-slug', 'new-slug']));
+  await assert.rejects(
+    () => assertCodexModelSupported('new-slug', 'openai-chat', options),
+    (err) => {
+      assert.equal(err.statusCode, 404, 'the cached list still decides inside the window');
+      return true;
+    },
+  );
+  assert.equal(await callCount(codexHome), 1, 'the runtime must not have been re-consulted');
+
+  now += 10 * 60 * 1000 + 1;
+  await assertCodexModelSupported('new-slug', 'openai-chat', options);
+  assert.equal(await callCount(codexHome), 2, 'the expired entry must force a fresh collection');
 });

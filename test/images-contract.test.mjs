@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import http from 'node:http';
+import net from 'node:net';
 import { startLocalApiProxy, GeneratedImageStore } from '../dist/proxy/http-server.js';
 
 // The Images surface has a documented input contract and almost none of its
@@ -341,15 +343,28 @@ test('store: the byte bound evicts the oldest, never the entry just stored', () 
   assert.equal(live.length, 3, `the bound holds 3 KiB, got ${live.length} entries`);
 });
 
-test('store: an image larger than the whole bound is still served once', () => {
+test('store: storing an image never evicts that same image', () => {
   // Eviction that does not stop at the new entry deletes the image the client
-  // was just handed a URL for, so the URL 404s on its first fetch. Only a single
-  // oversized image reaches this branch — several small ones stop earlier.
+  // was just handed a URL for, so the URL 404s before any request could use it.
+  // Only a single oversized image reaches this branch — several small ones stop
+  // earlier. This is the guarantee, and it is the whole guarantee: the next test
+  // pins how far it does NOT go.
   const store = new GeneratedImageStore(60_000, 1024);
   const id = store.put(Buffer.alloc(4096, 7).toString('base64'), 'png');
   const image = store.get(id);
-  assert.ok(image, 'the URL the client was handed must serve its image at least once');
+  assert.ok(image, 'the entry just stored must survive its own insertion');
   assert.equal(image.bytes.byteLength, 4096);
+});
+
+test('store: an oversized image is evicted by the next request, fetched or not', () => {
+  // Documented, because it is surprising: the contract cannot promise a first
+  // fetch. Making it true would mean pinning entries until someone fetches them,
+  // and an entry nobody fetches would pin forever — the unbounded growth the
+  // budget exists to stop.
+  const store = new GeneratedImageStore(60_000, 1024);
+  const oversized = store.put(Buffer.alloc(4096, 7).toString('base64'), 'png');
+  store.put(Buffer.alloc(64, 9).toString('base64'), 'png');
+  assert.equal(store.get(oversized), null, 'the later put must reclaim the budget');
 });
 
 test('store: eviction accounting survives expiry, so the bound does not drift', () => {
@@ -451,4 +466,227 @@ test('variations: input_fidelity is rejected there too', async () => {
   });
   assert.equal(status, 400);
   assert.match(payload.error.message, /only supported for image edits/);
+});
+
+// The URL the proxy hands back has to be one the client can actually follow.
+// `fetch` will not send a hostile or absent Host, so these go through node:http.
+async function generatedUrlWith(headers, fetchIt = false) {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
+    const raw = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: target.hostname, port: target.port, path: '/v1/images/generations', method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...headers },
+      }, (res) => { let d = ''; res.on('data', (c) => { d += c; }); res.on('end', () => resolve(d)); });
+      req.on('error', reject);
+      req.end(body);
+    });
+    const url = JSON.parse(raw).data[0].url;
+    // Fetched here, while the server is still listening: a URL is only useful if
+    // it resolves during the proxy's lifetime.
+    const served = fetchIt ? (await fetch(url)).status : null;
+    return { url, origin: `${target.hostname}:${target.port}`, served };
+  } finally {
+    await started.close();
+  }
+}
+
+test('a generated URL keeps the scheme the client reached the proxy with', async () => {
+  // The scheme was hard-coded `http://`. Behind an HTTPS tunnel that hands the
+  // client a link its own page refuses as mixed content, for bytes that are on
+  // the other side of the same connection.
+  const forwarded = await generatedUrlWith({ 'x-forwarded-proto': 'https' });
+  assert.match(forwarded.url, /^https:\/\//, `expected https, got ${forwarded.url}`);
+
+  const plain = await generatedUrlWith({});
+  assert.match(plain.url, /^http:\/\//, 'a plain request must stay http');
+});
+
+test('a comma-joined x-forwarded-proto uses the first hop', async () => {
+  const { url } = await generatedUrlWith({ 'x-forwarded-proto': 'https, http' });
+  assert.match(url, /^https:\/\//, `the client-facing hop is the first one: ${url}`);
+});
+
+test('an unrecognised x-forwarded-proto does not choose the scheme', async () => {
+  const { url } = await generatedUrlWith({ 'x-forwarded-proto': 'gopher' });
+  assert.match(url, /^http:\/\//, `expected the connection's own scheme: ${url}`);
+});
+
+test('a request with no Host still gets a URL pointing at this proxy', async () => {
+  // HTTP/1.0 has no Host line, and the authority used to fall back to a bare
+  // `127.0.0.1` with no port — a URL pointing at nothing.
+  //
+  // Raw socket, not `node:http`: passing `host: ''` there does NOT omit the
+  // header, it makes node substitute its own, and a test written that way passes
+  // whatever the fallback does.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
+    const raw = await new Promise((resolve, reject) => {
+      const socket = net.connect(Number(target.port), target.hostname, () => {
+        socket.write(
+          'POST /v1/images/generations HTTP/1.0\r\n'
+          + 'Content-Type: application/json\r\n'
+          + `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+        );
+      });
+      let data = '';
+      socket.on('data', (chunk) => { data += chunk; });
+      socket.on('end', () => resolve(data));
+      socket.on('error', reject);
+    });
+    const url = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')).data[0].url;
+    const origin = `${target.hostname}:${target.port}`;
+    assert.ok(url.includes(origin), `expected the bound address ${origin}, got ${url}`);
+    assert.equal((await fetch(url)).status, 200, 'the fallback URL must actually serve the image');
+  } finally {
+    await started.close();
+  }
+});
+
+// --- round 38: image promises the inventory showed nothing would catch ---
+
+function streamingImageBackend(usage) {
+  const result = {
+    created: 0,
+    images: [{ b64Json: 'iVBORw0KGgo=', revisedPrompt: null }],
+    ...(usage ? { usage } : {}),
+  };
+  return {
+    name: 'test', model: 'configured-model',
+    async generate() { return result; },
+    async *stream() {
+      yield { type: 'completed', created: 0, image: result.images[0], ...(usage ? { usage } : {}) };
+    },
+    async close() {},
+  };
+}
+
+async function postWith(backend, path, init) {
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${path}`, init);
+    return { status: res.status, text: await res.text() };
+  } finally {
+    await started.close();
+  }
+}
+
+function multipart(fields) {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(fields)) form.set(k, v);
+  form.set('image', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'sq.png');
+  return { method: 'POST', body: form };
+}
+
+for (const stream of [false, true]) {
+  test(`generations: an explicit partial_images 0 is accepted${stream ? ' while streaming' : ''}`, async () => {
+    // The contract supports `0` or omitted and rejects anything above. Only the
+    // rejection and the omitted case were tested, so a presence check in place
+    // of the value check would reject the one value that IS supported.
+    const { status } = await postWith(streamingImageBackend(), GEN, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'image-2', prompt: 'a dot', partial_images: 0, ...(stream ? { stream: true } : {}),
+      }),
+    });
+    assert.equal(status, 200);
+  });
+}
+
+for (const [path, fields, event] of [
+  ['/v1/images/edits', { model: 'gpt-image-1', prompt: 'a dot', stream: 'true' }, 'image_edit.completed'],
+  ['/v1/images/variations', { model: 'dall-e-2', stream: 'true' }, 'image_edit.completed'],
+]) {
+  test(`${path}: stream is supported there too, as ${event}`, async () => {
+    // `stream` is optional on all three operations. Every streaming image test
+    // targeted generations, so scoping the stream to generations alone would
+    // silently turn these into non-streaming JSON — and the event NAME is what
+    // says which operation streamed, so asserting only ".completed" would accept
+    // an edit stream announcing itself as a generation.
+    const { status, text } = await postWith(streamingImageBackend(), path, multipart(fields));
+    assert.equal(status, 200);
+    assert.match(text, /^event: /, `expected SSE, got: ${text.slice(0, 120)}`);
+    assert.ok(text.includes(`event: ${event}`), `expected ${event}, got: ${text.slice(0, 200)}`);
+  });
+}
+
+test('generations: the streamed completed event is named for its own operation', async () => {
+  const { text } = await postWith(streamingImageBackend(), GEN, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'image-2', prompt: 'a dot', stream: true }),
+  });
+  assert.ok(text.includes('event: image_generation.completed'), `got: ${text.slice(0, 200)}`);
+});
+
+test('edits: a prompt is required even when the image is present', async () => {
+  // The tested cases were a missing generation prompt and a missing edit image.
+  // Narrowing the prompt requirement to generations alone would leave both green.
+  const { status, text } = await postWith(
+    streamingImageBackend(), '/v1/images/edits', multipart({ model: 'gpt-image-1' }),
+  );
+  assert.equal(status, 400);
+  const payload = JSON.parse(text);
+  assert.equal(payload.error.param, 'prompt');
+  assert.equal(payload.error.code, 'missing_required_parameter');
+});
+
+test('edits: input_fidelity is accepted on a model that supports it', async () => {
+  // Every input_fidelity test was a rejection, so widening the guard to reject
+  // the field everywhere would have stayed green while breaking its one valid use.
+  const { status } = await postWith(
+    streamingImageBackend(),
+    '/v1/images/edits',
+    multipart({ model: 'gpt-image-1', prompt: 'a dot', input_fidelity: 'high' }),
+  );
+  assert.equal(status, 200);
+});
+
+test('generations: a streaming response carries usage in the completed event', async () => {
+  const { status, text } = await postWith(
+    streamingImageBackend({ inputTokens: 3, outputTokens: 4, source: 'provider' }),
+    GEN,
+    {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', stream: true }),
+    },
+  );
+  assert.equal(status, 200);
+  const completed = text.split('\n')
+    .filter((line) => line.startsWith('data: ') && line.includes('.completed'))
+    .map((line) => JSON.parse(line.slice(6)))
+    .at(-1);
+  assert.ok(completed, `expected a completed frame: ${text.slice(0, 200)}`);
+  assert.equal(completed.usage.input_tokens, 3);
+  assert.equal(completed.usage.output_tokens, 4);
+});
+
+test('generations: a backend reporting raw image usage has it passed through', async () => {
+  // The documented fallback for a backend that reports provider-shaped image
+  // usage rather than the normalized local shape.
+  const { status, text } = await postWith(
+    streamingImageBackend({ input_tokens: 11, output_tokens: 22, total_tokens: 33 }),
+    GEN,
+    {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot' }),
+    },
+  );
+  assert.equal(status, 200);
+  const usage = JSON.parse(text).usage;
+  assert.equal(usage.input_tokens, 11);
+  assert.equal(usage.output_tokens, 22);
+  assert.equal(usage.total_tokens, 33);
 });

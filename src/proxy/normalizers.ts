@@ -116,7 +116,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     shape: 'anthropic-messages',
     model: readRequiredModel(input.model, 'anthropic'),
     messages,
-    maxTokens: readOptionalNumber(input.max_tokens),
+    maxTokens: readRequiredMaxTokens(input.max_tokens),
     temperature: readOptionalNumber(input.temperature),
     effort: readAnthropicEffort(outputConfig?.effort),
     taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
@@ -228,6 +228,11 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
   if (!Array.isArray(value)) {
     throw new ProxyRequestError('messages must be an array.', 400);
   }
+  // `minItems: 1` on the direct API. An empty conversation was reaching the
+  // runtime as a turn with nothing in it.
+  if (value.length === 0) {
+    throw new ProxyRequestError('messages must contain at least one message.', 400);
+  }
   return value.map((item) => {
     const msg = asRecord(item);
     if (!msg) throw new ProxyRequestError('Each message must be an object.', 400);
@@ -261,6 +266,9 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
 function readAnthropicMessages(value: unknown): NormalizedMessage[] {
   if (!Array.isArray(value)) {
     throw new ProxyRequestError('messages must be an array.', 400, 'anthropic');
+  }
+  if (value.length === 0) {
+    throw new ProxyRequestError('messages must contain at least one message.', 400, 'anthropic');
   }
   return value.map((item) => {
     const msg = asRecord(item);
@@ -663,6 +671,19 @@ function readRole(value: unknown): NormalizedMessage['role'] {
  * providers here keeps the proxy's input contract identical to theirs: a request
  * that direct APIs reject must not quietly succeed against the proxy.
  */
+/**
+ * `max_tokens` on `/v1/messages`, which the direct Anthropic API requires — the
+ * proxy accepts exactly what it accepts. `0` is a documented value there (it
+ * pre-warms the prompt cache without generating), so the floor is 0, not 1.
+ */
+function readRequiredMaxTokens(value: unknown): number {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value;
+  const message = value === undefined || value === null
+    ? 'max_tokens is required.'
+    : 'max_tokens must be a non-negative integer.';
+  throw new ProxyRequestError(message, 400, 'anthropic');
+}
+
 function readRequiredModel(value: unknown, provider: 'openai' | 'anthropic'): string {
   if (typeof value === 'string' && value.trim()) return value;
   const message = value === undefined || value === null

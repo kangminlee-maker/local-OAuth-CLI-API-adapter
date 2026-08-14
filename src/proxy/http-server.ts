@@ -113,6 +113,17 @@ async function closeImageGenerationClient(options: ProxyServerOptions): Promise<
   await imageClient.close();
 }
 
+// Every endpoint this server answers with POST. Consulted before the method
+// check so an unknown path is a 404 whatever method it arrives with.
+const POST_ENDPOINTS = new Set([
+  '/v1/chat/completions',
+  '/v1/responses',
+  '/v1/messages',
+  '/v1/images/generations',
+  '/v1/images/edits',
+  '/v1/images/variations',
+]);
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -140,6 +151,11 @@ async function handleRequest(
     if (req.method === 'GET' && path.startsWith('/v1/images/generated/')) {
       writeGeneratedImage(res, generatedImages, path);
       return;
+    }
+    // Path first, method second: `GET /v1/nope` is an unknown endpoint, not an
+    // unsupported method — GET is a method this server serves.
+    if (!POST_ENDPOINTS.has(path)) {
+      throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
     }
     if (req.method !== 'POST') {
       throw new ProxyRequestError('Unsupported method.', 405);
@@ -234,6 +250,13 @@ function requireAuthorizedRequest(
   // it as off silently opens a proxy its operator believed was closed.
   if (authKey === undefined) return;
   if (!authKey) throw new Error('authKey is configured but empty; refusing to serve unauthenticated');
+  // Presented values are trimmed, because a header's surrounding whitespace is
+  // not part of its value. A configured key with edge whitespace could therefore
+  // never be presented by any request — the proxy would answer 401 to everyone,
+  // including its operator. That is a configuration mistake, reported as one.
+  if (authKey !== authKey.trim()) {
+    throw new Error('authKey has leading or trailing whitespace, which no request can present');
+  }
   if (presentedAuthKeys(req).some((candidate) => safeKeyEqual(candidate, authKey))) return;
   const provider = path === '/v1/messages' ? 'anthropic' : 'openai';
   throw new ProxyRequestError(
@@ -1049,9 +1072,27 @@ function writeGeneratedImage(
   res.end(image.bytes);
 }
 
+/**
+ * The link handed back for `response_format: url`.
+ *
+ * The authority is the one the client addressed — `Host` is how it reached this
+ * proxy, and rewriting it to the bound address would break every tunnelled
+ * client. When there is no `Host` (HTTP/1.0) the bound address is the only
+ * authority we know.
+ *
+ * The scheme is NOT hard-coded: behind an HTTPS tunnel a hard-coded `http://`
+ * hands the client a link its own page will refuse as mixed content, for bytes
+ * that are on the other side of the same TLS connection.
+ */
 function generatedImageUrl(req: IncomingMessage, id: string): string {
-  const host = headerValue(req.headers.host) || '127.0.0.1';
-  return `http://${host}/v1/images/generated/${encodeURIComponent(id)}`;
+  const socket = req.socket as { encrypted?: boolean; localAddress?: string; localPort?: number };
+  const host = headerValue(req.headers.host)
+    || (socket.localAddress ? `${socket.localAddress}:${socket.localPort}` : '127.0.0.1');
+  const forwarded = headerValue(req.headers['x-forwarded-proto']).split(',')[0]?.trim().toLowerCase();
+  const scheme = forwarded === 'https' || forwarded === 'http'
+    ? forwarded
+    : (socket.encrypted ? 'https' : 'http');
+  return `${scheme}://${host}/v1/images/generated/${encodeURIComponent(id)}`;
 }
 
 function imageContentType(outputFormat: string): string {
@@ -2256,9 +2297,11 @@ async function writeAnthropicMessagesStream(
           stop_sequence: result.stopSequence ?? null,
           stop_details: anthropicStopDetails(result, stopReason),
         },
-        usage: {
-          output_tokens: result.usage.outputTokens,
-        },
+        // The whole usage, not just the output count. `message_start` is written
+        // before the runtime has reported anything, so its counts are zeros; this
+        // is the first event that knows them, and without them a streaming client
+        // can never learn the input or cache tokens the contract promises.
+        usage: anthropicUsage(result.usage),
       });
       await writeSseEvent(res, 'message_stop', {
         type: 'message_stop',
