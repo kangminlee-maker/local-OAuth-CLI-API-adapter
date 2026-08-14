@@ -10,11 +10,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const fakeClaude = resolve(here, 'fixtures/fake-claude.cjs');
 const echoArgvClaude = resolve(here, 'fixtures/echo-argv-claude.cjs');
 const rejectModelClaude = resolve(here, 'fixtures/reject-model-claude.cjs');
+const rejectModel232 = resolve(here, 'fixtures/reject-model-claude-2-1-232.cjs');
 
 before(async () => {
   await chmod(fakeClaude, 0o755);
   await chmod(echoArgvClaude, 0o755);
   await chmod(rejectModelClaude, 0o755);
+  await chmod(rejectModel232, 0o755);
 });
 
 test('ClaudeCodeBackend streams persistent text deltas', async () => {
@@ -596,6 +598,27 @@ test('honorRequestModel on: a refusal on the persistent path is a 404 too', asyn
   } finally {
     delete process.env.CLAUDE_TEST_ARGV_LOG;
   }
+});
+
+test('honorRequestModel on: a 404 result with no structured error is still a 404', async () => {
+  // Claude Code 2.1.232 drops `error: "model_not_found"` and sends `null`, and
+  // the refusal sentence is a UI string that can be reworded or localized. The
+  // structured 404 has to carry the mapping on its own — this fixture's result
+  // text matches neither pattern, so only the `api_error_status` branch can
+  // produce the 404 below.
+  await assert.rejects(
+    () => runAgainstRejectingClaude(
+      { ...anthropicTuningRequest({ model: 'claude-not-a-model', effort: 'low' }), shape: 'openai-chat' },
+      'claude-opus-4-8',
+      { honorRequestModel: true, command: rejectModel232 },
+    ),
+    (err) => {
+      assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+      assert.equal(err.code, 'model_not_found');
+      assert.equal(err.param, 'model');
+      return true;
+    },
+  );
 });
 
 test('honorRequestModel off: a CLI model refusal stays a server-side failure', async () => {

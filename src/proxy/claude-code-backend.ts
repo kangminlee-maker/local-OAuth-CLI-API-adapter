@@ -479,7 +479,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       const waiter = this.waiter;
       this.waiter = null;
       if (message.subtype === 'success' && isClaudeModelRejectionResult(message)) {
-        waiter.reject(new Error(typeof message.result === 'string' ? message.result : 'model rejected'));
+        waiter.reject(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
       } else if (message.subtype === 'success') {
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
@@ -642,7 +642,7 @@ function runClaudeProcess(
         consumeClaudeMessage(waiter, message);
         if (message.type === 'result') {
           if (message.subtype === 'success' && isClaudeModelRejectionResult(message)) {
-            finish(new Error(typeof message.result === 'string' ? message.result : 'model rejected'));
+            finish(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
           } else if (message.subtype === 'success') {
             finish(undefined, {
               text: typeof message.result === 'string' ? message.result : waiter.text,
@@ -732,23 +732,45 @@ function isRetryableClaudeStructuredOutputError(err: Error): boolean {
 }
 
 /**
- * Claude Code refuses an unknown `--model` before it starts a session, reporting
- * "There's an issue with the selected model (<name>)". Matched on the stable part
- * of that sentence rather than the whole wording.
+ * Carries "the runtime refused this model" from wherever it was recognised to
+ * the one place that maps it to a status. Without it the fact has to be
+ * re-derived from the error's text at the mapping site, which makes the English
+ * sentence load-bearing twice over — and it already changed shape once between
+ * two patch releases.
+ */
+class ClaudeModelRejectionError extends Error {}
+
+/**
+ * True when the runtime refused the model. Either it was already recognised from
+ * a structured result event, or this is the plain-text path — the CLI refuses an
+ * unknown `--model` before starting a session and says "There's an issue with the
+ * selected model (<name>)" on stderr, with no structured event to read. Matched
+ * on the stable part of that sentence rather than the whole wording.
  */
 function isClaudeModelRejection(err: Error): boolean {
-  return /issue with the selected model/i.test(err.message);
+  return err instanceof ClaudeModelRejectionError
+    || /issue with the selected model/i.test(err.message);
 }
 
 /**
- * The same refusal as it arrives under `--output-format stream-json`: the process
- * exits 0 and reports the failure inside the result event. Nothing reaches stderr,
- * so an exit-code or stderr check never sees it — which is why the text used to
- * surface as an ordinary assistant reply.
+ * The same refusal as it arrives under `--output-format stream-json`: the failure
+ * is reported inside the result event rather than on stderr, which is why the
+ * text used to surface as an ordinary assistant reply.
+ *
+ * Three signals, deliberately ordered weakest-dependency first. `error:
+ * "model_not_found"` is the structured one — but 2.1.231 set it and 2.1.232 sends
+ * `null` in its place, so it cannot be relied on alone. `api_error_status: 404`
+ * is therefore sufficient by itself: on a turn this proxy builds, the model is
+ * the only resource the client names, so a 404 from the turn is a model the
+ * runtime will not run. A non-model 404 would be reported to the client as an
+ * unavailable model, which is the safer of the two ways to be wrong — the
+ * alternative is what this function was written to stop, a refusal returning 200
+ * with the refusal sentence as the assistant's answer. The English text stays as
+ * a last resort for a report that carries neither field.
  */
 function isClaudeModelRejectionResult(message: JsonObject): boolean {
   if (message.error === 'model_not_found') return true;
-  if (message.api_error_status !== 404) return false;
+  if (message.api_error_status === 404) return true;
   const text = typeof message.result === 'string' ? message.result : '';
   return /issue with the selected model/i.test(text);
 }
