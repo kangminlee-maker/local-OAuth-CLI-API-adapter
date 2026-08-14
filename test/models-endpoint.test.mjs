@@ -30,7 +30,13 @@ async function modelsFor(model) {
   });
   try {
     const res = await fetch(`${started.url}/v1/models`);
-    return await res.json();
+    const payload = await res.json();
+    // An empty `data` is a documented answer here, so the status and envelope
+    // have to be checked too: an error body that happens to serialize an empty
+    // array would otherwise satisfy every empty-list assertion below.
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(payload)}`);
+    assert.equal(payload.object, 'list');
+    return payload;
   } finally {
     await started.close();
   }
@@ -50,7 +56,9 @@ const BACKEND_IDENTIFIERS = ['codex-app-server', 'codex-backend', 'claude-code-c
 
 for (const identifier of BACKEND_IDENTIFIERS) {
   test(`GET /v1/models never advertises the backend identifier ${identifier}`, async () => {
-    // Advertising it would hand clients a value the proxy now rejects.
+    // An identifier names a transport, not a model a client can select, so it
+    // is never offered as a choice. What a request naming one actually gets is
+    // the runtime's business and depends on the honouring switch.
     const payload = await modelsFor(identifier);
     assert.deepEqual(payload.data.map((m) => m.id), []);
   });
@@ -89,11 +97,14 @@ async function modelsWithSetting(honorRequestModel, listed, backendModel = 'conf
     };
     const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30000 });
     const res = await fetch(started.url + '/v1/models');
-    process.stdout.write(JSON.stringify(await res.json()));
+    process.stdout.write(JSON.stringify({ status: res.status, payload: await res.json() }));
     await started.close();
   `);
   const { stdout } = await execFileAsync(process.execPath, [scriptPath], { cwd: root });
-  return JSON.parse(stdout);
+  const { status, payload } = JSON.parse(stdout);
+  assert.equal(status, 200, `expected 200, got ${status}: ${JSON.stringify(payload)}`);
+  assert.equal(payload.object, 'list');
+  return payload;
 }
 
 test('honour-on: the runtime catalogue is advertised, configured model first', async () => {
@@ -112,22 +123,29 @@ test('a runtime that cannot enumerate falls back to its single model', async () 
 });
 
 for (const identifier of BACKEND_IDENTIFIERS) {
-  test(`honour-on: ${identifier} is filtered out of the advertised catalogue`, async () => {
-    // A runtime that listed its own identifier — or a backend whose `model` is
-    // the identifier because nothing is configured — must not leak it into the
-    // list, in either position. Both are exercised at once here.
+  // The identifier can reach the list from two independent places, and they are
+  // kept in separate tests on purpose. Exercising both at once lets a filter
+  // that only de-duplicates against `backend.model` look like identifier
+  // filtering: the listed copy would vanish merely for equalling the configured
+  // one. Each position has to fail on its own.
+  test(`honour-on: ${identifier} listed by the runtime is filtered out`, async () => {
     const payload = await modelsWithSetting(
       true,
       ['gpt-5.6-sol', identifier, 'gpt-5.6-terra'],
-      identifier,
+      'configured-model',
     );
+    assert.deepEqual(payload.data.map((m) => m.id), ['configured-model', 'gpt-5.6-sol', 'gpt-5.6-terra']);
+  });
+
+  test(`honour-on: ${identifier} as the backend's own model is not listed first`, async () => {
+    const payload = await modelsWithSetting(true, ['gpt-5.6-sol', 'gpt-5.6-terra'], identifier);
     assert.deepEqual(payload.data.map((m) => m.id), ['gpt-5.6-sol', 'gpt-5.6-terra']);
   });
 
   test(`honour-on with nothing to advertise: ${identifier} yields an empty list`, async () => {
     // The documented consequence of "an identifier is not a selectable model":
     // with no configured model and no runtime catalogue there is nothing to
-    // advertise, so the list is empty rather than a value the proxy rejects.
+    // advertise, so the answer is an empty list rather than a transport name.
     const payload = await modelsWithSetting(true, null, identifier);
     assert.deepEqual(payload.data.map((m) => m.id), []);
   });

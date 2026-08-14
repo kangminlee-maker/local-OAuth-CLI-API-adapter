@@ -161,7 +161,8 @@ test('default transport, honorRequestModel on: the backend identifier is rejecte
   // `codex-backend` used to be a sentinel meaning "no model chosen", which made
   // a request naming it run the configured model. It is now an ordinary model
   // name, absent from the served catalogue, so it must 404. Reintroducing the
-  // sentinel would turn this back into a silent 200 on `gpt-5.5`.
+  // sentinel would turn this back into a silent 200 on `fixture-model-a`, which
+  // the catalogue does list.
   resetCodexModelCatalogCache();
   await assert.rejects(
     () => transportBody(
@@ -175,6 +176,32 @@ test('default transport, honorRequestModel on: the backend identifier is rejecte
       return true;
     },
   );
+});
+
+test('default transport, honorRequestModel on: what runs and what is reported agree on the identifier', async () => {
+  // `resolvedModel` feeds the model echoed in streaming chunks and is a separate
+  // code path from the one that builds the request. A sentinel restored in only
+  // one of them would leave the rejection test above green while the two
+  // disagreed. The uncollectable catalogue is what makes both observable at
+  // once: validation fails open, so the identifier actually executes.
+  resetCodexModelCatalogCache();
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(okSse(), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({
+    codexHome,
+    timeoutMs: 30_000,
+    model: 'fixture-model-a',
+    honorRequestModel: true,
+    codexCommand: fakeCodexModelsFail,
+  });
+  const request = { ...textRequest(), model: 'codex-backend' };
+  await backend.generate(request);
+  assert.equal(JSON.parse(calls[0].init.body).model, 'codex-backend', 'executed model');
+  assert.equal(await backend.resolvedModel(request), 'codex-backend', 'reported model');
 });
 
 test('default transport, honorRequestModel on: an uncollectable catalogue passes the model through', async () => {

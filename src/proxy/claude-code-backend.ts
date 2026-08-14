@@ -98,10 +98,15 @@ export class ClaudeCodeBackend implements LocalCliBackend {
    * The request model, or undefined when it carries no model choice — which over
    * HTTP no longer happens: normalization rejects an absent or empty `model`, so
    * only an internal caller can reach the undefined branch. The backend's own
-   * identifier (`claude-code-cli`) is a model name like any other here: it is
-   * compared against the *configured* model, never against the public identifier,
-   * so with nothing configured it forces the one-shot path and the CLI refuses
-   * it, rather than silently reusing a persistent process on the CLI default.
+   * identifier (`claude-code-cli`) is a model name like any other here — never a
+   * sentinel meaning "no model chosen".
+   *
+   * What that changes is confined to honouring mode. With honouring on and
+   * nothing configured, the identifier is compared against the *configured*
+   * model (undefined), never against `this.model` — which is the identifier
+   * itself — so it forces the one-shot path and the CLI refuses it. With
+   * honouring off the request model is not forwarded at all, so the identifier,
+   * like any other requested model, is simply ignored.
    */
   private explicitRequestModel(requestModel: string): string | undefined {
     return requestModel || undefined;

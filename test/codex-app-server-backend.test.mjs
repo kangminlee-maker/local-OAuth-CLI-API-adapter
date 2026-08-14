@@ -482,6 +482,27 @@ test('honorRequestModel on: the backend identifier is rejected, not read as omis
   }
 });
 
+test('honorRequestModel on: the reported model is the identifier too, not the configured one', async () => {
+  // `resolvedModel` feeds the model echoed back to the client and is a separate
+  // code path from `modelOverrideFor`, which decides what executes. A sentinel
+  // restored in only one of them would leave the rejection test above green
+  // while the two disagreed, so pin this one directly. It does not validate, so
+  // it answers for the identifier even though executing it would 404.
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'gpt-5.5',
+    honorRequestModel: true,
+  });
+  try {
+    const reported = await backend.resolvedModel({ ...textRequest(), model: 'codex-app-server' });
+    assert.equal(reported, 'codex-app-server');
+  } finally {
+    await backend.close();
+  }
+});
+
 test('honorRequestModel on: an anthropic-shaped request is rejected in the anthropic error shape', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   resetCodexModelCatalogCache();

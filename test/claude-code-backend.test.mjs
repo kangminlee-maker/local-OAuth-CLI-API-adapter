@@ -367,26 +367,44 @@ test('honorRequestModel on, nothing configured: the identifier still reaches --m
     { honorRequestModel: true },
   );
   assert.ok(argv.includes('-p'), `expected the one-shot path: ${argv.join(' ')}`);
-  assert.equal(argv[argv.indexOf('--model') + 1], 'claude-code-cli');
+  // Assert the flag exists before reading past it: `indexOf(...) + 1` is 0 when
+  // the flag is absent, so a regression that passed the model as a bare
+  // positional argument would otherwise be read as a pass.
+  const i = argv.indexOf('--model');
+  assert.ok(i !== -1, `expected --model in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], 'claude-code-cli');
 });
 
 test('honorRequestModel on, nothing configured: the CLI refusing the identifier is a 404', async () => {
   // The other half: the refusal the previous test makes reachable is mapped to
   // the surface's own not-found error, not to a 500 — and never to a 200 from
   // the CLI default.
-  await assert.rejects(
-    () => runAgainstRejectingClaude(
-      { ...anthropicTuningRequest({ model: 'claude-code-cli', effort: 'low' }), shape: 'openai-chat' },
-      undefined,
-      { honorRequestModel: true },
-    ),
-    (err) => {
-      assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
-      assert.equal(err.code, 'model_not_found');
-      assert.equal(err.param, 'model');
-      return true;
-    },
-  );
+  //
+  // The fixture refuses whatever it is given, including nothing, so the status
+  // alone would not prove the model was forwarded. Assert the recorded argv too.
+  const argvLog = join(await mkdtemp(join(tmpdir(), 'claude-argv-')), 'argv.log');
+  process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+  try {
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        { ...anthropicTuningRequest({ model: 'claude-code-cli', effort: 'low' }), shape: 'openai-chat' },
+        undefined,
+        { honorRequestModel: true },
+      ),
+      (err) => {
+        assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+        assert.equal(err.code, 'model_not_found');
+        assert.equal(err.param, 'model');
+        return true;
+      },
+    );
+    const argv = JSON.parse((await readFile(argvLog, 'utf8')).trim().split('\n')[0]);
+    const i = argv.indexOf('--model');
+    assert.ok(i !== -1, `expected --model in argv: ${argv.join(' ')}`);
+    assert.equal(argv[i + 1], 'claude-code-cli');
+  } finally {
+    delete process.env.CLAUDE_TEST_ARGV_LOG;
+  }
 });
 
 
