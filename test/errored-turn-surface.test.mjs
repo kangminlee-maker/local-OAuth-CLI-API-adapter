@@ -1,6 +1,17 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { before, test } from 'node:test';
+import { chmod } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const resultShapes = resolve(here, 'fixtures/claude-result-shapes.cjs');
+
+before(async () => {
+  await chmod(resultShapes, 0o755);
+});
 
 // What a client actually sees when a turn fails is decided by whether any bytes
 // have been committed. Both halves are pinned here: the contract describes them
@@ -83,4 +94,82 @@ test('a failed turn after the first chunk is an in-band SSE error, not a complet
     !events.some((e) => e !== '[DONE]' && JSON.parse(e).choices?.some((c) => c.finish_reason)),
     `a failed turn must not report a finish_reason: ${text}`,
   );
+});
+
+
+// The stub tests above pin the HTTP layer. These wire the REAL Claude backend to
+// the server, so the documented Claude statuses are established end to end
+// rather than inferred from a stub that throws a plain Error.
+async function claudeStatusFor(shape, body) {
+  const previous = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = shape;
+  const backend = new ClaudeCodeBackend({
+    command: resultShapes,
+    cwd: process.cwd(),
+    model: 'claude-opus-4-8',
+    timeoutMs: 30_000,
+    honorRequestModel: true,
+  });
+  const started = await startLocalApiProxy({
+    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, payload: await res.json() };
+  } finally {
+    await started.close();
+    await backend.close();
+    if (previous === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previous;
+  }
+}
+
+const CHAT = { model: 'claude-not-a-model', messages: [{ role: 'user', content: 'hi' }] };
+
+test('Claude: a refused model is a 404 model_not_found at the HTTP surface', async () => {
+  const { status, payload } = await claudeStatusFor('assistant_only', CHAT);
+  assert.equal(status, 404);
+  assert.equal(payload.error.code, 'model_not_found');
+  assert.equal(payload.error.param, 'model');
+});
+
+test('Claude: a bare 404 with no model signal is a 5xx at the HTTP surface', async () => {
+  const { status, payload } = await claudeStatusFor('bare_404', CHAT);
+  assert.ok(status >= 500 && status < 600, `expected a 5xx, got ${status}`);
+  assert.equal(payload.error.code, null);
+  assert.match(payload.error.message, /upstream returned 404/);
+});
+
+test('Claude: an errored result with no diagnostic is a 5xx that leaks no event fields', async () => {
+  const { status, payload } = await claudeStatusFor('error_no_text', CHAT);
+  assert.ok(status >= 500 && status < 600, `expected a 5xx, got ${status}`);
+  assert.ok(!payload.error.message.includes('sentinel-session'), payload.error.message);
+  assert.match(payload.error.message, /without a diagnostic message/);
+});
+
+test('Claude: child stderr never reaches the HTTP client', async () => {
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = () => true;
+  try {
+    const { status, payload } = await claudeStatusFor('stderr_only', CHAT);
+    assert.ok(status >= 500 && status < 600, `expected a 5xx, got ${status}`);
+    assert.ok(!payload.error.message.includes('SENTINEL_STDERR'), payload.error.message);
+    assert.ok(!payload.error.message.includes('internal.example'), payload.error.message);
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
+test('Claude: an error subtype with no diagnostic still names the failure kind', async () => {
+  // The kind is the only thing the runtime told us. Replacing it with a generic
+  // sentence would leave an operator with nothing to search for.
+  const { status, payload } = await claudeStatusFor('subtype_only', CHAT);
+  assert.ok(status >= 500 && status < 600, `expected a 5xx, got ${status}`);
+  assert.match(payload.error.message, /error_max_turns/);
+  assert.ok(!payload.error.message.includes('sentinel-session'), payload.error.message);
+  assert.ok(!payload.error.message.includes('total_cost_usd'), payload.error.message);
 });

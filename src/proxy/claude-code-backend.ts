@@ -509,9 +509,11 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   private failCurrent(err: Error): void {
-    const detail = this.stderr ? `\n${this.stderr.slice(-2000)}` : '';
-    const wrapped = new Error(`${err.message}${detail}`);
-    this.waiter?.reject(wrapped);
+    // The child's stderr is operator-local: it can carry gateway detail, settings
+    // values, paths and auth diagnostics, and this error becomes an HTTP 500's
+    // message or an in-band SSE error. It goes to the proxy's own stderr instead,
+    // flattened and bounded like every other diagnostic here.
+    this.waiter?.reject(claudeProcessFailure(err, this.stderr));
     this.waiter = null;
   }
 
@@ -674,7 +676,10 @@ function runClaudeProcess(
     child.on('error', (err) => finish(err));
     child.on('close', (code, signal) => {
       if (code === 0) return;
-      finish(new Error(stderr.trim() || `claude exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`));
+      finish(claudeProcessFailure(
+        new Error(`claude exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`),
+        stderr,
+      ));
     });
     if (options.stdinMessage && child.stdin) {
       child.stdin.write(`${JSON.stringify(options.stdinMessage)}\n`);
@@ -737,35 +742,81 @@ function readNumber(value: unknown): number {
 }
 
 /**
- * The runtime's own words for a failed turn, or nothing. Deliberately not a
- * serialization of the event: this string becomes an HTTP 500's `message`, and a
- * result event carries `session_id`, cost, usage and whatever fields a future
- * version adds. Two named string fields are read; anything else is answered with
- * a fixed sentence rather than by handing the client the event.
+ * A child-process failure, with the child's stderr kept away from the client.
+ *
+ * The refusal the CLI prints in plain-text mode arrives only on stderr, so it is
+ * recognised here and becomes the tagged rejection rather than travelling as
+ * text — that is the one thing the caller needs from those bytes. Everything else
+ * goes to the proxy's own stderr for the operator, and the returned error carries
+ * a fixed description.
  */
-/**
- * One log line, and only a log line. The runtime's message contains the model
- * string a client chose, so it can carry newlines that forge a second entry or
- * escape sequences a terminal would act on. Control characters become escapes
- * and the result is bounded — an operator lead, not a channel.
- */
-function asLogLine(message: string): string {
-  const flattened = message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, (ch) => (
-    `\\x${ch.codePointAt(0)?.toString(16).padStart(2, '0')}`
-  ));
-  return flattened.length > MAX_LOG_LINE_CHARS
-    ? `${flattened.slice(0, MAX_LOG_LINE_CHARS)}...[truncated]`
-    : flattened;
+function claudeProcessFailure(err: Error, childStderr: string): Error {
+  const detail = childStderr.trim();
+  if (detail) {
+    process.stderr.write(`claude process failure: ${asLogLine(detail)}\n`);
+  }
+  if (/issue with the selected model/i.test(detail)) {
+    return new ClaudeModelRejectionError(err.message);
+  }
+  return err;
 }
 
+/**
+ * One log line, and only a log line. The runtime's message contains the model
+ * string a client chose, so it can carry line breaks that forge a second entry
+ * or escape sequences a terminal would act on. Escaped: C0 and C1 controls, and
+ * U+2028/U+2029, which Unicode-aware log processors and terminals treat as line
+ * breaks even though they are not C0.
+ *
+ * Truncation walks code points and appends whole escapes, so a boundary can
+ * never split an astral character into a lone surrogate or leave a half-written
+ * escape. The returned string, marker included, stays within the limit.
+ */
+function asLogLine(message: string): string {
+  const budget = MAX_LOG_LINE_CHARS - TRUNCATION_MARKER.length;
+  let out = '';
+  for (const ch of message) {
+    const piece = NON_PRINTING.test(ch) ? `\\u{${ch.codePointAt(0)?.toString(16)}}` : ch;
+    if (out.length + piece.length > budget) return `${out}${TRUNCATION_MARKER}`;
+    out += piece;
+  }
+  return out;
+}
+
+// C0, DEL and C1, plus the two Unicode line separators.
+const NON_PRINTING = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+const TRUNCATION_MARKER = '...[truncated]';
 // Long enough for the CLI's refusal sentence and a model name; short enough that
 // a hostile value cannot flood an operator's log from one request.
 const MAX_LOG_LINE_CHARS = 500;
 
+/**
+ * The runtime's own words for a failed turn. Deliberately not a serialization of
+ * the event: this string becomes an HTTP 500's `message`, and a result event
+ * carries `session_id`, cost, usage and whatever fields a future version adds.
+ * Only fields documented to hold a diagnostic are read — `result`, `error`, and
+ * the `errors` array — and the failure's `subtype` is kept because it names the
+ * kind of failure rather than describing the session.
+ */
 function readErrorMessage(message: JsonObject): string {
+  const detail = readErrorDetail(message);
+  const subtype = typeof message.subtype === 'string' && message.subtype !== 'success'
+    ? message.subtype
+    : null;
+  if (detail && subtype) return `${subtype}: ${detail}`;
+  if (detail) return detail;
+  if (subtype) return `claude code reported a failed turn (${subtype})`;
+  return 'claude code reported a failed turn without a diagnostic message';
+}
+
+function readErrorDetail(message: JsonObject): string | null {
   if (typeof message.result === 'string' && message.result.trim()) return message.result;
   if (typeof message.error === 'string' && message.error.trim()) return message.error;
-  return 'claude code reported a failed turn without a diagnostic message';
+  if (Array.isArray(message.errors)) {
+    const joined = message.errors.filter((e): e is string => typeof e === 'string').join('; ').trim();
+    if (joined) return joined;
+  }
+  return null;
 }
 
 function isRetryableClaudeStructuredOutputError(err: Error): boolean {

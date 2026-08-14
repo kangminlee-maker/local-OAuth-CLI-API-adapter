@@ -285,6 +285,8 @@ function modelArgsIn(argv) {
   return argv.flatMap((arg, i) => (arg === '--model' ? [argv[i + 1]] : []));
 }
 
+const PREFIX = 'claude model rejection (reported as 404): ';
+
 const PROBE_SCHEMA = { type: 'object', additionalProperties: false, properties: {}, required: [] };
 
 function anthropicTuningRequest(overrides) {
@@ -675,6 +677,13 @@ test('honorRequestModel on: the assistant-event refusal is a 404 on the persiste
   const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
   process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
   process.env.CLAUDE_TEST_RESULT_SHAPE = 'assistant_only';
+  const diagnostics = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => {
+    const line = String(chunk);
+    if (line.includes('claude model rejection')) diagnostics.push(line);
+    return true;
+  };
   const backend = new ClaudeCodeBackend({
     command: resultShapes,
     cwd: process.cwd(),
@@ -705,7 +714,14 @@ test('honorRequestModel on: the assistant-event refusal is a 404 on the persiste
     assert.equal(turns.length, 2, `expected two answered user turns, saw ${turns.length}`);
     const argv = spawns[0];
     assert.equal(argv[argv.indexOf('--model') + 1], 'claude-retired');
+    // Which result settled which waiter. The fixture tags every answer with its
+    // turn number, so a late duplicate of turn 1 cannot impersonate turn 2 — the
+    // count alone could not tell those apart.
+    assert.deepEqual(diagnostics.map((d) => /\[turn-(\d+)\]/.exec(d)?.[1]), ['1', '2']);
+    // And the operator diagnostic fires on this route too, not only on one-shot.
+    assert.equal(diagnostics.length, 2, `expected one diagnostic per turn, saw ${diagnostics.length}`);
   } finally {
+    process.stderr.write = originalWrite;
     await backend.close();
     if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
     else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
@@ -749,7 +765,9 @@ test('honorRequestModel on: the operator gets the runtime message, flattened to 
   // record of what the runtime actually said. It is also the only place a
   // client-chosen string reaches a log, so it must not be able to forge a second
   // entry: the model here contains a newline and an ANSI escape.
-  const hostileModel = 'evil\u001b[31m\nclaude model rejection (reported as 404): forged entry';
+  // A newline, an ANSI escape, and U+2028 — which is not a C0 control but which
+  // Unicode-aware terminals and log processors still treat as a line break.
+  const hostileModel = 'evil\u001b[31m\nclaude model rejection (reported as 404): forged\u2028also-forged';
   const written = [];
   const originalWrite = process.stderr.write.bind(process.stderr);
   process.stderr.write = (chunk, ...rest) => {
@@ -772,6 +790,7 @@ test('honorRequestModel on: the operator gets the runtime message, flattened to 
     // whole point of escaping, and a raw ESC would be acted on by a terminal.
     assert.equal(lines[0].split('\n').length, 2, `diagnostic must be one line: ${JSON.stringify(lines[0])}`);
     assert.ok(!lines[0].includes('\u001b'), 'escape sequences must not survive');
+    assert.ok(!lines[0].includes('\u2028'), 'unicode line separators must not survive');
     assert.ok(!lines[0].includes('Say OK'), 'the prompt must not be logged');
   } finally {
     process.stderr.write = originalWrite;
@@ -800,6 +819,110 @@ test('an errored result with no diagnostic field does not hand the client the ev
       },
     );
   } finally {
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('child stderr is the operator\'s, not the client\'s', async () => {
+  // Claude's stderr can carry gateway detail, settings values, paths and auth
+  // diagnostics. It used to be appended to the error, which becomes an HTTP 500
+  // message or an in-band SSE error.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk, ...rest) => { written.push(String(chunk)); return true; };
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = 'stderr_only';
+  try {
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-not-a-model', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.ok(!err.message.includes('SENTINEL_STDERR'), `stderr reached the client: ${err.message}`);
+        assert.ok(!err.message.includes('internal.example'), `stderr reached the client: ${err.message}`);
+        assert.match(err.message, /claude exited with code=3/);
+        return true;
+      },
+    );
+    const diag = written.filter((l) => l.includes('claude process failure'));
+    assert.equal(diag.length, 1, `operator must still get it once, saw ${diag.length}`);
+    assert.match(diag[0], /SENTINEL_STDERR/);
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a structured-output failure carrying only subtype and errors stays retryable', async () => {
+  // The retry keys on the error text. When the diagnostic lives in `errors` and
+  // the kind in `subtype`, a fixed generic message would erase both and silently
+  // turn a retryable failure into a hard one.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = 'ede_retry';
+  const argvDir = await mkdtemp(join(tmpdir(), 'claude-argv-'));
+  const argvLog = join(argvDir, 'argv.log');
+  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
+  process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+  try {
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        // Anthropic shape with a schema: that is what puts `--json-schema` on the
+        // spawned argv and so takes the one-shot route, which is where the
+        // validate-and-retry loop lives. The OpenAI shape keeps the persistent
+        // path and never retries.
+        { ...anthropicTuningRequest({ model: 'claude-opus-4-8' }), jsonMode: true, jsonSchema: PROBE_SCHEMA },
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.match(err.message, /error_during_execution/);
+        assert.match(err.message, /ede_diagnostic/);
+        assert.ok(!err.message.includes('sentinel-session'), `event leaked: ${err.message}`);
+        return true;
+      },
+    );
+    // Retried means spawned more than once: the retry is what proves the marker
+    // survived into the message the classifier reads.
+    const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean)
+      .map((l) => JSON.parse(l)).filter((l) => l[0] !== '#turn');
+    assert.ok(spawns.length > 1, `expected a retry, saw ${spawns.length} spawn(s)`);
+  } finally {
+    if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
+    else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+    await rm(argvDir, { recursive: true, force: true });
+  }
+});
+
+test('the operator diagnostic is bounded, marker included', async () => {
+  // A client picks the model, the CLI echoes it, and this line is written per
+  // rejected request. Without a bound one request could flood an operator's log.
+  // The bound has to cover the truncation marker too, or the "500 characters"
+  // it advertises is really 514.
+  const longModel = 'm'.repeat(4000);
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = 'assistant_only';
+  try {
+    await assert.rejects(() => runAgainstRejectingClaude(
+      openAiRefusalRequest({ model: longModel, effort: 'low' }),
+      'claude-opus-4-8',
+      { honorRequestModel: true, command: resultShapes },
+    ));
+    const line = written.find((l) => l.includes('claude model rejection'));
+    assert.ok(line, 'expected the diagnostic');
+    const body = line.slice(PREFIX.length, -1);
+    assert.ok(body.length <= 500, `diagnostic body must stay within 500, got ${body.length}`);
+    assert.ok(body.endsWith('...[truncated]'), `expected the truncation marker: ${body.slice(-30)}`);
+  } finally {
+    process.stderr.write = originalWrite;
     if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
     else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
   }
