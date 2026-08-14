@@ -11,7 +11,7 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 | Runtime | Local version | Binary | Primary hot path |
 | --- | --- | --- | --- |
 | Codex CLI | `codex-cli 0.146.0` | `/opt/homebrew/bin/codex` | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.228` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Claude Code | `2.1.231` | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
 PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper가 실제로 실행되는 명령이므로 version·help·schema·parse probe 같은 동작 권위는 wrapper 기준으로 수집한다. 다만 wrapper script에는 바이너리 문자열이 없으므로 string scan만 native 바이너리를 대상으로 하며, 그 후보는 wrapper와 `--version`이 일치할 때만 채택한다. 일치하는 후보가 없으면 scan은 대상 없음으로 보고한다. report의 `Command on PATH`와 `Scan target` 열이 이 둘을 구분한다.
 
@@ -180,7 +180,9 @@ CLI option 값 도메인:
 
 `--model`의 값 도메인은 고정 enum이 아니라 서버가 정하는 목록이므로 위 표에 넣지 않는다. 모델 목록의 권위는 `codex debug models`이며, 각 항목은 `slug`, `supported_reasoning_levels`, `supported_in_api`, `visibility`, `priority`를 노출한다. CLI는 미지원 `--model` 값을 거부하지 않고 그대로 실행하다 요청 단계에서 실패하므로, 모델 검증은 proxy가 상류에서 수행해야 한다.
 
-proxy가 실제로 강제하는 것은 `slug` 존재 여부뿐이다. `supported_in_api`와 `visibility`가 local OAuth 경로에서 무엇을 막는지는 아직 probe로 확인하지 않았으므로, 이 필드로 모델을 거부하지 않는다. 확인되지 않은 필드를 근거로 차단하면 실제로는 동작하는 모델을 막게 된다. `supported_reasoning_levels`도 같은 이유로 effort 검증에 쓰지 않으며, 현재 effort 도메인은 아래 app-server 계약(모델이 광고하는 문자열)을 따른다.
+proxy가 강제하는 것은 `slug` 존재 여부뿐이다. `supported_in_api`와 `visibility`는 local OAuth proxy 경로에서 실행을 막지 않는다 — 네 가지 플래그 조합을 각각 실제 turn으로 호출해 모두 성공을 확인했다(L4 probe): `api=true/vis=list`(대조군), `api=false/vis=hide`, `api=false/vis=list`, `api=true/vis=hide`. 따라서 이 필드로 모델을 거부하지도, 노출 목록에서 빼지도 않는다. 두 필드는 다른 표면(공식 API, 선택 UI)의 정책으로 보이며 이 경로의 권위가 아니다.
+
+`supported_reasoning_levels`는 effort 검증에 쓰지 않는다. effort 도메인의 권위는 아래 app-server 계약(모델이 광고하는 문자열)이다.
 
 `codex app-server --code-mode-host <WS_URL>`는 로컬 host를 띄우는 대신 원격 code-mode host에 접속한다(L1). hot path는 로컬 stdio app-server이므로 기본값으로 쓰지 않는다.
 
@@ -296,7 +298,7 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 
 ### CLI command surface
 
-`--help` 재귀 walk 기준으로 50개 명령과 214개 option이 열거된다. root subcommand는 아래 13개이며, 여기에 뒤의 hidden root command가 더해진다.
+`--help` 재귀 walk 기준으로 50개 명령과 216개 option이 열거된다. root subcommand는 아래 13개이며, 여기에 뒤의 hidden root command가 더해진다.
 
 | Root subcommand | 설명 | Adapter 관련성 |
 | --- | --- | --- |
@@ -453,6 +455,7 @@ Rule: projections are convenience views. The raw event is always retained for au
 | `claude_strict_json_probe` | `--json-schema` validates final output for strict mode |
 | `direct_key_isolation_probe` | Child env has no direct OpenAI/Anthropic API keys in native chat mode |
 | `binary_docs_diff_probe` | Official-doc-only flags are checked against installed binary and marked supported/unsupported |
+| `codex_model_flag_gate_probe` | Each `supported_in_api`/`visibility` combination from `codex debug models` is run as a real turn through the proxy, establishing whether either flag gates execution on the local OAuth path |
 
 ## 다음 구현 항목
 
