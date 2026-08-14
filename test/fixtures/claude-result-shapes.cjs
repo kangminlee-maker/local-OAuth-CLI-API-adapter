@@ -19,6 +19,8 @@
 //                    diagnostic, only `subtype` and an `errors` array. Must stay
 //                    retryable.
 //   plaintext_refusal : the refusal on stderr with no structured event at all.
+//   delta_then_hang : streams a delta, never finishes; dies on the next input.
+//   ignores_sigterm : answers turns, ignores SIGTERM so close() hits its deadline.
 //   stale_sentence : turn 1 answers but leaves the refusal sentence on stderr;
 //                    turn 2 dies for an unrelated reason.
 //   exit_after_answer : answers, then dies while idle (no waiter).
@@ -27,6 +29,10 @@
 //   huge_both      : both `subtype` and detail oversized.
 //   huge_refusal   : a model rejection whose result text is oversized.
 //   unrelated_prefix : pre-answer stderr containing the words but not the form.
+//   hook_echo_parenthesised : the phrase WITH parentheses, mid-line, from a hook.
+//   output_then_refusal_text : output first, then refusal-looking stderr, exit != 0.
+//   delta_then_refusal : the same, but the output is a stream delta.
+//   api_error_without_string_error : an API-error assistant with a non-string error.
 //   multiline_detail : a legitimate multi-line diagnostic.
 //   max_turns_mentioning_ede : an authoritative subtype whose text mentions EDE.
 //   persistent_stderr : accepts a persistent turn, then dies with sentinel stderr.
@@ -109,6 +115,33 @@ function emit() {
     write({ type: 'result', subtype: 'success', is_error: true, result: 'first line\nsecond line' });
     return;
   }
+  if (shape === 'hook_echo_parenthesised') {
+    // A hook line containing the phrase AND parentheses, mid-line. Not a refusal
+    // report: the anchored matcher must reject what a substring search accepted.
+    process.stderr.write("hook log: user quoted there's an issue with the selected model (opus) yesterday\n");
+    process.exit(6);
+  }
+  if (shape === 'output_then_refusal_text') {
+    // Assistant output first — proof the model runs — then a line that LOOKS like
+    // a refusal, then a non-zero exit with no result. Must stay a process failure.
+    assistant({}, 'partial answer');
+    process.stderr.write("There's an issue with the selected model (whatever). It may not exist or you may not have access to it.\n");
+    process.exit(8);
+  }
+  if (shape === 'delta_then_refusal') {
+    // Model output as a STREAM DELTA rather than a finished assistant message —
+    // a child that dies mid-stream has still proved its model runs.
+    write({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } });
+    process.stderr.write("There's an issue with the selected model (whatever). It may not exist or you may not have access to it.\n");
+    process.exit(8);
+  }
+  if (shape === 'api_error_without_string_error') {
+    // An API-error assistant whose `error` is not a string. It must NOT count as
+    // model output, or it would suppress the refusal reported right after it.
+    assistant({ is_api_error_message: true, error: null }, 'synthetic');
+    process.stderr.write("There's an issue with the selected model (zzz). It may not exist or you may not have access to it.\n");
+    process.exit(1);
+  }
   if (shape === 'unrelated_prefix') {
     // Pre-answer stderr that merely contains the words, without the canonical
     // parenthesised form. Not a refusal report.
@@ -171,6 +204,44 @@ if (shape === 'plaintext_refusal') {
   process.stderr.write("There's an issue with the selected model (zzz). It may not exist or you "
     + 'may not have access to it. Run --model to pick a different model.\n');
   process.exit(1);
+}
+
+if (shape === 'delta_then_hang') {
+  // Streams a delta and never finishes the turn, so the turn times out with the
+  // child still alive. On the NEXT input it dies with a refusal-looking line —
+  // which must not re-open a question the delta already answered.
+  const rlHang = readline.createInterface({ input: process.stdin });
+  let seenHang = 0;
+  rlHang.on('line', (line) => {
+    if (!line.trim()) return;
+    seenHang += 1;
+    if (seenHang === 1) {
+      write({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } });
+      return;
+    }
+    process.stderr.write("There's an issue with the selected model (whatever). It may not exist or you may not have access to it.\n");
+    process.exit(8);
+  });
+  return;
+}
+
+if (shape === 'ignores_sigterm') {
+  // Answers turns normally but refuses to die on SIGTERM, so `close()` returns on
+  // its own deadline while this child is still alive — the window in which a late
+  // event from a retired child could land on its replacement.
+  process.on('SIGTERM', () => {});
+  const rlIg = readline.createInterface({ input: process.stdin });
+  rlIg.on('line', (line) => {
+    if (!line.trim()) return;
+    let text = '';
+    try {
+      const content = JSON.parse(line)?.message?.content;
+      text = Array.isArray(content) ? content.map((b) => (b && b.type === 'text' ? b.text : '')).join('') : '';
+    } catch { text = line; }
+    if (text.trim() !== '/clear') assistant({}, 'OK');
+    write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
+  });
+  return;
 }
 
 if (shape === 'stale_sentence') {

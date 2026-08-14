@@ -86,6 +86,22 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   private childAnswered = false;
   // Set by close(), so an intentional shutdown is not reported as a failure.
   private shuttingDown = false;
+  // Which child the backend currently owns. Every handler captures the value it
+  // was registered for and does nothing once it is superseded: a dying child's
+  // `close` arrives late, and without this it would reject a NEWER child's waiter
+  // and null a state that no longer belongs to it.
+  //
+  // `close()` normally waits for that `close` before returning, which keeps the
+  // window shut on its own. What this guards is the one branch where it does not:
+  // a descendant holding the stdio pipes open past the give-up deadline, after
+  // which `close()` returns and a replacement can be serving when the old event
+  // finally lands. That branch is not reachable in a test without a child that
+  // outlives its own SIGKILL, so this guard is reasoned defence, not covered by
+  // one — said plainly rather than implied by its presence.
+  private childGeneration = 0;
+  // A close in progress. Concurrent closes await the same one, and a respawn
+  // waits for it rather than racing the old child's teardown.
+  private closing: Promise<void> | null = null;
   // One operator diagnostic per child: `error` and `close` both fire for a
   // failed spawn, and the second says nothing the first did not.
   private childFailureReported = false;
@@ -219,7 +235,19 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   async close(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.closing = this.closeOnce().finally(() => {
+      this.closing = null;
+    });
+    return this.closing;
+  }
+
+  private async closeOnce(): Promise<void> {
     this.shuttingDown = true;
+    // Retire the generation FIRST. Whatever this child emits from here on belongs
+    // to a backend that has moved on, so its handlers must not touch state a
+    // replacement may already own.
+    this.childGeneration += 1;
     this.waiter?.reject(new Error('claude code backend closed'));
     this.waiter = null;
     this.lineReader?.close();
@@ -227,24 +255,30 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.child = null;
     this.lineReader = null;
     this.initialized = null;
-    if (!child || child.exitCode !== null || child.signalCode !== null) return;
-    // Await the child's exit rather than only signalling it. Returning while it
-    // is still alive leaves its `close` handler to run afterwards, against a
-    // backend that has already moved on — and makes "was this shutdown reported?"
-    // unanswerable from the outside.
+    if (!child) return;
+    // Always wait for `close`, never short-circuit on `exitCode`: Node can set
+    // that on `exit` and emit `close` only once the stdio pipes are done, and
+    // returning in between is what lets a late event land on the next child.
     await new Promise<void>((resolve) => {
+      let settled = false;
       const done = (): void => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        clearTimeout(sigkillTimer);
+        clearTimeout(giveUpTimer);
+        child.removeListener('close', done);
         resolve();
       };
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        child.once('close', done);
-      }, CHILD_SHUTDOWN_GRACE_MS);
+      const sigkillTimer = setTimeout(() => child.kill('SIGKILL'), CHILD_SHUTDOWN_GRACE_MS);
+      // A descendant holding the pipes open can keep `close` from ever arriving,
+      // even after SIGKILL. The backend has already let go of this child, so stop
+      // waiting rather than hanging the caller.
+      const giveUpTimer = setTimeout(done, CHILD_SHUTDOWN_GRACE_MS * 2);
       child.once('close', done);
       child.kill('SIGTERM');
     });
   }
+
 
 
   private async runRequest(
@@ -443,6 +477,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   private async start(): Promise<void> {
+    // Never overlap a teardown: the outgoing child still owns `this.child` until
+    // its `close` has been handled.
+    if (this.closing) await this.closing;
+    const generation = ++this.childGeneration;
     this.stderr = '';
     this.childAnswered = false;
     this.childFailureReported = false;
@@ -453,7 +491,8 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     // puts the offending value in the message — the configured path. That throw
     // never reaches the `error` handler below, so it is caught here and given the
     // same treatment as every other start failure.
-    this.child = this.spawnChild([
+    try {
+      this.child = this.spawnChild([
       '-p',
       '--input-format',
       'stream-json',
@@ -466,15 +505,25 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       '',
       '--no-session-persistence',
       ...(this.configuredModel ? ['--model', this.configuredModel] : []),
-      ...this.extraArgsFor(),
-    ]);
+        ...this.extraArgsFor(),
+      ]);
+    } catch (err) {
+      // Do not leave a rejected promise cached as the backend's start: a later
+      // request should make its own attempt and get its own report.
+      this.initialized = null;
+      throw err;
+    }
 
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', (chunk) => {
       this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
     });
-    this.child.on('error', (err) => this.failCurrent(err, 'the local claude runtime failed to start'));
+    this.child.on('error', (err) => {
+      if (generation !== this.childGeneration) return;
+      this.failCurrent(err, 'the local claude runtime failed to start');
+    });
     this.child.on('close', (code, signal) => {
+      if (generation !== this.childGeneration) return;
       this.failCurrent(
         new Error(`claude code exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`),
         `the local claude runtime exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`,
@@ -500,7 +549,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.waiter = null;
+        this.detachWaiter();
         reject(new Error(`claude turn timed out after ${this.timeoutMs}ms`));
       }, this.timeoutMs);
       const cleanup = (): void => {
@@ -510,7 +559,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       const abortFromSignal = (): void => {
         cleanup();
         const err = new Error('request aborted');
-        this.waiter = null;
+        this.detachWaiter();
         this.child?.kill('SIGTERM');
         reject(err);
       };
@@ -549,8 +598,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     consumeClaudeMessage(this.waiter, message);
     if (message.type === 'result') {
       const waiter = this.waiter;
-      this.waiter = null;
-      if (waiter.sawModelOutput) this.childAnswered = true;
+      this.detachWaiter();
       if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
         waiter.reject(claudeModelRejection(message));
       } else if (message.subtype === 'success' && message.is_error !== true) {
@@ -568,6 +616,22 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     }
   }
 
+  /**
+   * Carry "this child's model runs" up from the turn that observed it, then let
+   * the turn go. Every terminal detachment goes through here — a timeout and an
+   * abort end a turn just as much as a result does, and forgetting the proof
+   * there would let a later stderr sentence re-open a question this child has
+   * already answered.
+   */
+  private detachWaiter(): void {
+    this.promoteModelProof();
+    this.waiter = null;
+  }
+
+  private promoteModelProof(): void {
+    if (this.waiter?.sawModelOutput) this.childAnswered = true;
+  }
+
   private failCurrent(err: Error, publicMessage: string): void {
     // The child's stderr is operator-local: it can carry gateway detail, settings
     // values, paths and auth diagnostics, and this error becomes an HTTP 500's
@@ -576,7 +640,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     // Evaluated unconditionally: a child that dies while idle has no waiter, and
     // `this.waiter?.reject(f(...))` would skip the call — and the diagnostic with
     // it. This is the only record of why the runtime went away.
-    if (this.waiter?.sawModelOutput) this.childAnswered = true;
+    this.promoteModelProof();
     const report = !this.childFailureReported && !this.shuttingDown;
     this.childFailureReported = true;
     const failure = claudeProcessFailure(err, this.stderr, publicMessage, {
@@ -766,7 +830,12 @@ function runClaudeProcess(
     const failure = (err: Error, publicMessage: string): Error => {
       const report = !reported;
       reported = true;
-      return claudeProcessFailure(err, stderr, publicMessage, { report, allowRefusal: true });
+      // Same proof as the persistent route: output already seen means the model
+      // runs, so a refusal-looking stderr line afterwards is about something else.
+      return claudeProcessFailure(err, stderr, publicMessage, {
+        report,
+        allowRefusal: !waiter.sawModelOutput,
+      });
     };
     child.on('error', (err) => finish(failure(err, 'the local claude runtime failed to start')));
     child.on('close', (code, signal) => {
@@ -792,6 +861,9 @@ function consumeClaudeMessage(waiter: ClaudeWaiter, message: JsonObject): void {
     if (event?.type === 'content_block_delta') {
       const delta = asRecord(event.delta);
       if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+        // A streamed delta is model output too. A child that dies mid-stream has
+        // still proved its model runs.
+        waiter.sawModelOutput = true;
         waiter.text += delta.text;
         waiter.onTextDelta?.(delta.text);
       }
@@ -799,8 +871,12 @@ function consumeClaudeMessage(waiter: ClaudeWaiter, message: JsonObject): void {
     return;
   }
   if (message.type === 'assistant') {
-    if (message.is_api_error_message === true && typeof message.error === 'string') {
-      waiter.apiErrorKind = message.error;
+    // Branch on the flag alone. An API-error assistant is a synthetic message the
+    // CLI writes on the model's behalf, whatever shape its `error` field takes —
+    // reading it as model output would suppress a refusal the runtime is in the
+    // middle of reporting.
+    if (message.is_api_error_message === true) {
+      if (typeof message.error === 'string') waiter.apiErrorKind = message.error;
     } else {
       // Assistant output IS the proof that the configured model ran. Waiting for
       // the turn to resolve would miss a turn that produced text and then failed,
@@ -896,10 +972,19 @@ function asLogLine(message: string): string {
   return out;
 }
 
-// The CLI's refusal diagnostic, matched as the whole sentence it is rather than
-// as a phrase appearing anywhere in a buffer. The parenthesised model name is
-// what makes it a refusal report and not, say, a hook echoing the words back.
-const CLAUDE_REFUSAL_DIAGNOSTIC = /issue with the selected model\s*\([^)]*\)/i;
+// The CLI's refusal diagnostic, as a whole line. Anchoring matters: a hook or a
+// log echoing the words mid-line — even with parentheses — is not a refusal
+// report, and stderr here is a lifetime buffer where such a line can sit for a
+// long time. The second sentence is required too, for the same reason.
+//
+// Measured against 2.1.232:
+//   There's an issue with the selected model (<name>). It may not exist or you
+//   may not have access to it. Run --model to pick a different model.
+const CLAUDE_REFUSAL_DIAGNOSTIC = new RegExp(
+  String.raw`^[^\n]*\bthere's an issue with the selected model\s*\([^)\n]*\)`
+  + String.raw`[^\n]*\bmay not (?:exist|have access)\b`,
+  'im',
+);
 
 // C0, DEL and C1, plus the two Unicode line separators.
 const NON_PRINTING = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;

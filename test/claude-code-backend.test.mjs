@@ -1118,13 +1118,15 @@ test('a runtime that cannot be spawned does not name its path to the client', as
         return true;
       },
     );
-    // Exactly one: `error` and `close` both fire for a failed spawn, and the
-    // second says nothing the first did not.
-    assert.deepEqual(
-      written.filter((l) => l.includes('claude process failure')).length,
-      1,
-      `expected exactly one diagnostic: ${JSON.stringify(written)}`,
-    );
+    // `close` arrives after the turn has already rejected, so counting now would
+    // observe one line whether or not a duplicate is coming. Watch until a second
+    // appears — failing fast if it does — or until the window has passed.
+    const count = () => written.filter((l) => l.includes('claude process failure')).length;
+    const deadline = Date.now() + 1000;
+    while (Date.now() < deadline && count() < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(count(), 1, `expected exactly one diagnostic: ${JSON.stringify(written)}`);
     assert.ok(written.some((l) => l.includes('ENOENT')), 'the real cause must be in it');
   } finally {
     process.stderr.write = originalWrite;
@@ -1456,6 +1458,170 @@ test('a persistent child failing asynchronously is reported exactly once', async
   } finally {
     process.stderr.write = originalWrite;
     await backend?.close();
+  }
+});
+
+async function persistentFailure(shape, model = 'claude-retired') {
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = shape;
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model,
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    let caught;
+    await assert.rejects(
+      () => backend.generate({ ...anthropicTuningRequest({ model }), shape: 'openai-chat' }),
+      (err) => { caught = err; return true; },
+    );
+    return caught;
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+}
+
+test('a hook echoing the refusal phrase mid-line is not a refusal', async () => {
+  // Parentheses alone were the whole test before; a hook can have those too. The
+  // diagnostic has to be the line, not a fragment inside one.
+  const err = await persistentFailure('hook_echo_parenthesised');
+  assert.notEqual(err.statusCode, 404, `not a refusal: ${err.message}`);
+  assert.match(err.message, /the local claude runtime exited \(code=6/);
+});
+
+test('output already seen means a later refusal-looking line is not a refusal', async () => {
+  // The child produced assistant output, so its model demonstrably runs. What
+  // follows on stderr is about something else.
+  const err = await persistentFailure('output_then_refusal_text');
+  assert.notEqual(err.statusCode, 404, `output proved the model: ${err.message}`);
+  assert.match(err.message, /the local claude runtime exited \(code=8/);
+});
+
+test('an API-error assistant is not model output, so the refusal still lands', async () => {
+  // Its `error` is not a string, which used to drop it into the model-output
+  // branch and suppress the refusal the runtime was in the middle of reporting.
+  const err = await persistentFailure('api_error_without_string_error');
+  assert.equal(err.statusCode, 404, `expected the refusal to survive: ${err.message}`);
+  assert.equal(err.code, 'model_not_found');
+});
+
+test('a streamed delta proves the model too', async () => {
+  // Output does not have to be a finished assistant message. A child that dies
+  // mid-stream has already shown its model runs.
+  const err = await persistentFailure('delta_then_refusal');
+  assert.notEqual(err.statusCode, 404, `a delta is output: ${err.message}`);
+  assert.match(err.message, /the local claude runtime exited \(code=8/);
+});
+
+test('one-shot: output already seen means a later refusal-looking line is not a refusal', async () => {
+  // The one-shot route has its own waiter and its own failure path; the
+  // persistent test cannot reach it. Requesting a model other than the configured
+  // one is what sends this off the persistent route.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'output_then_refusal_text';
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.notEqual(err.statusCode, 404, `output proved the model: ${err.message}`);
+        assert.match(err.message, /the local claude runtime exited \(code=8/);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a timed-out turn does not forget what it already saw', async () => {
+  // A timeout ends a turn just as a result does. If the proof it observed is
+  // dropped when the waiter is detached, the child looks unanswered again and a
+  // later refusal-looking line re-opens a question the delta already answered.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'delta_then_hang';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 300, honorRequestModel: true,
+    });
+    const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
+    await assert.rejects(() => backend.generate(request), /timed out/);
+    await assert.rejects(
+      () => backend.generate(request),
+      (err) => {
+        assert.notEqual(err.statusCode, 404, `the delta already proved the model: ${err.message}`);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a retired child cannot disturb its replacement', async () => {
+  // `close()` returns on its own deadline when a child will not die. Everything
+  // that child emits afterwards belongs to a backend that has moved on — and a
+  // replacement may already be serving. Its late events must reach nothing.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
+  const argvDir = await mkdtemp(join(tmpdir(), 'claude-argv-'));
+  const argvLog = join(argvDir, 'argv.log');
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'ignores_sigterm';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
+    assert.equal((await backend.generate(request)).text, 'OK');
+
+    await backend.close();          // returns on the deadline; child 1 is alive
+    assert.equal((await backend.generate(request)).text, 'OK');  // child 2 serves
+
+    // Child 1 is killed as the deadline elapsed, so its close lands here. If its
+    // handlers still spoke for the backend, this next turn would find its state
+    // torn down.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal((await backend.generate(request)).text, 'OK');
+
+    // Two children, not three. An unscoped handler would have cleared child 2's
+    // state on its way out, and the third turn would quietly have spawned another
+    // — same answer, different fact. The count is what makes the difference
+    // visible.
+    const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean)
+      .map((l) => JSON.parse(l)).filter((l) => l[0] !== '#turn');
+    assert.equal(spawns.length, 2, `expected two children, saw ${spawns.length}`);
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+    if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
+    else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
+    await rm(argvDir, { recursive: true, force: true });
   }
 });
 
