@@ -494,3 +494,56 @@ test('/v1/messages: a mid-stream provider error keeps its mapping and bound', as
   assert.ok(payload.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
   assert.ok(payload.message.length <= 500, `bounded, got ${payload.message.length}`);
 });
+
+test('an empty authKey is a configuration error, not an open proxy', async () => {
+  // `if (!authKey) return` would restore the previous defect: a proxy its
+  // operator believed was closed, serving everyone.
+  let reached = false;
+  const backend = { ...backendThat({}), async generate() { reached = true; return null; } };
+  const started = await startLocalApiProxy({
+    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000, authKey: '',
+  });
+  try {
+    for (const [path, body] of [['/v1/models', null], ['/v1/chat/completions', CHAT]]) {
+      const res = await fetch(`${started.url}${path}`, body
+        ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }
+        : {});
+      assert.ok(res.status >= 400, `${path} must not be served, got ${res.status}`);
+    }
+    assert.equal(reached, false, 'the backend must never be reached');
+  } finally {
+    await started.close();
+  }
+});
+
+test('repeated x-api-key headers: one valid value is enough', async () => {
+  // Node folds duplicates into one comma-joined value, which made a stale
+  // duplicate veto a valid one — the same bug the two-header rule fixed.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: 'secret-key',
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/models`, {
+      headers: { 'x-api-key': 'stale, secret-key' },
+    });
+    assert.equal(res.status, 200);
+  } finally {
+    await started.close();
+  }
+});
+
+test('/v1/responses: a successful stream ends with completed then [DONE]', async () => {
+  const { status, text } = await call(usageBackend(), '/v1/responses', {
+    model: 'a-model', input: 'hi', stream: true,
+  });
+  assert.equal(status, 200);
+  const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
+  assert.equal(frames.at(-1), 'data: [DONE]');
+  const events = text.split('\n').filter((l) => l.startsWith('event: ')).map((l) => l.slice(7).trim());
+  assert.ok(events.includes('response.created'), `expected response.created: ${events.join(',')}`);
+  assert.equal(events.at(-1), 'response.completed', `the last event must be completion: ${events.join(',')}`);
+  // `"error": null` is a normal field of the Responses object, so look for an
+  // error EVENT rather than the substring.
+  assert.ok(!events.includes('error'), `a successful stream carries no error event: ${events.join(',')}`);
+});

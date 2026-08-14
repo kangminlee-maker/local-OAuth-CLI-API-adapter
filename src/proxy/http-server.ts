@@ -253,8 +253,14 @@ function requireAuthorizedRequest(
  */
 function presentedAuthKeys(headers: IncomingMessage['headers']): string[] {
   const presented: string[] = [];
-  const apiKey = headerValue(headers['x-api-key']).trim();
-  if (apiKey) presented.push(apiKey);
+  // Node folds repeated `x-api-key` lines into one comma-joined value. Splitting
+  // is what makes the any-valid rule hold for them too; without it a stale
+  // duplicate silently vetoes a valid one, which is the bug this rule fixed for
+  // the two DIFFERENT headers.
+  for (const candidate of headerValue(headers['x-api-key']).split(',')) {
+    const trimmed = candidate.trim();
+    if (trimmed) presented.push(trimmed);
+  }
   const authorization = headerValue(headers.authorization).trim();
   const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
   if (bearer) presented.push(bearer[1].trim());
@@ -588,7 +594,9 @@ function isNormalizedImage(value: NormalizedImage | undefined): value is Normali
 }
 
 function imageGenerationCount(value: unknown): number {
-  if (value === undefined || value === null) return 1;
+  // Only an ABSENT `n` defaults. An explicit `null` is a value the client chose
+  // to send, and the documented domain is an integer in 1..10.
+  if (value === undefined) return 1;
   const parsed = optionalInteger(value, 'n', 1, 10);
   if (parsed === undefined) {
     throw new ProxyRequestError('n must be an integer between 1 and 10.', 400);

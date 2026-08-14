@@ -51,6 +51,7 @@ for (const [label, n] of [
   ['fractional', 1.5],
   ['a non-numeric string', 'two'],
   ['negative', -1],
+  ['explicit null', null],
 ]) {
   test(`generations: n ${label} is rejected`, async () => {
     const { status, payload } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', n });
@@ -200,6 +201,96 @@ test('a generated image URL serves the image, and an unknown id is a 404', async
     assert.equal(missing.status, 404);
     const body = await missing.json();
     assert.equal(body.error.type, 'invalid_request_error');
+  } finally {
+    await started.close();
+  }
+});
+
+// The style guard is `style && operation !== 'generation'`. Testing it only on
+// generations exercises the false branch: the guard could be deleted entirely
+// and that test would still pass.
+async function postForm(path, fields) {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields)) form.set(k, v);
+    form.set('image', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'square.png');
+    const res = await fetch(`${started.url}${path}`, { method: 'POST', body: form });
+    return { status: res.status, payload: await res.json().catch(() => ({})) };
+  } finally {
+    await started.close();
+  }
+}
+
+for (const path of ['/v1/images/edits', '/v1/images/variations']) {
+  test(`${path}: style is rejected outside generations`, async () => {
+    const model = path.endsWith('variations') ? 'dall-e-2' : 'gpt-image-1';
+    const { status, payload } = await postForm(path, { model, prompt: 'a dot', style: 'vivid' });
+    assert.equal(status, 400, `style must be generation-only: ${JSON.stringify(payload)}`);
+    assert.match(payload.error.message, /only supported for image generations/);
+  });
+}
+
+test('generations: style is accepted, exactly 200', async () => {
+  const { status } = await postImages(GEN, { model: 'dall-e-3', prompt: 'a dot', style: 'vivid' });
+  assert.equal(status, 200);
+});
+
+test('edits: an image-2 transparent background is rejected there too', async () => {
+  // The guard is model-scoped, not operation-scoped. Adding an operation check
+  // would leave the generations test green while edits started accepting it.
+  const { status, payload } = await postForm('/v1/images/edits', {
+    model: 'image-2', prompt: 'a dot', background: 'transparent',
+  });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_value');
+});
+
+test('edits: n is validated there too', async () => {
+  const { status } = await postForm('/v1/images/edits', { model: 'image-2', prompt: 'a dot', n: '11' });
+  assert.equal(status, 400);
+});
+
+test('variations: a missing image is rejected', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const form = new FormData();
+    form.set('model', 'dall-e-2');
+    const res = await fetch(`${started.url}/v1/images/variations`, { method: 'POST', body: form });
+    assert.equal(res.status, 400);
+  } finally {
+    await started.close();
+  }
+});
+
+// The URL store's two promises — unguessable ids and expiry — were pinned by
+// neither. A constant id and an infinite TTL both passed.
+test('each generated image gets its own id, and each URL keeps its own bytes', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const urls = [];
+    for (const prompt of ['first', 'second']) {
+      const res = await fetch(`${started.url}${GEN}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'image-2', prompt, response_format: 'url' }),
+      });
+      urls.push((await res.json()).data[0].url);
+    }
+    assert.notEqual(urls[0], urls[1], 'two images must not share a URL');
+    for (const url of urls) {
+      const id = url.split('/').pop();
+      assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, `expected a UUID: ${id}`);
+      assert.equal((await fetch(url)).status, 200, 'each URL still serves its own image');
+    }
   } finally {
     await started.close();
   }

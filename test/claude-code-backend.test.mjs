@@ -1632,6 +1632,69 @@ test('a failed request does not leave its conversation for the next one', async 
   }
 });
 
+test('two requests in flight at once stay separate conversations', async () => {
+  // The persistent turn is serialized end to end — `withLock` wraps
+  // `ensureStarted` as well as the send — so overlapping requests queue rather
+  // than share a child. Measured rather than assumed: this is what a reviewer
+  // reading `runPersistentTurn` alone cannot see.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'echo_history';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired', timeoutMs: 30_000,
+    });
+    const ask = (content) => backend.generate({
+      ...anthropicTuningRequest({ model: 'claude-retired' }),
+      shape: 'openai-chat',
+      messages: [{ role: 'user', content, images: [] }],
+    });
+    const [alpha, bravo] = await Promise.all([ask('CANARY-ALPHA'), ask('CANARY-BRAVO')]);
+    assert.match(alpha.text, /CANARY-ALPHA/);
+    assert.match(bravo.text, /CANARY-BRAVO/);
+    assert.ok(!alpha.text.includes('CANARY-BRAVO'), `A saw B: ${alpha.text}`);
+    assert.ok(!bravo.text.includes('CANARY-ALPHA'), `B saw A: ${bravo.text}`);
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('the one-shot route is isolated too', async () => {
+  // A request naming a model other than the configured one takes the one-shot
+  // path, which has its own child per turn. The isolation tests above all run on
+  // the persistent route, so this pins the other one.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'echo_history';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-opus-4-8',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    const ask = (content) => backend.generate({
+      ...anthropicTuningRequest({ model: 'claude-sonnet-5' }),
+      shape: 'openai-chat',
+      messages: [{ role: 'user', content, images: [] }],
+    });
+    const first = await ask('CANARY-ONESHOT');
+    assert.match(first.text, /CANARY-ONESHOT/);
+    const second = await ask('SECOND-ONESHOT');
+    assert.ok(!second.text.includes('CANARY-ONESHOT'), `a later request saw an earlier one: ${second.text}`);
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
 test('honorRequestModel off: a CLI model refusal stays a server-side failure', async () => {
   // With honouring off the model came from local configuration, not the client,
   // so it must not be reported as a client-side not-found.
