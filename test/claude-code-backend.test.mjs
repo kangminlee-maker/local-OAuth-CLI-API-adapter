@@ -10,13 +10,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const fakeClaude = resolve(here, 'fixtures/fake-claude.cjs');
 const echoArgvClaude = resolve(here, 'fixtures/echo-argv-claude.cjs');
 const rejectModelClaude = resolve(here, 'fixtures/reject-model-claude.cjs');
-const rejectModel232 = resolve(here, 'fixtures/reject-model-claude-2-1-232.cjs');
+const resultShapes = resolve(here, 'fixtures/claude-result-shapes.cjs');
 
 before(async () => {
   await chmod(fakeClaude, 0o755);
   await chmod(echoArgvClaude, 0o755);
   await chmod(rejectModelClaude, 0o755);
-  await chmod(rejectModel232, 0o755);
+  await chmod(resultShapes, 0o755);
 });
 
 test('ClaudeCodeBackend streams persistent text deltas', async () => {
@@ -600,42 +600,33 @@ test('honorRequestModel on: a refusal on the persistent path is a 404 too', asyn
   }
 });
 
-test('honorRequestModel on: a 404 result with no structured error is still a 404', async () => {
-  // Claude Code 2.1.232 drops `error: "model_not_found"` and sends `null`, and
-  // the refusal sentence is a UI string that can be reworded or localized. The
-  // structured 404 has to carry the mapping on its own — this fixture's result
-  // text matches neither pattern, so only the `api_error_status` branch can
-  // produce the 404 below.
-  await assert.rejects(
-    () => runAgainstRejectingClaude(
-      { ...anthropicTuningRequest({ model: 'claude-not-a-model', effort: 'low' }), shape: 'openai-chat' },
-      'claude-opus-4-8',
-      { honorRequestModel: true, command: rejectModel232 },
-    ),
-    (err) => {
-      assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
-      assert.equal(err.code, 'model_not_found');
-      assert.equal(err.param, 'model');
-      return true;
-    },
-  );
-});
-
-test('honorRequestModel on: the 2.1.232 refusal is a 404 on the persistent route too', async () => {
-  // The one-shot test above cannot reach `handlePersistentLine`, because forcing
-  // a different model is what sends a request one-shot. Configure and request the
-  // same model so the persistent route runs, and use the fixture whose text
-  // matches neither pattern — only the structured assistant-event signal, carried
-  // across to the result event and tagged on the way out, can produce this 404.
-  const argvLog = join(await mkdtemp(join(tmpdir(), 'claude-argv-')), 'argv.log');
-  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
-  process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+// Each recognition branch gets its own shape, so a fixture cannot satisfy two
+// branches and make either look proven. `assistant_only` and `result_only` carry
+// result text that matches no pattern, so only their structured field can
+// classify them; `sentence_only` carries neither field.
+async function runShape(shape, request, model, options = {}) {
+  const previous = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = shape;
   try {
+    return await runAgainstRejectingClaude(request, model, { command: resultShapes, ...options });
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previous;
+  }
+}
+
+function openAiRefusalRequest(overrides) {
+  return { ...anthropicTuningRequest(overrides), shape: 'openai-chat' };
+}
+
+for (const shape of ['assistant_only', 'result_only', 'sentence_only']) {
+  test(`honorRequestModel on: the ${shape} refusal shape maps to 404`, async () => {
     await assert.rejects(
-      () => runAgainstRejectingClaude(
-        { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' },
-        'claude-retired',
-        { honorRequestModel: true, command: rejectModel232 },
+      () => runShape(
+        shape,
+        openAiRefusalRequest({ model: 'claude-not-a-model', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true },
       ),
       (err) => {
         assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
@@ -644,16 +635,106 @@ test('honorRequestModel on: the 2.1.232 refusal is a 404 on the persistent route
         return true;
       },
     );
-    // Confirms the route rather than assuming it: the one-shot path passes the
-    // prompt as an argument, the persistent one never does.
-    const argv = JSON.parse((await readFile(argvLog, 'utf8')).trim().split('\n')[0]);
-    assert.ok(
-      !argv.some((arg) => arg.includes('Say OK')),
-      `expected the persistent route (no prompt argument): ${argv.join(' ')}`,
-    );
+  });
+}
+
+test('honorRequestModel on: an errored 404 carrying no model signal is not a model error', async () => {
+  // The measured ambiguity has a floor: when NOTHING in the stream names the
+  // model, the proxy must not invent `model_not_found` — and must not resolve an
+  // `is_error` result as a 200 assistant reply either, which is the shape of the
+  // original defect.
+  await assert.rejects(
+    () => runShape(
+      'bare_404',
+      openAiRefusalRequest({ model: 'claude-not-a-model', effort: 'low' }),
+      'claude-opus-4-8',
+      { honorRequestModel: true },
+    ),
+    (err) => {
+      assert.notEqual(err.statusCode, 404, 'a bare gateway 404 must not be reported as a model error');
+      assert.equal(err.code, undefined);
+      assert.equal(err.param, undefined);
+      assert.match(err.message, /upstream returned 404/);
+      return true;
+    },
+  );
+});
+
+test('honorRequestModel on: the assistant-event refusal is a 404 on the persistent route too', async () => {
+  // The one-shot cases above cannot reach `handlePersistentLine`, because forcing
+  // a different model is what sends a request one-shot. Configure and request the
+  // same model so the persistent route runs.
+  //
+  // The route is proved by process count, not by argv: a one-shot regression
+  // would spawn once per turn, while the persistent process is spawned once and
+  // reused. The older "no prompt in argv" check could not tell the persistent
+  // route from one-shot-with-stream-JSON-stdin, which also keeps argv clean.
+  const argvDir = await mkdtemp(join(tmpdir(), 'claude-argv-'));
+  const argvLog = join(argvDir, 'argv.log');
+  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = 'assistant_only';
+  const backend = new ClaudeCodeBackend({
+    command: resultShapes,
+    cwd: process.cwd(),
+    model: 'claude-retired',
+    timeoutMs: 30_000,
+    honorRequestModel: true,
+  });
+  try {
+    const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
+    for (const attempt of [1, 2]) {
+      await assert.rejects(
+        () => backend.generate(request),
+        (err) => {
+          assert.equal(err.statusCode, 404, `attempt ${attempt}: expected 404, got: ${err.message}`);
+          assert.equal(err.code, 'model_not_found');
+          assert.equal(err.param, 'model');
+          return true;
+        },
+      );
+    }
+    const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean);
+    assert.equal(spawns.length, 1, `two turns must reuse one process, saw ${spawns.length} spawns`);
+    const argv = JSON.parse(spawns[0]);
+    assert.equal(argv[argv.indexOf('--model') + 1], 'claude-retired');
   } finally {
+    await backend.close();
     if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
     else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+    await rm(argvDir, { recursive: true, force: true });
+  }
+});
+
+test('honorRequestModel on: a bare 404 on the persistent route is not a model error either', async () => {
+  // The same floor as the one-shot case, on the other recognition site: an
+  // `is_error` result must not resolve as a 200 assistant reply just because its
+  // subtype says `success`.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  process.env.CLAUDE_TEST_RESULT_SHAPE = 'bare_404';
+  const backend = new ClaudeCodeBackend({
+    command: resultShapes,
+    cwd: process.cwd(),
+    model: 'claude-retired',
+    timeoutMs: 30_000,
+    honorRequestModel: true,
+  });
+  try {
+    await assert.rejects(
+      () => backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' }),
+      (err) => {
+        assert.notEqual(err.statusCode, 404, 'a bare gateway 404 must not be reported as a model error');
+        assert.match(err.message, /upstream returned 404/);
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
   }
 });
 

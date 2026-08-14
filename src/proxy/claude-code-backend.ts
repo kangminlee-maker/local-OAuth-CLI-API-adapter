@@ -241,6 +241,12 @@ export class ClaudeCodeBackend implements LocalCliBackend {
         && err instanceof Error
         && isClaudeModelRejection(err)
       ) {
+        // The mapped error carries a fixed sentence, so the runtime's own words
+        // reach nobody. They are the operator's only lead when the cause is not
+        // the model at all — the CLI reports a gateway 404 with these same
+        // fields — so put them on the proxy's stderr before they are dropped.
+        // Only the CLI's message: no prompt, no argv, no environment.
+        process.stderr.write(`claude model rejection (reported as 404): ${err.message}\n`);
         throw unsupportedModelError(
           model,
           request.shape,
@@ -487,7 +493,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       this.waiter = null;
       if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
         waiter.reject(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
-      } else if (message.subtype === 'success') {
+      } else if (message.subtype === 'success' && message.is_error !== true) {
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
           structuredOutput: message.structured_output ?? waiter.structuredOutput,
@@ -650,7 +656,7 @@ function runClaudeProcess(
         if (message.type === 'result') {
           if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
             finish(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
-          } else if (message.subtype === 'success') {
+          } else if (message.subtype === 'success' && message.is_error !== true) {
             finish(undefined, {
               text: typeof message.result === 'string' ? message.result : waiter.text,
               structuredOutput: message.structured_output ?? waiter.structuredOutput,
@@ -763,34 +769,45 @@ function isClaudeModelRejection(err: Error): boolean {
 }
 
 /**
- * The same refusal as it arrives under `--output-format stream-json`: the failure
- * is reported inside the result event rather than on stderr, which is why the
- * text used to surface as an ordinary assistant reply.
+ * Whether a finished turn is the runtime refusing the requested model.
  *
- * Three signals, deliberately ordered weakest-dependency first. `error:
- * "model_not_found"` is the structured one — but 2.1.231 set it and 2.1.232 sends
- * `null` in its place, so it cannot be relied on alone. `api_error_status: 404`
- * is therefore sufficient by itself: on a turn this proxy builds, the model is
- * the only resource the client names, so a 404 from the turn is a model the
- * runtime will not run. A non-model 404 would be reported to the client as an
- * unavailable model, which is the safer of the two ways to be wrong — the
- * alternative is what this function was written to stop, a refusal returning 200
- * with the refusal sentence as the assistant's answer. The English text stays as
- * a last resort for a report that carries neither field.
+ * The refusal arrives inside the event stream, not on stderr, and not as a
+ * non-zero exit — which is why it used to surface as an ordinary assistant reply.
+ * Where the structured kind sits moved between patch releases: 2.1.231 put
+ * `error: "model_not_found"` on the result event, 2.1.232 puts it on the
+ * assistant message (`is_api_error_message: true`) and omits it from the result,
+ * so `consumeClaudeMessage` carries it across on the waiter.
+ *
+ * Only those two structured signals classify here. A refusal carrying neither
+ * is left alone: the sentence match on the way out covers the plain-text path
+ * and catches it there, so testing the sentence twice would duplicate one rule
+ * rather than add a signal.
+ *
+ * KNOWN AMBIGUITY, measured rather than assumed. Claude Code 2.1.232 reports a
+ * plain HTTP 404 from whatever endpoint it talked to using these same fields.
+ * Probed directly: a VALID model (`haiku`) against an endpoint answering 404 to
+ * everything produced `error: "model_not_found"`, `api_error_status: 404`, and
+ * the selected-model sentence naming the real model — byte-identical in shape to
+ * a genuinely unknown model. Nothing in the stream separates the two, so this
+ * proxy cannot either. A 404 raised from here therefore means "the runtime would
+ * not run this model", not "this model does not exist"; if an operator points the
+ * CLI at a gateway that 404s, every request is reported as a model problem. That
+ * is documented in the API contract rather than papered over, and the unmapped
+ * text is written to the proxy's own stderr so the operator can see the real one.
  */
 function isClaudeModelRejectionResult(message: JsonObject, waiter: ClaudeWaiter): boolean {
   // 2.1.232: on the assistant message, carried here by `consumeClaudeMessage`.
   if (waiter.apiErrorKind === 'model_not_found') return true;
   // 2.1.231: on the result event itself.
   if (message.error === 'model_not_found') return true;
-  // Neither field present. A 404 alone is not enough: the CLI's own settings can
-  // route it through an operator-run gateway, and a 404 from there is the
-  // operator's to fix, not a model the client should stop asking for. Pair it
-  // with the refusal sentence, accepting that a rewording of that sentence costs
-  // this last-resort branch and nothing else.
-  if (message.api_error_status !== 404) return false;
-  const text = typeof message.result === 'string' ? message.result : '';
-  return /issue with the selected model/i.test(text);
+  // Neither field present: not classified here. A 404 alone is not enough — the
+  // CLI's own settings can route it through an operator-run gateway, and a 404
+  // from there is the operator's to fix, not a model the client should stop
+  // asking for. A result whose text IS the refusal sentence still maps, but
+  // through `isClaudeModelRejection` on the way out, which already matches that
+  // sentence for the plain-text path; repeating the test here would be a second
+  // copy of one rule, not a second signal.
+  return false;
 }
 
 // Flags that decide which model actually runs. `--fallback-model` counts: in
