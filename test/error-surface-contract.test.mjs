@@ -209,3 +209,148 @@ test('honour-off: a stream opens with the request model and closes with the exec
   assert.equal(models[0], 'client-model', 'the opening chunk echoes the request');
   assert.equal(models.at(-1), 'executed-model', 'the closing chunk reports what ran');
 });
+
+// A backend signals a provider error by carrying its JSON in the message. The
+// mapping has to read the ORIGINAL string: bounding before parsing turns a
+// mapped 429 into an unmapped 500 whose body is a fragment of broken JSON.
+function providerError(status, message) {
+  return () => new Error(JSON.stringify({
+    status,
+    error: { message, type: 'rate_limit_error', param: null, code: 'rate_limit_exceeded' },
+  }));
+}
+
+const LONG_PROVIDER_MESSAGE = 'M'.repeat(600);
+
+test('a provider error survives mapping even when its message is oversized', async () => {
+  const { status, text } = await call(
+    backendThat({ fail: providerError(429, LONG_PROVIDER_MESSAGE) }),
+    '/v1/chat/completions',
+    CHAT,
+  );
+  const body = JSON.parse(text);
+  assert.equal(status, 429, 'the provider status must survive');
+  assert.equal(body.error.type, 'rate_limit_error');
+  assert.equal(body.error.code, 'rate_limit_exceeded');
+  assert.ok(body.error.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
+  assert.ok(body.error.message.length <= 500, `bounded, got ${body.error.message.length}`);
+});
+
+test('/v1/messages: a mapped provider error uses the Anthropic envelope', async () => {
+  const { status, text } = await call(
+    backendThat({ fail: providerError(429, 'slow down') }),
+    '/v1/messages',
+    MESSAGES,
+  );
+  const body = JSON.parse(text);
+  assert.equal(status, 429);
+  assert.equal(body.type, 'error');
+  assert.equal(body.error.type, 'rate_limit_error');
+  assert.equal(body.error.param, undefined, 'the Anthropic shape has no param');
+  assert.equal(body.error.code, undefined, 'the Anthropic shape has no code');
+});
+
+test('a mid-stream provider error keeps its mapping in the SSE frame', async () => {
+  const { text } = await call(
+    backendThat({ delta: true, fail: providerError(429, LONG_PROVIDER_MESSAGE) }),
+    '/v1/chat/completions',
+    { ...CHAT, stream: true },
+  );
+  const frame = text.split('\n').find((line) => line.includes('"error"'));
+  const payload = JSON.parse(frame.replace(/^data: /, '')).error;
+  assert.equal(payload.type, 'rate_limit_error');
+  assert.ok(payload.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
+  assert.ok(payload.message.length <= 500);
+});
+
+// The generic branch: an unmapped failure whose own message is oversized. The
+// oversized-model tests exercise `ProxyRequestError`, which is a different one.
+const LONG_GENERIC = 'G'.repeat(900);
+
+for (const [path, body] of [
+  ['/v1/chat/completions', CHAT],
+  ['/v1/responses', { model: 'a-model', input: 'hi' }],
+  ['/v1/messages', MESSAGES],
+]) {
+  test(`${path}: an oversized unmapped failure is bounded`, async () => {
+    const { text } = await call(backendThat({ fail: () => new Error(LONG_GENERIC) }), path, body);
+    const message = JSON.parse(text).error.message;
+    assert.ok(message.length <= 500, `expected a bound, got ${message.length}`);
+    assert.ok(message.startsWith('GGGG'));
+  });
+}
+
+// `/v1/responses` is its own writer. Its failure envelope and terminal sequence
+// were pinned only for chat completions.
+test('/v1/responses: a pre-stream failure uses the OpenAI envelope', async () => {
+  const { status, text } = await call(
+    backendThat({ fail: () => new Error('boom') }),
+    '/v1/responses',
+    { model: 'a-model', input: 'hi' },
+  );
+  const body = JSON.parse(text);
+  assert.ok(status >= 500 && status < 600, `expected a 5xx, got ${status}`);
+  assert.equal(body.error.type, 'server_error');
+  assert.equal(body.type, undefined, 'not the Anthropic envelope');
+  assert.match(body.error.message, /boom/);
+});
+
+test('/v1/responses: a mid-stream failure ends with an error frame then [DONE]', async () => {
+  const { status, text } = await call(
+    backendThat({ delta: true, fail: () => new Error('mid-stream boom') }),
+    '/v1/responses',
+    { model: 'a-model', input: 'hi', stream: true },
+  );
+  assert.equal(status, 200, 'headers are committed by the first frame');
+  const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
+  assert.equal(frames.at(-1), 'data: [DONE]', `the stream must end on [DONE]: ${frames.at(-1)}`);
+  assert.ok(
+    frames.some((f) => f.includes('"error"') && f.includes('mid-stream boom')),
+    `expected an in-band error frame: ${text}`,
+  );
+});
+
+// The access gate is client-observable and, until now, undocumented. Its 401 is
+// shaped per surface for the same reason every other error is.
+async function unauthorized(path, body) {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: 'secret-key',
+  });
+  try {
+    const res = await fetch(`${started.url}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  } finally {
+    await started.close();
+  }
+}
+
+test('the access gate rejects /v1/responses in the OpenAI envelope', async () => {
+  const { status, body } = await unauthorized('/v1/responses', { model: 'a-model', input: 'hi' });
+  assert.equal(status, 401);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.equal(body.error.code, 'invalid_api_key');
+});
+
+test('the access gate rejects /v1/messages in the Anthropic envelope', async () => {
+  const { status, body } = await unauthorized('/v1/messages', MESSAGES);
+  assert.equal(status, 401);
+  assert.equal(body.type, 'error');
+  assert.equal(body.error.type, 'authentication_error');
+  assert.equal(body.error.code, undefined);
+});
+
+test('the access gate rejects an images route too', async () => {
+  const { status, body } = await unauthorized('/v1/images/generations', { model: 'image-2', prompt: 'hi' });
+  assert.equal(status, 401);
+  assert.equal(body.error.type, 'invalid_request_error');
+});
+
+test('/v1/responses: the non-streaming body reports the model the backend ran', async () => {
+  const { text } = await call(echoBackend(), '/v1/responses', { model: 'client-model', input: 'hi' });
+  assert.equal(JSON.parse(text).model, 'executed-model');
+});

@@ -2377,8 +2377,23 @@ function streamErrorPayload(err: unknown): unknown {
  * where the text becomes a response, not at each of the places that can raise
  * one.
  */
+function rawErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * An error as a client-visible string, bounded. Both the JSON writer and every
+ * SSE error producer come through here, which is the point: the ceiling belongs
+ * where the text becomes a response.
+ *
+ * Anything that PARSES an error must use `rawErrorMessage` instead. A backend
+ * signals a provider error by carrying its JSON in the message, and truncating
+ * that before parsing turns a mapped 429 into an unmapped 500 whose body is a
+ * fragment of broken JSON — which is exactly what happened when the bound was
+ * first added here.
+ */
 function errorMessage(err: unknown): string {
-  return boundedErrorMessage(err instanceof Error ? err.message : String(err));
+  return boundedErrorMessage(rawErrorMessage(err));
 }
 
 function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -2553,7 +2568,7 @@ function providerErrorFromBackendError(err: unknown): {
   readonly param: string | null;
   readonly code: string | null;
 } | null {
-  const outer = parseObject(errorMessage(err));
+  const outer = parseObject(rawErrorMessage(err));
   const inner = parseObject(typeof outer?.message === 'string' ? outer.message : undefined) ?? outer;
   const error = asRecordPayload(inner?.error);
   const statusCode = typeof inner?.status === 'number' ? inner.status : undefined;

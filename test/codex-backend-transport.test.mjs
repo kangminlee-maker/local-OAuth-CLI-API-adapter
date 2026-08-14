@@ -406,6 +406,36 @@ test('CodexBackendTransport streams native function-call argument deltas', async
   assert.equal(events.at(-1).result.usage.source, 'provider');
 });
 
+test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
+  // The contract exempts `/v1/images/*` from the switch: the request `model` is
+  // an Images route selector (`image-2`), not a Codex slug. Honouring it would
+  // send `image-2` where a Codex model belongs. The exemption currently holds by
+  // construction — the image path never consults the setting — which is exactly
+  // the kind of fact that a later edit can undo silently.
+  const codexHome = await createCodexHome();
+  const calls = [];
+  const image = tinyPngBase64();
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image },
+      },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({
+    codexHome, timeoutMs: 30_000, model: 'gpt-5.5', honorRequestModel: true,
+  });
+  await backend.generate({ ...imageRequest(), model: 'image-2' });
+  const body = JSON.parse(calls[0].init.body);
+  assert.equal(body.model, 'gpt-5.5', 'the configured Codex model runs, not the Images route selector');
+  assert.notEqual(body.model, 'image-2');
+});
+
 test('CodexBackendTransport maps Images API requests to backend image_generation tool results', async () => {
   const codexHome = await createCodexHome();
   const calls = [];
