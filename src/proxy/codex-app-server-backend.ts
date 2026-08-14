@@ -1154,16 +1154,17 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   }
 
   /**
-   * The request model, or undefined when it carries no model choice: an empty
-   * value, or the backend's own alias that clients echo back from `/v1/models`.
+   * The request model, or undefined when it carries no model choice — which over
+   * HTTP no longer happens: normalization rejects an absent or empty `model`, so
+   * only an internal caller can reach the undefined branch. The backend's own
+   * identifier (`codex-app-server`) is a model name like any other here, checked
+   * against the catalogue rather than read as an omission.
    *
    * A request naming the same model as the configured one is still a choice, not
    * an omission — otherwise it would skip validation and keep running a model the
    * served catalogue has since dropped.
    */
   private explicitRequestModel(requestModel: string): string | undefined {
-    // Normalization guarantees a non-empty model, and the backend's own name is
-    // no longer treated as "no choice": it is not a model a client can run.
     return requestModel || undefined;
   }
 

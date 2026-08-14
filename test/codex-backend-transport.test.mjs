@@ -157,6 +157,26 @@ test('default transport, honorRequestModel on: an unadvertised model is rejected
   );
 });
 
+test('default transport, honorRequestModel on: the backend identifier is rejected, not read as omission', async () => {
+  // `codex-backend` used to be a sentinel meaning "no model chosen", which made
+  // a request naming it run the configured model. It is now an ordinary model
+  // name, absent from the served catalogue, so it must 404. Reintroducing the
+  // sentinel would turn this back into a silent 200 on `gpt-5.5`.
+  resetCodexModelCatalogCache();
+  await assert.rejects(
+    () => transportBody(
+      { ...textRequest(), model: 'codex-backend' },
+      { model: 'fixture-model-a', honorRequestModel: true, codexCommand: fakeCodexModelsOk },
+    ),
+    (err) => {
+      assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+      assert.equal(err.code, 'model_not_found');
+      assert.equal(err.param, 'model');
+      return true;
+    },
+  );
+});
+
 test('default transport, honorRequestModel on: an uncollectable catalogue passes the model through', async () => {
   resetCodexModelCatalogCache();
   const body = await transportBody(

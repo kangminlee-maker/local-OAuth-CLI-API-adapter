@@ -95,9 +95,13 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   /**
-   * The request model, or undefined when it carries no model choice: an empty
-   * value, the sentinel the normalizers substitute for an omitted `model`, or the
-   * backend's own alias that clients echo back from `/v1/models`.
+   * The request model, or undefined when it carries no model choice — which over
+   * HTTP no longer happens: normalization rejects an absent or empty `model`, so
+   * only an internal caller can reach the undefined branch. The backend's own
+   * identifier (`claude-code-cli`) is a model name like any other here: it is
+   * compared against the *configured* model, never against the public identifier,
+   * so with nothing configured it forces the one-shot path and the CLI refuses
+   * it, rather than silently reusing a persistent process on the CLI default.
    */
   private explicitRequestModel(requestModel: string): string | undefined {
     return requestModel || undefined;

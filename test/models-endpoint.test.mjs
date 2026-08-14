@@ -43,11 +43,18 @@ test('GET /v1/models returns the configured model, not the backend alias', async
   assert.equal(payload.data[0].object, 'model');
 });
 
-test('GET /v1/models never advertises a backend identifier', async () => {
-  // Advertising it would hand clients a value the proxy now rejects.
-  const payload = await modelsFor('claude-code-cli');
-  assert.deepEqual(payload.data.map((m) => m.id), []);
-});
+// Every value the proxy would reject as a model. Kept as a literal list rather
+// than imported from the source so that dropping one from BACKEND_IDENTIFIERS
+// fails here instead of silently narrowing what both sides check.
+const BACKEND_IDENTIFIERS = ['codex-app-server', 'codex-backend', 'claude-code-cli'];
+
+for (const identifier of BACKEND_IDENTIFIERS) {
+  test(`GET /v1/models never advertises the backend identifier ${identifier}`, async () => {
+    // Advertising it would hand clients a value the proxy now rejects.
+    const payload = await modelsFor(identifier);
+    assert.deepEqual(payload.data.map((m) => m.id), []);
+  });
+}
 
 const execFileAsync = promisify(execFile);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -62,7 +69,7 @@ after(async () => {
 // run, so a new model generation shows up without a code change. With it off the
 // request model selects nothing, so advertising alternatives would invite a
 // choice the proxy ignores.
-async function modelsWithSetting(honorRequestModel, listed) {
+async function modelsWithSetting(honorRequestModel, listed, backendModel = 'configured-model') {
   const root = await mkdtemp(join(tmpdir(), 'models-endpoint-'));
   trees.push(root);
   await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
@@ -75,9 +82,9 @@ async function modelsWithSetting(honorRequestModel, listed) {
   await writeFile(scriptPath, `
     import { startLocalApiProxy } from ${JSON.stringify(join(root, 'dist/proxy/http-server.js'))};
     const backend = {
-      name: 'test', model: 'configured-model',
+      name: 'test', model: ${JSON.stringify(backendModel)},
       async availableModels() { return ${JSON.stringify(listed)}; },
-      async generate() { return { id: 'x', model: 'configured-model', text: 'OK', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 }; },
+      async generate() { return { id: 'x', model: ${JSON.stringify(backendModel)}, text: 'OK', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 }; },
       async close() {},
     };
     const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30000 });
@@ -103,3 +110,25 @@ test('a runtime that cannot enumerate falls back to its single model', async () 
   const payload = await modelsWithSetting(true, null);
   assert.deepEqual(payload.data.map((m) => m.id), ['configured-model']);
 });
+
+for (const identifier of BACKEND_IDENTIFIERS) {
+  test(`honour-on: ${identifier} is filtered out of the advertised catalogue`, async () => {
+    // A runtime that listed its own identifier — or a backend whose `model` is
+    // the identifier because nothing is configured — must not leak it into the
+    // list, in either position. Both are exercised at once here.
+    const payload = await modelsWithSetting(
+      true,
+      ['gpt-5.6-sol', identifier, 'gpt-5.6-terra'],
+      identifier,
+    );
+    assert.deepEqual(payload.data.map((m) => m.id), ['gpt-5.6-sol', 'gpt-5.6-terra']);
+  });
+
+  test(`honour-on with nothing to advertise: ${identifier} yields an empty list`, async () => {
+    // The documented consequence of "an identifier is not a selectable model":
+    // with no configured model and no runtime catalogue there is nothing to
+    // advertise, so the list is empty rather than a value the proxy rejects.
+    const payload = await modelsWithSetting(true, null, identifier);
+    assert.deepEqual(payload.data.map((m) => m.id), []);
+  });
+}

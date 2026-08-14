@@ -451,6 +451,37 @@ test('honorRequestModel on: a model the CLI does not advertise is rejected as no
   }
 });
 
+test('honorRequestModel on: the backend identifier is rejected, not read as omission', async () => {
+  // `codex-app-server` used to be a sentinel meaning "no model chosen", so a
+  // request naming it ran the configured model instead. It is now an ordinary
+  // model name and the served catalogue does not list it, so it must 404. The
+  // configured model is one the catalogue *does* list, so reintroducing the
+  // sentinel would make this a silent 200 on `gpt-5.5` rather than a rejection
+  // for some other reason.
+  process.env.CODEX_HOME = await createCodexHome();
+  resetCodexModelCatalogCache();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+    model: 'gpt-5.5',
+    honorRequestModel: true,
+  });
+  try {
+    await assert.rejects(
+      () => debugAppServerPayload(backend, { model: 'codex-app-server' }),
+      (err) => {
+        assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+        assert.equal(err.code, 'model_not_found');
+        assert.equal(err.param, 'model');
+        return true;
+      },
+    );
+  } finally {
+    await backend.close();
+  }
+});
+
 test('honorRequestModel on: an anthropic-shaped request is rejected in the anthropic error shape', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   resetCodexModelCatalogCache();

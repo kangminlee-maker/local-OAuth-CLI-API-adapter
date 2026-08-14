@@ -350,6 +350,45 @@ test('honorRequestModel on: the backend identifier is treated as a model name', 
   assert.equal(argv[argv.indexOf('--model') + 1], 'claude-code-cli');
 });
 
+test('honorRequestModel on, nothing configured: the identifier still reaches --model', async () => {
+  // The case where the identifier could quietly succeed. With no configured
+  // model `backend.model` IS `claude-code-cli`, so any routing that compared the
+  // request against the public identifier instead of the configured model would
+  // find them equal, reuse the persistent process — spawned without `--model`,
+  // i.e. the CLI default — and return 200 for a model the contract promises 404
+  // for. Forwarding it here is what proves the comparison is against the
+  // configured model, and that one-shot is what runs.
+  //
+  // No tuning flags, so nothing else forces one-shot: the model comparison is
+  // the only thing that can send this request off the persistent route.
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-code-cli' }),
+    undefined,
+    { honorRequestModel: true },
+  );
+  assert.ok(argv.includes('-p'), `expected the one-shot path: ${argv.join(' ')}`);
+  assert.equal(argv[argv.indexOf('--model') + 1], 'claude-code-cli');
+});
+
+test('honorRequestModel on, nothing configured: the CLI refusing the identifier is a 404', async () => {
+  // The other half: the refusal the previous test makes reachable is mapped to
+  // the surface's own not-found error, not to a 500 — and never to a 200 from
+  // the CLI default.
+  await assert.rejects(
+    () => runAgainstRejectingClaude(
+      { ...anthropicTuningRequest({ model: 'claude-code-cli', effort: 'low' }), shape: 'openai-chat' },
+      undefined,
+      { honorRequestModel: true },
+    ),
+    (err) => {
+      assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+      assert.equal(err.code, 'model_not_found');
+      assert.equal(err.param, 'model');
+      return true;
+    },
+  );
+});
+
 
 test('honorRequestModel on: an extra --model cannot override the requested model', async () => {
   // Operator extra arguments are appended after the resolved model, so leaving
