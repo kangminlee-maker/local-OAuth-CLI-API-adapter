@@ -18,6 +18,12 @@
 //   ede_retry      : a structured-output failure as documented — no scalar
 //                    diagnostic, only `subtype` and an `errors` array. Must stay
 //                    retryable.
+//   plaintext_refusal : the refusal on stderr with no structured event at all.
+//   stale_sentence : turn 1 answers but leaves the refusal sentence on stderr;
+//                    turn 2 dies for an unrelated reason.
+//   exit_after_answer : answers, then dies while idle (no waiter).
+//   huge_errors    : an oversized `errors[]` entry.
+//   persistent_stderr : accepts a persistent turn, then dies with sentinel stderr.
 //   stderr_only    : nothing on stdout, a sentinel on stderr, non-zero exit.
 //                    Those bytes are the operator's, not the client's.
 const readline = require('node:readline');
@@ -91,6 +97,15 @@ function emit() {
     write({ type: 'result', subtype: 'error_max_turns', session_id: 'sentinel-session', total_cost_usd: 0.1 });
     return;
   }
+  if (shape === 'huge_errors') {
+    // An upstream, gateway or hook can put arbitrary text in `errors[]`. Its size
+    // is not theirs to choose for the client.
+    write({
+      type: 'result', subtype: 'error_during_execution',
+      errors: [`[ede_diagnostic] ${'X'.repeat(9000)}`],
+    });
+    return;
+  }
   if (shape === 'ede_retry') {
     write({
       type: 'result', subtype: 'error_during_execution',
@@ -100,6 +115,79 @@ function emit() {
     return;
   }
   throw new Error(`unknown CLAUDE_TEST_RESULT_SHAPE: ${shape}`);
+}
+
+if (shape === 'plaintext_refusal') {
+  // The refusal as it arrives with NO structured event: the CLI's plain-text
+  // mode writes it to stderr and exits non-zero. Nothing on stdout, so only the
+  // stderr sentence can classify it.
+  process.stderr.write("There's an issue with the selected model (zzz). It may not exist or you "
+    + 'may not have access to it. Run --model to pick a different model.\n');
+  process.exit(1);
+}
+
+if (shape === 'stale_sentence') {
+  // Turn 1 answers normally but leaves the refusal sentence in the child's
+  // stderr. Turn 2 dies for an unrelated reason. If stderr is not attributed per
+  // turn, turn 2 is misread as a model rejection.
+  let seen = 0;
+  const rlStale = readline.createInterface({ input: process.stdin });
+  rlStale.on('line', (line) => {
+    if (!line.trim()) return;
+    let text = '';
+    try {
+      const content = JSON.parse(line)?.message?.content;
+      text = Array.isArray(content) ? content.map((b) => (b && b.type === 'text' ? b.text : '')).join('') : '';
+    } catch { text = line; }
+    if (text.trim() === '/clear') return;
+    seen += 1;
+    if (seen === 1) {
+      process.stderr.write("There's an issue with the selected model (earlier-turn). Run --model to pick a different model.\n");
+      write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
+      return;
+    }
+    process.stderr.write('UNRELATED_FAILURE disk full\n');
+    process.exit(7);
+  });
+  return;
+}
+
+if (shape === 'exit_after_answer') {
+  // Answers the turn, then dies while nothing is waiting. There is no waiter to
+  // reject, so the operator diagnostic is the only record that the runtime went.
+  const rlExit = readline.createInterface({ input: process.stdin });
+  rlExit.on('line', (line) => {
+    if (!line.trim()) return;
+    let text = '';
+    try {
+      const content = JSON.parse(line)?.message?.content;
+      text = Array.isArray(content) ? content.map((b) => (b && b.type === 'text' ? b.text : '')).join('') : '';
+    } catch { text = line; }
+    // Answer `/clear` too, so no waiter is left pending. Only then is the exit
+    // below a genuinely idle one — with a waiter still attached the reject path
+    // runs and the diagnostic comes along for free.
+    write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
+    if (text.trim() === '/clear') {
+      setTimeout(() => {
+        process.stderr.write('IDLE_EXIT_SENTINEL runtime went away\n');
+        process.exit(9);
+      }, 80);
+    }
+  });
+  return;
+}
+
+if (shape === 'persistent_stderr') {
+  // Accepts the persistent turn, then dies with sentinel stderr while that
+  // waiter is active — the failCurrent path, which the one-shot shapes cannot
+  // reach.
+  const rl0 = readline.createInterface({ input: process.stdin });
+  rl0.on('line', (line) => {
+    if (!line.trim()) return;
+    process.stderr.write('SENTINEL_STDERR gateway=https://internal.example token-ish=abcd\n');
+    process.exit(4);
+  });
+  return;
 }
 
 if (shape === 'stderr_only') {

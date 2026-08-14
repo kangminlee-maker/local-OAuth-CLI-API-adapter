@@ -417,9 +417,12 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.child.stderr.on('data', (chunk) => {
       this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
     });
-    this.child.on('error', (err) => this.failCurrent(err));
+    this.child.on('error', (err) => this.failCurrent(err, 'the local claude runtime failed to start'));
     this.child.on('close', (code, signal) => {
-      this.failCurrent(new Error(`claude code exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`));
+      this.failCurrent(
+        new Error(`claude code exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`),
+        `the local claude runtime exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`,
+      );
       this.child = null;
       this.lineReader = null;
       this.initialized = null;
@@ -473,6 +476,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
         if (signal.aborted) abortFromSignal();
         else signal.addEventListener('abort', abortFromSignal, { once: true });
       }
+      // Attribute stderr to THIS turn. The buffer spans the child's lifetime, so
+      // without a reset an earlier turn's bytes decide how this one is classified
+      // and what the operator diagnostic shows.
+      this.stderr = '';
       this.child?.stdin.write(`${JSON.stringify({
         type: 'user',
         message: {
@@ -503,17 +510,22 @@ export class ClaudeCodeBackend implements LocalCliBackend {
           stopSequence: readClaudeStopSequence(message),
         });
       } else {
-        waiter.reject(new Error(readErrorMessage(message)));
+        waiter.reject(claudeTurnFailure(message));
       }
     }
   }
 
-  private failCurrent(err: Error): void {
+  private failCurrent(err: Error, publicMessage: string): void {
     // The child's stderr is operator-local: it can carry gateway detail, settings
     // values, paths and auth diagnostics, and this error becomes an HTTP 500's
     // message or an in-band SSE error. It goes to the proxy's own stderr instead,
     // flattened and bounded like every other diagnostic here.
-    this.waiter?.reject(claudeProcessFailure(err, this.stderr));
+    // Evaluated unconditionally: a child that dies while idle has no waiter, and
+    // `this.waiter?.reject(f(...))` would skip the call — and the diagnostic with
+    // it. This is the only record of why the runtime went away.
+    const failure = claudeProcessFailure(err, this.stderr, publicMessage);
+    this.stderr = '';
+    this.waiter?.reject(failure);
     this.waiter = null;
   }
 
@@ -668,17 +680,22 @@ function runClaudeProcess(
               stopSequence: readClaudeStopSequence(message),
             });
           } else {
-            finish(new Error(readErrorMessage(message)));
+            finish(claudeTurnFailure(message));
           }
         }
       }
     });
-    child.on('error', (err) => finish(err));
+    child.on('error', (err) => finish(claudeProcessFailure(
+      err,
+      stderr,
+      'the local claude runtime failed to start',
+    )));
     child.on('close', (code, signal) => {
       if (code === 0) return;
       finish(claudeProcessFailure(
         new Error(`claude exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`),
         stderr,
+        `the local claude runtime exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`,
       ));
     });
     if (options.stdinMessage && child.stdin) {
@@ -742,23 +759,23 @@ function readNumber(value: unknown): number {
 }
 
 /**
- * A child-process failure, with the child's stderr kept away from the client.
+ * A child-process failure, with everything operator-local kept out of the
+ * client's error: the child's stderr, and the OS message too — `spawn
+ * /some/where/claude ENOENT` names a configured path.
  *
  * The refusal the CLI prints in plain-text mode arrives only on stderr, so it is
- * recognised here and becomes the tagged rejection rather than travelling as
- * text — that is the one thing the caller needs from those bytes. Everything else
- * goes to the proxy's own stderr for the operator, and the returned error carries
- * a fixed description.
+ * recognised here and becomes the tagged rejection — that is the one thing a
+ * caller needs from those bytes. Everything else goes to the proxy's own stderr,
+ * and the returned error carries the fixed description the caller passed.
  */
-function claudeProcessFailure(err: Error, childStderr: string): Error {
+function claudeProcessFailure(err: Error, childStderr: string, publicMessage: string): Error {
   const detail = childStderr.trim();
-  if (detail) {
-    process.stderr.write(`claude process failure: ${asLogLine(detail)}\n`);
-  }
+  const operatorLine = detail ? `${err.message} :: ${detail}` : err.message;
+  process.stderr.write(`claude process failure: ${asLogLine(operatorLine)}\n`);
   if (/issue with the selected model/i.test(detail)) {
-    return new ClaudeModelRejectionError(err.message);
+    return new ClaudeModelRejectionError(publicMessage);
   }
-  return err;
+  return new Error(publicMessage);
 }
 
 /**
@@ -791,22 +808,27 @@ const TRUNCATION_MARKER = '...[truncated]';
 const MAX_LOG_LINE_CHARS = 500;
 
 /**
- * The runtime's own words for a failed turn. Deliberately not a serialization of
- * the event: this string becomes an HTTP 500's `message`, and a result event
- * carries `session_id`, cost, usage and whatever fields a future version adds.
- * Only fields documented to hold a diagnostic are read — `result`, `error`, and
- * the `errors` array — and the failure's `subtype` is kept because it names the
- * kind of failure rather than describing the session.
+ * A failed turn as an error: the kind it reports, and the runtime's own words
+ * bounded to the same limit as the operator log.
+ *
+ * Deliberately not a serialization of the event — this message becomes an HTTP
+ * 500 and an in-band SSE error, and a result event carries `session_id`, cost
+ * and usage. Only fields documented to hold a diagnostic are read (`result`,
+ * `error`, `errors[]`), and they are bounded: `errors[]` in particular is
+ * unrestricted text that an upstream, a gateway or a hook can fill, so its size
+ * is not theirs to choose. The full text still reaches the operator.
  */
-function readErrorMessage(message: JsonObject): string {
-  const detail = readErrorDetail(message);
+function claudeTurnFailure(message: JsonObject): ClaudeTurnError {
   const subtype = typeof message.subtype === 'string' && message.subtype !== 'success'
     ? message.subtype
-    : null;
-  if (detail && subtype) return `${subtype}: ${detail}`;
-  if (detail) return detail;
-  if (subtype) return `claude code reported a failed turn (${subtype})`;
-  return 'claude code reported a failed turn without a diagnostic message';
+    : undefined;
+  const detail = readErrorDetail(message);
+  if (detail) process.stderr.write(`claude turn failure: ${asLogLine(detail)}\n`);
+  const bounded = detail ? asLogLine(detail) : null;
+  if (bounded && subtype) return new ClaudeTurnError(`${subtype}: ${bounded}`, subtype);
+  if (bounded) return new ClaudeTurnError(bounded);
+  if (subtype) return new ClaudeTurnError(`claude code reported a failed turn (${subtype})`, subtype);
+  return new ClaudeTurnError('claude code reported a failed turn without a diagnostic message');
 }
 
 function readErrorDetail(message: JsonObject): string | null {
@@ -819,7 +841,16 @@ function readErrorDetail(message: JsonObject): string | null {
   return null;
 }
 
+/**
+ * Whether a failed turn is worth one more attempt. Read from the failure's own
+ * `subtype` when the error carries one, so it does not depend on the diagnostic
+ * text surviving into the message — which is exactly what broke once already,
+ * when a generic fallback replaced the text and silently made every
+ * structured-output failure permanent. The text match stays for errors that
+ * arrive without structure.
+ */
 function isRetryableClaudeStructuredOutputError(err: Error): boolean {
+  if (err instanceof ClaudeTurnError && err.subtype === 'error_during_execution') return true;
   return err.message.includes('error_during_execution')
     || err.message.includes('[ede_diagnostic]');
 }
@@ -831,7 +862,13 @@ function isRetryableClaudeStructuredOutputError(err: Error): boolean {
  * sentence load-bearing twice over — and it already changed shape once between
  * two patch releases.
  */
-class ClaudeModelRejectionError extends Error {}
+class ClaudeTurnError extends Error {
+  constructor(message: string, readonly subtype?: string) {
+    super(message);
+  }
+}
+
+class ClaudeModelRejectionError extends ClaudeTurnError {}
 
 /**
  * True when the runtime refused the model. Either it was already recognised from

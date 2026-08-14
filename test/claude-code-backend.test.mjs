@@ -679,19 +679,23 @@ test('honorRequestModel on: the assistant-event refusal is a 404 on the persiste
   process.env.CLAUDE_TEST_RESULT_SHAPE = 'assistant_only';
   const diagnostics = [];
   const originalWrite = process.stderr.write.bind(process.stderr);
-  process.stderr.write = (chunk, ...rest) => {
-    const line = String(chunk);
-    if (line.includes('claude model rejection')) diagnostics.push(line);
-    return true;
-  };
-  const backend = new ClaudeCodeBackend({
-    command: resultShapes,
-    cwd: process.cwd(),
-    model: 'claude-retired',
-    timeoutMs: 30_000,
-    honorRequestModel: true,
-  });
+  // Everything that needs undoing is installed inside the try: a throw during
+  // construction would otherwise leave stderr, the environment and the temp tree
+  // as they are, contaminating later tests.
+  let backend = null;
   try {
+    process.stderr.write = (chunk) => {
+      const line = String(chunk);
+      if (line.includes('claude model rejection')) diagnostics.push(line);
+      return true;
+    };
+    backend = new ClaudeCodeBackend({
+      command: resultShapes,
+      cwd: process.cwd(),
+      model: 'claude-retired',
+      timeoutMs: 30_000,
+      honorRequestModel: true,
+    });
     const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
     for (const attempt of [1, 2]) {
       await assert.rejects(
@@ -722,7 +726,7 @@ test('honorRequestModel on: the assistant-event refusal is a 404 on the persiste
     assert.equal(diagnostics.length, 2, `expected one diagnostic per turn, saw ${diagnostics.length}`);
   } finally {
     process.stderr.write = originalWrite;
-    await backend.close();
+    await backend?.close();
     if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
     else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
     if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
@@ -767,7 +771,7 @@ test('honorRequestModel on: the operator gets the runtime message, flattened to 
   // entry: the model here contains a newline and an ANSI escape.
   // A newline, an ANSI escape, and U+2028 — which is not a C0 control but which
   // Unicode-aware terminals and log processors still treat as a line break.
-  const hostileModel = 'evil\u001b[31m\nclaude model rejection (reported as 404): forged\u2028also-forged';
+  const hostileModel = 'evil\u001b[31m\nclaude model rejection (reported as 404): forged\u2028also\u2029forged';
   const written = [];
   const originalWrite = process.stderr.write.bind(process.stderr);
   process.stderr.write = (chunk, ...rest) => {
@@ -790,7 +794,8 @@ test('honorRequestModel on: the operator gets the runtime message, flattened to 
     // whole point of escaping, and a raw ESC would be acted on by a terminal.
     assert.equal(lines[0].split('\n').length, 2, `diagnostic must be one line: ${JSON.stringify(lines[0])}`);
     assert.ok(!lines[0].includes('\u001b'), 'escape sequences must not survive');
-    assert.ok(!lines[0].includes('\u2028'), 'unicode line separators must not survive');
+    assert.ok(!lines[0].includes('\u2028'), 'U+2028 must not survive');
+    assert.ok(!lines[0].includes('\u2029'), 'U+2029 must not survive');
     assert.ok(!lines[0].includes('Say OK'), 'the prompt must not be logged');
   } finally {
     process.stderr.write = originalWrite;
@@ -843,7 +848,8 @@ test('child stderr is the operator\'s, not the client\'s', async () => {
       (err) => {
         assert.ok(!err.message.includes('SENTINEL_STDERR'), `stderr reached the client: ${err.message}`);
         assert.ok(!err.message.includes('internal.example'), `stderr reached the client: ${err.message}`);
-        assert.match(err.message, /claude exited with code=3/);
+        // A fixed description: the exit code, no path, no OS text.
+        assert.match(err.message, /the local claude runtime exited \(code=3/);
         return true;
       },
     );
@@ -925,6 +931,196 @@ test('the operator diagnostic is bounded, marker included', async () => {
     process.stderr.write = originalWrite;
     if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
     else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a plain-text refusal on stderr is still a 404, and the stderr stays operator-side', async () => {
+  // No structured event at all — the CLI's other reporting mode. Recognising the
+  // sentence in the child's stderr is the only thing that can classify this, and
+  // the bytes it was recognised from must not travel to the client.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'plaintext_refusal';
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'zzz', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+        assert.equal(err.code, 'model_not_found');
+        assert.ok(!err.message.includes('Run --model'), `stderr reached the client: ${err.message}`);
+        return true;
+      },
+    );
+    assert.ok(
+      written.some((l) => l.includes('claude process failure') && l.includes('issue with the selected model')),
+      'the operator must still see what the runtime said',
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a persistent child dying mid-turn keeps its stderr operator-side', async () => {
+  // The `failCurrent` path. Every other stderr test forces one-shot by asking for
+  // a model other than the configured one, so this route was uncovered.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  let backend = null;
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'persistent_stderr';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes,
+      cwd: process.cwd(),
+      model: 'claude-retired',
+      timeoutMs: 30_000,
+      honorRequestModel: true,
+    });
+    await assert.rejects(
+      () => backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' }),
+      (err) => {
+        assert.ok(!err.message.includes('SENTINEL_STDERR'), `stderr reached the client: ${err.message}`);
+        assert.ok(!err.message.includes('internal.example'), `stderr reached the client: ${err.message}`);
+        assert.match(err.message, /the local claude runtime exited/);
+        return true;
+      },
+    );
+    assert.ok(
+      written.some((l) => l.includes('claude process failure') && l.includes('SENTINEL_STDERR')),
+      `the operator must still see it: ${JSON.stringify(written)}`,
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('an earlier turn\'s stderr does not classify a later failure', async () => {
+  // The child's stderr buffer spans its lifetime. Turn 1 leaves the refusal
+  // sentence there and succeeds; turn 2 dies of something unrelated. Without
+  // per-turn attribution the stale sentence makes turn 2 a 404 model error and
+  // sends the client to change a model that is fine.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'stale_sentence';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
+    const first = await backend.generate(request);
+    assert.equal(first.text, 'OK');
+    await assert.rejects(
+      () => backend.generate(request),
+      (err) => {
+        assert.notEqual(err.statusCode, 404, `an unrelated failure must not become a model error: ${err.message}`);
+        assert.match(err.message, /the local claude runtime exited/);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a persistent child dying while idle still tells the operator', async () => {
+  // No waiter to reject, so the diagnostic is the only record. Written as
+  // `this.waiter?.reject(f(...))`, the call would be skipped entirely.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  let backend = null;
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'exit_after_answer';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    const result = await backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' });
+    assert.equal(result.text, 'OK');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.ok(
+      written.some((l) => l.includes('claude process failure') && l.includes('IDLE_EXIT_SENTINEL')),
+      `expected an operator diagnostic for the idle exit: ${JSON.stringify(written)}`,
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('an oversized runtime diagnostic is bounded before it reaches the client', async () => {
+  // `errors[]` is unrestricted text an upstream can fill. Its size is not theirs
+  // to choose for the client, though the operator still gets it.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'huge_errors';
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        { ...anthropicTuningRequest({ model: 'claude-opus-4-8' }), jsonMode: true, jsonSchema: PROBE_SCHEMA },
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.ok(err.message.length <= 600, `client message must be bounded, got ${err.message.length}`);
+        assert.match(err.message, /error_during_execution/);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a runtime that cannot be spawned does not name its path to the client', async () => {
+  // `spawn /operator/private/path/claude ENOENT` discloses a configured path.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-not-a-model', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: '/nonexistent/operator/path/claude-binary' },
+      ),
+      (err) => {
+        assert.ok(!err.message.includes('/nonexistent/operator/path'), `path leaked: ${err.message}`);
+        assert.ok(!err.message.includes('ENOENT'), `OS detail leaked: ${err.message}`);
+        assert.match(err.message, /the local claude runtime failed to start/);
+        return true;
+      },
+    );
+    assert.ok(
+      written.some((l) => l.includes('claude process failure') && l.includes('ENOENT')),
+      `the operator must still see the real cause: ${JSON.stringify(written)}`,
+    );
+  } finally {
+    process.stderr.write = originalWrite;
   }
 });
 

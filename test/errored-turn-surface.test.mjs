@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import { before, test } from 'node:test';
-import { chmod } from 'node:fs/promises';
+import { test } from 'node:test';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
@@ -9,9 +8,8 @@ import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 const here = dirname(fileURLToPath(import.meta.url));
 const resultShapes = resolve(here, 'fixtures/claude-result-shapes.cjs');
 
-before(async () => {
-  await chmod(resultShapes, 0o755);
-});
+// The fixture is committed executable; the suite does not chmod a tracked file,
+// which would fail in a read-only checkout.
 
 // What a client actually sees when a turn fails is decided by whether any bytes
 // have been committed. Both halves are pinned here: the contract describes them
