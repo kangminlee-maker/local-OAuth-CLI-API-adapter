@@ -59,7 +59,10 @@ test('GET /v1/models returns the configured model, not the backend alias', async
 const PINNED_IDENTIFIERS = ['codex-app-server', 'codex-backend', 'claude-code-cli'];
 
 test('the pinned identifier list is exactly the production one', () => {
-  assert.deepEqual([...BACKEND_IDENTIFIERS], PINNED_IDENTIFIERS);
+  // Sorted, because production only ever asks this list for membership. Pinning
+  // the declaration order would fail a harmless reordering while catching
+  // nothing extra; sorted comparison still catches additions and removals.
+  assert.deepEqual([...BACKEND_IDENTIFIERS].sort(), [...PINNED_IDENTIFIERS].sort());
 });
 
 for (const identifier of PINNED_IDENTIFIERS) {
@@ -126,6 +129,17 @@ test('honour-on: the runtime catalogue is advertised, configured model first', a
 test('honour-off: only the configured model is advertised', async () => {
   const payload = await modelsWithSetting(false, ['gpt-5.6-sol', 'gpt-5.6-terra']);
   assert.deepEqual(payload.data.map((m) => m.id), ['configured-model']);
+});
+
+test('honour-on: a duplicate slug is advertised once, in first-seen order', async () => {
+  // `id` is the client's key for a model, so a list carrying one twice is
+  // malformed whatever the runtime meant by it. De-duplication must not reorder
+  // what survives, and must still drop the configured model from the tail.
+  const payload = await modelsWithSetting(
+    true,
+    ['gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'configured-model'],
+  );
+  assert.deepEqual(payload.data.map((m) => m.id), ['configured-model', 'gpt-5.6-terra', 'gpt-5.6-sol']);
 });
 
 test('a runtime that cannot enumerate falls back to its single model', async () => {

@@ -184,10 +184,15 @@ test('honour-on: streaming chunks report the executed model, not the request ech
   const scriptPath = join(root, 'echo.mjs');
   await writeFile(scriptPath, `
     import { startLocalApiProxy } from ${JSON.stringify(join(root, 'dist/proxy/http-server.js'))};
+    // Three distinct values, so the reported one can only have come from
+    // resolvedModel: the configured model, the model the request asks for, and
+    // the model that actually runs. An earlier version made the configured model
+    // and the executed model the same string, which let the production call be
+    // replaced with backend.model while the test stayed green.
+    let resolvedCalls = 0;
     const backend = {
-      name: 'test', model: 'actually-runs-this',
-      // The request names no model, so the configured one runs.
-      async resolvedModel() { return 'actually-runs-this'; },
+      name: 'test', model: 'configured-not-this',
+      async resolvedModel() { resolvedCalls += 1; return 'actually-runs-this'; },
       async generate() { return { id: 'x', model: 'actually-runs-this', text: 'OK', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 }; },
       async *stream() {
         yield { type: 'text_delta', delta: 'hi' };
@@ -199,14 +204,16 @@ test('honour-on: streaming chunks report the executed model, not the request ech
     const res = await fetch(started.url + '/v1/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'codex-app-server', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+      body: JSON.stringify({ model: 'gpt-5.6-sol', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
     });
     const text = await res.text();
     await started.close();
-    process.stdout.write(JSON.stringify({ text }));
+    process.stdout.write(JSON.stringify({ text, resolvedCalls }));
   `);
   const { stdout } = await execFileAsync(process.execPath, [scriptPath], { cwd: root });
-  const { text } = JSON.parse(stdout);
+  const { text, resolvedCalls } = JSON.parse(stdout);
+  assert.equal(resolvedCalls, 1, 'the streaming path must ask the backend which model runs');
   assert.ok(text.includes('actually-runs-this'), `chunks must name the executed model: ${text}`);
-  assert.ok(!text.includes('codex-app-server'), `chunks must not echo the sentinel: ${text}`);
+  assert.ok(!text.includes('gpt-5.6-sol'), `chunks must not echo the request model: ${text}`);
+  assert.ok(!text.includes('configured-not-this'), `chunks must not fall back to the configured model: ${text}`);
 });

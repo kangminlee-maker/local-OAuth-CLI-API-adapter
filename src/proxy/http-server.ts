@@ -1178,7 +1178,10 @@ async function advertisedModels(backend: LocalCliBackend): Promise<readonly stri
   const configured = BACKEND_IDENTIFIERS.includes(backend.model) ? null : backend.model;
   const rest = (listed ?? []).filter((id) => id !== configured && !BACKEND_IDENTIFIERS.includes(id));
   const ids = configured ? [configured, ...rest] : rest;
-  return ids;
+  // A runtime that advertised the same slug twice would otherwise put it in the
+  // response twice; a model list with duplicate `id`s is malformed for a client
+  // whatever the runtime meant by it. First occurrence wins, so order holds.
+  return [...new Set(ids)];
 }
 
 function openAiImagesGenerationResponse(
