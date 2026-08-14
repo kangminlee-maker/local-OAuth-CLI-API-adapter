@@ -1043,12 +1043,17 @@ test('an earlier turn\'s stderr does not classify a later failure', async () => 
 test('a persistent child dying while idle still tells the operator', async () => {
   // No waiter to reject, so the diagnostic is the only record. Written as
   // `this.waiter?.reject(f(...))`, the call would be skipped entirely.
-  const written = [];
   const originalWrite = process.stderr.write.bind(process.stderr);
   const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
   let backend = null;
+  let observed;
+  const seen = new Promise((resolve) => { observed = resolve; });
   try {
-    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    process.stderr.write = (chunk) => {
+      const line = String(chunk);
+      if (line.includes('claude process failure') && line.includes('IDLE_EXIT_SENTINEL')) observed();
+      return true;
+    };
     process.env.CLAUDE_TEST_RESULT_SHAPE = 'exit_after_answer';
     backend = new ClaudeCodeBackend({
       command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
@@ -1056,11 +1061,9 @@ test('a persistent child dying while idle still tells the operator', async () =>
     });
     const result = await backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' });
     assert.equal(result.text, 'OK');
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    assert.ok(
-      written.some((l) => l.includes('claude process failure') && l.includes('IDLE_EXIT_SENTINEL')),
-      `expected an operator diagnostic for the idle exit: ${JSON.stringify(written)}`,
-    );
+    // Waiting on the observation, not on a fixed sleep: the child's exit timer
+    // runs in another process, so any fixed margin is a race on a loaded machine.
+    await seen;
   } finally {
     process.stderr.write = originalWrite;
     await backend?.close();
@@ -1121,6 +1124,123 @@ test('a runtime that cannot be spawned does not name its path to the client', as
     );
   } finally {
     process.stderr.write = originalWrite;
+  }
+});
+
+test('an oversized subtype cannot bypass the client-message bound', async () => {
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'huge_subtype';
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.ok(err.message.length <= 600, `bound must cover the whole message, got ${err.message.length}`);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('an authoritative subtype decides retries, not a mention in the text', async () => {
+  // `error_max_turns` whose diagnostic mentions an earlier execution error. The
+  // subtype says do not retry; the legacy text match would say retry.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
+  const argvDir = await mkdtemp(join(tmpdir(), 'claude-argv-'));
+  const argvLog = join(argvDir, 'argv.log');
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'max_turns_mentioning_ede';
+    process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        { ...anthropicTuningRequest({ model: 'claude-opus-4-8' }), jsonMode: true, jsonSchema: PROBE_SCHEMA },
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.match(err.message, /error_max_turns/);
+        return true;
+      },
+    );
+    const spawns = (await readFile(argvLog, 'utf8')).trim().split('\n').filter(Boolean)
+      .map((l) => JSON.parse(l)).filter((l) => l[0] !== '#turn');
+    assert.equal(spawns.length, 1, `an authoritative subtype must not be retried, saw ${spawns.length} spawns`);
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+    if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
+    else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
+    await rm(argvDir, { recursive: true, force: true });
+  }
+});
+
+test('a runtime that cannot even be spawned synchronously stays operator-side', async () => {
+  // `spawn` throws before returning a child for an empty or NUL-bearing command,
+  // and Node puts the offending value in the message. That throw never reaches
+  // the child `error` handler.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-not-a-model', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: `/operator/private/path/claude${String.fromCharCode(0)}x` },
+      ),
+      (err) => {
+        assert.ok(!err.message.includes('/operator/private/path'), `path leaked: ${err.message}`);
+        assert.match(err.message, /the local claude runtime failed to start/);
+        return true;
+      },
+    );
+    assert.ok(
+      written.some((l) => l.includes('claude process failure')),
+      `the operator must still see it: ${JSON.stringify(written)}`,
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+});
+
+test('an intentional shutdown is not reported as a process failure', async () => {
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  let backend = null;
+  try {
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'assistant_only';
+    backend = new ClaudeCodeBackend({
+      command: fakeClaude, cwd: process.cwd(), model: 'claude-opus-4-8', timeoutMs: 30_000,
+    });
+    await backend.generate(textRequest());
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    await backend.close();
+    backend = null;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.deepEqual(
+      written.filter((l) => l.includes('claude process failure')),
+      [],
+      'closing the backend is not a failure',
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
   }
 });
 

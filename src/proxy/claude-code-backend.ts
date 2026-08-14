@@ -75,6 +75,18 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   private initialized: Promise<void> | null = null;
   private waiter: ClaudeWaiter | null = null;
   private stderr = '';
+  // A persistent child fixes its model at spawn. Once it has answered anything,
+  // the model is demonstrably runnable, so a refusal sentence arriving on stderr
+  // later cannot mean "bad model" — it is a late or unrelated byte. Clearing a
+  // receive buffer would not settle that either: stdout and stderr are separate
+  // pipes with no delivery ordering between them, so a turn boundary cannot be
+  // drawn by timing. This flag draws it by fact instead.
+  private childAnswered = false;
+  // Set by close(), so an intentional shutdown is not reported as a failure.
+  private shuttingDown = false;
+  // One operator diagnostic per child: `error` and `close` both fire for a
+  // failed spawn, and the second says nothing the first did not.
+  private childFailureReported = false;
   private lock: Promise<void> = Promise.resolve();
 
   constructor(options: ClaudeCodeBackendOptions) {
@@ -205,6 +217,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   }
 
   async close(): Promise<void> {
+    this.shuttingDown = true;
     this.waiter?.reject(new Error('claude code backend closed'));
     this.waiter = null;
     this.lineReader?.close();
@@ -391,8 +404,33 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     return this.initialized;
   }
 
+  private spawnChild(argv: readonly string[]): ChildProcessWithoutNullStreams {
+    try {
+      return spawn(this.command, [...argv], {
+        cwd: this.cwd,
+        shell: false,
+        env: proxyChildProcessEnv(),
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      throw claudeProcessFailure(
+        err instanceof Error ? err : new Error(String(err)),
+        '',
+        'the local claude runtime failed to start',
+        { report: true, allowRefusal: false },
+      );
+    }
+  }
+
   private async start(): Promise<void> {
-    this.child = spawn(this.command, [
+    this.stderr = '';
+    this.childAnswered = false;
+    this.childFailureReported = false;
+    // `spawn` throws synchronously for an empty or NUL-bearing command, and Node
+    // puts the offending value in the message — the configured path. That throw
+    // never reaches the `error` handler below, so it is caught here and given the
+    // same treatment as every other start failure.
+    this.child = this.spawnChild([
       '-p',
       '--input-format',
       'stream-json',
@@ -406,12 +444,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       '--no-session-persistence',
       ...(this.configuredModel ? ['--model', this.configuredModel] : []),
       ...this.extraArgsFor(),
-    ], {
-      cwd: this.cwd,
-      shell: false,
-      env: proxyChildProcessEnv(),
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    ]);
 
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', (chunk) => {
@@ -476,10 +509,6 @@ export class ClaudeCodeBackend implements LocalCliBackend {
         if (signal.aborted) abortFromSignal();
         else signal.addEventListener('abort', abortFromSignal, { once: true });
       }
-      // Attribute stderr to THIS turn. The buffer spans the child's lifetime, so
-      // without a reset an earlier turn's bytes decide how this one is classified
-      // and what the operator diagnostic shows.
-      this.stderr = '';
       this.child?.stdin.write(`${JSON.stringify({
         type: 'user',
         message: {
@@ -501,6 +530,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
         waiter.reject(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
       } else if (message.subtype === 'success' && message.is_error !== true) {
+        this.childAnswered = true;
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
           structuredOutput: message.structured_output ?? waiter.structuredOutput,
@@ -523,8 +553,12 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     // Evaluated unconditionally: a child that dies while idle has no waiter, and
     // `this.waiter?.reject(f(...))` would skip the call — and the diagnostic with
     // it. This is the only record of why the runtime went away.
-    const failure = claudeProcessFailure(err, this.stderr, publicMessage);
-    this.stderr = '';
+    const report = !this.childFailureReported && !this.shuttingDown;
+    this.childFailureReported = true;
+    const failure = claudeProcessFailure(err, this.stderr, publicMessage, {
+      report,
+      allowRefusal: !this.childAnswered,
+    });
     this.waiter?.reject(failure);
     this.waiter = null;
   }
@@ -631,14 +665,30 @@ function runClaudeProcess(
   }
 
   return new Promise<ClaudeTurnResult>((resolve, reject) => {
-    const child = spawn(command, [...args], {
-      cwd: options.cwd,
-      shell: false,
-      env: proxyChildProcessEnv(),
-      signal: controller.signal,
-      stdio: options.stdinMessage ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
-    });
     let stderr = '';
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      // Synchronous throws — an empty or NUL-bearing command — never reach the
+      // `error` handler below, and Node puts the configured path in the message.
+      // The cast preserves the type this call had before it was wrapped: stdio is
+      // chosen at runtime, so the general overload widens the streams to nullable
+      // and every existing use site would need a guard it never needed.
+      child = spawn(command, [...args], {
+        cwd: options.cwd,
+        shell: false,
+        env: proxyChildProcessEnv(),
+        signal: controller.signal,
+        stdio: options.stdinMessage ? ['pipe', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe'],
+      }) as ChildProcessWithoutNullStreams;
+    } catch (err) {
+      reject(claudeProcessFailure(
+        err instanceof Error ? err : new Error(String(err)),
+        '',
+        'the local claude runtime failed to start',
+        { report: true, allowRefusal: false },
+      ));
+      return;
+    }
     const waiter: ClaudeWaiter = {
       text: '',
       structuredOutput: undefined,
@@ -685,16 +735,20 @@ function runClaudeProcess(
         }
       }
     });
-    child.on('error', (err) => finish(claudeProcessFailure(
-      err,
-      stderr,
-      'the local claude runtime failed to start',
-    )));
+    // A one-shot child is spawned per turn, so its stderr belongs to that turn and
+    // a refusal there is always about this request's model. `error` and `close`
+    // can both fire for one failed spawn; only the first is worth reporting.
+    let reported = false;
+    const failure = (err: Error, publicMessage: string): Error => {
+      const report = !reported;
+      reported = true;
+      return claudeProcessFailure(err, stderr, publicMessage, { report, allowRefusal: true });
+    };
+    child.on('error', (err) => finish(failure(err, 'the local claude runtime failed to start')));
     child.on('close', (code, signal) => {
       if (code === 0) return;
-      finish(claudeProcessFailure(
+      finish(failure(
         new Error(`claude exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`),
-        stderr,
         `the local claude runtime exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`,
       ));
     });
@@ -768,27 +822,39 @@ function readNumber(value: unknown): number {
  * caller needs from those bytes. Everything else goes to the proxy's own stderr,
  * and the returned error carries the fixed description the caller passed.
  */
-function claudeProcessFailure(err: Error, childStderr: string, publicMessage: string): Error {
+function claudeProcessFailure(
+  err: Error,
+  childStderr: string,
+  publicMessage: string,
+  options: { readonly report: boolean; readonly allowRefusal: boolean },
+): Error {
   const detail = childStderr.trim();
-  const operatorLine = detail ? `${err.message} :: ${detail}` : err.message;
-  process.stderr.write(`claude process failure: ${asLogLine(operatorLine)}\n`);
-  if (/issue with the selected model/i.test(detail)) {
+  if (options.report) {
+    const operatorLine = detail ? `${err.message} :: ${detail}` : err.message;
+    process.stderr.write(`claude process failure: ${asLogLine(operatorLine)}\n`);
+  }
+  if (options.allowRefusal && /issue with the selected model/i.test(detail)) {
     return new ClaudeModelRejectionError(publicMessage);
   }
   return new Error(publicMessage);
 }
 
 /**
- * One log line, and only a log line. The runtime's message contains the model
- * string a client chose, so it can carry line breaks that forge a second entry
- * or escape sequences a terminal would act on. Escaped: C0 and C1 controls, and
- * U+2028/U+2029, which Unicode-aware log processors and terminals treat as line
- * breaks even though they are not C0.
- *
- * Truncation walks code points and appends whole escapes, so a boundary can
- * never split an astral character into a lone surrogate or leave a half-written
- * escape. The returned string, marker included, stays within the limit.
+ * A client-visible diagnostic, bounded but not escaped. HTTP JSON and SSE JSON
+ * already encode control characters safely, so escaping them here would make a
+ * legitimate multi-line runtime message arrive as escape notation. Truncation
+ * walks code points so a boundary cannot split an astral character.
  */
+function boundedText(message: string): string {
+  const budget = MAX_LOG_LINE_CHARS - TRUNCATION_MARKER.length;
+  let out = '';
+  for (const ch of message) {
+    if (out.length + ch.length > budget) return `${out}${TRUNCATION_MARKER}`;
+    out += ch;
+  }
+  return out;
+}
+
 function asLogLine(message: string): string {
   const budget = MAX_LOG_LINE_CHARS - TRUNCATION_MARKER.length;
   let out = '';
@@ -824,11 +890,13 @@ function claudeTurnFailure(message: JsonObject): ClaudeTurnError {
     : undefined;
   const detail = readErrorDetail(message);
   if (detail) process.stderr.write(`claude turn failure: ${asLogLine(detail)}\n`);
-  const bounded = detail ? asLogLine(detail) : null;
-  if (bounded && subtype) return new ClaudeTurnError(`${subtype}: ${bounded}`, subtype);
-  if (bounded) return new ClaudeTurnError(bounded);
-  if (subtype) return new ClaudeTurnError(`claude code reported a failed turn (${subtype})`, subtype);
-  return new ClaudeTurnError('claude code reported a failed turn without a diagnostic message');
+  // Bound what is COMPOSED, not just the detail: `subtype` is a runtime-supplied
+  // string too, and bounding one half leaves the other free to be any size.
+  const composed = detail && subtype ? `${subtype}: ${detail}`
+    : detail ? detail
+    : subtype ? `claude code reported a failed turn (${subtype})`
+    : 'claude code reported a failed turn without a diagnostic message';
+  return new ClaudeTurnError(boundedText(composed), subtype);
 }
 
 function readErrorDetail(message: JsonObject): string | null {
@@ -850,11 +918,17 @@ function readErrorDetail(message: JsonObject): string | null {
  * arrive without structure.
  */
 function isRetryableClaudeStructuredOutputError(err: Error): boolean {
-  if (err instanceof ClaudeTurnError && err.subtype === 'error_during_execution') return true;
+  // A refused model is never retryable: a second attempt runs the same model.
+  if (err instanceof ClaudeModelRejectionError) return false;
+  // A typed failure knows its own kind, and that answer is final — falling
+  // through to the text would let an `error_max_turns` whose diagnostic merely
+  // mentions an earlier execution error be retried against its own subtype.
+  if (err instanceof ClaudeTurnError && err.subtype !== undefined) {
+    return err.subtype === 'error_during_execution';
+  }
   return err.message.includes('error_during_execution')
     || err.message.includes('[ede_diagnostic]');
 }
-
 /**
  * Carries "the runtime refused this model" from wherever it was recognised to
  * the one place that maps it to a status. Without it the fact has to be

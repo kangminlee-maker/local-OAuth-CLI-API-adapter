@@ -171,3 +171,12 @@ test('Claude: an error subtype with no diagnostic still names the failure kind',
   assert.ok(!payload.error.message.includes('sentinel-session'), payload.error.message);
   assert.ok(!payload.error.message.includes('total_cost_usd'), payload.error.message);
 });
+
+test('Claude: a multi-line runtime diagnostic reaches the client as text, not escapes', async () => {
+  // Bounding is a size concern; escaping is a LOG concern. HTTP JSON already
+  // encodes control characters safely, so escaping them here would hand the
+  // client `\\u{a}` where the runtime wrote a newline.
+  const { payload } = await claudeStatusFor('multiline_detail', CHAT);
+  assert.match(payload.error.message, /first line\nsecond line/);
+  assert.ok(!payload.error.message.includes('\\u{a}'), payload.error.message);
+});

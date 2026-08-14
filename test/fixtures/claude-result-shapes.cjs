@@ -23,6 +23,9 @@
 //                    turn 2 dies for an unrelated reason.
 //   exit_after_answer : answers, then dies while idle (no waiter).
 //   huge_errors    : an oversized `errors[]` entry.
+//   huge_subtype   : an oversized `subtype`.
+//   multiline_detail : a legitimate multi-line diagnostic.
+//   max_turns_mentioning_ede : an authoritative subtype whose text mentions EDE.
 //   persistent_stderr : accepts a persistent turn, then dies with sentinel stderr.
 //   stderr_only    : nothing on stdout, a sentinel on stderr, non-zero exit.
 //                    Those bytes are the operator's, not the client's.
@@ -97,6 +100,27 @@ function emit() {
     write({ type: 'result', subtype: 'error_max_turns', session_id: 'sentinel-session', total_cost_usd: 0.1 });
     return;
   }
+  if (shape === 'multiline_detail') {
+    // A legitimate multi-line diagnostic. JSON encodes newlines safely, so the
+    // client must receive the text, not escape notation.
+    write({ type: 'result', subtype: 'success', is_error: true, result: 'first line\nsecond line' });
+    return;
+  }
+  if (shape === 'huge_subtype') {
+    // `subtype` is runtime-supplied text too. Bounding only the detail leaves the
+    // other half of the composed message free to be any size.
+    write({ type: 'result', subtype: 'X'.repeat(9000), is_error: true });
+    return;
+  }
+  if (shape === 'max_turns_mentioning_ede') {
+    // An authoritative subtype whose diagnostic merely MENTIONS an execution
+    // error. The subtype is the answer; matching the text would retry it.
+    write({
+      type: 'result', subtype: 'error_max_turns',
+      errors: ['gave up after an earlier error_during_execution [ede_diagnostic]'],
+    });
+    return;
+  }
   if (shape === 'huge_errors') {
     // An upstream, gateway or hook can put arbitrary text in `errors[]`. Its size
     // is not theirs to choose for the client.
@@ -139,15 +163,29 @@ if (shape === 'stale_sentence') {
       const content = JSON.parse(line)?.message?.content;
       text = Array.isArray(content) ? content.map((b) => (b && b.type === 'text' ? b.text : '')).join('') : '';
     } catch { text = line; }
-    if (text.trim() === '/clear') return;
-    seen += 1;
-    if (seen === 1) {
-      process.stderr.write("There's an issue with the selected model (earlier-turn). Run --model to pick a different model.\n");
-      write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
+    // Answer `/clear`: the backend awaits it after every persistent turn, and an
+    // unanswered one blocks until the turn timeout.
+    if (text.trim() === '/clear') {
+      write({ type: 'result', subtype: 'success', is_error: false, result: 'cleared', usage: { input_tokens: 0, output_tokens: 0 } });
       return;
     }
-    process.stderr.write('UNRELATED_FAILURE disk full\n');
-    process.exit(7);
+    seen += 1;
+    if (seen === 1) {
+      // stdout FIRST, stderr after a delay. Two independent pipes with no
+      // ordering between them: the parent can resolve turn 1 and admit turn 2
+      // before this stderr arrives, which is exactly why clearing a receive
+      // buffer cannot draw a turn boundary.
+      write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
+      setTimeout(() => {
+        process.stderr.write("There's an issue with the selected model (earlier-turn). Run --model to pick a different model.\n");
+      }, 40);
+      return;
+    }
+    // Give the delayed stderr above time to land in the parent's buffer first.
+    setTimeout(() => {
+      process.stderr.write('UNRELATED_FAILURE disk full\n');
+      process.exit(7);
+    }, 60);
   });
   return;
 }
