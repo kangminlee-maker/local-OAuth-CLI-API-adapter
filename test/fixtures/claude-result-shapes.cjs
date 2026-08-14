@@ -24,6 +24,7 @@
 //   exit_after_answer : answers, then dies while idle (no waiter).
 //   huge_errors    : an oversized `errors[]` entry.
 //   huge_subtype   : an oversized `subtype`.
+//   huge_both      : both `subtype` and detail oversized.
 //   multiline_detail : a legitimate multi-line diagnostic.
 //   max_turns_mentioning_ede : an authoritative subtype whose text mentions EDE.
 //   persistent_stderr : accepts a persistent turn, then dies with sentinel stderr.
@@ -106,6 +107,12 @@ function emit() {
     write({ type: 'result', subtype: 'success', is_error: true, result: 'first line\nsecond line' });
     return;
   }
+  if (shape === 'huge_both') {
+    // Both halves oversized: bounding each component separately and composing
+    // afterwards would exceed the limit even though neither half did.
+    write({ type: 'result', subtype: 'S'.repeat(9000), is_error: true, result: 'D'.repeat(9000) });
+    return;
+  }
   if (shape === 'huge_subtype') {
     // `subtype` is runtime-supplied text too. Bounding only the detail leaves the
     // other half of the composed message free to be any size.
@@ -175,6 +182,9 @@ if (shape === 'stale_sentence') {
       // ordering between them: the parent can resolve turn 1 and admit turn 2
       // before this stderr arrives, which is exactly why clearing a receive
       // buffer cannot draw a turn boundary.
+      // A real successful turn emits assistant output first — that output is what
+      // proves the configured model ran.
+      assistant({}, 'OK');
       write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
       setTimeout(() => {
         process.stderr.write("There's an issue with the selected model (earlier-turn). Run --model to pick a different model.\n");
@@ -204,6 +214,7 @@ if (shape === 'exit_after_answer') {
     // Answer `/clear` too, so no waiter is left pending. Only then is the exit
     // below a genuinely idle one — with a waiter still attached the reject path
     // runs and the diagnostic comes along for free.
+    if (text.trim() !== '/clear') assistant({}, 'OK');
     write({ type: 'result', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1 } });
     if (text.trim() === '/clear') {
       setTimeout(() => {

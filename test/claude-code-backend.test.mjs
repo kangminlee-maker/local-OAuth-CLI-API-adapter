@@ -1087,7 +1087,7 @@ test('an oversized runtime diagnostic is bounded before it reaches the client', 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 600, `client message must be bounded, got ${err.message.length}`);
+        assert.ok(err.message.length <= 500, `client message must be bounded to 500, got ${err.message.length}`);
         assert.match(err.message, /error_during_execution/);
         return true;
       },
@@ -1118,10 +1118,14 @@ test('a runtime that cannot be spawned does not name its path to the client', as
         return true;
       },
     );
-    assert.ok(
-      written.some((l) => l.includes('claude process failure') && l.includes('ENOENT')),
-      `the operator must still see the real cause: ${JSON.stringify(written)}`,
+    // Exactly one: `error` and `close` both fire for a failed spawn, and the
+    // second says nothing the first did not.
+    assert.deepEqual(
+      written.filter((l) => l.includes('claude process failure')).length,
+      1,
+      `expected exactly one diagnostic: ${JSON.stringify(written)}`,
     );
+    assert.ok(written.some((l) => l.includes('ENOENT')), 'the real cause must be in it');
   } finally {
     process.stderr.write = originalWrite;
   }
@@ -1140,7 +1144,7 @@ test('an oversized subtype cannot bypass the client-message bound', async () => 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 600, `bound must cover the whole message, got ${err.message.length}`);
+        assert.ok(err.message.length <= 500, `bound must cover the whole message, got ${err.message.length}`);
         return true;
       },
     );
@@ -1223,19 +1227,138 @@ test('an intentional shutdown is not reported as a process failure', async () =>
   let backend = null;
   try {
     process.env.CLAUDE_TEST_RESULT_SHAPE = 'assistant_only';
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
     backend = new ClaudeCodeBackend({
       command: fakeClaude, cwd: process.cwd(), model: 'claude-opus-4-8', timeoutMs: 30_000,
     });
+    // Capture across the WHOLE lifecycle, not from just before close: a report
+    // emitted earlier would otherwise be invisible. `close()` awaits the child's
+    // exit, so no sleep is needed and none can hide a late write.
     await backend.generate(textRequest());
-    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
     await backend.close();
     backend = null;
-    await new Promise((resolve) => setTimeout(resolve, 150));
     assert.deepEqual(
       written.filter((l) => l.includes('claude process failure')),
       [],
       'closing the backend is not a failure',
     );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('the bound applies to the composed message, not to each half', async () => {
+  // Bounding subtype and detail separately would let their concatenation exceed
+  // the limit even though neither component did.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'huge_both';
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.ok(err.message.length <= 500, `composed message must be bounded, got ${err.message.length}`);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a persistent runtime that cannot be spawned synchronously stays operator-side too', async () => {
+  // The one-shot NUL test cannot reach `spawnChild`: asking for the configured
+  // model is what keeps a request on the persistent route.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    backend = new ClaudeCodeBackend({
+      command: `/operator/private/path/claude${String.fromCharCode(0)}x`,
+      cwd: process.cwd(), model: 'claude-retired', timeoutMs: 30_000, honorRequestModel: true,
+    });
+    await assert.rejects(
+      () => backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' }),
+      (err) => {
+        assert.ok(!err.message.includes('/operator/private/path'), `path leaked: ${err.message}`);
+        assert.match(err.message, /the local claude runtime failed to start/);
+        return true;
+      },
+    );
+    assert.ok(
+      written.some((l) => l.includes('claude process failure')),
+      `the operator must still see it: ${JSON.stringify(written)}`,
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+  }
+});
+
+test('a persistent child that has not answered yet can still be refused', async () => {
+  // The complement of the stale-sentence test: before any model output, a
+  // refusal on stderr is exactly what it looks like, and must still map to 404.
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  let backend = null;
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'plaintext_refusal';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    await assert.rejects(
+      () => backend.generate({ ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' }),
+      (err) => {
+        assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+        assert.equal(err.code, 'model_not_found');
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    await backend?.close();
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+  }
+});
+
+test('a backend used again after close still reports its new child\'s failures', async () => {
+  // `close()` clears the cached start, so a later request spawns a NEW child. If
+  // the shutdown flag belonged to the backend rather than to the child being
+  // terminated, that child's failures would be silently unreported forever.
+  const written = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  let backend = null;
+  try {
+    process.stderr.write = (chunk) => { written.push(String(chunk)); return true; };
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'persistent_stderr';
+    backend = new ClaudeCodeBackend({
+      command: resultShapes, cwd: process.cwd(), model: 'claude-retired',
+      timeoutMs: 30_000, honorRequestModel: true,
+    });
+    const request = { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' };
+    await assert.rejects(() => backend.generate(request));
+    const afterFirst = written.filter((l) => l.includes('claude process failure')).length;
+    assert.equal(afterFirst, 1, `expected one diagnostic for the first child, saw ${afterFirst}`);
+
+    await backend.close();
+    await assert.rejects(() => backend.generate(request));
+    const afterSecond = written.filter((l) => l.includes('claude process failure')).length;
+    assert.equal(afterSecond, 2, `the respawned child's failure must be reported too, saw ${afterSecond}`);
   } finally {
     process.stderr.write = originalWrite;
     await backend?.close();

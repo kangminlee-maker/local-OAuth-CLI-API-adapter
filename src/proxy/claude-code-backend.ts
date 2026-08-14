@@ -36,6 +36,8 @@ interface ClaudeCodeBackendOptions {
 interface ClaudeWaiter {
   readonly onTextDelta?: (delta: string) => void;
   text: string;
+  /** Set once the model has produced output of its own on this turn. */
+  sawModelOutput?: boolean;
   /**
    * The `error` of the last assistant message flagged `is_api_error_message`.
    * Claude Code 2.1.232 reports a refused model there — `"model_not_found"` —
@@ -221,11 +223,29 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.waiter?.reject(new Error('claude code backend closed'));
     this.waiter = null;
     this.lineReader?.close();
-    this.child?.kill('SIGTERM');
+    const child = this.child;
     this.child = null;
     this.lineReader = null;
     this.initialized = null;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    // Await the child's exit rather than only signalling it. Returning while it
+    // is still alive leaves its `close` handler to run afterwards, against a
+    // backend that has already moved on — and makes "was this shutdown reported?"
+    // unanswerable from the outside.
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        child.once('close', done);
+      }, CHILD_SHUTDOWN_GRACE_MS);
+      child.once('close', done);
+      child.kill('SIGTERM');
+    });
   }
+
 
   private async runRequest(
     request: NormalizedRequest,
@@ -426,6 +446,9 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.stderr = '';
     this.childAnswered = false;
     this.childFailureReported = false;
+    // Scoped to the child, not to the backend: `close()` clears `initialized`, so
+    // a later request spawns a new child, and that one's failures are news.
+    this.shuttingDown = false;
     // `spawn` throws synchronously for an empty or NUL-bearing command, and Node
     // puts the offending value in the message — the configured path. That throw
     // never reaches the `error` handler below, so it is caught here and given the
@@ -527,10 +550,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     if (message.type === 'result') {
       const waiter = this.waiter;
       this.waiter = null;
+      if (waiter.sawModelOutput) this.childAnswered = true;
       if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
         waiter.reject(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
       } else if (message.subtype === 'success' && message.is_error !== true) {
-        this.childAnswered = true;
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
           structuredOutput: message.structured_output ?? waiter.structuredOutput,
@@ -553,6 +576,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     // Evaluated unconditionally: a child that dies while idle has no waiter, and
     // `this.waiter?.reject(f(...))` would skip the call — and the diagnostic with
     // it. This is the only record of why the runtime went away.
+    if (this.waiter?.sawModelOutput) this.childAnswered = true;
     const report = !this.childFailureReported && !this.shuttingDown;
     this.childFailureReported = true;
     const failure = claudeProcessFailure(err, this.stderr, publicMessage, {
@@ -777,6 +801,12 @@ function consumeClaudeMessage(waiter: ClaudeWaiter, message: JsonObject): void {
   if (message.type === 'assistant') {
     if (message.is_api_error_message === true && typeof message.error === 'string') {
       waiter.apiErrorKind = message.error;
+    } else {
+      // Assistant output IS the proof that the configured model ran. Waiting for
+      // the turn to resolve would miss a turn that produced text and then failed,
+      // and would count a locally answered `/clear` — which names no model — as
+      // proof.
+      waiter.sawModelOutput = true;
     }
     const msg = asRecord(message.message);
     const content = Array.isArray(msg?.content) ? msg.content : [];
@@ -872,6 +902,8 @@ const TRUNCATION_MARKER = '...[truncated]';
 // Long enough for the CLI's refusal sentence and a model name; short enough that
 // a hostile value cannot flood an operator's log from one request.
 const MAX_LOG_LINE_CHARS = 500;
+// A terminating child gets this long to exit before it is killed outright.
+const CHILD_SHUTDOWN_GRACE_MS = 2_000;
 
 /**
  * A failed turn as an error: the kind it reports, and the runtime's own words
@@ -882,7 +914,9 @@ const MAX_LOG_LINE_CHARS = 500;
  * and usage. Only fields documented to hold a diagnostic are read (`result`,
  * `error`, `errors[]`), and they are bounded: `errors[]` in particular is
  * unrestricted text that an upstream, a gateway or a hook can fill, so its size
- * is not theirs to choose. The full text still reaches the operator.
+ * is not theirs to choose. The operator gets it too — flattened and bounded to
+ * the same limit, not in full: one line per failed request is a channel a
+ * client can drive, so no length here is the operator's to choose either.
  */
 function claudeTurnFailure(message: JsonObject): ClaudeTurnError {
   const subtype = typeof message.subtype === 'string' && message.subtype !== 'success'
