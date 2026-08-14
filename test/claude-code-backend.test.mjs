@@ -621,6 +621,42 @@ test('honorRequestModel on: a 404 result with no structured error is still a 404
   );
 });
 
+test('honorRequestModel on: the 2.1.232 refusal is a 404 on the persistent route too', async () => {
+  // The one-shot test above cannot reach `handlePersistentLine`, because forcing
+  // a different model is what sends a request one-shot. Configure and request the
+  // same model so the persistent route runs, and use the fixture whose text
+  // matches neither pattern — only the structured assistant-event signal, carried
+  // across to the result event and tagged on the way out, can produce this 404.
+  const argvLog = join(await mkdtemp(join(tmpdir(), 'claude-argv-')), 'argv.log');
+  const previousLog = process.env.CLAUDE_TEST_ARGV_LOG;
+  process.env.CLAUDE_TEST_ARGV_LOG = argvLog;
+  try {
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        { ...anthropicTuningRequest({ model: 'claude-retired' }), shape: 'openai-chat' },
+        'claude-retired',
+        { honorRequestModel: true, command: rejectModel232 },
+      ),
+      (err) => {
+        assert.equal(err.statusCode, 404, `expected 404, got: ${err.message}`);
+        assert.equal(err.code, 'model_not_found');
+        assert.equal(err.param, 'model');
+        return true;
+      },
+    );
+    // Confirms the route rather than assuming it: the one-shot path passes the
+    // prompt as an argument, the persistent one never does.
+    const argv = JSON.parse((await readFile(argvLog, 'utf8')).trim().split('\n')[0]);
+    assert.ok(
+      !argv.some((arg) => arg.includes('Say OK')),
+      `expected the persistent route (no prompt argument): ${argv.join(' ')}`,
+    );
+  } finally {
+    if (previousLog === undefined) delete process.env.CLAUDE_TEST_ARGV_LOG;
+    else process.env.CLAUDE_TEST_ARGV_LOG = previousLog;
+  }
+});
+
 test('honorRequestModel off: a CLI model refusal stays a server-side failure', async () => {
   // With honouring off the model came from local configuration, not the client,
   // so it must not be reported as a client-side not-found.

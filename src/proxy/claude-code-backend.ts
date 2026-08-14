@@ -36,6 +36,13 @@ interface ClaudeCodeBackendOptions {
 interface ClaudeWaiter {
   readonly onTextDelta?: (delta: string) => void;
   text: string;
+  /**
+   * The `error` of the last assistant message flagged `is_api_error_message`.
+   * Claude Code 2.1.232 reports a refused model there — `"model_not_found"` —
+   * and leaves the field off the result event, where 2.1.231 had put it. The
+   * result event is what settles the turn, so the kind has to be carried across.
+   */
+  apiErrorKind?: string;
   structuredOutput: unknown;
   usage: unknown;
   resolve: (value: ClaudeTurnResult) => void;
@@ -478,7 +485,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     if (message.type === 'result') {
       const waiter = this.waiter;
       this.waiter = null;
-      if (message.subtype === 'success' && isClaudeModelRejectionResult(message)) {
+      if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
         waiter.reject(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
       } else if (message.subtype === 'success') {
         waiter.resolve({
@@ -641,7 +648,7 @@ function runClaudeProcess(
         if (!message) continue;
         consumeClaudeMessage(waiter, message);
         if (message.type === 'result') {
-          if (message.subtype === 'success' && isClaudeModelRejectionResult(message)) {
+          if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
             finish(new ClaudeModelRejectionError(typeof message.result === 'string' ? message.result : 'model rejected'));
           } else if (message.subtype === 'success') {
             finish(undefined, {
@@ -686,6 +693,9 @@ function consumeClaudeMessage(waiter: ClaudeWaiter, message: JsonObject): void {
     return;
   }
   if (message.type === 'assistant') {
+    if (message.is_api_error_message === true && typeof message.error === 'string') {
+      waiter.apiErrorKind = message.error;
+    }
     const msg = asRecord(message.message);
     const content = Array.isArray(msg?.content) ? msg.content : [];
     const text = content.map((part) => {
@@ -768,9 +778,17 @@ function isClaudeModelRejection(err: Error): boolean {
  * with the refusal sentence as the assistant's answer. The English text stays as
  * a last resort for a report that carries neither field.
  */
-function isClaudeModelRejectionResult(message: JsonObject): boolean {
+function isClaudeModelRejectionResult(message: JsonObject, waiter: ClaudeWaiter): boolean {
+  // 2.1.232: on the assistant message, carried here by `consumeClaudeMessage`.
+  if (waiter.apiErrorKind === 'model_not_found') return true;
+  // 2.1.231: on the result event itself.
   if (message.error === 'model_not_found') return true;
-  if (message.api_error_status === 404) return true;
+  // Neither field present. A 404 alone is not enough: the CLI's own settings can
+  // route it through an operator-run gateway, and a 404 from there is the
+  // operator's to fix, not a model the client should stop asking for. Pair it
+  // with the refusal sentence, accepting that a rewording of that sentence costs
+  // this last-resort branch and nothing else.
+  if (message.api_error_status !== 404) return false;
   const text = typeof message.result === 'string' ? message.result : '';
   return /issue with the selected model/i.test(text);
 }
