@@ -1407,6 +1407,10 @@ function parseMultipartFormData(
   // segments[0] is the preamble before the opening boundary; each later one is
   // a complete part, `headers\r\n\r\ncontent`, its delimiter CRLFs consumed.
   for (const part of segments.slice(1)) {
+    // An empty header block ends at the part's very first CRLF — searching
+    // for CRLFCRLF from the top read the CONTENT as headers when the block
+    // was empty.
+    if (part.startsWith('\r\n')) continue;
     const headerEnd = part.indexOf('\r\n\r\n');
     if (headerEnd === -1) continue;
     const rawHeaders = part.slice(0, headerEnd);
@@ -1440,7 +1444,20 @@ function multipartBoundary(contentType: string): string | null {
   const params: string[] = [];
   let current = '';
   let inQuotes = false;
+  let escaped = false;
   for (const ch of contentType.slice(semi + 1)) {
+    if (escaped) {
+      // A quoted-pair: the escaped character is literal — `\"` neither closes
+      // the quote nor `\;` separates.
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (inQuotes && ch === '\\') {
+      current += ch;
+      escaped = true;
+      continue;
+    }
     if (ch === '"') inQuotes = !inQuotes;
     if (ch === ';' && !inQuotes) {
       params.push(current);
@@ -1453,14 +1470,16 @@ function multipartBoundary(contentType: string): string | null {
   for (const param of params) {
     const eq = param.indexOf('=');
     if (eq === -1) continue;
-    if (param.slice(0, eq).trim().toLowerCase() !== 'boundary') continue;
-    let value = param.slice(eq + 1).trim();
+    // OWS only — String.trim also eats U+00A0, which under latin1 header
+    // decoding is a real byte and NOT in the boundary alphabet.
+    if (stripOws(param.slice(0, eq)).toLowerCase() !== 'boundary') continue;
+    let value = stripOws(param.slice(eq + 1));
     if (value.startsWith('"')) {
       // A quoted value is the WHOLE value; a suffix after the closing quote is
-      // malformed, not ignorable.
-      const quoted = /^"([^"]*)"$/.exec(value);
+      // malformed, not ignorable. Quoted-pairs decode: `"B\?"` names `B?`.
+      const quoted = /^"((?:[^"\\]|\\.)*)"$/.exec(value);
       if (!quoted) return null;
-      value = quoted[1] ?? '';
+      value = (quoted[1] ?? '').replace(/\\(.)/g, '$1');
     }
     // RFC 2046 bchars: 1-70 characters from a fixed alphabet, the last not a
     // space.

@@ -1618,7 +1618,7 @@ test('a close-delimiter PREFIX is data too: later parts survive it', async () =>
 
 // --- round 50 ---
 
-async function rawMultipart(bodyLines, boundaryParam, path = '/v1/images/generations') {
+async function rawMultipart(bodyLines, paramTail, path = '/v1/images/generations') {
   const started = await startLocalApiProxy({
     backend: imageBackend(), imageGenerationClient: imageBackend(),
     host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
@@ -1629,7 +1629,7 @@ async function rawMultipart(bodyLines, boundaryParam, path = '/v1/images/generat
     return await new Promise((resolve, reject) => {
       const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.from(
         `POST ${path} HTTP/1.1\r\nHost: h\r\n`
-        + `Content-Type: multipart/form-data; boundary=${boundaryParam}\r\n`
+        + `Content-Type: multipart/form-data; ${paramTail}\r\n`
         + `Content-Length: ${Buffer.byteLength(body, 'latin1')}\r\nConnection: close\r\n\r\n${body}`,
         'latin1',
       )));
@@ -1651,19 +1651,19 @@ test('a folded Content-Disposition header still names its part', async () => {
     '--AaB03x', 'Content-Disposition: form-data;', ' name="model"', '', 'dall-e-2',
     '--AaB03x', 'Content-Disposition: form-data;', '\tname="image"; filename="x.png"', 'Content-Type: image/png', '', png,
     '--AaB03x--', '',
-  ], 'AaB03x', '/v1/images/variations');
+  ], 'boundary=AaB03x', '/v1/images/variations');
   assert.match(status, /200/, status);
 });
 
 test('boundary grammar is enforced: empty and trailing-space boundaries are 400', async () => {
   const empty = await rawMultipart([
     '--""', 'Content-Disposition: form-data; name="prompt"', '', 'a dot', '--""--', '',
-  ], '""');
+  ], 'boundary=""');
   assert.match(empty, /400/, `an empty boundary is not a boundary: ${empty}`);
 
   const trailing = await rawMultipart([
     '--B ', 'Content-Disposition: form-data; name="prompt"', '', 'a dot', '--B --', '',
-  ], '"B "');
+  ], 'boundary="B "');
   assert.match(trailing, /400/, `a boundary may not end in a space: ${trailing}`);
 });
 
@@ -1672,7 +1672,7 @@ test('a quoted boundary parameter is accepted', async () => {
     '--AaB03x', 'Content-Disposition: form-data; name="model"', '', 'image-2',
     '--AaB03x', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--AaB03x--', '',
-  ], '"AaB03x"');
+  ], 'boundary="AaB03x"');
   assert.match(status, /200/, status);
 });
 
@@ -1712,6 +1712,70 @@ test('a quoted boundary with a trailing suffix is malformed, not truncated', asy
     '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
     '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--B--', '',
-  ], '"B"junk');
+  ], 'boundary="B"junk');
   assert.match(status, /400/, `"B"junk is not a boundary parameter: ${status}`);
+});
+
+// --- round 52 ---
+
+test('an empty header block does not read the content as headers', async () => {
+  // `--B\r\n\r\n<content>` has NO headers; the parser searched for CRLFCRLF
+  // from the top and promoted content lines to headers, conjuring a
+  // disposition the part never had.
+  const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
+  const status = await rawMultipart([
+    '--B', '', 'Content-Disposition: form-data; name="image"; filename="x.png"', 'Content-Type: image/png', '', png,
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B--', '',
+  ], 'boundary=B', '/v1/images/variations');
+  assert.match(status, /400/, `a headerless part names nothing — the image is missing: ${status}`);
+});
+
+test('an escaped quote inside another parameter does not derail the boundary walk', async () => {
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    '--B--', '',
+  ], 'note="x\\";boundary=decoy"; boundary=B', '/v1/images/generations');
+  assert.match(status, /200/, `the quoted-pair keeps the decoy quoted: ${status}`);
+});
+
+test('a quoted-pair in the boundary value decodes', async () => {
+  const status = await rawMultipart([
+    '--B?', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B?', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    '--B?--', '',
+  ], 'boundary="B\\?"', '/v1/images/generations');
+  assert.match(status, /200/, `"B\\?" names B?: ${status}`);
+});
+
+test('a non-OWS byte beside the boundary value is not trimmed away', async () => {
+  // U+00A0 under latin1 decoding is a real byte outside the boundary alphabet;
+  // String.trim ate it and accepted the remainder.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = [
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+      '--B--', '',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
+        Buffer.from('POST /v1/images/generations HTTP/1.1\r\nHost: h\r\nContent-Type: multipart/form-data; boundary=B'),
+        Buffer.from([0xa0]),
+        Buffer.from(`\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`),
+      ])));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+    assert.match(raw, /400/, `B<0xA0> is outside the boundary grammar: ${raw}`);
+  } finally {
+    await started.close();
+  }
 });
