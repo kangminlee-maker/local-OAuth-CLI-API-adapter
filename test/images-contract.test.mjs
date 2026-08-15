@@ -1929,3 +1929,57 @@ test('a non-OWS byte in a part-header name or value is not trimmed away', async 
     await started.close();
   }
 });
+
+// --- round 56 ---
+
+test('a malformed disposition type does not name a part', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = Buffer.concat([
+      Buffer.from('--B\r\nContent-Disposition:', 'latin1'),
+      Buffer.from([0xa0]),
+      Buffer.from(
+        'form-data; name="prompt"\r\n\r\na dot\r\n'
+        + '--B\r\nContent-Disposition: form-data; name="model"\r\n\r\nimage-2\r\n--B--\r\n', 'latin1'),
+    ]);
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
+        Buffer.from(
+          'POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n'
+          + 'Content-Type: multipart/form-data; boundary=B\r\n'
+          + `Content-Length: ${body.byteLength}\r\nConnection: close\r\n\r\n`, 'latin1'),
+        body,
+      ])));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+    assert.match(raw, /400/, `<0xA0>form-data is not the form-data type — the prompt is missing: ${raw}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('a non-OWS byte inside a data-URL media type is not repaired away', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit',
+    image: `data:\u00a0image/png;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+  });
+  assert.equal(status, 400, 'the malformed token must not become image/png');
+});
+
+test('delimiter-looking bytes in the epilogue are ignored', async () => {
+  // After a valid close delimiter the scanner must STOP: an epilogue carrying
+  // `\r\n--B\r\n...` shaped bytes is not more parts.
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    '--B--', '--B', 'Content-Disposition: form-data; name="n"', '', '11', '--B--', '',
+  ], 'boundary=B', '/v1/images/generations');
+  assert.match(status, /200/, `the fake n=11 part lives in the epilogue and must be ignored: ${status}`);
+});

@@ -773,7 +773,10 @@ function imageSourceFromUrlLike(
   const dataUrl = /^data:([^;,]+);base64,(.*)$/s.exec(url);
   if (dataUrl) {
     // Media-type tokens are case-insensitive; `data:IMAGE/PNG` is a PNG.
-    const mediaType = (dataUrl[1]?.trim() || 'image/png').toLowerCase();
+    // The media-type token is FRAMING: per the whitespace doctrine, only
+    // ASCII OWS strips. A 0xA0 byte keeps the token malformed rather than
+    // being repaired into `image/png`.
+    const mediaType = (stripOws(dataUrl[1] ?? '') || 'image/png').toLowerCase();
     const data = dataUrl[2]?.replace(/\s/g, '') ?? '';
     if (!mediaType.startsWith('image/') || !data) return null;
     return {
@@ -1522,8 +1525,13 @@ function parseContentDisposition(value: string | undefined): {
   readonly filename?: string;
 } {
   if (!value) return {};
+  const segments = splitHeaderParameters(value);
+  // The disposition TYPE is the first segment and must be `form-data` (OWS
+  // only; a 0xA0 byte keeps it malformed). It was skipped unexamined, so any
+  // junk type still named a part.
+  if (stripOws(segments[0] ?? '').toLowerCase() !== 'form-data') return {};
   const out: Record<string, string> = {};
-  for (const part of splitHeaderParameters(value).slice(1)) {
+  for (const part of segments.slice(1)) {
     const index = part.indexOf('=');
     if (index === -1) continue;
     // Parameter names are case-insensitive; `NAME="image"` names the part.
