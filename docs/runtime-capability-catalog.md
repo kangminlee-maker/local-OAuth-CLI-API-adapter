@@ -382,7 +382,7 @@ parse probe로 등록이 확인된 그 밖의 hidden flag:
 | Flag | Accepts | Adapter relevance |
 | --- | --- | --- |
 | `--teammate-mode` | `auto`, `tmux`, `iterm2`, `in-process` | 없음; agent-team UX |
-| `--max-thinking-tokens` | 수 | 없음; `--thinking`으로 대체됨 |
+| `--max-thinking-tokens` | 수 | 런타임 무력 확인: 직접 API가 거부할 값(100, 10^7)도 thinking이 켜진 채 실행된다(`MAX_THINKING_TOKENS` 변수도 동일). adapter는 `thinking.budget_tokens`를 parity 검증만 하고 전달하지 않는다 — 계약 문서 `thinking` 행에 기록 |
 | `--managed-settings`, `--parent-session-id`, `--plan-mode-instructions`, `--prefill`, `--prefill-b64` | 값 flag | 없음; drift 추적용 |
 | `--system-prompt-file`, `--append-system-prompt-file` | 파일 경로 | 없음; adapter는 인라인 `--system-prompt` 사용 |
 | `--resume-session-at` | `--resume`와 함께만 유효 | 없음 |

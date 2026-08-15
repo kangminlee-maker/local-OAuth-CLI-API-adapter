@@ -245,8 +245,15 @@ function readAnthropicThinking(value: unknown, maxTokens: number): NormalizedThi
     );
   }
   // The `enabled` variant requires budget_tokens: ≥ 1024 and less than
-  // max_tokens, per the direct schema.
-  let budgetTokens: number | undefined;
+  // max_tokens, per the direct schema. The number is validated for parity and
+  // then deliberately NOT carried on the normalized request: no backend
+  // consumes it. The local runtime governs its own thinking budget — the
+  // pinned CLI registers numeric budget controls (`--max-thinking-tokens`,
+  // the `MAX_THINKING_TOKENS` variable) but both are inert at runtime, probed
+  // with values the direct API would reject (100 and 10^7) executing while
+  // thinking engages. Carrying the number would let a mock assert a delivery
+  // no real backend performs; the contract's `thinking` row documents the
+  // divergence instead.
   if (type === 'enabled') {
     const budget = thinking.budget_tokens;
     if (typeof budget !== 'number' || !Number.isInteger(budget)) {
@@ -266,14 +273,12 @@ function readAnthropicThinking(value: unknown, maxTokens: number): NormalizedThi
         'anthropic',
       );
     }
-    budgetTokens = budget;
   }
   return {
     type,
     display: type !== 'disabled' && (display === 'summarized' || display === 'omitted')
       ? display
       : undefined,
-    ...(budgetTokens !== undefined ? { budgetTokens } : {}),
   };
 }
 

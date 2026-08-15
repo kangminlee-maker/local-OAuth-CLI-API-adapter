@@ -14,9 +14,10 @@ export type NormalizedAnthropicEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'm
 export interface NormalizedThinking {
   readonly type: 'adaptive' | 'enabled' | 'disabled';
   readonly display?: 'summarized' | 'omitted';
-  // Required by the direct API's `enabled` variant; carried so a backend that
-  // can honor it has the number the client chose.
-  readonly budgetTokens?: number;
+  // budget_tokens is validated by the normalizer and deliberately not carried:
+  // no backend consumes it — the local runtime governs its own thinking
+  // budget, and the pinned CLI's numeric budget controls are inert at runtime.
+  // The contract's `thinking` row documents the divergence.
 }
 
 export interface NormalizedMessage {

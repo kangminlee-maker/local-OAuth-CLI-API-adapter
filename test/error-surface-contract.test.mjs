@@ -1998,7 +1998,13 @@ test('/v1/messages: a refusal without runtime details gets the synthesized stop_
 
 // --- round 45 coverage ---
 
-test('the validated thinking budget reaches the backend intact', async () => {
+test('the thinking budget is validated, then deliberately not delivered', async () => {
+  // The earlier version of this pin asserted the budget "reaches the backend
+  // intact" — delivery to a MOCK, while no real backend consumes the field
+  // and the pinned CLI's numeric budget controls are inert at runtime (values
+  // the direct API rejects execute while thinking engages). The divergence is
+  // documented in the contract's `thinking` row; this pin now asserts the
+  // normalized request carries nothing a backend does not consume.
   let seen;
   const backend = {
     name: 'test', model: 'configured-model',
@@ -2011,7 +2017,7 @@ test('the validated thinking budget reaches the backend intact', async () => {
     thinking: { type: 'enabled', budget_tokens: 4096 },
   });
   assert.equal(status, 200);
-  assert.equal(seen?.budgetTokens, 4096, 'the exact client-chosen budget must be delivered');
+  assert.deepEqual(seen, { type: 'enabled', display: undefined });
 });
 
 test('an Anthropic stream carries its model only in message_start', async () => {
