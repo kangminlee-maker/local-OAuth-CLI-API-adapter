@@ -779,12 +779,17 @@ function imageSourceFromUrlLike(
     // No default: the regex requires at least one media-type character, so an
     // empty capture is impossible and an OWS-only one is present junk — the
     // `|| 'image/png'` fallback was REPAIRING `data: \t;base64,...`.
-    const mediaType = stripOws(dataUrl[1] ?? '').toLowerCase();
+    const rawMediaType = stripOws(dataUrl[1] ?? '');
     const data = dataUrl[2]?.replace(/\s/g, '') ?? '';
-    // The WHOLE token must be image/<subtype-token> under the RFC 2045 token
-    // grammar: every CHAR except SPACE, CTLs and tspecials — which PERMITS
+    // Validate BEFORE case-folding: RFC 2045 tokens are US-ASCII, and
+    // JavaScript toLowerCase folds Unicode — U+212A KELVIN SIGN became `k`,
+    // admitting a subtype the grammar excludes. The class carries A-Z itself.
+    // Grammar: every CHAR except SPACE, CTLs and tspecials — which PERMITS
     // `{}` (the HTTP tchar class wrongly rejected `image/x-{foo}`).
-    if (!/^image\/[0-9a-z!#$%&'*+\-.^_\`{|}~]+$/.test(mediaType) || !data) return null;
+    if (!/^[Ii][Mm][Aa][Gg][Ee]\/[0-9A-Za-z!#$%&'*+\-.^_\`{|}~]+$/.test(rawMediaType) || !data) {
+      return null;
+    }
+    const mediaType = rawMediaType.toLowerCase();
     return {
       source: { type: 'base64', mediaType, data },
     };

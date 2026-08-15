@@ -2011,3 +2011,31 @@ test('a whitespace-only data-URL media type is junk, not image/png', async () =>
   });
   assert.equal(status, 400, 'OWS-only content must not be repaired into a default');
 });
+
+// --- round 59 ---
+
+test('Unicode case-folding cannot smuggle a non-ASCII subtype', async () => {
+  // U+212A KELVIN SIGN folds to ASCII k; RFC 2045 tokens are US-ASCII, so the
+  // validation must see the ORIGINAL character and reject it.
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit',
+    image: `data:image/\u212a;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+  });
+  assert.equal(status, 400, 'KELVIN SIGN is not an ASCII token character');
+});
+
+test('an ASCII tspecial in the subtype is rejected', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit',
+    image: `data:image/png?x;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+  });
+  assert.equal(status, 400, '? is a tspecial and ends no token');
+});
+
+test('an uppercase ASCII subtype still folds and passes', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit',
+    image: `data:IMAGE/PNG;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+  });
+  assert.equal(status, 200, 'ASCII case-insensitivity is preserved');
+});
