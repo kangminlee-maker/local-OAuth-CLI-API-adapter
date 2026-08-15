@@ -1675,3 +1675,43 @@ test('a quoted boundary parameter is accepted', async () => {
   ], '"AaB03x"');
   assert.match(status, /200/, status);
 });
+
+// --- round 51 ---
+
+test('a decoy boundary inside another quoted parameter is text', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = [
+      '--real', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--real', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+      '--real--', '',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.from(
+        `POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n`
+        + `Content-Type: multipart/form-data; note="x;boundary=decoy"; boundary=real\r\n`
+        + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+      )));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+    assert.match(raw, /200/, `the parameter NAMED boundary must win: ${raw}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('a quoted boundary with a trailing suffix is malformed, not truncated', async () => {
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    '--B--', '',
+  ], '"B"junk');
+  assert.match(status, /400/, `"B"junk is not a boundary parameter: ${status}`);
+});

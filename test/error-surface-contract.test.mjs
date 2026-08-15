@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import http from 'node:http';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { unsupportedModelError } from '../dist/proxy/types.js';
+import { LocalCliChatError } from '../dist/chat/types.js';
 
 // What a client actually receives when something goes wrong, per surface. These
 // are HTTP-level: the backends have their own tests, but the contract promises a
@@ -2030,3 +2031,25 @@ test('an Anthropic stream carries its model only in message_start', async () => 
   }
 });
 
+
+test('an oversized native error message is bounded like every other surface', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    chatSessionManager: {
+      async create() { throw new LocalCliChatError('N'.repeat(900), 502, 'runtime_failed'); },
+      async closeAll() {},
+    },
+  });
+  try {
+    const res = await fetch(`${started.url}/local/cli/sessions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.equal(body.error.type, 'local_cli_chat_error');
+    assert.ok(body.error.message.length <= 500, `bounded, got ${body.error.message.length}`);
+    assert.ok(body.error.message.endsWith('...[truncated]'), body.error.message.slice(-20));
+  } finally {
+    await started.close();
+  }
+});

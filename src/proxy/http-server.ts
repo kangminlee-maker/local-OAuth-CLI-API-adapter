@@ -1430,16 +1430,46 @@ function parseMultipartFormData(
 }
 
 function multipartBoundary(contentType: string): string | null {
-  const match = /(?:^|;)\s*boundary=(?:"([^"]*)"|([^;]+))/i.exec(contentType);
-  const candidate = match?.[1] ?? match?.[2]?.trim() ?? null;
-  if (candidate === null) return null;
-  // RFC 2046 bchars: 1-70 characters from a fixed alphabet, the last not a
-  // space. `boundary=""` used to slip through as the two literal quote bytes,
-  // and a trailing-space boundary was matched verbatim.
-  if (!/^[0-9A-Za-z'()+_,\-./:=? ]{0,69}[0-9A-Za-z'()+_,\-./:=?]$/.test(candidate)) {
-    return null;
+  // Parameters are walked with quote awareness: a `;` inside a quoted value
+  // does not separate, and `boundary=` inside ANOTHER parameter's quoted value
+  // is text — the naive regex picked a decoy out of `note="x;boundary=bogus"`
+  // and stopped at the closing quote of `boundary="B"junk`, silently accepting
+  // a malformed parameter.
+  const semi = contentType.indexOf(';');
+  if (semi === -1) return null;
+  const params: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (const ch of contentType.slice(semi + 1)) {
+    if (ch === '"') inQuotes = !inQuotes;
+    if (ch === ';' && !inQuotes) {
+      params.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
   }
-  return candidate;
+  params.push(current);
+  for (const param of params) {
+    const eq = param.indexOf('=');
+    if (eq === -1) continue;
+    if (param.slice(0, eq).trim().toLowerCase() !== 'boundary') continue;
+    let value = param.slice(eq + 1).trim();
+    if (value.startsWith('"')) {
+      // A quoted value is the WHOLE value; a suffix after the closing quote is
+      // malformed, not ignorable.
+      const quoted = /^"([^"]*)"$/.exec(value);
+      if (!quoted) return null;
+      value = quoted[1] ?? '';
+    }
+    // RFC 2046 bchars: 1-70 characters from a fixed alphabet, the last not a
+    // space.
+    if (!/^[0-9A-Za-z'()+_,\-./:=? ]{0,69}[0-9A-Za-z'()+_,\-./:=?]$/.test(value)) {
+      return null;
+    }
+    return value;
+  }
+  return null;
 }
 
 function multipartHeaders(raw: string): Record<string, string> {
