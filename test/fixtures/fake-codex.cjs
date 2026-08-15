@@ -320,7 +320,19 @@ function assertNoDirectProviderEnv() {
 }
 
 function debugPayload() {
+  // cwd and the files visible there let a test PROVE ambient isolation end to
+  // end: the thread must run in the isolated temp workspace, not the caller's.
+  let cwdFiles = null;
+  try {
+    cwdFiles = lastThreadStartParams?.cwd
+      ? require('node:fs').readdirSync(lastThreadStartParams.cwd)
+      : null;
+  } catch {
+    cwdFiles = ['<unreadable>'];
+  }
   return {
+    threadCwd: lastThreadStartParams?.cwd ?? null,
+    threadCwdFiles: cwdFiles,
     threadStart: pick(lastThreadStartParams, [
       'baseInstructions',
       'developerInstructions',
