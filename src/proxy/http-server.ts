@@ -1509,7 +1509,10 @@ function multipartHeaders(raw: string): Record<string, string> {
   for (const line of unfolded.split('\r\n')) {
     const index = line.indexOf(':');
     if (index === -1) continue;
-    out[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
+    // OWS only, the multipart path's LAST remaining String.trim: a 0xA0 byte
+    // beside a field name or value is a real byte that makes the header
+    // malformed, not whitespace to forgive.
+    out[stripOws(line.slice(0, index)).toLowerCase()] = stripOws(line.slice(index + 1));
   }
   return out;
 }

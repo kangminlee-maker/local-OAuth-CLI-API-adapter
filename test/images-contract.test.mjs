@@ -1885,3 +1885,47 @@ test('a non-OWS byte before a disposition parameter name is not trimmed away', a
     await started.close();
   }
 });
+
+// --- round 55 ---
+
+test('a non-OWS byte in a part-header name or value is not trimmed away', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  const send = async (dispositionBytes) => {
+    const body = Buffer.concat([
+      Buffer.from('--B\r\n', 'latin1'),
+      dispositionBytes,
+      Buffer.from('\r\n\r\na dot\r\n--B\r\nContent-Disposition: form-data; name="model"\r\n\r\nimage-2\r\n--B--\r\n', 'latin1'),
+    ]);
+    return await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
+        Buffer.from(
+          'POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n'
+          + 'Content-Type: multipart/form-data; boundary=B\r\n'
+          + `Content-Length: ${body.byteLength}\r\nConnection: close\r\n\r\n`, 'latin1'),
+        body,
+      ])));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+  };
+  try {
+    const nameByte = await send(Buffer.concat([
+      Buffer.from('Content-Disposition', 'latin1'), Buffer.from([0xa0]),
+      Buffer.from(': form-data; name="prompt"', 'latin1'),
+    ]));
+    assert.match(nameByte, /400/, `Content-Disposition<0xA0> is not that header: ${nameByte}`);
+
+    const valueByte = await send(Buffer.concat([
+      Buffer.from('Content-Disposition: form-data; name="prompt"', 'latin1'), Buffer.from([0xa0]),
+    ]));
+    assert.match(valueByte, /400/, `a trailing 0xA0 keeps the value malformed: ${valueByte}`);
+  } finally {
+    await started.close();
+  }
+});
