@@ -772,7 +772,8 @@ function imageSourceFromUrlLike(
   if (!url) return null;
   const dataUrl = /^data:([^;,]+);base64,(.*)$/s.exec(url);
   if (dataUrl) {
-    const mediaType = dataUrl[1]?.trim() || 'image/png';
+    // Media-type tokens are case-insensitive; `data:IMAGE/PNG` is a PNG.
+    const mediaType = (dataUrl[1]?.trim() || 'image/png').toLowerCase();
     const data = dataUrl[2]?.replace(/\s/g, '') ?? '';
     if (!mediaType.startsWith('image/') || !data) return null;
     return {
@@ -1371,22 +1372,44 @@ function parseMultipartFormData(
   if (!boundary) throw new ProxyRequestError('multipart/form-data boundary is required.', 400);
   const output: Record<string, unknown> = {};
   const binary = body.toString('latin1');
-  // A boundary DELIMITS only at the start of a line (RFC 2046: preceded by
-  // CRLF). Splitting on the bare marker treated the same bytes INSIDE a field
-  // value — or inside an uploaded file — as a delimiter, silently truncating
-  // the data. Prepending CRLF gives the opening boundary the same shape as
-  // every later one.
-  const parts = `\r\n${binary}`.split(`\r\n--${boundary}`);
-  parts.shift();
-  for (const rawPart of parts) {
-    if (!rawPart || rawPart === '--\r\n' || rawPart === '--') continue;
-    const part = rawPart.startsWith('\r\n') ? rawPart.slice(2) : rawPart;
-    if (part.startsWith('--')) continue;
+  // A boundary DELIMITS only when the whole delimiter line matches (RFC
+  // 2046): at the start of a line AND terminated by optional whitespace plus
+  // CRLF, or by `--` for the close. Bare splitting truncated data twice —
+  // first on mid-line marker bytes, then on line-starting PREFIXES
+  // (`--BX` where the boundary is `B` is data, because `X` terminates
+  // nothing). A scanner checks both sides of every candidate.
+  const source = `\r\n${binary}`;
+  const marker = `\r\n--${boundary}`;
+  const segments: string[] = [];
+  let start = 0;
+  let cursor = 0;
+  let closed = false;
+  while (!closed) {
+    const at = source.indexOf(marker, cursor);
+    if (at === -1) break;
+    const rest = source.slice(at + marker.length);
+    const delimiter = /^[ \t]*\r\n/.exec(rest);
+    if (delimiter) {
+      segments.push(source.slice(start, at));
+      cursor = at + marker.length + delimiter[0].length;
+      start = cursor;
+    } else if (rest.startsWith('--')) {
+      segments.push(source.slice(start, at));
+      closed = true;
+    } else {
+      // A prefix of real data — keep scanning past it.
+      cursor = at + marker.length;
+    }
+  }
+  // segments[0] is the preamble before the opening boundary; each later one is
+  // a complete part, `headers\r\n\r\ncontent`, its delimiter CRLFs consumed.
+  for (const part of segments.slice(1)) {
     const headerEnd = part.indexOf('\r\n\r\n');
     if (headerEnd === -1) continue;
     const rawHeaders = part.slice(0, headerEnd);
-    let rawContent = part.slice(headerEnd + 4);
-    if (rawContent.endsWith('\r\n')) rawContent = rawContent.slice(0, -2);
+    // The delimiter's CRLF was consumed by the scanner, so the content is
+    // exactly the part's bytes.
+    const rawContent = part.slice(headerEnd + 4);
     const headers = multipartHeaders(rawHeaders);
     const disposition = parseContentDisposition(headers['content-disposition']);
     if (!disposition.name) continue;
@@ -1427,7 +1450,8 @@ function parseContentDisposition(value: string | undefined): {
   for (const part of value.split(';').slice(1)) {
     const index = part.indexOf('=');
     if (index === -1) continue;
-    const key = part.slice(0, index).trim();
+    // Parameter names are case-insensitive; `NAME="image"` names the part.
+    const key = part.slice(0, index).trim().toLowerCase();
     let val = part.slice(index + 1).trim();
     if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
     out[key] = val;

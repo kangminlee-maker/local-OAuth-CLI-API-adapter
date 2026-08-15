@@ -1500,3 +1500,76 @@ test('boundary bytes inside multipart data are data, not delimiters', async () =
     await started.close();
   }
 });
+
+// --- round 48 ---
+
+test('a line-starting boundary PREFIX is data: only a terminated delimiter splits', async () => {
+  // `--BX` where the boundary is `B` delimits nothing — X is not the optional
+  // whitespace, CRLF, or `--` the RFC requires after the token.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const B = 'B';
+    const body = [
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', `--${B}X\r\ndraw a cat`,
+      `--${B}--`, '',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(
+        `POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n`
+        + `Content-Type: multipart/form-data; boundary=${B}\r\n`
+        + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+      ));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data));
+      conn.on('error', reject);
+    });
+    assert.match(raw.split('\r\n')[0], /200/, `the prompt must survive its prefix bytes: ${raw.slice(0, 200)}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('a case-variant data-URL media type is still an image', async () => {
+  const upper = PNG_DATA_URL.replace('data:image/png', 'data:IMAGE/PNG');
+  const { status, payload } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'repair', image: upper,
+  });
+  assert.equal(status, 200, JSON.stringify(payload));
+});
+
+test('case-variant disposition parameter names still name the part', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const B = 'AaB03x';
+    const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
+    const body = [
+      `--${B}`, 'Content-Disposition: form-data; NAME="model"', '', 'dall-e-2',
+      `--${B}`, `Content-Disposition: form-data; NAME="image"; FILENAME="x.png"`, 'Content-Type: image/png', '', png,
+      `--${B}--`, '',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(
+        `POST /v1/images/variations HTTP/1.1\r\nHost: h\r\n`
+        + `Content-Type: multipart/form-data; boundary=${B}\r\n`
+        + `Content-Length: ${Buffer.byteLength(body, 'latin1')}\r\nConnection: close\r\n\r\n${body}`,
+      ));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data));
+      conn.on('error', reject);
+    });
+    assert.match(raw.split('\r\n')[0], /200/, raw.slice(0, 200));
+  } finally {
+    await started.close();
+  }
+});
