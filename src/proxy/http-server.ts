@@ -244,7 +244,7 @@ async function handleRequest(
           await requestReportingExecutedModel(backend, normalized),
         );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
+        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
         writeJson(res, 200, openAiChatResponse(result));
       }
       return;
@@ -260,7 +260,7 @@ async function handleRequest(
           await requestReportingExecutedModel(backend, normalized),
         );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
+        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
         writeJson(res, 200, openAiResponsesResponse(result, normalized));
       }
       return;
@@ -276,7 +276,7 @@ async function handleRequest(
           await requestReportingExecutedModel(backend, normalized),
         );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
+        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
         writeJson(res, 200, anthropicMessagesResponse(result));
       }
       return;
@@ -469,7 +469,7 @@ async function handleOpenAiImageRequest(
     await writeOpenAiImageStream(
       req,
       res,
-      runImageGenerationStreamWithTimeout(client, request, options.requestTimeoutMs),
+      runImageGenerationStreamWithTimeout(client, request, options.requestTimeoutMs, res),
       generatedImages,
       request,
     );
@@ -479,6 +479,8 @@ async function handleOpenAiImageRequest(
     client,
     request,
     options.requestTimeoutMs,
+  
+    res,
   );
   writeJson(res, 200, openAiImagesGenerationResponse(req, generatedImages, result, request));
 }
@@ -504,9 +506,9 @@ function normalizeOpenAiImageRequest(
   if (prompt.length > 32_000) {
     throw new ProxyRequestError('prompt must be 32000 characters or fewer.', 400);
   }
-  const responseFormat = typeof input.response_format === 'string'
-    ? input.response_format
-    : 'b64_json';
+  // Absence gets the default; a present value of any shape is validated. A
+  // number or null used to be silently replaced with `b64_json`.
+  const responseFormat = input.response_format === undefined ? 'b64_json' : input.response_format;
   if (responseFormat !== 'b64_json' && responseFormat !== 'url') {
     throw new ProxyRequestError('response_format must be one of url or b64_json.', 400);
   }
@@ -650,9 +652,9 @@ function imageInputsForOperation(
   isMultipart: boolean,
 ): readonly NormalizedImage[] {
   if (operation === 'generation') return [];
-  const value = operation === 'edit' && !isMultipart
-    ? input.images
-    : input.image ?? input['image[]'] ?? input.images;
+  // The documented aliases hold in BOTH encodings: a JSON edit naming its
+  // image with the singular `image` field was rejected as having none.
+  const value = input.image ?? input['image[]'] ?? input.images;
   return imageInputArray(value);
 }
 
@@ -878,13 +880,13 @@ async function runImageGenerationWithTimeout(
   client: OpenAiImageGenerationClient,
   request: OpenAiImageGenerationRequest,
   requestTimeoutMs: number,
+  res: ServerResponse,
 ): Promise<OpenAiImageGenerationResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const abort = turnAbort(res, requestTimeoutMs);
   try {
-    return await client.generate(request, controller.signal);
+    return await client.generate(request, abort.signal);
   } finally {
-    clearTimeout(timer);
+    abort.release();
   }
 }
 
@@ -892,17 +894,17 @@ async function* runImageGenerationStreamWithTimeout(
   client: OpenAiImageGenerationClient,
   request: OpenAiImageGenerationRequest,
   requestTimeoutMs: number,
+  res: ServerResponse,
 ): AsyncIterable<OpenAiImageGenerationStreamEvent> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const abort = turnAbort(res, requestTimeoutMs);
   try {
     if (client.stream) {
-      for await (const event of client.stream(request, controller.signal)) {
+      for await (const event of client.stream(request, abort.signal)) {
         yield event;
       }
       return;
     }
-    const result = await client.generate(request, controller.signal);
+    const result = await client.generate(request, abort.signal);
     for (const [index, image] of result.images.entries()) {
       yield {
         type: 'completed',
@@ -917,7 +919,7 @@ async function* runImageGenerationStreamWithTimeout(
       };
     }
   } finally {
-    clearTimeout(timer);
+    abort.release();
   }
 }
 
@@ -946,17 +948,43 @@ export function openAiImageQualityReasoningEffort(
   return image2QualityToGpt55ReasoningEffort(quality);
 }
 
+/**
+ * One abort signal per backend turn: the timeout, or the client walking away.
+ * The RESPONSE's close is the disconnect signal — `IncomingMessage` closes as
+ * soon as the body is consumed, which is every normal request; `writableEnded`
+ * separates an orderly finish from a client that left. Call `release` when the
+ * turn settles, or the listener outlives the request.
+ */
+function turnAbort(res: ServerResponse, requestTimeoutMs: number): { signal: AbortSignal; release: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const onClose = (): void => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.once('close', onClose);
+  return {
+    signal: controller.signal,
+    release: () => {
+      clearTimeout(timer);
+      res.removeListener('close', onClose);
+    },
+  };
+}
+
 async function runWithTimeout(
   backend: LocalCliBackend,
   request: NormalizedRequest,
   requestTimeoutMs: number,
+  res: ServerResponse,
 ): Promise<LocalCompletionResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  // The disconnect half matters even without streaming: on a serialized
+  // backend an abandoned turn kept its slot to the timeout, and the NEXT
+  // client paid for it.
+  const abort = turnAbort(res, requestTimeoutMs);
   try {
-    return await backend.generate(request, controller.signal);
+    return await backend.generate(request, abort.signal);
   } finally {
-    clearTimeout(timer);
+    abort.release();
   }
 }
 
@@ -1022,26 +1050,37 @@ function streamEvents(
   requestTimeoutMs: number,
   res: ServerResponse,
 ): Promise<AsyncIterable<LocalStreamEvent>> {
-  if (!honorRequestModel()) {
-    // Untouched default: headers go out first and the writer's own iteration
-    // owns cancellation, exactly as before this setting existed.
-    return Promise.resolve(runStreamWithTimeout(backend, request, requestTimeoutMs));
-  }
-  // The RESPONSE's close, not the request's: `IncomingMessage` closes as soon as
-  // the body has been consumed, which is every normal request. Aborting on that
-  // would kill healthy streams. `writableEnded` separates an orderly finish from
-  // a client that walked away.
+  // The disconnect signal is wired in BOTH modes and lives for the whole
+  // iteration. It used to exist only during honor-on prefetch, so a client
+  // that left mid-stream kept its backend turn running to the timeout — and on
+  // a serialized backend the next client paid for it.
   const clientGone = new AbortController();
   const onResponseClose = (): void => {
     if (!res.writableEnded) clientGone.abort();
   };
   res.once('close', onResponseClose);
-  const events = runStreamWithTimeout(backend, request, requestTimeoutMs, clientGone.signal);
-  return withFirstEventSettled(events).finally(() => {
-    // Only the prefetch needs this listener; the response writer owns
-    // cancellation from here on.
+  const release = (): void => {
     res.removeListener('close', onResponseClose);
-  });
+  };
+  const events = releaseOnFinish(
+    runStreamWithTimeout(backend, request, requestTimeoutMs, clientGone.signal),
+    release,
+  );
+  if (!honorRequestModel()) {
+    return Promise.resolve(events);
+  }
+  return withFirstEventSettled(events);
+}
+
+async function* releaseOnFinish(
+  events: AsyncIterable<LocalStreamEvent>,
+  release: () => void,
+): AsyncIterable<LocalStreamEvent> {
+  try {
+    for await (const event of events) yield event;
+  } finally {
+    release();
+  }
 }
 
 async function* runStreamWithTimeout(
@@ -1107,7 +1146,7 @@ export class GeneratedImageStore {
     private readonly maxEntries: number = GENERATED_IMAGE_MAX_ENTRIES,
   ) {}
 
-  put(b64Json: string, outputFormat: string): string {
+  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string {
     this.cleanupExpired();
     const id = randomUUID();
     const bytes = Buffer.from(b64Json, 'base64');
@@ -1117,11 +1156,15 @@ export class GeneratedImageStore {
       expiresAt: Date.now() + this.ttlMs,
     });
     this.heldBytes += bytes.byteLength;
-    // Map preserves insertion order, so the first key is the oldest entry. The
-    // image just stored is never the one evicted: a client that asked for it is
-    // about to fetch it.
+    // Map preserves insertion order, so iteration meets oldest entries first.
+    // Never evicted: the image just stored, and any id in `pinned` — the other
+    // images of the SAME response, whose URLs are about to be handed out
+    // together. Without the pin, an oversized first image was evicted by its
+    // own sibling before the response was even sent.
     for (const [oldest] of this.images) {
-      if ((this.heldBytes <= this.maxBytes && this.images.size <= this.maxEntries) || oldest === id) break;
+      if (this.heldBytes <= this.maxBytes && this.images.size <= this.maxEntries) break;
+      if (oldest === id) break;
+      if (pinned?.has(oldest)) continue;
       this.drop(oldest);
     }
     return id;
@@ -1408,7 +1451,12 @@ function openAiImagesGenerationResponse(
 ): unknown {
   return {
     created: result.created,
-    data: result.images.map((image) => openAiImageObject(req, generatedImages, image, request)),
+    // One pin set for the whole response: sibling images must not evict each
+    // other before their URLs are even sent.
+    data: (() => {
+      const batch = new Set<string>();
+      return result.images.map((image) => openAiImageObject(req, generatedImages, image, request, batch));
+    })(),
     ...openAiImageResponseMetadata(result, request),
     ...(result.usage ? { usage: openAiImagesUsage(result.usage) } : {}),
   };
@@ -1447,12 +1495,15 @@ function openAiImageObject(
   generatedImages: GeneratedImageStore,
   image: OpenAiGeneratedImage,
   request: OpenAiImageGenerationRequest,
+  batch?: Set<string>,
 ): unknown {
   if (request.responseFormat === 'url') {
     const id = generatedImages.put(
       image.b64Json,
       request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+      batch,
     );
+    batch?.add(id);
     return {
       url: generatedImageUrl(req, id),
       ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),

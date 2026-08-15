@@ -996,3 +996,91 @@ test('a timed-out image stream still ends with data: [DONE]', async () => {
     await started.close();
   }
 });
+
+// --- round 43 ---
+
+// Big enough that one decoded image cannot fit beside another in the budget —
+// small enough to keep the test fast. The store bound is exercised through the
+// real HTTP path, so the real 128 MiB constant cannot be used here; the probe
+// asserts the PINNING rule, which is budget-independent.
+const GENERATED_BUDGET_PROBE = 256 * 1024;
+
+for (const [label, value] of [['a number', 17], ['null', null], ['an object', {}]]) {
+  test(`generations: response_format ${label} is rejected, not defaulted`, async () => {
+    // A present non-string was silently replaced with b64_json.
+    const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', response_format: value });
+    assert.equal(status, 400, `response_format=${JSON.stringify(value)} is not b64_json or url`);
+  });
+}
+
+const PNG_DATA_URL = `data:image/png;base64,${Buffer.from('89504e470d0a1a0a', 'hex').toString('base64')}`;
+for (const [label, fields] of [
+  ['singular image', { image: { image_url: PNG_DATA_URL } }],
+  ['image[] spelling', { 'image[]': [{ image_url: PNG_DATA_URL }] }],
+  ['images array', { images: [{ image_url: PNG_DATA_URL }] }],
+]) {
+  test(`edits: a JSON body may name its image as ${label}`, async () => {
+    // The documented aliases hold in both encodings; JSON edits read only
+    // `images` and rejected the other two documented spellings.
+    const { status, payload } = await postImages('/v1/images/edits', {
+      model: 'image-2', prompt: 'make it blue', ...fields,
+    });
+    assert.equal(status, 200, `${label} must be accepted: ${JSON.stringify(payload)}`);
+  });
+}
+
+test('store: sibling images of one response cannot evict each other', () => {
+  // An n=2 response whose first image exceeds the budget had its first URL
+  // 404 before the response was even sent — evicted by its own sibling.
+  const store = new GeneratedImageStore(60_000, 1024, 100);
+  const batch = new Set();
+  const big = store.put(Buffer.alloc(4096, 1).toString('base64'), 'png', batch);
+  batch.add(big);
+  const second = store.put(Buffer.alloc(64, 2).toString('base64'), 'png', batch);
+  batch.add(second);
+  assert.ok(store.get(big), 'the oversized sibling must survive its own response');
+  assert.ok(store.get(second), 'and so must the second');
+});
+
+test('store: under the entry cap, eviction is still oldest-first', () => {
+  const store = new GeneratedImageStore(60_000, 1024 * 1024, 2);
+  const a = store.put('AA==', 'png');
+  const b = store.put('AA==', 'png');
+  const c = store.put('AA==', 'png');
+  assert.equal(store.get(a), null, 'A is the oldest and must go');
+  assert.ok(store.get(b), 'B stays');
+  assert.ok(store.get(c), 'C stays');
+});
+
+test('an n=2 URL response serves both URLs, even when the first image is oversized', async () => {
+  const big = Buffer.alloc(GENERATED_BUDGET_PROBE, 7).toString('base64');
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request) {
+      return {
+        created: 0,
+        images: Array.from({ length: request.n ?? 1 }, (_v, i) => ({
+          b64Json: i === 0 ? big : 'iVBORw0KGgo=', revisedPrompt: null,
+        })),
+      };
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2, response_format: 'url' }),
+    });
+    const data = (await res.json()).data;
+    assert.equal(data.length, 2);
+    for (const [index, item] of data.entries()) {
+      assert.equal((await fetch(item.url)).status, 200, `url[${index}] must serve immediately after the response`);
+    }
+  } finally {
+    await started.close();
+  }
+});

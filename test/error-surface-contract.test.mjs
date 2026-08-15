@@ -1716,3 +1716,151 @@ test('chat system and developer messages reach the backend conversation', async 
   assert.ok(seen.some((m) => m.role === 'system' && m.content.includes('Be terse.')), JSON.stringify(seen));
   assert.ok(seen.some((m) => m.role === 'developer' && m.content.includes('Answer in French.')), JSON.stringify(seen));
 });
+
+// --- round 43: null holes, disconnect aborts, termination passthrough ---
+
+for (const [label, body] of [
+  ['thinking.display null', { thinking: { type: 'enabled', display: null } }],
+  ['thinking.display null under disabled', { thinking: { type: 'disabled', display: null } }],
+  ['output_config.format null', { output_config: { format: null } }],
+  ['output_config.task_budget null', { output_config: { task_budget: null } }],
+]) {
+  test(`/v1/messages: ${label} is a present wrong value, not omission`, async () => {
+    // The r42 fixes validated these fields and then exempted the one non-object
+    // every JSON client can most easily send.
+    const base = { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] };
+    const { status, text } = await call(backendThat({}), '/v1/messages', { ...base, ...body });
+    assert.equal(status, 400, `${label} must be rejected`);
+    assert.equal(JSON.parse(text).type, 'error');
+  });
+}
+
+test('a client disconnect aborts the backend turn, freeing a serialized backend', async () => {
+  // The promise existed; the wiring covered only honor-on prefetch. On a
+  // serialized backend an abandoned turn kept its slot until the timeout and
+  // the NEXT client paid for it.
+  let firstAborted = false;
+  let running = null;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request, signal) {
+      if (request.messages.some((m) => m.content.includes('hang'))) {
+        running = new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => { firstAborted = true; reject(new Error('aborted')); }, { once: true });
+        });
+        await running;
+      }
+      return ok();
+    },
+    async *stream() {},
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const controller = new AbortController();
+    const hung = fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'a-model', messages: [{ role: 'user', content: 'hang' }] }),
+      signal: controller.signal,
+    }).catch(() => null);
+    // Let the turn start, then walk away.
+    await new Promise((r) => setTimeout(r, 150));
+    controller.abort();
+    await hung;
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(firstAborted, true, 'the abandoned turn must be aborted, not left to the timeout');
+  } finally {
+    await started.close();
+  }
+});
+
+test('a mid-stream disconnect aborts the turn in default (honor-off) mode too', async () => {
+  let aborted = false;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { return ok(); },
+    async *stream(request, signal) {
+      yield { type: 'text_delta', delta: 'first chunk' };
+      await new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+      });
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const controller = new AbortController();
+    const res = await fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'a-model', messages: [{ role: 'user', content: 'hi' }], stream: true }),
+      signal: controller.signal,
+    });
+    const reader = res.body.getReader();
+    await reader.read();
+    controller.abort();
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(aborted, true, 'the stream turn must see the abort after the client leaves');
+  } finally {
+    await started.close();
+  }
+});
+
+test('/v1/messages: pause_turn passes through, streaming and not', async () => {
+  const paused = () => ({
+    id: 'x', model: 'configured-model', text: 'partial', toolCalls: [],
+    usage: { inputTokens: 1, outputTokens: 1, source: 'provider' }, latencyMs: 1,
+    stopReason: 'pause_turn',
+  });
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { return paused(); },
+    async *stream() { yield { type: 'completed', result: paused() }; },
+    async close() {},
+  };
+  const plain = await call(backend, '/v1/messages', MESSAGES);
+  assert.equal(JSON.parse(plain.text).stop_reason, 'pause_turn');
+
+  const streamed = await call(backend, '/v1/messages', { ...MESSAGES, stream: true });
+  const delta = streamed.text.split('\n')
+    .filter((l) => l.startsWith('data: ') && l.includes('"message_delta"'))
+    .map((l) => JSON.parse(l.slice(6)))
+    .at(-1);
+  assert.equal(delta.delta.stop_reason, 'pause_turn', JSON.stringify(delta));
+});
+
+for (const [path, body, isAnthropic] of [
+  ['/v1/chat/completions', CHAT, false],
+  ['/v1/responses', { model: 'a-model', input: 'hi' }, false],
+  ['/v1/messages', MESSAGES, true],
+]) {
+  test(`${path}: a non-streaming timeout is an HTTP error in the surface envelope`, async () => {
+    const backend = {
+      name: 'test', model: 'configured-model',
+      async generate(request, signal) {
+        await new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('timed out')), { once: true });
+        });
+      },
+      async *stream() {},
+      async close() {},
+    };
+    const started = await startLocalApiProxy({
+      backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 250,
+    });
+    try {
+      const res = await fetch(`${started.url}${path}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      assert.ok(res.status >= 500, `a timeout before any byte is an HTTP error, got ${res.status}`);
+      const payload = await res.json();
+      if (isAnthropic) assert.equal(payload.type, 'error', JSON.stringify(payload));
+      else assert.ok(payload.error, JSON.stringify(payload));
+    } finally {
+      await started.close();
+    }
+  });
+}

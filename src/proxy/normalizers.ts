@@ -135,7 +135,10 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
 // (accepts a nested `json_schema.schema` variant). A json_schema format with no
 // resolvable schema is malformed input, not absence — reject it (fail-loud).
 function readAnthropicOutputFormat(value: unknown): unknown {
-  if (value === undefined || value === null) return undefined;
+  // Only absence is omission. `null` is a present value of the wrong shape —
+  // the r42 fix said "non-object is 400" and then exempted the one non-object
+  // every JSON client can most easily send.
+  if (value === undefined) return undefined;
   const format = asRecord(value);
   // `"json_schema"` the STRING is a present, malformed value — treating it as
   // omission executed the request without the structured output it asked for.
@@ -188,7 +191,7 @@ function readAnthropicEffort(value: unknown): NormalizedAnthropicEffort | undefi
 const ANTHROPIC_TASK_BUDGET_MIN_TOKENS = 20_000;
 
 function readAnthropicTaskBudget(value: unknown): number | undefined {
-  if (value === undefined || value === null) return undefined;
+  if (value === undefined) return undefined;
   const budget = asRecord(value);
   const total = budget?.total;
   const invalid = (message: string): never => {
@@ -222,7 +225,7 @@ function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
   // discard — the direct API validates it. A VALID display under `disabled` is
   // the one thing deliberately dropped: disabled never produces thinking
   // blocks for display to govern.
-  if (display !== undefined && display !== null && display !== 'summarized' && display !== 'omitted') {
+  if (display !== undefined && display !== 'summarized' && display !== 'omitted') {
     throw new ProxyRequestError(
       'thinking.display must be summarized or omitted.',
       400,
