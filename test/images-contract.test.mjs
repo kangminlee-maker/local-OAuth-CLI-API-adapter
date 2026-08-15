@@ -2039,3 +2039,55 @@ test('an uppercase ASCII subtype still folds and passes', async () => {
   });
   assert.equal(status, 200, 'ASCII case-insensitivity is preserved');
 });
+
+// --- round 60: the last three coverage pins ---
+
+test('duplicate part headers resolve last-wins, as documented', async () => {
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="decoy"', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B--', '',
+  ], 'boundary=B', '/v1/images/generations');
+  assert.match(status, /200/, `the LAST disposition names the part: ${status}`);
+});
+
+test('an unterminated final part is dropped, not guessed at', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    // The prompt lives ONLY in a final part that never closes.
+    const body = [
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.from(
+        'POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n'
+        + 'Content-Type: multipart/form-data; boundary=B\r\n'
+        + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`, 'latin1')));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+    assert.match(raw, /400/, `the unterminated prompt part must be dropped: ${raw}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('OWS between a boundary and its CRLF is permitted', async () => {
+  // The padded delimiter opens the REQUIRED part: rejecting it must change
+  // the status. (Padding the optional model part let a rejection pass as 200
+  // via the default model — the first version of this pin survived its own
+  // mutation.)
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B \t', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    '--B--', '',
+  ], 'boundary=B', '/v1/images/generations');
+  assert.match(status, /200/, `transport padding after the boundary is legal: ${status}`);
+});
