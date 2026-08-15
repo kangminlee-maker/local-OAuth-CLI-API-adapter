@@ -1779,3 +1779,44 @@ test('a non-OWS byte beside the boundary value is not trimmed away', async () =>
     await started.close();
   }
 });
+
+// --- round 53 ---
+
+test('a quoted-pair in a disposition parameter decodes', async () => {
+  const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B', 'Content-Disposition: form-data; name="im\\age"; filename="x.png"', 'Content-Type: image/png', '', png,
+    '--B--', '',
+  ], 'boundary=B', '/v1/images/variations');
+  assert.match(status, /200/, `name="im\\age" names image: ${status}`);
+});
+
+test('a non-OWS byte before the boundary parameter name is not trimmed away', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = [
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+      '--B--', '',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
+        Buffer.from('POST /v1/images/generations HTTP/1.1\r\nHost: h\r\nContent-Type: multipart/form-data; '),
+        Buffer.from([0xa0]),
+        Buffer.from(`boundary=B\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`),
+      ])));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+    assert.match(raw, /400/, `<0xA0>boundary is not the boundary parameter: ${raw}`);
+  } finally {
+    await started.close();
+  }
+});

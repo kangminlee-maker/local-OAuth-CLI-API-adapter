@@ -1517,7 +1517,11 @@ function parseContentDisposition(value: string | undefined): {
     // Parameter names are case-insensitive; `NAME="image"` names the part.
     const key = part.slice(0, index).trim().toLowerCase();
     let val = part.slice(index + 1).trim();
-    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+    if (val.startsWith('"') && val.endsWith('"')) {
+      // Quoted-pairs decode here as they do in the boundary parameter:
+      // `name="im\age"` names `image`.
+      val = val.slice(1, -1).replace(/\\(.)/g, '$1');
+    }
     out[key] = val;
   }
   return { name: out.name, filename: out.filename };
