@@ -99,7 +99,13 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const system = flattenAnthropicSystem(input.system);
   if (system) messages.push({ role: 'system', content: system, images: [] });
   messages.push(...readAnthropicMessages(input.messages));
+  // The CONTAINER is not nullable on the direct API — its leaves are. A
+  // present non-object here silently disabled every output control.
+  if (input.output_config !== undefined && !asRecord(input.output_config)) {
+    throw new ProxyRequestError('output_config must be an object.', 400, 'anthropic');
+  }
   const outputConfig = asRecord(input.output_config);
+  const maxTokens = readRequiredMaxTokens(input.max_tokens);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
   if (outputFormat !== undefined && tools.length > 0) {
@@ -116,11 +122,11 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     shape: 'anthropic-messages',
     model: readRequiredModel(input.model, 'anthropic'),
     messages,
-    maxTokens: readRequiredMaxTokens(input.max_tokens),
+    maxTokens,
     temperature: readOptionalNumber(input.temperature),
     effort: readAnthropicEffort(outputConfig?.effort),
     taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
-    thinking: readAnthropicThinking(input.thinking),
+    thinking: readAnthropicThinking(input.thinking, maxTokens),
     stream: input.stream === true,
     streamOptions: readStreamOptions(undefined),
     jsonMode: outputFormat !== undefined,
@@ -135,10 +141,10 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
 // (accepts a nested `json_schema.schema` variant). A json_schema format with no
 // resolvable schema is malformed input, not absence — reject it (fail-loud).
 function readAnthropicOutputFormat(value: unknown): unknown {
-  // Only absence is omission. `null` is a present value of the wrong shape —
-  // the r42 fix said "non-object is 400" and then exempted the one non-object
-  // every JSON client can most easily send.
-  if (value === undefined) return undefined;
+  // `format?: JSONOutputFormat | null` on the direct API: null IS omission for
+  // this LEAF (the output_config container is what rejects null). A non-null
+  // non-object is malformed.
+  if (value === undefined || value === null) return undefined;
   const format = asRecord(value);
   // `"json_schema"` the STRING is a present, malformed value — treating it as
   // omission executed the request without the structured output it asked for.
@@ -191,7 +197,9 @@ function readAnthropicEffort(value: unknown): NormalizedAnthropicEffort | undefi
 const ANTHROPIC_TASK_BUDGET_MIN_TOKENS = 20_000;
 
 function readAnthropicTaskBudget(value: unknown): number | undefined {
-  if (value === undefined) return undefined;
+  // A proxy/CLI extension field; its null rule follows its nullable siblings
+  // (`effort`, `format`) so one output_config rule holds for every leaf.
+  if (value === undefined || value === null) return undefined;
   const budget = asRecord(value);
   const total = budget?.total;
   const invalid = (message: string): never => {
@@ -209,10 +217,16 @@ function readAnthropicTaskBudget(value: unknown): number | undefined {
   return total as number;
 }
 
-function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
-  if (value === undefined || value === null) return undefined;
+function readAnthropicThinking(value: unknown, maxTokens: number): NormalizedThinking | undefined {
+  if (value === undefined) return undefined;
   const thinking = asRecord(value);
-  const type = thinking?.type;
+  // The container is `thinking?: ThinkingConfigParam` on the direct API — the
+  // union has no null member, so `thinking: null` is malformed input, not
+  // omission. (Its LEAF `display` is declared nullable; the container is not.)
+  if (!thinking) {
+    throw new ProxyRequestError('thinking must be an object.', 400, 'anthropic');
+  }
+  const type = thinking.type;
   if (type !== 'adaptive' && type !== 'enabled' && type !== 'disabled') {
     throw new ProxyRequestError(
       'thinking.type must be one of adaptive, enabled, or disabled.',
@@ -220,11 +234,9 @@ function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
       'anthropic',
     );
   }
-  const display = thinking?.display;
-  // A defined display outside the enum is invalid input, not a preference to
-  // discard — the direct API validates it. A VALID display under `disabled` is
-  // the one thing deliberately dropped: disabled never produces thinking
-  // blocks for display to govern.
+  // `display?: 'summarized' | 'omitted' | null` — null IS omission here, per
+  // the direct type. A defined non-null value outside the enum is invalid.
+  const display = thinking.display === null ? undefined : thinking.display;
   if (display !== undefined && display !== 'summarized' && display !== 'omitted') {
     throw new ProxyRequestError(
       'thinking.display must be summarized or omitted.',
@@ -232,11 +244,36 @@ function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
       'anthropic',
     );
   }
+  // The `enabled` variant requires budget_tokens: ≥ 1024 and less than
+  // max_tokens, per the direct schema.
+  let budgetTokens: number | undefined;
+  if (type === 'enabled') {
+    const budget = thinking.budget_tokens;
+    if (typeof budget !== 'number' || !Number.isInteger(budget)) {
+      throw new ProxyRequestError(
+        'thinking.budget_tokens is required for enabled thinking.',
+        400,
+        'anthropic',
+      );
+    }
+    if (budget < 1024) {
+      throw new ProxyRequestError('thinking.budget_tokens must be at least 1024.', 400, 'anthropic');
+    }
+    if (budget >= maxTokens) {
+      throw new ProxyRequestError(
+        'thinking.budget_tokens must be less than max_tokens.',
+        400,
+        'anthropic',
+      );
+    }
+    budgetTokens = budget;
+  }
   return {
     type,
     display: type !== 'disabled' && (display === 'summarized' || display === 'omitted')
       ? display
       : undefined,
+    ...(budgetTokens !== undefined ? { budgetTokens } : {}),
   };
 }
 

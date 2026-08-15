@@ -24,7 +24,8 @@ import type {
   ProxyServerOptions,
 } from './types.js';
 import { honorRequestModel } from '../settings.js';
-import { BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
+import {
+  GeneratedImageStoreLike, BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { missingToolCallArgumentDelta } from './tool-call-stream.js';
@@ -80,7 +81,10 @@ interface ParsedImageRequestBody {
 export async function startLocalApiProxy(
   options: ProxyServerOptions,
 ): Promise<StartedProxyServer> {
-  const generatedImages = new GeneratedImageStore();
+  // Injectable like the backends: the store's budgets are real behaviour
+  // (eviction, pinning) that HTTP-level tests cannot exercise against the
+  // production 128 MiB constant.
+  const generatedImages = options.generatedImageStore ?? new GeneratedImageStore();
   const server = createServer((req, res) => {
     void handleRequest(req, res, options, generatedImages);
   });
@@ -152,7 +156,7 @@ async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
 ): Promise<void> {
   const { backend, requestTimeoutMs } = options;
   setCorsHeaders(res);
@@ -461,7 +465,7 @@ async function handleOpenAiImageRequest(
   req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
   const client = options.imageGenerationClient ?? unsupportedLocalOAuthImageGenerationClient();
@@ -506,9 +510,12 @@ function normalizeOpenAiImageRequest(
   if (prompt.length > 32_000) {
     throw new ProxyRequestError('prompt must be 32000 characters or fewer.', 400);
   }
-  // Absence gets the default; a present value of any shape is validated. A
-  // number or null used to be silently replaced with `b64_json`.
-  const responseFormat = input.response_format === undefined ? 'b64_json' : input.response_format;
+  // Absence and null get the default (the direct API declares the field
+  // nullable); any other present value is validated rather than silently
+  // replaced with `b64_json`.
+  const responseFormat = input.response_format === undefined || input.response_format === null
+    ? 'b64_json'
+    : input.response_format;
   if (responseFormat !== 'b64_json' && responseFormat !== 'url') {
     throw new ProxyRequestError('response_format must be one of url or b64_json.', 400);
   }
@@ -526,11 +533,6 @@ function normalizeOpenAiImageRequest(
   const proxyRoute = optionalImageProxyRoute(input.x_proxy_image_route);
   const outputFormat = optionalEnum(input.output_format, 'output_format', ['png', 'jpeg', 'webp'])
     ?? proxyRoute?.outputFormat;
-  // Explicit null is a value the client chose, not omission — the rule `n` and
-  // `partial_images` already follow.
-  if (input.output_compression === null) {
-    throw new ProxyRequestError('output_compression must be an integer between 0 and 100.', 400);
-  }
   const outputCompression = optionalInteger(input.output_compression, 'output_compression', 0, 100)
     ?? proxyRoute?.outputCompression;
   const request: OpenAiImageGenerationRequest = {
@@ -659,7 +661,17 @@ function imageInputsForOperation(
 }
 
 function imageInputArray(value: unknown): readonly NormalizedImage[] {
-  if (Array.isArray(value)) return value.map(optionalImageInput).filter(isNormalizedImage);
+  if (Array.isArray(value)) {
+    // Every supplied member must be a valid image reference. Filtering the
+    // bad ones executed the request with silently altered input.
+    return value.map((member, index) => {
+      const image = optionalImageInput(member);
+      if (!image) {
+        throw new ProxyRequestError(`image[${index}] is not a valid image reference.`, 400);
+      }
+      return image;
+    });
+  }
   const image = optionalImageInput(value);
   return image ? [image] : [];
 }
@@ -737,9 +749,10 @@ function isNormalizedImage(value: NormalizedImage | undefined): value is Normali
 }
 
 function imageGenerationCount(value: unknown): number {
-  // Only an ABSENT `n` defaults. An explicit `null` is a value the client chose
-  // to send, and the documented domain is an integer in 1..10.
-  if (value === undefined) return 1;
+  // The direct API declares `n` nullable (`Optional[int]`), so null IS
+  // omission — the earlier explicit-null rejection was anti-parity, measured
+  // against the published SDK types.
+  if (value === undefined || value === null) return 1;
   const parsed = optionalInteger(value, 'n', 1, 10);
   if (parsed === undefined) {
     throw new ProxyRequestError('n must be an integer between 1 and 10.', 400);
@@ -748,9 +761,8 @@ function imageGenerationCount(value: unknown): number {
 }
 
 function partialImageCount(value: unknown): number {
-  // `undefined` alone is omission. An explicit null is a value, and it is not
-  // in the documented domain — the same rule `n` follows.
-  if (value === undefined) return 0;
+  // Nullable on the direct API, like `n`: null is omission.
+  if (value === undefined || value === null) return 0;
   const parsed = optionalInteger(value, 'partial_images', 0, 3);
   if (parsed === undefined) {
     throw new ProxyRequestError('partial_images must be an integer between 0 and 3.', 400);
@@ -777,7 +789,10 @@ function optionalEnum<T extends string>(
   field: string,
   allowed: readonly T[],
 ): T | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
+  // null is omission (these fields are nullable on the direct API); an empty
+  // string is a PRESENT value outside the enum and used to be silently
+  // dropped, running the request without the control the client sent.
+  if (value === undefined || value === null) return undefined;
   if (typeof value !== 'string' || !allowed.includes(value as T)) {
     throw new ProxyRequestError(`${field} must be one of ${allowed.join(', ')}.`, 400);
   }
@@ -1202,7 +1217,7 @@ export class GeneratedImageStore {
 
 function writeGeneratedImage(
   res: ServerResponse,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   path: string,
 ): void {
   // Byte-for-byte, no percent-decoding: issued ids are plain UUIDs, so no
@@ -1278,7 +1293,11 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 async function readImageRequestBody(req: IncomingMessage): Promise<ParsedImageRequestBody> {
   const body = await readBodyBuffer(req);
   const contentType = headerValue(req.headers['content-type']);
-  if (contentType.toLowerCase().includes('multipart/form-data')) {
+  // The media-type ESSENCE, not a substring: `application/json;
+  // profile="...multipart/form-data..."` is JSON whose parameter happens to
+  // contain those words.
+  const essence = stripOws(contentType.split(';')[0] ?? '').toLowerCase();
+  if (essence === 'multipart/form-data') {
     return { body: parseMultipartFormData(body, contentType), isMultipart: true };
   }
   const text = body.toString('utf8');
@@ -1445,7 +1464,7 @@ async function advertisedModels(backend: LocalCliBackend): Promise<readonly stri
 
 function openAiImagesGenerationResponse(
   req: IncomingMessage,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   result: OpenAiImageGenerationResult,
   request: OpenAiImageGenerationRequest,
 ): unknown {
@@ -1492,7 +1511,7 @@ function responseSize(value: string | undefined): string | undefined {
 
 function openAiImageObject(
   req: IncomingMessage,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   image: OpenAiGeneratedImage,
   request: OpenAiImageGenerationRequest,
   batch?: Set<string>,
@@ -1519,10 +1538,18 @@ async function writeOpenAiImageStream(
   req: IncomingMessage,
   res: ServerResponse,
   events: AsyncIterable<OpenAiImageGenerationStreamEvent>,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
   writeSseHeaders(res);
+  // One pin set for the whole stream: sibling images of one response must not
+  // evict each other, exactly as in the non-streaming path.
+  const batch = new Set<string>();
+  const putPinned = (b64Json: string): string => {
+    const id = generatedImages.put(b64Json, request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
+    batch.add(id);
+    return id;
+  };
   try {
     for await (const event of events) {
       if (event.type === 'partial_image') continue;
@@ -1535,7 +1562,7 @@ async function writeOpenAiImageStream(
         quality: event.quality ?? request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
         size: event.size ?? request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
         ...(request.responseFormat === 'url'
-          ? { url: generatedImageUrl(req, generatedImages.put(event.image.b64Json, request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT)) }
+          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json)) }
           : { b64_json: event.image.b64Json }),
         ...(event.usage ? { usage: openAiImagesUsage(event.usage) } : {}),
       };

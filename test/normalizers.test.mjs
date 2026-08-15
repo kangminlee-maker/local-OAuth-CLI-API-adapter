@@ -189,8 +189,16 @@ test('Anthropic normalizer rejects non-tokens / sub-minimum / fractional task_bu
 });
 
 test('Anthropic normalizer accepts thinking enabled and rejects unknown types', () => {
-  const enabled = normalizeAnthropicMessagesRequest(anthropicBody({ thinking: { type: 'enabled' } }));
-  assert.deepEqual(enabled.thinking, { type: 'enabled', display: undefined });
+  // `enabled` requires budget_tokens on the direct API (>= 1024, < max_tokens).
+  const enabled = normalizeAnthropicMessagesRequest(anthropicBody({
+    max_tokens: 4096,
+    thinking: { type: 'enabled', budget_tokens: 2048 },
+  }));
+  assert.deepEqual(enabled.thinking, { type: 'enabled', display: undefined, budgetTokens: 2048 });
+  assert.throws(
+    () => normalizeAnthropicMessagesRequest(anthropicBody({ thinking: { type: 'enabled' } })),
+    /budget_tokens is required/,
+  );
   assert.throws(
     () => normalizeAnthropicMessagesRequest(anthropicBody({ thinking: { type: 'sometimes' } })),
     /thinking.type must be one of/,

@@ -1719,21 +1719,50 @@ test('chat system and developer messages reach the backend conversation', async 
 
 // --- round 43: null holes, disconnect aborts, termination passthrough ---
 
+// LEAVES declared nullable on the direct API treat null as omission; the
+// CONTAINERS are not nullable and reject it. Both directions were wrong at
+// some point: the leaves briefly rejected null (anti-parity, measured against
+// the published SDK types), and the containers silently accepted it.
 for (const [label, body] of [
-  ['thinking.display null', { thinking: { type: 'enabled', display: null } }],
+  ['thinking.display null (adaptive)', { thinking: { type: 'adaptive', display: null } }],
   ['thinking.display null under disabled', { thinking: { type: 'disabled', display: null } }],
   ['output_config.format null', { output_config: { format: null } }],
   ['output_config.task_budget null', { output_config: { task_budget: null } }],
 ]) {
-  test(`/v1/messages: ${label} is a present wrong value, not omission`, async () => {
-    // The r42 fixes validated these fields and then exempted the one non-object
-    // every JSON client can most easily send.
+  test(`/v1/messages: ${label} is omission — the leaf is nullable`, async () => {
+    const base = { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] };
+    const { status } = await call(backendThat({}), '/v1/messages', { ...base, ...body });
+    assert.equal(status, 200, `${label} is declared nullable on the direct API`);
+  });
+}
+
+for (const [label, body] of [
+  ['thinking: null', { thinking: null }],
+  ['thinking: a string', { thinking: 'adaptive' }],
+  ['output_config: null', { output_config: null }],
+  ['output_config: a string', { output_config: 'json' }],
+]) {
+  test(`/v1/messages: container ${label} is rejected — the container is not nullable`, async () => {
     const base = { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] };
     const { status, text } = await call(backendThat({}), '/v1/messages', { ...base, ...body });
     assert.equal(status, 400, `${label} must be rejected`);
     assert.equal(JSON.parse(text).type, 'error');
   });
 }
+
+test('/v1/messages: enabled thinking requires budget_tokens in its direct domain', async () => {
+  const base = { model: 'a-model', max_tokens: 4096, messages: [{ role: 'user', content: 'hi' }] };
+  for (const [label, thinking, expected] of [
+    ['missing budget', { type: 'enabled' }, 400],
+    ['non-integer budget', { type: 'enabled', budget_tokens: 'lots' }, 400],
+    ['budget below 1024', { type: 'enabled', budget_tokens: 512 }, 400],
+    ['budget not below max_tokens', { type: 'enabled', budget_tokens: 4096 }, 400],
+    ['a valid budget', { type: 'enabled', budget_tokens: 2048 }, 200],
+  ]) {
+    const { status } = await call(backendThat({}), '/v1/messages', { ...base, thinking });
+    assert.equal(status, expected, `${label}: expected ${expected}`);
+  }
+});
 
 test('a client disconnect aborts the backend turn, freeing a serialized backend', async () => {
   // The promise existed; the wiring covered only honor-on prefetch. On a
@@ -1864,3 +1893,104 @@ for (const [path, body, isAnthropic] of [
     }
   });
 }
+
+// --- round 44 coverage: per-surface disconnects, stream timeouts, synthesis ---
+
+for (const [path, body] of [
+  ['/v1/responses', { model: 'a-model', input: 'hang' }],
+  ['/v1/messages', { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hang' }] }],
+]) {
+  test(`${path}: a non-streaming disconnect aborts the backend turn`, async () => {
+    let aborted = false;
+    const backend = {
+      name: 'test', model: 'configured-model',
+      async generate(request, signal) {
+        await new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+        });
+      },
+      async *stream() {},
+      async close() {},
+    };
+    const started = await startLocalApiProxy({
+      backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    });
+    try {
+      const controller = new AbortController();
+      const pending = fetch(`${started.url}${path}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body), signal: controller.signal,
+      }).catch(() => null);
+      await new Promise((r) => setTimeout(r, 150));
+      controller.abort();
+      await pending;
+      await new Promise((r) => setTimeout(r, 150));
+      assert.equal(aborted, true, 'the abandoned turn must see the abort');
+    } finally {
+      await started.close();
+    }
+  });
+}
+
+for (const [path, body, isAnthropic] of [
+  ['/v1/chat/completions', { model: 'a-model', messages: [{ role: 'user', content: 'hi' }], stream: true }, false],
+  ['/v1/responses', { model: 'a-model', input: 'hi', stream: true }, false],
+  ['/v1/messages', { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }], stream: true }, true],
+]) {
+  test(`${path}: a mid-stream timeout lands as the surface's terminal sequence`, async () => {
+    const backend = {
+      name: 'test', model: 'configured-model',
+      async generate() { return ok(); },
+      async *stream(request, signal) {
+        yield { type: 'text_delta', delta: 'first' };
+        await new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('timed out')), { once: true });
+        });
+      },
+      async close() {},
+    };
+    const started = await startLocalApiProxy({
+      backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 300,
+    });
+    try {
+      const res = await fetch(`${started.url}${path}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      assert.equal(res.status, 200, 'the stream was committed before the timer fired');
+      const text = await res.text();
+      if (isAnthropic) {
+        assert.match(text, /event: error/, text.slice(-200));
+        assert.doesNotMatch(text, /message_stop/, 'a timed-out turn did not finish normally');
+      } else {
+        const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
+        assert.equal(frames.at(-1), 'data: [DONE]', frames.at(-1));
+        assert.ok(frames.some((f) => f.includes('"error"')), text.slice(-200));
+      }
+    } finally {
+      await started.close();
+    }
+  });
+}
+
+test('/v1/messages: a refusal without runtime details gets the synthesized stop_details', async () => {
+  const refusal = () => ({
+    id: 'x', model: 'configured-model', text: '', toolCalls: [],
+    usage: { inputTokens: 1, outputTokens: 1, source: 'provider' }, latencyMs: 1,
+    stopReason: 'refusal',
+  });
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { return refusal(); },
+    async *stream() { yield { type: 'completed', result: refusal() }; },
+    async close() {},
+  };
+  const plain = JSON.parse((await call(backend, '/v1/messages', MESSAGES)).text);
+  assert.equal(plain.stop_reason, 'refusal');
+  assert.deepEqual(plain.stop_details, { type: 'refusal', category: null });
+
+  const streamed = (await call(backend, '/v1/messages', { ...MESSAGES, stream: true })).text;
+  const delta = streamed.split('\n')
+    .filter((l) => l.startsWith('data: ') && l.includes('"message_delta"'))
+    .map((l) => JSON.parse(l.slice(6))).at(-1);
+  assert.deepEqual(delta.delta.stop_details, { type: 'refusal', category: null });
+});

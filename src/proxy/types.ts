@@ -14,6 +14,9 @@ export type NormalizedAnthropicEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'm
 export interface NormalizedThinking {
   readonly type: 'adaptive' | 'enabled' | 'disabled';
   readonly display?: 'summarized' | 'omitted';
+  // Required by the direct API's `enabled` variant; carried so a backend that
+  // can honor it has the number the client chose.
+  readonly budgetTokens?: number;
 }
 
 export interface NormalizedMessage {
@@ -234,10 +237,23 @@ export interface LocalCliBackend {
   close(): Promise<void>;
 }
 
+/**
+ * The generated-image store's public surface. The implementation lives with the
+ * HTTP server; this names only what the server needs, so a test can inject the
+ * same class built with smaller budgets — eviction and pinning are behaviour
+ * that HTTP-level tests cannot exercise against the production 128 MiB.
+ */
+export interface GeneratedImageStoreLike {
+  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string;
+  get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null;
+  clear(): void;
+}
+
 export interface ProxyServerOptions {
   readonly backend: LocalCliBackend;
   readonly imageGenerationClient?: OpenAiImageGenerationClient;
   readonly chatSessionManager?: LocalCliChatSessionManager;
+  readonly generatedImageStore?: GeneratedImageStoreLike;
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;

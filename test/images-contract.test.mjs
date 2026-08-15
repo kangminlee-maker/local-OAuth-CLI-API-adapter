@@ -53,7 +53,6 @@ for (const [label, n] of [
   ['fractional', 1.5],
   ['a non-numeric string', 'two'],
   ['negative', -1],
-  ['explicit null', null],
 ]) {
   test(`generations: n ${label} is rejected`, async () => {
     const { status, payload } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', n });
@@ -61,6 +60,19 @@ for (const [label, n] of [
     assert.match(payload.error.message, /n must be an integer between 1 and 10/);
   });
 }
+
+test('generations: nullable fields treat null as omission, per the direct types', async () => {
+  // `n`, `partial_images`, `output_compression`, `response_format` are all
+  // declared nullable (`Optional[...]`) on the direct API. The explicit-null
+  // rejections of earlier rounds were anti-parity, measured against the
+  // published SDK types, and are reversed.
+  const { status, payload } = await postImages(GEN, {
+    model: 'image-2', prompt: 'a dot',
+    n: null, partial_images: null, output_compression: null, response_format: null,
+  });
+  assert.equal(status, 200, JSON.stringify(payload));
+  assert.equal(payload.data.length, 1, 'null n means the default of 1');
+});
 
 test('generations: a numeric string n is accepted, because form fields are strings', async () => {
   // `/v1/images/*` accepts multipart/form-data, where every field arrives as a
@@ -741,11 +753,9 @@ test('a generated id that does not percent-decode is a 404 miss, not a 500', asy
   }
 });
 
-test('generations: an explicit partial_images null is rejected, like n', async () => {
-  const { status, payload } = await postImages(GEN, {
-    model: 'image-2', prompt: 'a dot', partial_images: null,
-  });
-  assert.equal(status, 400, `null is a value the client chose: ${JSON.stringify(payload)}`);
+test('generations: partial_images null is omission — the field is nullable', async () => {
+  const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', partial_images: null });
+  assert.equal(status, 200);
 });
 
 // --- round 40 ---
@@ -793,11 +803,11 @@ test('a generated path with extra separators is an unknown endpoint, whatever th
   }
 });
 
-test('generations: an explicit output_compression null is rejected, like n', async () => {
+test('generations: output_compression null is omission — the field is nullable', async () => {
   const { status } = await postImages(GEN, {
     model: 'gpt-image-1', prompt: 'a dot', output_compression: null,
   });
-  assert.equal(status, 400);
+  assert.equal(status, 200);
 });
 
 test('generations: standard output_compression wins over the route hint', async () => {
@@ -1005,13 +1015,79 @@ test('a timed-out image stream still ends with data: [DONE]', async () => {
 // asserts the PINNING rule, which is budget-independent.
 const GENERATED_BUDGET_PROBE = 256 * 1024;
 
-for (const [label, value] of [['a number', 17], ['null', null], ['an object', {}]]) {
+for (const [label, value] of [['a number', 17], ['an object', {}]]) {
   test(`generations: response_format ${label} is rejected, not defaulted`, async () => {
-    // A present non-string was silently replaced with b64_json.
+    // A present non-string was silently replaced with b64_json. Null is the
+    // exception: the field is nullable on the direct API.
     const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', response_format: value });
     assert.equal(status, 400, `response_format=${JSON.stringify(value)} is not b64_json or url`);
   });
 }
+
+test('generations: an empty-string enum value is a present wrong value, not omission', async () => {
+  const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', quality: '' });
+  assert.equal(status, 400, 'an empty string is outside the quality enum');
+});
+
+test('edits: a malformed member of an image array is rejected, not dropped', async () => {
+  // Filtering the bad member executed the request with silently altered input.
+  const { status, payload } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'make it blue',
+    images: [{ image_url: PNG_DATA_URL }, 7],
+  });
+  assert.equal(status, 400, JSON.stringify(payload));
+  assert.match(payload.error.message, /image\[1\]/, 'the rejection must name the member');
+});
+
+test('multipart detection uses the media-type essence, not a substring', async () => {
+  // `application/json; profile="...multipart/form-data..."` is JSON.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json; profile="https://example.test/multipart/form-data"' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot' }),
+    });
+    assert.equal(res.status, 200, await res.text());
+  } finally {
+    await started.close();
+  }
+});
+
+test('a streamed n=2 URL response serves both URLs — siblings share one pin set', async () => {
+  const big = Buffer.alloc(GENERATED_BUDGET_PROBE, 7).toString('base64');
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { return { created: 0, images: [] }; },
+    async *stream() {
+      yield { type: 'completed', created: 0, image: { b64Json: big, revisedPrompt: null } };
+      yield { type: 'completed', created: 0, image: { b64Json: 'iVBORw0KGgo=', revisedPrompt: null } };
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    generatedImageStore: new GeneratedImageStore(60_000, 1024, 100),
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2, stream: true, response_format: 'url' }),
+    });
+    const text = await res.text();
+    const urls = [...text.matchAll(/"url":"([^"]+)"/g)].map((m) => m[1]);
+    assert.equal(urls.length, 2, text.slice(0, 200));
+    for (const [index, url] of urls.entries()) {
+      assert.equal((await fetch(url)).status, 200, `url[${index}] must survive its sibling`);
+    }
+  } finally {
+    await started.close();
+  }
+});
 
 const PNG_DATA_URL = `data:image/png;base64,${Buffer.from('89504e470d0a1a0a', 'hex').toString('base64')}`;
 for (const [label, fields] of [
@@ -1069,6 +1145,9 @@ test('an n=2 URL response serves both URLs, even when the first image is oversiz
   const started = await startLocalApiProxy({
     backend, imageGenerationClient: backend,
     host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    // A store whose byte budget the first image EXCEEDS — without this the
+    // production 128 MiB budget never binds and the test pins nothing.
+    generatedImageStore: new GeneratedImageStore(60_000, 1024, 100),
   });
   try {
     const res = await fetch(`${started.url}${GEN}`, {
@@ -1080,6 +1159,44 @@ test('an n=2 URL response serves both URLs, even when the first image is oversiz
     for (const [index, item] of data.entries()) {
       assert.equal((await fetch(item.url)).status, 200, `url[${index}] must serve immediately after the response`);
     }
+  } finally {
+    await started.close();
+  }
+});
+
+test('generations: the 32,000-code-unit prompt boundary is inclusive', async () => {
+  const at = await postImages(GEN, { model: 'image-2', prompt: 'x'.repeat(32_000) });
+  assert.equal(at.status, 200, 'exactly 32,000 units is inside the bound');
+  const over = await postImages(GEN, { model: 'image-2', prompt: 'x'.repeat(32_001) });
+  assert.equal(over.status, 400);
+});
+
+test('a non-streaming image disconnect aborts the backend', async () => {
+  let aborted = false;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request, signal) {
+      await new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => { aborted = true; reject(new Error('aborted')); }, { once: true });
+      });
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const controller = new AbortController();
+    const pending = fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot' }), signal: controller.signal,
+    }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 150));
+    controller.abort();
+    await pending;
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(aborted, true, 'the abandoned generation must see the abort');
   } finally {
     await started.close();
   }
