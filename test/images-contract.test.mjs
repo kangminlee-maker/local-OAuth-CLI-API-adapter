@@ -946,3 +946,53 @@ test('a forwarded proto with a non-OWS byte does not choose the scheme', async (
     await started.close();
   }
 });
+
+// --- round 42 ---
+
+test('store: a flood of tiny images is bounded by entry count, not only bytes', () => {
+  // The byte budget counts payloads; Map keys and entry metadata are overhead
+  // the budget never sees. 1-byte images could grow the store unboundedly.
+  const store = new GeneratedImageStore(60_000, 1024 * 1024, 50);
+  const ids = Array.from({ length: 120 }, () => store.put('AA==', 'png'));
+  const live = ids.filter((id) => store.get(id));
+  assert.ok(live.length <= 50, `entries must be bounded: ${live.length}`);
+  assert.ok(store.get(ids.at(-1)), 'the newest entry survives');
+  assert.equal(store.get(ids[0]), null, 'the oldest was evicted');
+});
+
+test('a timed-out image stream still ends with data: [DONE]', async () => {
+  // The terminal-frame promise covers every mid-stream failure, the timeout
+  // included — a skip conditioned on the timeout error would leave the thrown-
+  // iterator test green.
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { return { created: 0, images: [{ b64Json: 'iVBORw0KGgo=', revisedPrompt: null }] }; },
+    async *stream(request, signal) {
+      yield { type: 'completed', created: 0, image: { b64Json: 'iVBORw0KGgo=', revisedPrompt: null } };
+      // Honors the abort like the real backends do — the proxy's timeout is a
+      // signal to the backend, not an in-proxy deadline, so a fixture that
+      // ignores it tests a backend bug, not the proxy.
+      await new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('timed out')), { once: true });
+      });
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 300,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'x', stream: true }),
+    });
+    const text = await res.text();
+    const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
+    assert.equal(frames.at(-1), 'data: [DONE]', `expected the terminal frame: ${frames.at(-1)}`);
+    assert.ok(frames.some((f) => f.startsWith('event: error') || f.includes('"error"')),
+      `expected an error frame before it: ${text.slice(-200)}`);
+  } finally {
+    await started.close();
+  }
+});

@@ -57,6 +57,10 @@ const GENERATED_IMAGE_TTL_MS = 60 * 60 * 1000;
 // Expiry alone bounds nothing: a client generating images for an hour grows the
 // store without limit. Bytes, not entries, are what runs the machine out.
 const GENERATED_IMAGE_MAX_BYTES = 128 * 1024 * 1024;
+// The byte budget bounds payloads, not Map overhead: a flood of 1-byte images
+// would grow keys and entry metadata with almost no counted bytes. Entries are
+// bounded separately.
+const GENERATED_IMAGE_MAX_ENTRIES = 10_000;
 const IMAGE_PROXY_VISUAL_CLASSES = [
   'primitive_flat_shape',
   'geometric_icon',
@@ -298,27 +302,35 @@ function requireAuthorizedRequest(
   // An empty configured key is a configuration mistake, not "no gate": treating
   // it as off silently opens a proxy its operator believed was closed.
   if (authKey === undefined) return;
-  if (!authKey) throw new Error('authKey is configured but empty; refusing to serve unauthenticated');
-  // Presented values are trimmed, because a header's surrounding whitespace is
-  // not part of its value. A configured key with edge whitespace could therefore
-  // never be presented by any request — the proxy would answer 401 to everyone,
-  // including its operator. That is a configuration mistake, reported as one.
+  // Each rejected class below is a key no request could ever present: empty;
+  // edge whitespace (presented values are trimmed); unpaired surrogates (no
+  // UTF-8 encoding — the U+FFFD replacement would make a DIFFERENT credential
+  // compare equal); control bytes (the HTTP parser rejects the presenting
+  // request before the gate sees it). The proxy would answer 401 to everyone,
+  // including its operator.
+  //
+  // The SPECIFIC cause goes to the operator's stderr only. The response gets
+  // one fixed sentence: which class of mistake was made is configuration
+  // state, and an unauthenticated caller has no business learning it.
+  const configurationMistake = (): never => {
+    throw new Error('the access gate is misconfigured; see the proxy log');
+  };
+  if (!authKey) {
+    process.stderr.write('authKey is configured but empty; refusing to serve unauthenticated\n');
+    configurationMistake();
+  }
   if (authKey !== authKey.trim()) {
-    throw new Error('authKey has leading or trailing whitespace, which no request can present');
+    process.stderr.write('authKey has leading or trailing whitespace, which no request can present\n');
+    configurationMistake();
   }
-  // An unpaired surrogate has no UTF-8 encoding: Buffer.from replaces it with
-  // U+FFFD, so the DIFFERENT credential \uFFFD would compare equal. A key that
-  // does not survive the encoding round-trip is a configuration mistake, not a
-  // key — no client could present it faithfully.
   if (Buffer.from(authKey, 'utf8').toString('utf8') !== authKey) {
-    throw new Error('authKey contains unpaired surrogates, which cannot be encoded as UTF-8 bytes');
+    process.stderr.write('authKey contains unpaired surrogates, which cannot be encoded as UTF-8 bytes\n');
+    configurationMistake();
   }
-  // Field-content forbids most control bytes. A key whose UTF-8 bytes include
-  // one passes every check here and then can NEVER be presented — the HTTP
-  // parser rejects the request before the gate sees it.
   for (const byte of Buffer.from(authKey, 'utf8')) {
     if ((byte < 0x20 && byte !== 0x09) || byte === 0x7f) {
-      throw new Error('authKey contains control bytes that HTTP forbids in header values');
+      process.stderr.write('authKey contains control bytes that HTTP forbids in header values\n');
+      configurationMistake();
     }
   }
   if (presentedAuthKeys(req).some((candidate) => safeKeyEqual(candidate, authKey))) return;
@@ -1092,6 +1104,7 @@ export class GeneratedImageStore {
   constructor(
     private readonly ttlMs: number = GENERATED_IMAGE_TTL_MS,
     private readonly maxBytes: number = GENERATED_IMAGE_MAX_BYTES,
+    private readonly maxEntries: number = GENERATED_IMAGE_MAX_ENTRIES,
   ) {}
 
   put(b64Json: string, outputFormat: string): string {
@@ -1108,7 +1121,7 @@ export class GeneratedImageStore {
     // image just stored is never the one evicted: a client that asked for it is
     // about to fetch it.
     for (const [oldest] of this.images) {
-      if (this.heldBytes <= this.maxBytes || oldest === id) break;
+      if ((this.heldBytes <= this.maxBytes && this.images.size <= this.maxEntries) || oldest === id) break;
       this.drop(oldest);
     }
     return id;
@@ -2767,6 +2780,20 @@ function writeError(
   }
   const providerError = providerErrorFromBackendError(err);
   if (providerError) {
+    // The mapped status and message survive; the ENVELOPE belongs to the
+    // caller's surface. A 429 on the native surface is still a 429 — reported
+    // as this surface reports errors.
+    if (shape === 'local-cli') {
+      writeJson(res, providerError.statusCode, {
+        error: {
+          message: boundedErrorMessage(providerError.message),
+          type: 'local_cli_chat_error',
+          param: null,
+          code: providerError.code ?? null,
+        },
+      });
+      return;
+    }
     if (shape === 'anthropic') {
       writeJson(res, providerError.statusCode, {
         type: 'error',

@@ -135,8 +135,17 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
 // (accepts a nested `json_schema.schema` variant). A json_schema format with no
 // resolvable schema is malformed input, not absence — reject it (fail-loud).
 function readAnthropicOutputFormat(value: unknown): unknown {
+  if (value === undefined || value === null) return undefined;
   const format = asRecord(value);
-  if (!format) return undefined;
+  // `"json_schema"` the STRING is a present, malformed value — treating it as
+  // omission executed the request without the structured output it asked for.
+  if (!format) {
+    throw new ProxyRequestError(
+      'output_config.format must be an object.',
+      400,
+      'anthropic',
+    );
+  }
   if (format.type !== 'json_schema') {
     throw new ProxyRequestError(
       'output_config.format.type must be json_schema.',
@@ -209,9 +218,19 @@ function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
     );
   }
   const display = thinking?.display;
+  // A defined display outside the enum is invalid input, not a preference to
+  // discard — the direct API validates it. A VALID display under `disabled` is
+  // the one thing deliberately dropped: disabled never produces thinking
+  // blocks for display to govern.
+  if (display !== undefined && display !== null && display !== 'summarized' && display !== 'omitted') {
+    throw new ProxyRequestError(
+      'thinking.display must be summarized or omitted.',
+      400,
+      'anthropic',
+    );
+  }
   return {
     type,
-    // display governs visibility of thinking blocks, which disabled never produces.
     display: type !== 'disabled' && (display === 'summarized' || display === 'omitted')
       ? display
       : undefined,

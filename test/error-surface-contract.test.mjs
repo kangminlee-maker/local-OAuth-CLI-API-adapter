@@ -1552,7 +1552,9 @@ test('an authKey with a control byte is a configuration error, not an unpresenta
   try {
     const res = await fetch(`${started.url}/v1/models`);
     assert.equal(res.status, 500);
-    assert.match((await res.json()).error.message, /control bytes/);
+    // The SPECIFIC cause is operator-only; the response carries one fixed
+    // sentence for every configuration-error class.
+    assert.match((await res.json()).error.message, /access gate is misconfigured/);
   } finally {
     await started.close();
   }
@@ -1596,3 +1598,121 @@ for (const [path, body, readUsage] of [
     if (total !== undefined) assert.equal(total, 11);
   });
 }
+
+// --- round 42: native envelope completeness, output-control validation ---
+
+test('a provider-mapped error on the native surface keeps its status but wears the native envelope', async () => {
+  // The mapped 429 is still a 429; the ENVELOPE belongs to the caller's
+  // surface — this branch was falling through to the OpenAI writer.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    chatSessionManager: {
+      async create() {
+        throw new Error(JSON.stringify({
+          status: 429,
+          error: { type: 'rate_limit_error', message: 'slow down', code: 'rate_limit' },
+        }));
+      },
+      async closeAll() {},
+    },
+  });
+  try {
+    const res = await fetch(`${started.url}/local/cli/sessions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(res.status, 429, 'the mapped status survives');
+    const body = await res.json();
+    assert.equal(body.error.type, 'local_cli_chat_error', JSON.stringify(body));
+    assert.match(body.error.message, /slow down/);
+  } finally {
+    await started.close();
+  }
+});
+
+test('the native surface reports a configuration error in its own envelope', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: ' broken ',
+  });
+  try {
+    const res = await fetch(`${started.url}/local/cli/sessions`);
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.equal(body.error.type, 'local_cli_chat_error', JSON.stringify(body));
+    assert.match(body.error.message, /access gate is misconfigured/);
+  } finally {
+    await started.close();
+  }
+});
+
+test('every authKey configuration mistake gets the same fixed public sentence', async () => {
+  // Which class of mistake was made is configuration state; an unauthenticated
+  // caller has no business learning it.
+  const keys = ['', ' pad ', '\ud800', `x${String.fromCharCode(31)}`, `x${String.fromCharCode(127)}`];
+  const seen = new Set();
+  for (const authKey of keys) {
+    const started = await startLocalApiProxy({
+      backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000, authKey,
+    });
+    try {
+      const res = await fetch(`${started.url}/v1/models`);
+      assert.equal(res.status, 500, `key ${JSON.stringify(authKey)} must be a configuration error`);
+      seen.add((await res.json()).error.message);
+    } finally {
+      await started.close();
+    }
+  }
+  assert.equal(seen.size, 1, `one sentence for every class: ${[...seen].join(' | ')}`);
+});
+
+test('a legal but unusual preflight method token still gets its 204', async () => {
+  // The exemption is grammar-based, not an allow-list: PATCH names a method.
+  const res = await rawStatusWith('secret', Buffer.from(
+    'OPTIONS /v1/nope HTTP/1.1\r\nHost: h\r\nAccess-Control-Request-Method: PATCH\r\nConnection: close\r\n\r\n',
+  ));
+  assert.match(res.split('\r\n')[0], /204/, res.slice(0, 40));
+});
+
+test('/v1/messages: thinking and output_config are validated at the HTTP boundary', async () => {
+  const base = { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] };
+  for (const [label, extra] of [
+    ['an invalid thinking.display', { thinking: { type: 'adaptive', display: 'raw' } }],
+    ['an invalid effort', { output_config: { effort: 'extreme' } }],
+    ['a scalar format', { output_config: { format: 'json_schema' } }],
+    ['an undersized task_budget', { output_config: { task_budget: { type: 'tokens', total: 10 } } }],
+  ]) {
+    const { status, text } = await call(backendThat({}), '/v1/messages', { ...base, ...extra });
+    assert.equal(status, 400, `${label} must be rejected`);
+    const body = JSON.parse(text);
+    assert.equal(body.type, 'error', `${label} must use the Anthropic envelope`);
+  }
+  const okDisplay = await call(backendThat({}), '/v1/messages', {
+    ...base, thinking: { type: 'adaptive', display: 'omitted' },
+  });
+  assert.equal(okDisplay.status, 200, 'a valid display stays valid');
+  const droppedUnderDisabled = await call(backendThat({}), '/v1/messages', {
+    ...base, thinking: { type: 'disabled', display: 'summarized' },
+  });
+  assert.equal(droppedUnderDisabled.status, 200, 'a VALID display under disabled is dropped, not rejected');
+});
+
+test('chat system and developer messages reach the backend conversation', async () => {
+  let seen;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request) { seen = request.messages; return ok(); },
+    async *stream() {},
+    async close() {},
+  };
+  const { status } = await call(backend, '/v1/chat/completions', {
+    model: 'a-model',
+    messages: [
+      { role: 'system', content: 'Be terse.' },
+      { role: 'developer', content: 'Answer in French.' },
+      { role: 'user', content: 'hi' },
+    ],
+  });
+  assert.equal(status, 200);
+  assert.ok(seen.some((m) => m.role === 'system' && m.content.includes('Be terse.')), JSON.stringify(seen));
+  assert.ok(seen.some((m) => m.role === 'developer' && m.content.includes('Answer in French.')), JSON.stringify(seen));
+});
