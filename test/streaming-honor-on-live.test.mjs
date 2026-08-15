@@ -53,6 +53,14 @@ async function runScenario(scenario, honorRequestModel = true) {
             }, { once: true });
           });
           yield { type: 'text_delta', delta: 'hello' };
+          if (${scenario === 'late-disconnect' ? 'true' : 'false'}) {
+            // Hold after the first event so a post-prefetch disconnect has a
+            // pending turn to abort.
+            await new Promise((r, rejectP) => {
+              const timer = setTimeout(r, 5000);
+              signal?.addEventListener('abort', () => { clearTimeout(timer); rejectP(new Error('aborted')); }, { once: true });
+            });
+          }
           yield { type: 'text_delta', delta: ' world' };
           yield { type: 'completed', result: { id: 'x', model: 'live-model', text: 'hello world', toolCalls: [], usage: { inputTokens: 1, outputTokens: 2, source: 'estimated' }, latencyMs: 1 } };
         } finally {
@@ -77,6 +85,7 @@ async function runScenario(scenario, honorRequestModel = true) {
       req.on('error', () => resolveP({ error: true }));
       req.end(body);
       ${scenario === 'disconnect' ? "setTimeout(() => req.destroy(), 100);" : ''}
+      ${scenario === 'late-disconnect' ? "setTimeout(() => req.destroy(), 300);" : ''}
     });
     await new Promise((r) => setTimeout(r, 300));
     await started.close();
@@ -93,6 +102,14 @@ test('honour-on: a valid model streams normally and is not aborted by the prefet
   assert.ok(result.text.includes('hello'), `expected streamed text: ${result.text}`);
   assert.ok(result.text.includes('[DONE]'), `expected a completed stream: ${result.text}`);
   assert.equal(result.state.aborted, false, 'a healthy request must not be aborted');
+  assert.equal(result.state.cleanedUp, true);
+});
+
+test('honour-on: a disconnect AFTER the first event still aborts the backend', async () => {
+  // The close listener used to be released once the prefetched event settled,
+  // so only the pre-first-event case was protected.
+  const result = await runScenario('late-disconnect');
+  assert.equal(result.state.aborted, true, 'the backend signal must abort after a late disconnect');
   assert.equal(result.state.cleanedUp, true);
 });
 

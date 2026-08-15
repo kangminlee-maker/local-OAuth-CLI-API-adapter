@@ -495,7 +495,10 @@ function normalizeOpenAiImageRequest(
   isMultipart: boolean,
 ): OpenAiImageGenerationRequest {
   const input = asRecordPayload(body);
-  const explicitResponseFormat = Object.prototype.hasOwnProperty.call(input, 'response_format');
+  // "Explicit" means a real value: null is omission (the field is nullable on
+  // the direct API), so a GPT-image request carrying response_format: null must
+  // behave exactly like one without the property.
+  const explicitResponseFormat = input.response_format !== undefined && input.response_format !== null;
   const prompt = imagePrompt(input.prompt, operation);
   if (!prompt.trim()) {
     throw new ProxyRequestError(
@@ -519,6 +522,13 @@ function normalizeOpenAiImageRequest(
   if (responseFormat !== 'b64_json' && responseFormat !== 'url') {
     throw new ProxyRequestError('response_format must be one of url or b64_json.', 400);
   }
+  // Absence and null default (the field is nullable on the direct API); a
+  // present non-string or blank string is malformed input, not a request for
+  // dall-e-2 — substituting a model the client never named ran the wrong route.
+  if (input.model !== undefined && input.model !== null
+    && (typeof input.model !== 'string' || !input.model.trim())) {
+    throw new ProxyRequestError('model must be a non-empty string.', 400, 'openai', 'invalid_request_error', 'model');
+  }
   const model = typeof input.model === 'string' && input.model.trim()
     ? input.model
     : 'dall-e-2';
@@ -541,7 +551,7 @@ function normalizeOpenAiImageRequest(
     prompt,
     n: imageGenerationCount(input.n),
     images,
-    mask: optionalImageInput(input.mask),
+    mask: requiredValidImageInput(input.mask, 'mask'),
     size: optionalImageSize(input.size),
     quality: optionalEnum(input.quality, 'quality', ['standard', 'hd', 'low', 'medium', 'high', 'auto']),
     background: optionalEnum(input.background, 'background', ['transparent', 'opaque', 'auto']),
@@ -611,6 +621,19 @@ function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void
       'invalid_png_output_compression',
     );
   }
+  if (request.inputFidelity && request.model === 'image-2') {
+    // The model-specific rejection carries its documented envelope
+    // (image_generation_user_error); the generic operation guard below used to
+    // shadow it for generations and variations.
+    throw new ProxyRequestError(
+      'input_fidelity is disabled for image-2.',
+      400,
+      'openai',
+      'image_generation_user_error',
+      'tools',
+      'invalid_input_fidelity_model',
+    );
+  }
   if (request.inputFidelity && request.operation !== 'edit') {
     throw new ProxyRequestError('input_fidelity is only supported for image edits.', 400);
   }
@@ -626,16 +649,6 @@ function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void
   }
   if (request.background === 'transparent' && request.outputFormat === 'jpeg') {
     throw new ProxyRequestError('background transparent requires output_format to be png or webp.', 400);
-  }
-  if (request.model === 'image-2' && request.inputFidelity) {
-    throw new ProxyRequestError(
-      'input_fidelity is disabled for image-2.',
-      400,
-      'openai',
-      'image_generation_user_error',
-      'tools',
-      'invalid_input_fidelity_model',
-    );
   }
   if (request.style && request.operation !== 'generation') {
     throw new ProxyRequestError('style is only supported for image generations.', 400);
@@ -674,6 +687,20 @@ function imageInputArray(value: unknown): readonly NormalizedImage[] {
   }
   const image = optionalImageInput(value);
   return image ? [image] : [];
+}
+
+/**
+ * An optional image field whose PRESENT values must be valid: omission and
+ * null pass through as absence, but `mask: 42` used to be silently dropped —
+ * executing an unmasked edit the client never asked for.
+ */
+function requiredValidImageInput(value: unknown, field: string): NormalizedImage | undefined {
+  if (value === undefined || value === null) return undefined;
+  const image = optionalImageInput(value);
+  if (!image) {
+    throw new ProxyRequestError(`${field} is not a valid image reference.`, 400);
+  }
+  return image;
 }
 
 function optionalImageInput(value: unknown): NormalizedImage | undefined {
@@ -805,7 +832,9 @@ function optionalInteger(
   min: number,
   max: number,
 ): number | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
+  // null is omission (nullable on the direct API); an empty string is a
+  // PRESENT value that is not an integer.
+  if (value === undefined || value === null) return undefined;
   const parsed = typeof value === 'number'
     ? value
     : typeof value === 'string' && /^\d+$/.test(value.trim())
@@ -1550,9 +1579,14 @@ async function writeOpenAiImageStream(
     batch.add(id);
     return id;
   };
+  // The event count is backend-controlled; `n` is the request's. A runaway
+  // stream must not emit more images than were asked for — nor pin more.
+  let completedEmitted = 0;
   try {
     for await (const event of events) {
       if (event.type === 'partial_image') continue;
+      if (completedEmitted >= (request.n ?? 1)) break;
+      completedEmitted += 1;
       const type = imageStreamEventType(request.operation, event.type);
       const payload = {
         type,

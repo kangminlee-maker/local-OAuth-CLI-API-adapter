@@ -1201,3 +1201,143 @@ test('a non-streaming image disconnect aborts the backend', async () => {
     await started.close();
   }
 });
+
+// --- round 45 ---
+
+test('gpt-image-1 with response_format null behaves as omission, not unknown_parameter', async () => {
+  const { status, payload } = await postImages(GEN, {
+    model: 'gpt-image-1', prompt: 'a dot', response_format: null,
+  });
+  assert.equal(status, 200, JSON.stringify(payload));
+});
+
+for (const path of [GEN, '/v1/images/edits']) {
+  test(`${path}: an empty-string output_compression is a present wrong value`, async () => {
+    const body = path === GEN
+      ? { model: 'image-2', prompt: 'a dot', output_compression: '' }
+      : { model: 'image-2', prompt: 'a dot', images: [{ image_url: PNG_DATA_URL }], output_compression: '' };
+    const { status } = await postImages(path, body);
+    assert.equal(status, 400, 'an empty string is not an integer');
+  });
+}
+
+test('edits: a malformed mask is rejected, not silently dropped', async () => {
+  // Executing an unmasked edit the client never asked for is a semantic
+  // alteration, not a convenience.
+  const { status, payload } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'make it blue', images: [{ image_url: PNG_DATA_URL }], mask: 42,
+  });
+  assert.equal(status, 400, JSON.stringify(payload));
+  assert.match(payload.error.message, /mask/);
+});
+
+test('edits: mask null is omission — the unmasked edit was asked for', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'make it blue', images: [{ image_url: PNG_DATA_URL }], mask: null,
+  });
+  assert.equal(status, 200);
+});
+
+for (const [label, model] of [['a number', 7], ['an empty string', ''], ['whitespace', '  ']]) {
+  test(`generations: model ${label} is rejected, never rewritten to dall-e-2`, async () => {
+    const { status, payload } = await postImages(GEN, { model, prompt: 'a dot' });
+    assert.equal(status, 400, `model=${JSON.stringify(model)} must not select a different model`);
+    assert.equal(payload.error.param, 'model');
+  });
+}
+
+test('generations: model null defaults, as the nullable direct field declares', async () => {
+  const { status } = await postImages(GEN, { model: null, prompt: 'a dot' });
+  assert.equal(status, 200);
+});
+
+for (const [path, extra] of [
+  [GEN, {}],
+  ['/v1/images/variations', null],
+]) {
+  test(`${path === GEN ? 'generations' : 'variations'}: image-2 input_fidelity carries its documented envelope`, async () => {
+    const { status, payload } = path === GEN
+      ? await postImages(GEN, { model: 'image-2', prompt: 'a dot', input_fidelity: 'high' })
+      : await postVariationFidelity();
+    assert.equal(status, 400);
+    assert.equal(payload.error.type, 'image_generation_user_error', JSON.stringify(payload.error));
+    assert.equal(payload.error.code, 'invalid_input_fidelity_model');
+  });
+}
+
+async function postVariationFidelity() {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const form = new FormData();
+    form.set('model', 'image-2');
+    form.set('input_fidelity', 'high');
+    form.set('image', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'sq.png');
+    const res = await fetch(`${started.url}/v1/images/variations`, { method: 'POST', body: form });
+    return { status: res.status, payload: await res.json() };
+  } finally {
+    await started.close();
+  }
+}
+
+test('a runaway stream cannot emit more images than n, and pins stay bounded', async () => {
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { return { created: 0, images: [] }; },
+    async *stream() {
+      for (let i = 0; i < 50; i += 1) {
+        yield { type: 'completed', created: 0, image: { b64Json: 'iVBORw0KGgo=', revisedPrompt: null } };
+      }
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2, stream: true, response_format: 'url' }),
+    });
+    const text = await res.text();
+    const urls = [...text.matchAll(/"url":"([^"]+)"/g)];
+    assert.equal(urls.length, 2, `the stream must stop at n: ${urls.length}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('multipart works with an uppercase media-type essence', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const boundary = 'testboundary123';
+    const body = [
+      `--${boundary}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${boundary}`, 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+      `--${boundary}--`, '',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => {
+        conn.write(
+          `POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n`
+          + `Content-Type: MULTIPART/FORM-DATA; boundary=${boundary}\r\n`
+          + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+        );
+      });
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data));
+      conn.on('error', reject);
+    });
+    assert.match(raw.split('\r\n')[0], /200/, raw.slice(0, 200));
+  } finally {
+    await started.close();
+  }
+});

@@ -1994,3 +1994,39 @@ test('/v1/messages: a refusal without runtime details gets the synthesized stop_
     .map((l) => JSON.parse(l.slice(6))).at(-1);
   assert.deepEqual(delta.delta.stop_details, { type: 'refusal', category: null });
 });
+
+// --- round 45 coverage ---
+
+test('the validated thinking budget reaches the backend intact', async () => {
+  let seen;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request) { seen = request.thinking; return ok(); },
+    async *stream() {},
+    async close() {},
+  };
+  const { status } = await call(backend, '/v1/messages', {
+    model: 'a-model', max_tokens: 8192, messages: [{ role: 'user', content: 'hi' }],
+    thinking: { type: 'enabled', budget_tokens: 4096 },
+  });
+  assert.equal(status, 200);
+  assert.equal(seen?.budgetTokens, 4096, 'the exact client-chosen budget must be delivered');
+});
+
+test('an Anthropic stream carries its model only in message_start', async () => {
+  const { text } = await call(
+    usageBackendReporting({ inputTokens: 1, outputTokens: 1, source: 'provider' }),
+    '/v1/messages',
+    { ...MESSAGES, stream: true },
+  );
+  const events = text.split('\n')
+    .filter((l) => l.startsWith('data: '))
+    .map((l) => JSON.parse(l.slice(6)));
+  const start = events.find((e) => e.type === 'message_start');
+  assert.ok(start?.message?.model, 'message_start carries the model');
+  for (const event of events.filter((e) => e.type !== 'message_start')) {
+    assert.equal(event.model, undefined, `${event.type} must not carry a model field`);
+    assert.equal(event.message?.model, undefined, `${event.type} must not carry a nested model`);
+  }
+});
+
