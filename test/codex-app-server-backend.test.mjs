@@ -725,3 +725,40 @@ function providerEnvNames() {
     'OPENAI_BASE_URL',
   ];
 }
+
+test('a request whose client already left never starts a turn', async () => {
+  // The abort listener is once-only and a no-op while turnId is null, and an
+  // aborted catalogue wait deliberately fails open — so a disconnect during
+  // the pre-turn waits used to run the whole turn for nobody. A pre-aborted
+  // signal is the deterministic form of that window.
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex, cwd: process.cwd(), timeoutMs: 10_000,
+  });
+  try {
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(
+      () => backend.generate({
+        shape: 'openai-chat', model: 'codex-app-server',
+        messages: [{ role: 'user', content: 'never runs', images: [] }],
+        stream: false, streamOptions: { includeUsage: false, includeObfuscation: false },
+        jsonMode: false, tools: [], toolChoice: { type: 'auto' }, raw: {},
+      }, aborted.signal),
+      /request aborted/,
+    );
+
+    // The fixture counts turn/start calls; the aborted request must not have
+    // added one, so the follow-up debug turn is turn number 1.
+    const debug = await backend.generate({
+      shape: 'openai-chat', model: 'codex-app-server',
+      messages: [{ role: 'user', content: 'DEBUG_PAYLOAD', images: [] }],
+      stream: false, streamOptions: { includeUsage: false, includeObfuscation: false },
+      jsonMode: false, tools: [], toolChoice: { type: 'auto' }, raw: {},
+    });
+    const payload = JSON.parse(debug.text);
+    assert.equal(payload.turnCount, 1, 'the aborted request must never have started a turn');
+  } finally {
+    await backend.close();
+  }
+});

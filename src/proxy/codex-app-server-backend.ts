@@ -406,6 +406,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     try {
       [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
       const cwd = this.isolation?.workDir ?? this.cwd;
+      // Same rule as the text turn: a disconnect during the waits above must
+      // not START a turn (the once-listener was a no-op while turnId was null).
+      if (signal?.aborted) throw new Error('request aborted');
       phaseStartedAt = Date.now();
       const turn = await this.send('turn/start', {
         threadId,
@@ -422,6 +425,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       timing.turnStartMs = Date.now() - phaseStartedAt;
       turnId = readPath<string>(turn, ['result', 'turn', 'id']);
       if (!turnId) throw new Error('codex app-server did not return a turn id');
+      // The once-listener may have been consumed during the round-trip while
+      // turnId was null; deliver the interrupt it could not.
+      if (signal?.aborted) await abort();
       phaseStartedAt = Date.now();
       const result = await this.waitForImageTurn(threadId, turnId, signal);
       timing.turnWaitMs = Date.now() - phaseStartedAt;
@@ -508,6 +514,11 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
       const cwd = this.isolation?.workDir ?? this.cwd;
       const modelOverride = await this.modelOverrideFor(request, signal);
+      // The abort listener is once-only and a no-op while turnId is null, and
+      // an aborted catalogue lookup deliberately fails open — so a client that
+      // disconnected during the waits above would otherwise still START a
+      // turn nobody is waiting for.
+      if (signal?.aborted) throw new Error('request aborted');
       phaseStartedAt = Date.now();
       const turn = await this.send('turn/start', {
         threadId,
@@ -524,6 +535,10 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       timing.turnStartMs = Date.now() - phaseStartedAt;
       turnId = readPath<string>(turn, ['result', 'turn', 'id']);
       if (!turnId) throw new Error('codex app-server did not return a turn id');
+      // The abort may have fired during the turn/start round-trip, consuming
+      // the once-listener while turnId was still null. Now that the id exists,
+      // deliver the interrupt it could not.
+      if (signal?.aborted) await abort();
       phaseStartedAt = Date.now();
       const turnResult = await this.waitForTurn(threadId, turnId, signal, observedTextDelta);
       timing.turnWaitMs = Date.now() - phaseStartedAt;

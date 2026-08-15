@@ -331,6 +331,7 @@ function debugPayload() {
     cwdFiles = ['<unreadable>'];
   }
   return {
+    turnCount: turnSeq,
     threadCwd: lastThreadStartParams?.cwd ?? null,
     threadCwdFiles: cwdFiles,
     threadStart: pick(lastThreadStartParams, [
