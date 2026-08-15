@@ -829,3 +829,120 @@ test('generations: standard output_compression wins over the route hint', async 
     await started.close();
   }
 });
+
+// --- round 41 ---
+
+test('a failed image stream still ends with data: [DONE]', async () => {
+  // The one OpenAI surface whose mid-stream error ended without the promised
+  // terminal frame.
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { return { created: 0, images: [{ b64Json: 'iVBORw0KGgo=', revisedPrompt: null }] }; },
+    async *stream() { throw new Error('backend exploded'); },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'x', stream: true }),
+    });
+    assert.equal(res.status, 200, 'the stream was already committed');
+    const text = await res.text();
+    assert.match(text, /event: error/);
+    const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
+    assert.equal(frames.at(-1), 'data: [DONE]', `the last frame must be the terminal one: ${frames.at(-1)}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('generated ids are matched byte-for-byte: encoding is not an alias', async () => {
+  // Issued ids are plain UUIDs, so no client needs encoding — and decoding
+  // created aliases: two raw targets naming one image.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
+    });
+    const url = (await res.json()).data[0].url;
+    assert.equal((await fetch(url)).status, 200);
+    const id = url.split('/').pop();
+    // %-encode the first hex digit: same decoded value, different raw bytes.
+    const aliased = url.replace(id, `%${id.charCodeAt(0).toString(16)}${id.slice(1)}`);
+    assert.equal((await fetch(aliased)).status, 404, 'an encoded spelling is a different, unissued id');
+  } finally {
+    await started.close();
+  }
+});
+
+test('route-only output_compression is the effective value when the standard field is omitted', async () => {
+  let seen;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request) {
+      seen = request.outputCompression;
+      return { created: 0, images: [{ b64Json: 'iVBORw0KGgo=', revisedPrompt: null }] };
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'image-2', prompt: 'a dot', output_format: 'jpeg',
+        x_proxy_image_route: { output_compression: 20 },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(seen, 20, 'with the standard field omitted, the route hint applies');
+  } finally {
+    await started.close();
+  }
+});
+
+test('a forwarded proto with a non-OWS byte does not choose the scheme', async () => {
+  // `https` followed by byte 0xA0 is not the token `https`. String.trim ate the
+  // byte (it is U+00A0 under latin1 decoding) and upgraded the URL; OWS-only
+  // stripping leaves the token unrecognised, falling back to the connection.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => {
+        conn.write(Buffer.concat([
+          Buffer.from(
+            'POST /v1/images/generations HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n'
+            + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\nX-Forwarded-Proto: https`,
+          ),
+          Buffer.from([0xa0]),
+          Buffer.from(`\r\n\r\n${body}`),
+        ]));
+      });
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data));
+      conn.on('error', reject);
+    });
+    const url = /"url":"([^"]+)"/.exec(raw)?.[1];
+    assert.ok(url, raw.slice(0, 120));
+    assert.match(url, /^http:\/\//, `the malformed hop must not upgrade the scheme: ${url}`);
+  } finally {
+    await started.close();
+  }
+});

@@ -1465,3 +1465,134 @@ test('/v1/responses: instructions reach the backend as an instruction message', 
     `instructions must be lifted into the conversation: ${JSON.stringify(seen)}`,
   );
 });
+
+// --- round 41: preflight grammar, native envelope, CONNECT, presentable keys ---
+
+test('a preflight must name a real method: a malformed token does not bypass the gate', async () => {
+  for (const bad of ['P OST', ',', '()']) {
+    const res = await rawStatusWith('secret', Buffer.from(
+      `OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: h\r\nAccess-Control-Request-Method: ${bad}\r\nConnection: close\r\n\r\n`,
+    ));
+    assert.match(res.split('\r\n')[0], /401/, `${bad} is not a method name: ${res.slice(0, 40)}`);
+  }
+  const real = await rawStatusWith('secret', Buffer.from(
+    'OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: h\r\nAccess-Control-Request-Method: POST\r\nConnection: close\r\n\r\n',
+  ));
+  assert.match(real.split('\r\n')[0], /204/, 'a real preflight keeps its exemption');
+});
+
+test('the native sessions surface answers gate failures in its own envelope', async () => {
+  // The contract gives /local/cli/sessions its own envelope for its errors;
+  // the gate and configuration failures happen before its handler, but the
+  // caller is still a native-surface caller.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: 'secret-key',
+  });
+  try {
+    const res = await fetch(`${started.url}/local/cli/sessions`);
+    assert.equal(res.status, 401);
+    const body = await res.json();
+    assert.equal(body.error.type, 'local_cli_chat_error', JSON.stringify(body));
+
+    const authed = await fetch(`${started.url}/local/cli/sessions`, {
+      headers: { 'x-api-key': 'secret-key' },
+    });
+    assert.notEqual(authed.status, 401, 'a valid key must pass the gate on this surface');
+  } finally {
+    await started.close();
+  }
+});
+
+test('the sessions surface does not lose the shared gate', async () => {
+  // One-line risk: an exemption for the native prefix. Root and a subpath.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: 'secret-key',
+  });
+  try {
+    for (const path of ['/local/cli/sessions', '/local/cli/sessions/some-id/turns']) {
+      const res = await fetch(`${started.url}${path}`, { method: 'POST' });
+      assert.equal(res.status, 401, `${path} must be gated`);
+    }
+  } finally {
+    await started.close();
+  }
+});
+
+test('CONNECT receives an HTTP 405, not a dead socket', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const res = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => {
+        conn.write('CONNECT example.com:443 HTTP/1.1\r\nHost: h\r\n\r\n');
+      });
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data));
+      conn.on('error', reject);
+      setTimeout(() => { conn.destroy(); resolve(data || 'NO RESPONSE'); }, 3000);
+    });
+    assert.match(res.split('\r\n')[0], /405/, `expected an HTTP answer: ${res.slice(0, 40)}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('an authKey with a control byte is a configuration error, not an unpresentable key', async () => {
+  // Node's parser rejects a header carrying the byte before the gate could see
+  // it, so the key passes configuration and can never authenticate anyone.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: `a${String.fromCharCode(0)}b`,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/models`);
+    assert.equal(res.status, 500);
+    assert.match((await res.json()).error.message, /control bytes/);
+  } finally {
+    await started.close();
+  }
+});
+
+test('every response carries the static CORS policy, success and error alike', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const okRes = await fetch(`${started.url}/v1/models`);
+    const errRes = await fetch(`${started.url}/v1/nope`);
+    for (const [label, res] of [['success', okRes], ['error', errRes]]) {
+      assert.equal(res.headers.get('access-control-allow-origin'), '*', `${label} must carry the wildcard`);
+      assert.match(res.headers.get('access-control-allow-methods') ?? '', /POST/, label);
+      assert.match(res.headers.get('access-control-allow-headers') ?? '', /x-api-key/, label);
+    }
+  } finally {
+    await started.close();
+  }
+});
+
+for (const [path, body, readUsage] of [
+  ['/v1/responses', { model: 'a-model', input: 'hi' },
+    (b) => [b.usage.input_tokens, b.usage.output_tokens, b.usage.total_tokens]],
+  ['/v1/messages', { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    (b) => [b.usage.input_tokens, b.usage.output_tokens, undefined]],
+]) {
+  test(`${path}: estimated usage is reported when the runtime reports none`, async () => {
+    // The chat surface pins this fallback; these two did not, so a
+    // provider-only usage mapper would silently drop their counts.
+    const { status, text } = await call(
+      usageBackendReporting({ inputTokens: 5, outputTokens: 6, source: 'estimated' }),
+      path,
+      body,
+    );
+    assert.equal(status, 200);
+    const [input, output, total] = readUsage(JSON.parse(text));
+    assert.equal(input, 5);
+    assert.equal(output, 6);
+    if (total !== undefined) assert.equal(total, 11);
+  });
+}

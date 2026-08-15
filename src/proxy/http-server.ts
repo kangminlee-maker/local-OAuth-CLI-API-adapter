@@ -46,7 +46,7 @@ export interface StartedProxyServer {
   close(): Promise<void>;
 }
 
-type ErrorResponseShape = 'openai' | 'openai-chat' | 'openai-responses' | 'anthropic';
+type ErrorResponseShape = 'openai' | 'openai-chat' | 'openai-responses' | 'anthropic' | 'local-cli';
 type OpenAiImageOperation = OpenAiImageGenerationRequest['operation'];
 
 const DEFAULT_IMAGE_GENERATION_SIZE = 'auto';
@@ -79,6 +79,26 @@ export async function startLocalApiProxy(
   const generatedImages = new GeneratedImageStore();
   const server = createServer((req, res) => {
     void handleRequest(req, res, options, generatedImages);
+  });
+  // Node routes CONNECT to this event and, with no listener, destroys the
+  // socket — the one method that got no HTTP answer at all. It is a tunnel
+  // request this proxy does not serve; say so in the promised shape.
+  server.on('connect', (_req, socket) => {
+    const body = JSON.stringify({
+      error: {
+        message: 'Unsupported method.',
+        type: 'invalid_request_error',
+        param: null,
+        code: null,
+      },
+    });
+    socket.end(
+      'HTTP/1.1 405 Method Not Allowed\r\n'
+      + 'content-type: application/json; charset=utf-8\r\n'
+      + `content-length: ${Buffer.byteLength(body)}\r\n`
+      + 'connection: close\r\n\r\n'
+      + body,
+    );
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -137,7 +157,7 @@ async function handleRequest(
   // before it will attach credentials, which is why it bypasses the gate. A
   // preflight always names the method it is asking about; a bare OPTIONS does
   // not, is an ordinary request, and goes through dispatch like any other.
-  if (req.method === 'OPTIONS' && stripOws(headerValue(req.headers['access-control-request-method'])) !== '') {
+  if (req.method === 'OPTIONS' && isHttpMethodToken(stripOws(headerValue(req.headers['access-control-request-method'])))) {
     res.writeHead(204).end();
     return;
   }
@@ -154,6 +174,9 @@ async function handleRequest(
     // fail: a method rejection, a body-parse failure or a configuration error
     // on /v1/messages must already answer in the Anthropic shape.
     if (path === '/v1/messages') errorShape = 'anthropic';
+    if (path === '/local/cli/sessions' || path.startsWith('/local/cli/sessions/')) {
+      errorShape = 'local-cli';
+    }
     requireAuthorizedRequest(req, path, options.authKey);
     if (path === '/local/cli/sessions' || path.startsWith('/local/cli/sessions/')) {
       await handleLocalCliChatRequest(req, res, options, path);
@@ -290,6 +313,14 @@ function requireAuthorizedRequest(
   if (Buffer.from(authKey, 'utf8').toString('utf8') !== authKey) {
     throw new Error('authKey contains unpaired surrogates, which cannot be encoded as UTF-8 bytes');
   }
+  // Field-content forbids most control bytes. A key whose UTF-8 bytes include
+  // one passes every check here and then can NEVER be presented — the HTTP
+  // parser rejects the request before the gate sees it.
+  for (const byte of Buffer.from(authKey, 'utf8')) {
+    if ((byte < 0x20 && byte !== 0x09) || byte === 0x7f) {
+      throw new Error('authKey contains control bytes that HTTP forbids in header values');
+    }
+  }
   if (presentedAuthKeys(req).some((candidate) => safeKeyEqual(candidate, authKey))) return;
   const provider = path === '/v1/messages' ? 'anthropic' : 'openai';
   throw new ProxyRequestError(
@@ -337,6 +368,13 @@ function presentedAuthKeys(req: IncomingMessage): string[] {
     if (token) presented.push(token);
   }
   return presented;
+}
+
+// RFC 9110 token grammar. The preflight exemption is for a request that NAMES
+// the method it is asking about; `P OST` or `,` names none, and treating mere
+// non-emptiness as a name let malformed OPTIONS skip the gate.
+function isHttpMethodToken(value: string): boolean {
+  return /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value);
 }
 
 // RFC 7230 optional whitespace: ASCII space and horizontal tab, nothing else.
@@ -1111,14 +1149,12 @@ function writeGeneratedImage(
   generatedImages: GeneratedImageStore,
   path: string,
 ): void {
-  let id: string;
-  try {
-    id = decodeURIComponent(path.slice('/v1/images/generated/'.length));
-  } catch {
-    // `%FF` is not decodable. An id the proxy could never have issued is the
-    // same miss as one it has forgotten — not a 500.
-    id = '';
-  }
+  // Byte-for-byte, no percent-decoding: issued ids are plain UUIDs, so no
+  // client ever needs encoding, and decoding created aliases — `%61bc...` and
+  // `abc...` named the same image, while `%2F` decoded into a separator the
+  // route grammar had already excluded. A `%FF` or `%2F` segment is simply an
+  // id that was never issued: the ordinary miss.
+  const id = path.slice('/v1/images/generated/'.length);
   const image = generatedImages.get(id);
   if (!image) {
     writeJson(res, 404, {
@@ -1160,7 +1196,7 @@ function generatedImageUrl(req: IncomingMessage, id: string): string {
   const socket = req.socket as { encrypted?: boolean; localAddress?: string; localPort?: number };
   const host = headerValue(req.headers.host)
     || (socket.localAddress ? `${urlHostname(socket.localAddress)}:${socket.localPort}` : '127.0.0.1');
-  const forwarded = headerValue(req.headers['x-forwarded-proto']).split(',')[0]?.trim().toLowerCase();
+  const forwarded = stripOws(headerValue(req.headers['x-forwarded-proto']).split(',')[0] ?? '').toLowerCase();
   const scheme = forwarded === 'https' || forwarded === 'http'
     ? forwarded
     : (socket.encrypted ? 'https' : 'http');
@@ -1443,6 +1479,9 @@ async function writeOpenAiImageStream(
     }
   } catch (err) {
     await writeSseEvent(res, 'error', streamErrorPayload(err));
+    // The OpenAI mid-stream contract: an in-band error, then `data: [DONE]` —
+    // the images stream was the one OpenAI surface that ended without it.
+    res.write('data: [DONE]\n\n');
   } finally {
     res.end();
   }
@@ -2686,6 +2725,20 @@ function writeError(
     return;
   }
   if (err instanceof ProxyRequestError) {
+    // The native surface promises its own envelope for everything, the gate
+    // and configuration failures included — they happen before its handler,
+    // but the caller is still a native-surface caller.
+    if (shape === 'local-cli') {
+      writeJson(res, err.statusCode, {
+        error: {
+          message: boundedErrorMessage(err.message),
+          type: 'local_cli_chat_error',
+          param: null,
+          code: err.code,
+        },
+      });
+      return;
+    }
     // The error's own provider wins when it names one; otherwise the caller's
     // surface decides. The shared throws — method rejections, body-parse
     // failures, the 413 — carry the default provider, and on /v1/messages they
@@ -2738,6 +2791,12 @@ function writeError(
   // asked in. `/v1/messages` has its own envelope and no `param`/`code`; sending
   // the OpenAI body there hands an Anthropic client something it cannot parse.
   const message = boundedErrorMessage(err instanceof Error ? err.message : String(err));
+  if (shape === 'local-cli') {
+    writeJson(res, 500, {
+      error: { message, type: 'local_cli_chat_error', param: null, code: null },
+    });
+    return;
+  }
   if (shape === 'anthropic') {
     writeJson(res, 500, { type: 'error', error: { type: 'api_error', message } });
     return;
