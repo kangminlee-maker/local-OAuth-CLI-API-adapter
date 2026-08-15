@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import readline from 'node:readline';
 import {
@@ -10,7 +10,7 @@ import {
   honorRequestModel,
 } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
-import { assertCodexModelSupported, codexModels } from './codex-model-catalog.js';
+import { assertCodexModelSupported, codexModels, sourceCodexHome } from './codex-model-catalog.js';
 import {
   baseInstructions,
   buildPrompt,
@@ -1562,12 +1562,6 @@ export function minimalCodexConfigToml(options: {
     'inherit = "none"',
     '',
   ].join('\n');
-}
-
-function sourceCodexHome(): string {
-  return process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
-    ? process.env.CODEX_HOME
-    : join(homedir(), '.codex');
 }
 
 async function copyCodexAuth(sourceHome: string, targetHome: string): Promise<void> {

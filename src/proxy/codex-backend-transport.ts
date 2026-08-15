@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { extname, join } from 'node:path';
 import { honorRequestModel } from '../settings.js';
 import {
@@ -9,7 +8,7 @@ import {
   requestInstructionText,
   usageFor,
 } from './backend-contract.js';
-import { assertCodexModelSupported, codexModels } from './codex-model-catalog.js';
+import { assertCodexModelSupported, codexModels, sourceCodexHome } from './codex-model-catalog.js';
 import {
   image2QualityToGpt55ReasoningEffort,
   image2ViaGpt55PromptFromRequest,
@@ -1519,12 +1518,6 @@ function ensureJsonString(value: string): string {
   } catch {
     return JSON.stringify({ input: value });
   }
-}
-
-function sourceCodexHome(): string {
-  return process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
-    ? process.env.CODEX_HOME
-    : join(homedir(), '.codex');
 }
 
 function mediaTypeForPath(path: string): string {

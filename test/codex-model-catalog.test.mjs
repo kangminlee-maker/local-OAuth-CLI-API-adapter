@@ -223,6 +223,35 @@ test('a different account in the same CODEX_HOME does not reuse the cached catal
   assert.equal(await callCount(codexHome), 2, 'a credential change must force a fresh lookup');
 });
 
+test('an account switch in the DEFAULT home retires the cached catalogue too', async () => {
+  // With no codexHome supplied the lookup still runs against the effective
+  // default home (CODEX_HOME from the environment, else ~/.codex). The stamp
+  // used to fingerprint "no home" as a constant, so a login there kept
+  // serving the previous account's entitlements until the TTL expired.
+  const codexHome = await newHome();
+  const previousEnv = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  try {
+    await writeFile(join(codexHome, 'auth.json'), `${JSON.stringify({ tokens: { account_id: 'a' } })}\n`);
+    await codexModels({ command: okCommand });
+    assert.equal(await callCount(codexHome), 1, 'expected the lookup to run in the env-named home');
+
+    await codexModels({ command: okCommand });
+    assert.equal(await callCount(codexHome), 1, 'unchanged credentials should still cache');
+
+    await new Promise((r) => setTimeout(r, 10));
+    await writeFile(
+      join(codexHome, 'auth.json'),
+      `${JSON.stringify({ tokens: { account_id: 'b', extra: 'longer-file' } })}\n`,
+    );
+    await codexModels({ command: okCommand });
+    assert.equal(await callCount(codexHome), 2, 'a default-home credential change must force a fresh lookup');
+  } finally {
+    if (previousEnv === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousEnv;
+  }
+});
+
 test('a same-sized credential swap with unchanged metadata still forces a fresh lookup', async () => {
   // File metadata is not account identity: `cp -p`, an equal-length rewrite, or a
   // coarse-timestamp filesystem all preserve mtime and size.

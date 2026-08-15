@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { proxyChildProcessEnv } from './process-env.js';
 import { unsupportedModelError } from './types.js';
@@ -82,8 +82,14 @@ export async function codexModels(
   // base the transport uses when it reads auth.json from this value. Rebasing it
   // on the runtime cwd instead would point the lookup at a different Codex
   // profile than the one executing the request.
+  // When no home is supplied the lookup still runs against one — CODEX_HOME
+  // from this process's environment, else ~/.codex, the same resolution the
+  // backends use for auth. The EFFECTIVE home is what the stamp and the cache
+  // key must watch: fingerprinting "no home" as a constant would keep serving
+  // the previous account's entitlements after a login in the default home
+  // until the TTL expired.
   const codexHome = options.codexHome === undefined
-    ? undefined
+    ? resolve(process.cwd(), sourceCodexHome())
     : resolve(process.cwd(), options.codexHome);
   // A directory this process created and owns. The OS temp root is NOT empty —
   // it is shared, and anything with Codex configuration sitting in it would be
@@ -100,7 +106,7 @@ export async function codexModels(
   const authGeneration = await authFingerprint(codexHome);
   // Serialized rather than space-joined: a space inside any component would
   // otherwise let two distinct tuples share one entry.
-  const key = JSON.stringify([command, codexHome ?? null, cwd, authGeneration]);
+  const key = JSON.stringify([command, codexHome, cwd, authGeneration]);
 
   const cached = cache.get(key);
   if (cached) {
@@ -198,7 +204,7 @@ function probeDir(): Promise<string | null> {
 
 function collectModels(
   command: string,
-  codexHome: string | undefined,
+  codexHome: string,
   cwd: string,
 ): Promise<readonly CodexModel[] | null> {
   return new Promise((resolve) => {
@@ -207,7 +213,11 @@ function collectModels(
       ['debug', 'models'],
       {
         cwd,
-        env: proxyChildProcessEnv(codexHome ? { CODEX_HOME: codexHome } : {}),
+        // Always explicit, and always the resolved effective home the cache
+        // key fingerprints: an inherited relative or blank CODEX_HOME would
+        // otherwise resolve against the probe directory in the child and
+        // diverge from the directory the auth stamp watches.
+        env: proxyChildProcessEnv({ CODEX_HOME: codexHome }),
         timeout: MODEL_LIST_TIMEOUT_MS,
         // Every model carries its full base instructions, so the payload is far
         // larger than a typical CLI response.
@@ -285,8 +295,7 @@ function resolveCommand(command: string, runtimeCwd: string | undefined): string
  * when the file is rewritten by a login or refresh; the contents are never read,
  * so no token material enters the cache key.
  */
-async function authFingerprint(codexHome: string | undefined): Promise<string> {
-  if (!codexHome) return 'no-home';
+async function authFingerprint(codexHome: string): Promise<string> {
   const path = join(codexHome, 'auth.json');
   try {
     const raw = await readFile(path, 'utf8');
@@ -307,6 +316,18 @@ async function authFingerprint(codexHome: string | undefined): Promise<string> {
       return 'absent';
     }
   }
+}
+
+/**
+ * The home the Codex CLI would use when none is supplied: CODEX_HOME from the
+ * environment when it names anything, else `~/.codex`. Shared so the model
+ * catalogue, the app-server isolation copy, and the transport's auth read all
+ * watch the same directory.
+ */
+export function sourceCodexHome(): string {
+  return process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
+    ? process.env.CODEX_HOME
+    : join(homedir(), '.codex');
 }
 
 function accountIdFrom(raw: string): string | null {
