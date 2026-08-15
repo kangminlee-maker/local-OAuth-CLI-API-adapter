@@ -121,7 +121,7 @@ async function proxy(args: readonly string[]): Promise<number> {
 
   process.stdout.write(`local OAuth CLI API proxy ready\n`);
   process.stdout.write(`  backend: ${backend.name}\n`);
-  process.stdout.write(`  auth: ${authKey ? 'required (Authorization: Bearer or x-api-key)' : 'open (no key gate)'}\n`);
+  process.stdout.write(`  auth: ${authGateStatus(authKey)}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexTransport: ${selectedCodexTransport}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexImageTransport: ${selectedCodexImageTransport}\n`);
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
@@ -226,6 +226,21 @@ export function configuredAuthKey(
   env: string | undefined,
 ): string | undefined {
   return flag ?? env;
+}
+
+/**
+ * The startup status keys on CONFIGURED vs ABSENT, never on truthiness: an
+ * empty configured key is a gate the server refuses to serve through (a fixed
+ * 500 per request), and announcing it as "open (no key gate)" would tell the
+ * operator their proxy is intentionally unauthenticated. Whether a configured
+ * key is VALID is the server's judgment alone — its config-error checks put
+ * the specific cause on stderr at the first request — so the status claims
+ * only what the CLI knows: a gate is configured, or it is not.
+ */
+export function authGateStatus(authKey: string | undefined): string {
+  return authKey !== undefined
+    ? 'required (Authorization: Bearer or x-api-key)'
+    : 'open (no key gate)';
 }
 
 function parseCodexTransport(value: string | undefined): CodexProxyTransport {
