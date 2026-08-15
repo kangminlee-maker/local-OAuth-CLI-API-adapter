@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import readline from 'node:readline';
+import type { Readable } from 'node:stream';
 import { honorRequestModel } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
 import {
@@ -73,7 +73,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   private readonly timeoutMs: number;
   private readonly extraArgs: readonly string[];
   private child: ChildProcessWithoutNullStreams | null = null;
-  private lineReader: readline.Interface | null = null;
+  private lineReader: NdjsonReader | null = null;
   private initialized: Promise<void> | null = null;
   private waiter: ClaudeWaiter | null = null;
   private stderr = '';
@@ -547,8 +547,8 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       this.lineReader = null;
       this.initialized = null;
     });
-    this.lineReader = readline.createInterface({ input: this.child.stdout });
-    this.lineReader.on('line', (line) => this.handlePersistentLine(line));
+    this.child.stdout.setEncoding('utf8');
+    this.lineReader = readNdjsonLines(this.child.stdout, (line) => this.handlePersistentLine(line));
   }
 
   private sendPersistentMessage(
@@ -748,6 +748,51 @@ function claudeContextIsolationArgs(): string[] {
   ];
 }
 
+interface NdjsonReader {
+  close(): void;
+}
+
+/**
+ * Reads the CLI's stdout as LF-framed JSON records. Two properties matter and
+ * no stock reader has both. Records are not aligned to pipe chunks, so a line
+ * longer than one chunk must be reassembled — parsing each chunk alone drops
+ * both halves as invalid fragments, and the unterminated tail must flush when
+ * the stream ends (before the child's `close` event can fire). And the frame
+ * is the LF BYTE alone: readline also breaks on U+2028/U+2029, which appear
+ * raw inside legal JSON payloads (JSON.stringify does not escape them), so it
+ * shreds such a record into unparseable fragments. The stream must be in
+ * utf8 mode: its decoder is what keeps a code point split across chunks
+ * whole.
+ */
+function readNdjsonLines(stream: Readable, onLine: (line: string) => void): NdjsonReader {
+  let tail = '';
+  let open = true;
+  const onData = (chunk: string): void => {
+    const parts = `${tail}${chunk}`.split('\n');
+    tail = parts.pop() ?? '';
+    for (const part of parts) {
+      // A handler may close this reader mid-batch (teardown): stop delivering.
+      if (!open) return;
+      onLine(part);
+    }
+  };
+  const onEnd = (): void => {
+    if (!open || tail === '') return;
+    const last = tail;
+    tail = '';
+    onLine(last);
+  };
+  stream.on('data', onData);
+  stream.on('end', onEnd);
+  return {
+    close(): void {
+      open = false;
+      stream.removeListener('data', onData);
+      stream.removeListener('end', onEnd);
+    },
+  };
+}
+
 function runClaudeProcess(
   command: string,
   args: readonly string[],
@@ -800,7 +845,9 @@ function runClaudeProcess(
       resolve,
       reject,
     };
+    let settled = false;
     const finish = (err?: Error, value?: ClaudeTurnResult): void => {
+      settled = true;
       clearTimeout(timeout);
       if (options.signal) options.signal.removeEventListener('abort', abortFromParent);
       if (err) reject(err);
@@ -815,26 +862,24 @@ function runClaudeProcess(
     child.stderr.on('data', (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-12_000);
     });
-    child.stdout.on('data', (chunk) => {
-      for (const line of String(chunk).split(/\n/)) {
-        const message = parseJsonObject(line);
-        if (!message) continue;
-        consumeClaudeMessage(waiter, message);
-        if (message.type === 'result') {
-          if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
-            finish(claudeModelRejection(message));
-          } else if (message.subtype === 'success' && message.is_error !== true) {
-            finish(undefined, {
-              text: typeof message.result === 'string' ? message.result : waiter.text,
-              structuredOutput: message.structured_output ?? waiter.structuredOutput,
-              usage: message.usage ?? waiter.usage,
-              stopReason: readClaudeStopReason(message),
-              stopDetails: message.stop_details,
-              stopSequence: readClaudeStopSequence(message),
-            });
-          } else {
-            finish(claudeTurnFailure(message));
-          }
+    readNdjsonLines(child.stdout, (line) => {
+      const message = parseJsonObject(line);
+      if (!message) return;
+      consumeClaudeMessage(waiter, message);
+      if (message.type === 'result') {
+        if (message.subtype === 'success' && isClaudeModelRejectionResult(message, waiter)) {
+          finish(claudeModelRejection(message));
+        } else if (message.subtype === 'success' && message.is_error !== true) {
+          finish(undefined, {
+            text: typeof message.result === 'string' ? message.result : waiter.text,
+            structuredOutput: message.structured_output ?? waiter.structuredOutput,
+            usage: message.usage ?? waiter.usage,
+            stopReason: readClaudeStopReason(message),
+            stopDetails: message.stop_details,
+            stopSequence: readClaudeStopSequence(message),
+          });
+        } else {
+          finish(claudeTurnFailure(message));
         }
       }
     });
@@ -854,7 +899,17 @@ function runClaudeProcess(
     };
     child.on('error', (err) => finish(failure(err, 'the local claude runtime failed to start')));
     child.on('close', (code, signal) => {
-      if (code === 0) return;
+      if (code === 0 && settled) return;
+      if (code === 0) {
+        // A clean exit whose result message never arrived (or never parsed).
+        // Returning here would leave the promise unsettled and the request
+        // hanging forever; no later event can settle it once the child is gone.
+        finish(failure(
+          new Error('claude exited with code=0 before a result message'),
+          'the local claude runtime exited without a result',
+        ));
+        return;
+      }
       finish(failure(
         new Error(`claude exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`),
         `the local claude runtime exited (code=${code ?? 'null'} signal=${signal ?? 'null'})`,

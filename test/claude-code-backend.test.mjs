@@ -662,6 +662,58 @@ test('honorRequestModel on: an errored 404 carrying no model signal is not a mod
   );
 });
 
+test('one-shot: a result record split across stream chunks still resolves', async () => {
+  // NDJSON records are framed by newlines, not by pipe chunks: a result line
+  // longer than one chunk arrives in pieces. Parsing each chunk alone dropped
+  // both halves, and the clean exit then left the request hanging forever.
+  // A different request model forces the one-shot route.
+  const result = await runShape(
+    'split_result',
+    openAiRefusalRequest({ model: 'claude-split-probe', effort: 'low' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true },
+  );
+  assert.match(result.text, /split-ok/);
+});
+
+test('one-shot: a clean exit with no result settles as a failure, not a hang', async () => {
+  // The hang is converted into a bounded outcome here, so a regression fails
+  // the assertion instead of stalling the whole suite.
+  const timer = new Promise((resolve) => {
+    setTimeout(() => resolve({ kind: 'hung' }), 5000).unref();
+  });
+  const outcome = await Promise.race([
+    runShape(
+      'silent_exit_zero',
+      openAiRefusalRequest({ model: 'claude-split-probe', effort: 'low' }),
+      'claude-opus-4-8',
+      { honorRequestModel: true },
+    ).then(
+      (value) => ({ kind: 'resolved', value }),
+      (err) => ({ kind: 'rejected', err }),
+    ),
+    timer,
+  ]);
+  assert.equal(outcome.kind, 'rejected', `a resultless 0 exit must reject the turn, got: ${outcome.kind}`);
+  assert.match(outcome.err.message, /exited without a result/);
+});
+
+test('persistent route: a result carrying raw U+2028/U+2029 arrives intact', async () => {
+  // JSON.stringify does not escape the Unicode line separators, so they appear
+  // RAW inside a legal one-line NDJSON record. Records are framed by LF alone;
+  // a reader that also breaks on U+2028/U+2029 (readline does) shreds the
+  // record into unparseable fragments and the turn never settles. Same model
+  // as configured and no tuning overrides, so this takes the persistent route;
+  // the short timeout bounds the hang a regression would otherwise become.
+  const result = await runShape(
+    'ls_in_result',
+    openAiRefusalRequest({ model: 'claude-opus-4-8' }),
+    'claude-opus-4-8',
+    { honorRequestModel: true, timeoutMs: 5000 },
+  );
+  assert.equal(result.text, 'kept\u2028and\u2029kept');
+});
+
 test('honorRequestModel on: the assistant-event refusal is a 404 on the persistent route too', async () => {
   // The one-shot cases above cannot reach `handlePersistentLine`, because forcing
   // a different model is what sends a request one-shot. Configure and request the

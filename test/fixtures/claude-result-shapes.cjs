@@ -40,6 +40,17 @@
 //   persistent_stderr : accepts a persistent turn, then dies with sentinel stderr.
 //   stderr_only    : nothing on stdout, a sentinel on stderr, non-zero exit.
 //                    Those bytes are the operator's, not the client's.
+//   split_result   : one successful result record written in two pipe writes
+//                    with a real pause between them, then exit 0. NDJSON is
+//                    framed by newlines, not by chunks.
+//   silent_exit_zero : model output but never a result message, then exit 0.
+//                    A clean exit with no result must settle as a failure,
+//                    not leave the request hanging.
+//   ls_in_result   : a persistent turn whose result text carries RAW
+//                    U+2028/U+2029 — legal JSON output that JSON.stringify
+//                    does not escape. Records are framed by LF alone; a
+//                    reader that also breaks on Unicode line separators
+//                    shreds this record into unparseable fragments.
 const readline = require('node:readline');
 
 const argv = process.argv.slice(2);
@@ -352,6 +363,56 @@ if (shape === 'persistent_stderr') {
 if (shape === 'stderr_only') {
   process.stderr.write('SENTINEL_STDERR gateway=https://internal.example token-ish=abcd\n');
   process.exit(3);
+}
+
+if (shape === 'split_result') {
+  // The result record in two pipe writes with a real pause between them, so
+  // the halves arrive as separate stream chunks. A reader that parses each
+  // chunk as whole lines drops both halves and never sees the result.
+  const record = JSON.stringify({
+    type: 'result', subtype: 'success', is_error: false,
+    result: `split-ok [model=${selectedModel}]`,
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const half = Math.floor(record.length / 2);
+  process.stdout.write(record.slice(0, half));
+  // The pending timer is the only live handle, so it also keeps the child
+  // alive until the second half has been written.
+  setTimeout(() => {
+    process.stdout.write(`${record.slice(half)}\n`);
+    process.exit(0);
+  }, 150);
+  return;
+}
+
+if (shape === 'ls_in_result') {
+  // Serves persistent turns whose answer text carries raw U+2028/U+2029.
+  // `/clear` is answered too, so the backend's between-turn reset never
+  // blocks on this fixture.
+  const rlLs = readline.createInterface({ input: process.stdin });
+  rlLs.on('line', (line) => {
+    if (!line.trim()) return;
+    let text = '';
+    try {
+      const content = JSON.parse(line)?.message?.content;
+      text = Array.isArray(content) ? content.map((b) => (b && b.type === 'text' ? b.text : '')).join('') : '';
+    } catch { text = line; }
+    if (text.trim() === '/clear') {
+      write({ type: 'result', subtype: 'success', is_error: false, result: 'cleared', usage: { input_tokens: 0, output_tokens: 0 } });
+      return;
+    }
+    const payload = 'kept\u2028and\u2029kept';
+    assistant({}, payload);
+    write({ type: 'result', subtype: 'success', is_error: false, result: payload, usage: { input_tokens: 1, output_tokens: 1 } });
+  });
+  return;
+}
+
+if (shape === 'silent_exit_zero') {
+  // Model output but never a result message, then a clean exit. The waiter
+  // must be settled as a failure: with the child gone, nothing else ever can.
+  write({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } });
+  process.exit(0);
 }
 
 // One-shot: no stdin is piped, so answer immediately and exit.
