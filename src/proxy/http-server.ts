@@ -776,11 +776,15 @@ function imageSourceFromUrlLike(
     // The media-type token is FRAMING: per the whitespace doctrine, only
     // ASCII OWS strips. A 0xA0 byte keeps the token malformed rather than
     // being repaired into `image/png`.
-    const mediaType = (stripOws(dataUrl[1] ?? '') || 'image/png').toLowerCase();
+    // No default: the regex requires at least one media-type character, so an
+    // empty capture is impossible and an OWS-only one is present junk — the
+    // `|| 'image/png'` fallback was REPAIRING `data: \t;base64,...`.
+    const mediaType = stripOws(dataUrl[1] ?? '').toLowerCase();
     const data = dataUrl[2]?.replace(/\s/g, '') ?? '';
-    // The WHOLE token must be image/<subtype-token> — a prefix check let
-    // `image/png<0xA0>` through with its trailing junk byte intact.
-    if (!/^image\/[!#$%&'*+.^_\`|~0-9a-z-]+$/.test(mediaType) || !data) return null;
+    // The WHOLE token must be image/<subtype-token> under the RFC 2045 token
+    // grammar: every CHAR except SPACE, CTLs and tspecials — which PERMITS
+    // `{}` (the HTTP tchar class wrongly rejected `image/x-{foo}`).
+    if (!/^image\/[0-9a-z!#$%&'*+\-.^_\`{|}~]+$/.test(mediaType) || !data) return null;
     return {
       source: { type: 'base64', mediaType, data },
     };

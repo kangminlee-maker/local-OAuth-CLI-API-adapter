@@ -1993,3 +1993,21 @@ test('a trailing non-OWS byte on a data-URL media type keeps it malformed', asyn
   });
   assert.equal(status, 400, 'image/png<0xA0> is not the token image/png');
 });
+
+// --- round 58 ---
+
+test('an RFC 2045 subtype with braces is a valid image reference', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit',
+    image: `data:image/x-{foo};base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+  });
+  assert.equal(status, 200, '{ and } are not tspecials — x-{foo} is a token');
+});
+
+test('a whitespace-only data-URL media type is junk, not image/png', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit',
+    image: `data: \t;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+  });
+  assert.equal(status, 400, 'OWS-only content must not be repaired into a default');
+});
