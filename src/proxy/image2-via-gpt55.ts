@@ -25,7 +25,10 @@ export function image2QualityToGpt55ReasoningEffort(
   quality: string | undefined,
 ): NormalizedReasoningEffort {
   if (quality === 'low') return 'low';
-  if (quality === 'medium') return 'medium';
+  // `standard` is the documented alias of `medium` in BOTH halves of the
+  // quality mapping; this half had dropped it, sending standard-quality
+  // requests to high effort against the stated table.
+  if (quality === 'medium' || quality === 'standard') return 'medium';
   return 'high';
 }
 

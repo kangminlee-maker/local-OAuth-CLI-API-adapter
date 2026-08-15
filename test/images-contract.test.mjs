@@ -1454,3 +1454,49 @@ test('edits: the misleading multipart parameter is JSON there too', async () => 
   })())];
   assert.equal(status, 200);
 });
+
+// --- round 47 ---
+
+test('boundary bytes inside multipart data are data, not delimiters', async () => {
+  // RFC 2046: a boundary delimits only at the start of a line. Global
+  // splitting truncated any field — or uploaded file — whose BYTES contained
+  // the marker, silently altering client input.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  const B = 'AaB03x';
+  const send = (bodyLines) => new Promise((resolve, reject) => {
+    const body = bodyLines.join('\r\n');
+    const conn = net.connect(Number(target.port), target.hostname, () => conn.write(
+      `POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n`
+      + `Content-Type: multipart/form-data; boundary=${B}\r\n`
+      + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+    ));
+    let data = '';
+    conn.on('data', (chunk) => { data += chunk; });
+    conn.on('end', () => resolve(data));
+    conn.on('error', reject);
+  });
+  try {
+    const truncatable = await send([
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+      `--${B}`, 'Content-Disposition: form-data; name="output_format"', '', `jpeg--${B}junk`,
+      `--${B}--`, '',
+    ]);
+    assert.match(truncatable.split('\r\n')[0], /400/,
+      'the whole value, marker bytes included, must reach the enum check');
+
+    const control = await send([
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', `a dot with --${B} inside`,
+      `--${B}--`, '',
+    ]);
+    assert.match(control.split('\r\n')[0], /200/,
+      'marker bytes inside an otherwise valid field are just data');
+  } finally {
+    await started.close();
+  }
+});

@@ -1718,15 +1718,19 @@ test('forwards output_config effort to claude --effort (one-shot argv)', async (
   assert.equal(argv[i + 1], 'low');
 });
 
-test('gates effort out for the configured Haiku model on a one-shot turn', async () => {
+test('gates effort out for every Haiku spelling on a one-shot turn', async () => {
   // Force one-shot via output_config.format so the spawned argv is inspectable, and
   // gate on the configured (CLI-run) model, not the client-supplied request.model.
-  const argv = await spawnedArgv(
-    anthropicTuningRequest({ effort: 'high', jsonMode: true, jsonSchema: PROBE_SCHEMA }),
-    'claude-haiku-4-5',
-  );
-  assert.ok(argv.includes('--json-schema'), `expected one-shot argv: ${argv.join(' ')}`);
-  assert.ok(!argv.includes('--effort'), `did not expect --effort for Haiku: ${argv.join(' ')}`);
+  // Both the alias and the version-pinned name must gate; a narrowed
+  // recogniser would forward --effort for the other spelling.
+  for (const model of ['haiku', 'claude-haiku-4-5']) {
+    const argv = await spawnedArgv(
+      anthropicTuningRequest({ effort: 'high', jsonMode: true, jsonSchema: PROBE_SCHEMA }),
+      model,
+    );
+    assert.ok(argv.includes('--json-schema'), `expected one-shot argv: ${argv.join(' ')}`);
+    assert.ok(!argv.includes('--effort'), `did not expect --effort for ${model}: ${argv.join(' ')}`);
+  }
 });
 
 test('forwards output_config.format schema to claude --json-schema', async () => {

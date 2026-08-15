@@ -1371,7 +1371,13 @@ function parseMultipartFormData(
   if (!boundary) throw new ProxyRequestError('multipart/form-data boundary is required.', 400);
   const output: Record<string, unknown> = {};
   const binary = body.toString('latin1');
-  const parts = binary.split(`--${boundary}`);
+  // A boundary DELIMITS only at the start of a line (RFC 2046: preceded by
+  // CRLF). Splitting on the bare marker treated the same bytes INSIDE a field
+  // value — or inside an uploaded file — as a delimiter, silently truncating
+  // the data. Prepending CRLF gives the opening boundary the same shape as
+  // every later one.
+  const parts = `\r\n${binary}`.split(`\r\n--${boundary}`);
+  parts.shift();
   for (const rawPart of parts) {
     if (!rawPart || rawPart === '--\r\n' || rawPart === '--') continue;
     const part = rawPart.startsWith('\r\n') ? rawPart.slice(2) : rawPart;

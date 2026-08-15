@@ -6,12 +6,21 @@ import {
   image2ViaGpt55PromptFromRequest,
 } from '../dist/proxy/image2-via-gpt55.js';
 
-test('image-2 quality maps to gpt-5.5 reasoning effort', () => {
-  assert.equal(image2QualityToGpt55ReasoningEffort(undefined), 'high');
-  assert.equal(image2QualityToGpt55ReasoningEffort('high'), 'high');
-  assert.equal(image2QualityToGpt55ReasoningEffort('medium'), 'medium');
-  assert.equal(image2QualityToGpt55ReasoningEffort('low'), 'low');
-  assert.equal(image2QualityToGpt55ReasoningEffort('auto'), 'high');
+test('image-2 quality maps to gpt-5.5 reasoning effort — the whole documented table', () => {
+  // Every documented cell, because a one-cell regression (standard->high, the
+  // defect this table caught) survives spot checks.
+  for (const [quality, effort] of [
+    ['low', 'low'],
+    ['medium', 'medium'],
+    ['standard', 'medium'],
+    ['high', 'high'],
+    ['hd', 'high'],
+    ['auto', 'high'],
+    [undefined, 'high'],
+  ]) {
+    assert.equal(image2QualityToGpt55ReasoningEffort(quality), effort,
+      `${quality ?? 'omitted'} must map to ${effort}`);
+  }
 });
 
 test('image2_via_gpt55 prompt preserves square geometry on portrait canvas', () => {
