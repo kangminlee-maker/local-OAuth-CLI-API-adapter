@@ -1615,3 +1615,63 @@ test('a close-delimiter PREFIX is data too: later parts survive it', async () =>
     await started.close();
   }
 });
+
+// --- round 50 ---
+
+async function rawMultipart(bodyLines, boundaryParam, path = '/v1/images/generations') {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const body = bodyLines.join('\r\n');
+    return await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.from(
+        `POST ${path} HTTP/1.1\r\nHost: h\r\n`
+        + `Content-Type: multipart/form-data; boundary=${boundaryParam}\r\n`
+        + `Content-Length: ${Buffer.byteLength(body, 'latin1')}\r\nConnection: close\r\n\r\n${body}`,
+        'latin1',
+      )));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+  } finally {
+    await started.close();
+  }
+}
+
+test('a folded Content-Disposition header still names its part', async () => {
+  // RFC 822 folding: CRLF + SP/HTAB continues the field. The continuation was
+  // dropped for having no colon, taking the disposition's `name` with it.
+  const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
+  const status = await rawMultipart([
+    '--AaB03x', 'Content-Disposition: form-data;', ' name="model"', '', 'dall-e-2',
+    '--AaB03x', 'Content-Disposition: form-data;', '\tname="image"; filename="x.png"', 'Content-Type: image/png', '', png,
+    '--AaB03x--', '',
+  ], 'AaB03x', '/v1/images/variations');
+  assert.match(status, /200/, status);
+});
+
+test('boundary grammar is enforced: empty and trailing-space boundaries are 400', async () => {
+  const empty = await rawMultipart([
+    '--""', 'Content-Disposition: form-data; name="prompt"', '', 'a dot', '--""--', '',
+  ], '""');
+  assert.match(empty, /400/, `an empty boundary is not a boundary: ${empty}`);
+
+  const trailing = await rawMultipart([
+    '--B ', 'Content-Disposition: form-data; name="prompt"', '', 'a dot', '--B --', '',
+  ], '"B "');
+  assert.match(trailing, /400/, `a boundary may not end in a space: ${trailing}`);
+});
+
+test('a quoted boundary parameter is accepted', async () => {
+  const status = await rawMultipart([
+    '--AaB03x', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--AaB03x', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+    '--AaB03x--', '',
+  ], '"AaB03x"');
+  assert.match(status, /200/, status);
+});

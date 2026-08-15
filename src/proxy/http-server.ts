@@ -1430,13 +1430,25 @@ function parseMultipartFormData(
 }
 
 function multipartBoundary(contentType: string): string | null {
-  const match = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType);
-  return match?.[1] ?? match?.[2]?.trim() ?? null;
+  const match = /(?:^|;)\s*boundary=(?:"([^"]*)"|([^;]+))/i.exec(contentType);
+  const candidate = match?.[1] ?? match?.[2]?.trim() ?? null;
+  if (candidate === null) return null;
+  // RFC 2046 bchars: 1-70 characters from a fixed alphabet, the last not a
+  // space. `boundary=""` used to slip through as the two literal quote bytes,
+  // and a trailing-space boundary was matched verbatim.
+  if (!/^[0-9A-Za-z'()+_,\-./:=? ]{0,69}[0-9A-Za-z'()+_,\-./:=?]$/.test(candidate)) {
+    return null;
+  }
+  return candidate;
 }
 
 function multipartHeaders(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const line of raw.split('\r\n')) {
+  // Unfold first: a CRLF followed by SP/HTAB continues the previous field
+  // (RFC 822 folding). The continuation line has no colon, so it was silently
+  // dropped — taking a folded Content-Disposition's `name` with it.
+  const unfolded = raw.replace(/\r\n[ \t]+/g, ' ');
+  for (const line of unfolded.split('\r\n')) {
     const index = line.indexOf(':');
     if (index === -1) continue;
     out[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
