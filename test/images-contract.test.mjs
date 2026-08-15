@@ -1983,3 +1983,13 @@ test('delimiter-looking bytes in the epilogue are ignored', async () => {
   ], 'boundary=B', '/v1/images/generations');
   assert.match(status, /200/, `the fake n=11 part lives in the epilogue and must be ignored: ${status}`);
 });
+
+// --- round 57 ---
+
+test('a trailing non-OWS byte on a data-URL media type keeps it malformed', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit',
+    image: `data:image/png\u00a0;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+  });
+  assert.equal(status, 400, 'image/png<0xA0> is not the token image/png');
+});

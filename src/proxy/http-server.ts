@@ -778,7 +778,9 @@ function imageSourceFromUrlLike(
     // being repaired into `image/png`.
     const mediaType = (stripOws(dataUrl[1] ?? '') || 'image/png').toLowerCase();
     const data = dataUrl[2]?.replace(/\s/g, '') ?? '';
-    if (!mediaType.startsWith('image/') || !data) return null;
+    // The WHOLE token must be image/<subtype-token> — a prefix check let
+    // `image/png<0xA0>` through with its trailing junk byte intact.
+    if (!/^image\/[!#$%&'*+.^_\`|~0-9a-z-]+$/.test(mediaType) || !data) return null;
     return {
       source: { type: 'base64', mediaType, data },
     };
