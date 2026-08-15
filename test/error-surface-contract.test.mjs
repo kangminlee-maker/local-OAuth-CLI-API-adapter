@@ -1057,3 +1057,239 @@ test('stream_options.include_obfuscation defaults to on and is turned off explic
   });
   assert.doesNotMatch(turnedOff.text, /obfuscation/, 'an explicit false must turn it off');
 });
+
+// --- round 39: dispatch identity, surface envelopes for shared errors, and the
+// gate's byte-level contract ---
+
+import net from 'node:net';
+
+async function rawRequest(url, lines, body = '') {
+  const target = new URL(url);
+  return await new Promise((resolve, reject) => {
+    const conn = net.connect(Number(target.port), target.hostname, () => {
+      conn.write(lines.join('\r\n') + '\r\n\r\n' + body);
+    });
+    let data = '';
+    conn.on('data', (chunk) => { data += chunk; });
+    conn.on('end', () => resolve(data));
+    conn.on('error', reject);
+  });
+}
+
+test('a dot-segment path is not normalized into a served endpoint', async () => {
+  // `new URL().pathname` collapses `/x/../v1/chat/completions` to the real
+  // endpoint, so a request the contract promises a 404 executed a completion.
+  // Raw sockets, because every HTTP client normalizes before sending.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const body = JSON.stringify(CHAT);
+    for (const path of ['/x/../v1/chat/completions', '/v1/chat/./completions']) {
+      const raw = await rawRequest(started.url, [
+        `POST ${path} HTTP/1.1`, 'Host: h', 'Content-Type: application/json',
+        `Content-Length: ${Buffer.byteLength(body)}`, 'Connection: close',
+      ], body);
+      assert.match(raw, /^HTTP\/1\.1 404 /, `${path} must not be routable: ${raw.slice(0, 60)}`);
+    }
+  } finally {
+    await started.close();
+  }
+});
+
+test('an unparseable request target is a 404, not a 500 thrown before the gate', async () => {
+  // `//example:99999/v1/models` made the WHATWG constructor throw — a generic
+  // 500 emitted before authentication ran.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const raw = await rawRequest(started.url, [
+      'GET //example:99999/v1/models HTTP/1.1', 'Host: h', 'Connection: close',
+    ]);
+    assert.match(raw, /^HTTP\/1\.1 404 /, raw.slice(0, 60));
+  } finally {
+    await started.close();
+  }
+});
+
+test('a query string does not change the endpoint', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/models?probe=1`);
+    assert.equal(res.status, 200);
+  } finally {
+    await started.close();
+  }
+});
+
+test('a bare OPTIONS goes through dispatch: 404 unknown, 405 known', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const unknown = await fetch(`${started.url}/v1/nope`, { method: 'OPTIONS' });
+    assert.equal(unknown.status, 404);
+    const known = await fetch(`${started.url}/v1/chat/completions`, { method: 'OPTIONS' });
+    assert.equal(known.status, 405);
+  } finally {
+    await started.close();
+  }
+});
+
+test('wrong methods on the GET routes are 405, not unknown endpoints', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const post = await fetch(`${started.url}/v1/models`, { method: 'POST' });
+    assert.equal(post.status, 405, 'POST /v1/models is a method problem, the path exists');
+    const head = await fetch(`${started.url}/v1/models`, { method: 'HEAD' });
+    assert.equal(head.status, 405);
+  } finally {
+    await started.close();
+  }
+});
+
+test('/v1/messages: shared pre-handler errors answer in the Anthropic envelope', async () => {
+  // The method rejection and the JSON-parse failure are thrown by shared code
+  // with no provider; the surface, decided from the path alone, must shape them.
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const method = await fetch(`${started.url}/v1/messages`, { method: 'GET' });
+    assert.equal(method.status, 405);
+    const methodBody = await method.json();
+    assert.equal(methodBody.type, 'error', `expected the Anthropic shape: ${JSON.stringify(methodBody)}`);
+    assert.equal(methodBody.error.type, 'invalid_request_error');
+    assert.equal(methodBody.error.param, undefined);
+
+    const parse = await fetch(`${started.url}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{',
+    });
+    assert.equal(parse.status, 400);
+    const parseBody = await parse.json();
+    assert.equal(parseBody.type, 'error', `expected the Anthropic shape: ${JSON.stringify(parseBody)}`);
+  } finally {
+    await started.close();
+  }
+});
+
+test('a non-ASCII key sent as its UTF-8 bytes authenticates', async () => {
+  // Node decodes header bytes as latin1; the gate re-encodes candidates to
+  // recover the wire bytes and compares against the key's UTF-8 bytes. Raw
+  // socket, because fetch refuses non-latin1 header strings.
+  const key = 'k\u{1F511}';
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    authKey: key,
+  });
+  const target = new URL(started.url);
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => {
+        conn.write(Buffer.concat([
+          Buffer.from('GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nx-api-key: '),
+          Buffer.from(key, 'utf8'),
+          Buffer.from('\r\n\r\n'),
+        ]));
+      });
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+    assert.match(status, /200/, status);
+  } finally {
+    await started.close();
+  }
+});
+
+test('/v1/responses: a non-string non-array input is rejected, omission is not', async () => {
+  for (const input of [7, null, true, {}]) {
+    const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input });
+    assert.equal(status, 400, `input=${JSON.stringify(input)} is not a string or array`);
+    assert.equal(JSON.parse(text).error.param, 'input');
+  }
+  const omitted = await call(backendThat({}), '/v1/responses', { model: 'a-model' });
+  assert.equal(omitted.status, 200, 'omission keeps its existing behaviour');
+});
+
+test('/v1/responses: a non-string item type is rejected, an unknown string type is not', async () => {
+  // `type: null` took the typed-item exemption and skipped role validation.
+  // Unknown STRING types stay accepted deliberately: the direct item union
+  // grows with the API, and pinning it here would 400 tomorrow's valid items.
+  const bad = await call(backendThat({}), '/v1/responses', {
+    model: 'a-model', input: [{ type: null, content: 'hi' }],
+  });
+  assert.equal(bad.status, 400);
+  assert.equal(JSON.parse(bad.text).error.param, 'input[0].type');
+
+  const unknown = await call(backendThat({}), '/v1/responses', {
+    model: 'a-model', input: [{ type: 'not_yet_invented', content: 'hi' }],
+  });
+  assert.equal(unknown.status, 200);
+});
+
+// --- round 39 coverage: promises the inventory showed nothing pins ---
+
+test('an assistant with the singular deprecated function_call needs no content either', async () => {
+  // The exemption names tool_calls AND function_call; only tool_calls was
+  // pinned, so the function_call half could be deleted unnoticed.
+  const { status } = await call(
+    backendThat({}),
+    '/v1/chat/completions',
+    {
+      model: 'a-model',
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'assistant', function_call: { name: 'w', arguments: '{}' } },
+        { role: 'function', name: 'w', content: 'sunny' },
+      ],
+    },
+  );
+  assert.equal(status, 200);
+});
+
+test('chat accepts nested reasoning.effort as the alternate spelling', async () => {
+  // The contract names both `reasoning_effort` and `reasoning.effort` on chat;
+  // only the top-level spelling was tested there.
+  let seen;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request) { seen = request.reasoningEffort; return ok(); },
+    async *stream() {},
+    async close() {},
+  };
+  const { status } = await call(backend, '/v1/chat/completions', {
+    ...CHAT, reasoning: { effort: 'high' },
+  });
+  assert.equal(status, 200);
+  assert.equal(seen, 'high', 'the nested spelling must reach the backend');
+});
+
+test('/v1/responses: a non-streaming tool call is reported as a function_call output item', async () => {
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() {
+      return {
+        id: 'x', model: 'configured-model', text: '',
+        toolCalls: [{ id: 'c1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+        usage: { inputTokens: 1, outputTokens: 1, source: 'provider' }, latencyMs: 1,
+      };
+    },
+    async *stream() {},
+    async close() {},
+  };
+  const { status, text } = await call(backend, '/v1/responses', { model: 'a-model', input: 'hi' });
+  assert.equal(status, 200);
+  const body = JSON.parse(text);
+  const call_ = body.output.find((item) => item.type === 'function_call');
+  assert.ok(call_, `expected a function_call item: ${JSON.stringify(body.output)}`);
+  assert.equal(call_.name, 'get_weather');
+  assert.equal(call_.arguments, '{"city":"Seoul"}');
+  assert.ok(call_.call_id, 'a call_id is what the client replays back');
+});

@@ -91,7 +91,7 @@ export async function startLocalApiProxy(
   const actualPort = address && isAddressInfo(address) ? address.port : options.port;
   return {
     server,
-    url: `http://${options.host}:${actualPort}`,
+    url: `http://${urlHostname(options.host)}:${actualPort}`,
     async close() {
       await Promise.all([
         new Promise<void>((resolve, reject) => {
@@ -133,32 +133,50 @@ async function handleRequest(
   const { backend, requestTimeoutMs } = options;
   setCorsHeaders(res);
   let errorShape: ErrorResponseShape = 'openai';
-  if (req.method === 'OPTIONS') {
+  // 204 is for a real CORS preflight — the browser's permission question, sent
+  // before it will attach credentials, which is why it bypasses the gate. A
+  // preflight always names the method it is asking about; a bare OPTIONS does
+  // not, is an ordinary request, and goes through dispatch like any other.
+  if (req.method === 'OPTIONS' && req.headers['access-control-request-method'] !== undefined) {
     res.writeHead(204).end();
     return;
   }
   try {
-    const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    // The raw request target with only the query removed — NOT a parsed URL.
+    // WHATWG parsing normalizes dot segments and backslashes, so
+    // `/x/../v1/chat/completions` silently became a routable path, breaking the
+    // exact-match promise; and a target it cannot parse (`//host:99999/...`)
+    // threw before the gate ran.
+    const rawTarget = req.url ?? '/';
+    const queryIndex = rawTarget.indexOf('?');
+    const path = queryIndex === -1 ? rawTarget : rawTarget.slice(0, queryIndex);
+    // The caller's envelope is decided by the path alone, before anything can
+    // fail: a method rejection, a body-parse failure or a configuration error
+    // on /v1/messages must already answer in the Anthropic shape.
+    if (path === '/v1/messages') errorShape = 'anthropic';
     requireAuthorizedRequest(req, path, options.authKey);
     if (path === '/local/cli/sessions' || path.startsWith('/local/cli/sessions/')) {
       await handleLocalCliChatRequest(req, res, options, path);
       return;
     }
-    if (req.method === 'GET' && path === '/v1/models') {
+    const isGetRoute = path === '/v1/models' || path.startsWith('/v1/images/generated/');
+    // Path first, method second: `GET /v1/nope` is an unknown endpoint, not an
+    // unsupported method. 405 is reserved for a path this proxy does serve —
+    // including the GET routes, so `POST /v1/models` is a method problem, not a
+    // missing endpoint.
+    if (!isGetRoute && !POST_ENDPOINTS.has(path)) {
+      throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
+    }
+    if (req.method !== (isGetRoute ? 'GET' : 'POST')) {
+      throw new ProxyRequestError('Unsupported method.', 405);
+    }
+    if (path === '/v1/models') {
       writeJson(res, 200, await openAiModelsResponse(backend));
       return;
     }
-    if (req.method === 'GET' && path.startsWith('/v1/images/generated/')) {
+    if (path.startsWith('/v1/images/generated/')) {
       writeGeneratedImage(res, generatedImages, path);
       return;
-    }
-    // Path first, method second: `GET /v1/nope` is an unknown endpoint, not an
-    // unsupported method — GET is a method this server serves.
-    if (!POST_ENDPOINTS.has(path)) {
-      throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
-    }
-    if (req.method !== 'POST') {
-      throw new ProxyRequestError('Unsupported method.', 405);
     }
 
     if (path === '/v1/images/generations') {
@@ -287,7 +305,9 @@ function presentedAuthKeys(req: IncomingMessage): string[] {
   const raw = req.rawHeaders;
   for (let i = 0; i + 1 < raw.length; i += 2) {
     if (raw[i].toLowerCase() !== 'x-api-key') continue;
-    const trimmed = raw[i + 1].trim();
+    // OWS only (space/tab, per RFC 7230) — String.trim also eats U+00A0, which
+    // under latin1 header decoding is a real byte of a multibyte key.
+    const trimmed = raw[i + 1].replace(/^[ \t]+|[ \t]+$/g, '');
     if (trimmed) presented.push(trimmed);
   }
   const headers = req.headers;
@@ -298,8 +318,13 @@ function presentedAuthKeys(req: IncomingMessage): string[] {
 }
 
 function safeKeyEqual(presented: string, expected: string): boolean {
-  const presentedBytes = Buffer.from(presented);
-  const expectedBytes = Buffer.from(expected);
+  // Node decodes header bytes as latin1, so a client that sent the UTF-8 bytes
+  // of a non-ASCII key arrives here as that byte sequence read as latin1.
+  // Re-encoding the candidate as latin1 recovers the wire bytes; the configured
+  // key is compared as its UTF-8 bytes. Pure-ASCII keys are unaffected — the
+  // two encodings agree there.
+  const presentedBytes = Buffer.from(presented, 'latin1');
+  const expectedBytes = Buffer.from(expected, 'utf8');
   if (presentedBytes.length !== expectedBytes.length) return false;
   return timingSafeEqual(presentedBytes, expectedBytes);
 }
@@ -639,7 +664,9 @@ function imageGenerationCount(value: unknown): number {
 }
 
 function partialImageCount(value: unknown): number {
-  if (value === undefined || value === null) return 0;
+  // `undefined` alone is omission. An explicit null is a value, and it is not
+  // in the documented domain — the same rule `n` follows.
+  if (value === undefined) return 0;
   const parsed = optionalInteger(value, 'partial_images', 0, 3);
   if (parsed === undefined) {
     throw new ProxyRequestError('partial_images must be an integer between 0 and 3.', 400);
@@ -1052,7 +1079,14 @@ function writeGeneratedImage(
   generatedImages: GeneratedImageStore,
   path: string,
 ): void {
-  const id = decodeURIComponent(path.slice('/v1/images/generated/'.length));
+  let id: string;
+  try {
+    id = decodeURIComponent(path.slice('/v1/images/generated/'.length));
+  } catch {
+    // `%FF` is not decodable. An id the proxy could never have issued is the
+    // same miss as one it has forgotten — not a 500.
+    id = '';
+  }
   const image = generatedImages.get(id);
   if (!image) {
     writeJson(res, 404, {
@@ -1072,6 +1106,12 @@ function writeGeneratedImage(
   res.end(image.bytes);
 }
 
+// An IPv6 literal needs brackets inside a URL authority — `http://::1:8080`
+// does not parse. Hostnames and IPv4 pass through untouched.
+function urlHostname(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
 /**
  * The link handed back for `response_format: url`.
  *
@@ -1087,7 +1127,7 @@ function writeGeneratedImage(
 function generatedImageUrl(req: IncomingMessage, id: string): string {
   const socket = req.socket as { encrypted?: boolean; localAddress?: string; localPort?: number };
   const host = headerValue(req.headers.host)
-    || (socket.localAddress ? `${socket.localAddress}:${socket.localPort}` : '127.0.0.1');
+    || (socket.localAddress ? `${urlHostname(socket.localAddress)}:${socket.localPort}` : '127.0.0.1');
   const forwarded = headerValue(req.headers['x-forwarded-proto']).split(',')[0]?.trim().toLowerCase();
   const scheme = forwarded === 'https' || forwarded === 'http'
     ? forwarded
@@ -2614,7 +2654,13 @@ function writeError(
     return;
   }
   if (err instanceof ProxyRequestError) {
-    if (err.provider === 'anthropic') {
+    // The error's own provider wins when it names one; otherwise the caller's
+    // surface decides. The shared throws — method rejections, body-parse
+    // failures, the 413 — carry the default provider, and on /v1/messages they
+    // were answered in the OpenAI shape an Anthropic client cannot parse.
+    // `invalid_request_error`, the type these throws carry, is native to both
+    // vocabularies.
+    if (err.provider === 'anthropic' || shape === 'anthropic') {
       writeJson(res, err.statusCode, {
         type: 'error',
         error: {

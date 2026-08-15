@@ -311,7 +311,20 @@ function requireOpenAiChatContent(msg: Record<string, unknown>, index: number): 
 
 function readResponsesInput(value: unknown): NormalizedMessage[] {
   if (typeof value === 'string') return [{ role: 'user', content: value, images: [] }];
-  if (!Array.isArray(value)) return [{ role: 'user', content: '', images: [] }];
+  // Omission is one thing; a defined value of the wrong shape is another. The
+  // direct API takes a string or an array — a number or `null` used to be
+  // silently replaced with an empty user message, which committed a 200 for a
+  // request the direct API rejects.
+  if (value === undefined) return [{ role: 'user', content: '', images: [] }];
+  if (!Array.isArray(value)) {
+    throw new ProxyRequestError(
+      'input must be a string or an array of input items.',
+      400,
+      'openai',
+      'invalid_request_error',
+      'input',
+    );
+  }
   return value.map((item, index) => {
     const msg = asRecord(item);
     if (!msg) {
@@ -334,6 +347,20 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
  * error where the item claims to be a message.
  */
 function readResponsesRole(msg: Record<string, unknown>, index: number): NormalizedMessage['role'] {
+  // `type` is the item discriminator and the direct API only accepts strings
+  // there — `type: null` is not a typed item, it is malformed input, and
+  // letting it take the typed-item exemption skipped role validation entirely.
+  // Unknown STRING types are deliberately not rejected: the direct item union
+  // grows with the API, and pinning it here would 400 tomorrow's valid items.
+  if (msg.type !== undefined && typeof msg.type !== 'string') {
+    throw new ProxyRequestError(
+      `input[${index}].type must be a string.`,
+      400,
+      'openai',
+      'invalid_request_error',
+      `input[${index}].type`,
+    );
+  }
   const isMessage = msg.type === undefined || msg.type === 'message';
   if (!isMessage) return msg.role === 'assistant' ? 'assistant' : 'user';
   const value = msg.role;

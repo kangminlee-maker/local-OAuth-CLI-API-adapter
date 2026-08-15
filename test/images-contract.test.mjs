@@ -690,3 +690,60 @@ test('generations: a backend reporting raw image usage has it passed through', a
   assert.equal(usage.output_tokens, 22);
   assert.equal(usage.total_tokens, 33);
 });
+
+test('an IPv6 listener produces bracketed, parseable URLs', async () => {
+  // `http://::1:8080` does not parse as a URL — an IPv6 authority needs
+  // brackets. Both the proxy's own url and the no-Host fallback build one.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '::1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const parsed = new URL(started.url);
+    assert.match(parsed.hostname, /^\[?::1\]?$/, `expected the IPv6 loopback: ${started.url}`);
+
+    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
+    const raw = await new Promise((resolve, reject) => {
+      const socket = net.connect(Number(parsed.port), '::1', () => {
+        socket.write(
+          'POST /v1/images/generations HTTP/1.0\r\n'
+          + 'Content-Type: application/json\r\n'
+          + `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+        );
+      });
+      let data = '';
+      socket.on('data', (chunk) => { data += chunk; });
+      socket.on('end', () => resolve(data));
+      socket.on('error', reject);
+    });
+    const url = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')).data[0].url;
+    assert.doesNotThrow(() => new URL(url), `the fallback URL must parse: ${url}`);
+    assert.equal((await fetch(url)).status, 200, 'and it must actually serve the image');
+  } finally {
+    await started.close();
+  }
+});
+
+test('a generated id that does not percent-decode is a 404 miss, not a 500', async () => {
+  // `%FF` made decodeURIComponent throw — a 500 for an id the proxy could never
+  // have issued, where the contract promises the indistinguishable 404.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/images/generated/%FF`);
+    assert.equal(res.status, 404);
+    const body = await res.json();
+    assert.equal(body.error.type, 'invalid_request_error');
+  } finally {
+    await started.close();
+  }
+});
+
+test('generations: an explicit partial_images null is rejected, like n', async () => {
+  const { status, payload } = await postImages(GEN, {
+    model: 'image-2', prompt: 'a dot', partial_images: null,
+  });
+  assert.equal(status, 400, `null is a value the client chose: ${JSON.stringify(payload)}`);
+});
