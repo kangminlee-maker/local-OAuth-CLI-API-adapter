@@ -1558,17 +1558,59 @@ test('case-variant disposition parameter names still name the part', async () =>
       `--${B}--`, '',
     ].join('\r\n');
     const raw = await new Promise((resolve, reject) => {
-      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(
+      // latin1 Buffer, not a string write: the PNG magic's \x89 would become
+      // two UTF-8 bytes and overrun the latin1-counted Content-Length.
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.from(
         `POST /v1/images/variations HTTP/1.1\r\nHost: h\r\n`
         + `Content-Type: multipart/form-data; boundary=${B}\r\n`
         + `Content-Length: ${Buffer.byteLength(body, 'latin1')}\r\nConnection: close\r\n\r\n${body}`,
-      ));
+        'latin1',
+      )));
       let data = '';
       conn.on('data', (chunk) => { data += chunk; });
       conn.on('end', () => resolve(data));
       conn.on('error', reject);
     });
     assert.match(raw.split('\r\n')[0], /200/, raw.slice(0, 200));
+  } finally {
+    await started.close();
+  }
+});
+
+// --- round 49 ---
+
+test('a close-delimiter PREFIX is data too: later parts survive it', async () => {
+  // `--B--X` closes nothing: the close is `--` then optional whitespace then
+  // CRLF or end of body. The bare startsWith check discarded every part after
+  // such bytes — a prompt or an uploaded PNG containing them lost its siblings.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const B = 'B';
+    // The REQUIRED part comes after the fake close: dropping it must change
+    // the status. (A dropped `model` part merely falls back to the default —
+    // the first version of this test passed against the broken close check.)
+    const body = [
+      `--${B}`, 'Content-Disposition: form-data; name="junk"', '', `before\r\n--${B}--X\r\nafter`,
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
+      `--${B}--`, 'epilogue',
+    ].join('\r\n');
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(
+        `POST /v1/images/generations HTTP/1.1\r\nHost: h\r\n`
+        + `Content-Type: multipart/form-data; boundary=${B}\r\n`
+        + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`,
+      ));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data));
+      conn.on('error', reject);
+    });
+    assert.match(raw.split('\r\n')[0], /200/, `the prompt after the fake close must survive: ${raw.slice(0, 200)}`);
   } finally {
     await started.close();
   }

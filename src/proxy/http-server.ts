@@ -1393,7 +1393,10 @@ function parseMultipartFormData(
       segments.push(source.slice(start, at));
       cursor = at + marker.length + delimiter[0].length;
       start = cursor;
-    } else if (rest.startsWith('--')) {
+    } else if (/^--[ \t]*(\r\n|$)/.test(rest)) {
+      // The CLOSE delimiter has the same whole-line rule: `--` then optional
+      // whitespace then CRLF or end of body. `--B--X` is data — the bare
+      // startsWith check truncated everything after such bytes.
       segments.push(source.slice(start, at));
       closed = true;
     } else {
