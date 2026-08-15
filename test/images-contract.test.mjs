@@ -1341,3 +1341,116 @@ test('multipart works with an uppercase media-type essence', async () => {
     await started.close();
   }
 });
+
+// --- round 46 ---
+
+test('generations and variations ignore mask entirely, as the contract says', async () => {
+  // Round 45's mask validation leaked onto the operations whose row says
+  // "ignored" — a request the contract promises succeeds was 400.
+  const gen = await postImages(GEN, { model: 'image-2', prompt: 'a dot', mask: 42 });
+  assert.equal(gen.status, 200, 'a generation ignores mask, valid or not');
+});
+
+test('edits: a malformed array member keeps its index even when the parser throws', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', {
+    model: 'image-2', prompt: 'edit', images: [
+      { image_url: PNG_DATA_URL },
+      { image_url: PNG_DATA_URL, file_id: 'also-this' },
+    ],
+  });
+  assert.equal(status, 400);
+  assert.match(payload.error.message, /image\[1\]/, JSON.stringify(payload.error));
+});
+
+test('a non-streaming response also caps at n images', async () => {
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() {
+      return {
+        created: 0,
+        images: Array.from({ length: 5 }, () => ({ b64Json: 'iVBORw0KGgo=', revisedPrompt: null })),
+      };
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2 }),
+    });
+    const data = (await res.json()).data;
+    assert.equal(data.length, 2, 'the response must not exceed the requested n');
+  } finally {
+    await started.close();
+  }
+});
+
+// The operation matrices the panel kept asking for: the rules hold on edits and
+// variations, not only generations.
+const EDIT_BASE = { model: 'image-2', prompt: 'edit', images: [{ image_url: PNG_DATA_URL }] };
+
+test('edits: nullable leaves treat null as omission there too', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', {
+    ...EDIT_BASE, n: null, output_compression: null, response_format: null, partial_images: null,
+  });
+  assert.equal(status, 200, JSON.stringify(payload));
+});
+
+test('edits: an absent model defaults there too', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    prompt: 'edit', images: [{ image_url: PNG_DATA_URL }],
+  });
+  assert.notEqual(status, 404, 'no model means the default route, not a rejection');
+});
+
+test('edits: an empty-string enum is rejected there too', async () => {
+  const { status } = await postImages('/v1/images/edits', { ...EDIT_BASE, quality: '' });
+  assert.equal(status, 400);
+});
+
+test('variations: repeated image[] parts accumulate, and text members are URL references', async () => {
+  // A multipart member is either a file part (valid base64 input) or a text
+  // value — and ANY non-empty string is a valid URL-type reference by design
+  // (the backend owns fetch failures). A shape-malformed member is therefore
+  // unreachable through multipart; the indexed-400 rule is a JSON-only path,
+  // pinned on edits. This test pins what multipart DOES promise: repeated
+  // parts accumulate rather than overwrite.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const form = new FormData();
+    form.set('model', 'dall-e-2');
+    form.append('image[]', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'a.png');
+    form.append('image[]', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'b.png');
+    const res = await fetch(`${started.url}/v1/images/variations`, { method: 'POST', body: form });
+    assert.equal(res.status, 200, await res.text());
+  } finally {
+    await started.close();
+  }
+});
+
+test('edits: the misleading multipart parameter is JSON there too', async () => {
+  const { 0: status } = [(await (async () => {
+    const started = await startLocalApiProxy({
+      backend: imageBackend(), imageGenerationClient: imageBackend(),
+      host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    });
+    try {
+      const res = await fetch(`${started.url}/v1/images/edits`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; profile="x/multipart/form-data"' },
+        body: JSON.stringify(EDIT_BASE),
+      });
+      return res.status;
+    } finally {
+      await started.close();
+    }
+  })())];
+  assert.equal(status, 200);
+});

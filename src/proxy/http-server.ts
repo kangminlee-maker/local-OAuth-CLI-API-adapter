@@ -551,7 +551,10 @@ function normalizeOpenAiImageRequest(
     prompt,
     n: imageGenerationCount(input.n),
     images,
-    mask: requiredValidImageInput(input.mask, 'mask'),
+    // Validated only where the contract gives it meaning. On generations and
+    // variations the row says "ignored" — validating an ignored field rejected
+    // requests the contract promises succeed.
+    mask: operation === 'edit' ? requiredValidImageInput(input.mask, 'mask') : undefined,
     size: optionalImageSize(input.size),
     quality: optionalEnum(input.quality, 'quality', ['standard', 'hd', 'low', 'medium', 'high', 'auto']),
     background: optionalEnum(input.background, 'background', ['transparent', 'opaque', 'auto']),
@@ -678,7 +681,15 @@ function imageInputArray(value: unknown): readonly NormalizedImage[] {
     // Every supplied member must be a valid image reference. Filtering the
     // bad ones executed the request with silently altered input.
     return value.map((member, index) => {
-      const image = optionalImageInput(member);
+      let image: NormalizedImage | undefined;
+      try {
+        image = optionalImageInput(member);
+      } catch (err) {
+        // The member parser throws its own diagnostics (`exactly one source`);
+        // the index is this function's to add, whichever path rejected.
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new ProxyRequestError(`image[${index}]: ${detail}`, 400);
+      }
       if (!image) {
         throw new ProxyRequestError(`image[${index}] is not a valid image reference.`, 400);
       }
@@ -1500,10 +1511,13 @@ function openAiImagesGenerationResponse(
   return {
     created: result.created,
     // One pin set for the whole response: sibling images must not evict each
-    // other before their URLs are even sent.
+    // other before their URLs are even sent. And at most `n` of them — the
+    // count is backend-controlled, `n` is the request's, the same rule the
+    // streamed path applies.
     data: (() => {
       const batch = new Set<string>();
-      return result.images.map((image) => openAiImageObject(req, generatedImages, image, request, batch));
+      return result.images.slice(0, request.n ?? 1)
+        .map((image) => openAiImageObject(req, generatedImages, image, request, batch));
     })(),
     ...openAiImageResponseMetadata(result, request),
     ...(result.usage ? { usage: openAiImagesUsage(result.usage) } : {}),
