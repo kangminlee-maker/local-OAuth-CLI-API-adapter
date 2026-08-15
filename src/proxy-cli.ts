@@ -108,7 +108,7 @@ async function proxy(args: readonly string[]): Promise<number> {
           }),
     },
   });
-  const authKey = normalizeAuthKey(options.authKey ?? process.env.LOCAL_OAUTH_PROXY_KEY);
+  const authKey = configuredAuthKey(options.authKey, process.env.LOCAL_OAUTH_PROXY_KEY);
   const started = await startLocalApiProxy({
     backend,
     imageGenerationClient,
@@ -211,10 +211,21 @@ function parseIntOption(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
-function normalizeAuthKey(value: string | undefined): string | undefined {
-  if (value === undefined) return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
+/**
+ * The configured key, RAW. Only true absence — no flag, no env var — means
+ * "no gate". The old normalization trimmed and turned an empty or
+ * whitespace-only key into undefined, which read a misconfigured deployment
+ * (a secret expanding to "") as a request for an OPEN proxy and silently
+ * served everything unauthenticated; it also repaired edge-whitespace keys
+ * the server is contracted to reject as configuration errors. Every
+ * configured value now reaches the server's own checks, which answer a fixed
+ * 500 instead of opening the gate.
+ */
+export function configuredAuthKey(
+  flag: string | undefined,
+  env: string | undefined,
+): string | undefined {
+  return flag ?? env;
 }
 
 function parseCodexTransport(value: string | undefined): CodexProxyTransport {
