@@ -233,11 +233,12 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
   if (value.length === 0) {
     throw new ProxyRequestError('messages must contain at least one message.', 400);
   }
-  return value.map((item) => {
+  return value.map((item, index) => {
     const msg = asRecord(item);
     if (!msg) throw new ProxyRequestError('Each message must be an object.', 400);
-    const role = readRole(msg.role);
-    const content = flattenOpenAiMessage(msg);
+    const role = readOpenAiChatRole(msg.role, index);
+    requireOpenAiChatContent(msg, index);
+    const content = flattenOpenAiMessage(msg, role);
     return {
       role,
       content: content.text,
@@ -246,21 +247,115 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
   });
 }
 
+/**
+ * The direct API's role set, enforced as it enforces it: `role` is the
+ * discriminator of every message schema, so a missing or unknown role is a 400
+ * there — never a silent rewrite. The proxy used to normalize unknowns to
+ * `user`, which turned a typo'd `assistantt` into a user turn: no error
+ * anywhere, just a conversation whose meaning quietly changed.
+ *
+ * `function` is deprecated on the direct API but still in its schema; it
+ * carries a tool result, which is what `tool` means here.
+ */
+function readOpenAiChatRole(value: unknown, index: number): NormalizedMessage['role'] {
+  if (
+    value === 'system'
+    || value === 'developer'
+    || value === 'user'
+    || value === 'assistant'
+    || value === 'tool'
+  ) {
+    return value;
+  }
+  if (value === 'function') return 'tool';
+  const missing = value === undefined || value === null;
+  throw new ProxyRequestError(
+    missing
+      ? `messages[${index}].role is required.`
+      : `messages[${index}].role must be one of system, developer, user, assistant, tool or function.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    `messages[${index}].role`,
+    missing ? 'missing_required_parameter' : null,
+  );
+}
+
+/**
+ * `content` as the direct API accepts it: a string or an array of parts.
+ * An assistant message may omit it (or send null) when it carries `tool_calls`
+ * or the deprecated `function_call` instead — the message the client is
+ * replaying is the model's own tool-call turn, which has no text. A deprecated
+ * `function` message's content is nullable there too.
+ */
+function requireOpenAiChatContent(msg: Record<string, unknown>, index: number): void {
+  const content = msg.content;
+  if (typeof content === 'string' || Array.isArray(content)) return;
+  const absent = content === undefined || content === null;
+  if (absent && msg.role === 'assistant') {
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return;
+    if (asRecord(msg.function_call)) return;
+  }
+  if (content === null && msg.role === 'function') return;
+  throw new ProxyRequestError(
+    absent
+      ? `messages[${index}].content is required.`
+      : `messages[${index}].content must be a string or an array of content parts.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    `messages[${index}].content`,
+    absent ? 'missing_required_parameter' : null,
+  );
+}
+
 function readResponsesInput(value: unknown): NormalizedMessage[] {
   if (typeof value === 'string') return [{ role: 'user', content: value, images: [] }];
   if (!Array.isArray(value)) return [{ role: 'user', content: '', images: [] }];
-  return value.map((item) => {
+  return value.map((item, index) => {
     const msg = asRecord(item);
     if (!msg) {
-      return { role: 'user' as const, content: String(item ?? ''), images: [] };
+      throw new ProxyRequestError(`input[${index}] must be an object.`, 400);
     }
     const content = flattenResponsesMessage(msg);
     return {
-      role: readRole(msg.role ?? 'user'),
+      role: readResponsesRole(msg, index),
       content: content.text,
       images: content.images,
     };
   });
+}
+
+/**
+ * Responses input items are polymorphic: typed items (`function_call`,
+ * `function_call_output`, `reasoning`, ...) have no `role` and are valid
+ * without one. Only a message item — no `type`, or `type: "message"` — carries
+ * a role, and there the direct API requires it. So absence of `role` is only an
+ * error where the item claims to be a message.
+ */
+function readResponsesRole(msg: Record<string, unknown>, index: number): NormalizedMessage['role'] {
+  const isMessage = msg.type === undefined || msg.type === 'message';
+  if (!isMessage) return msg.role === 'assistant' ? 'assistant' : 'user';
+  const value = msg.role;
+  if (
+    value === 'system'
+    || value === 'developer'
+    || value === 'user'
+    || value === 'assistant'
+  ) {
+    return value;
+  }
+  const missing = value === undefined || value === null;
+  throw new ProxyRequestError(
+    missing
+      ? `input[${index}].role is required.`
+      : `input[${index}].role must be one of system, developer, user or assistant.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    `input[${index}].role`,
+    missing ? 'missing_required_parameter' : null,
+  );
 }
 
 function readAnthropicMessages(value: unknown): NormalizedMessage[] {
@@ -270,21 +365,42 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
   if (value.length === 0) {
     throw new ProxyRequestError('messages must contain at least one message.', 400, 'anthropic');
   }
-  return value.map((item) => {
+  return value.map((item, index) => {
     const msg = asRecord(item);
     if (!msg) throw new ProxyRequestError('Each message must be an object.', 400, 'anthropic');
-    const role = msg.role === 'assistant' ? 'assistant' : 'user';
-    const content = flattenAnthropicMessage(msg);
+    const role = msg.role;
+    if (role !== 'user' && role !== 'assistant') {
+      // The direct API's whole role set for messages[]; `system` in particular
+      // is a top-level field there, not a role, and rewriting it to `user`
+      // hid that mistake instead of reporting it.
+      throw new ProxyRequestError(
+        role === undefined || role === null
+          ? `messages.${index}.role is required.`
+          : `messages.${index}.role must be user or assistant.`,
+        400,
+        'anthropic',
+      );
+    }
+    const content = msg.content;
+    if (typeof content !== 'string' && !Array.isArray(content)) {
+      throw new ProxyRequestError(
+        content === undefined || content === null
+          ? `messages.${index}.content is required.`
+          : `messages.${index}.content must be a string or an array of content blocks.`,
+        400,
+        'anthropic',
+      );
+    }
+    const flattened = flattenAnthropicMessage(msg);
     return {
       role,
-      content: content.text,
-      images: content.images,
+      content: flattened.text,
+      images: flattened.images,
     };
   });
 }
 
-function flattenOpenAiMessage(msg: Record<string, unknown>): NormalizedContent {
-  const role = readRole(msg.role);
+function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMessage['role']): NormalizedContent {
   const content = flattenOpenAiContent(msg.content);
   const toolCalls = Array.isArray(msg.tool_calls)
     ? msg.tool_calls.map((toolCall) => {
@@ -650,19 +766,6 @@ function readOptionalString(value: unknown): string | undefined {
 
 function readOptionalBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
-}
-
-function readRole(value: unknown): NormalizedMessage['role'] {
-  if (
-    value === 'system'
-    || value === 'developer'
-    || value === 'user'
-    || value === 'assistant'
-    || value === 'tool'
-  ) {
-    return value;
-  }
-  return 'user';
 }
 
 /**

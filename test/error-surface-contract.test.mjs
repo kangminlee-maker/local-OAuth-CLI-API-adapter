@@ -812,16 +812,160 @@ for (const [path, body] of [
   });
 }
 
-test('an unknown role is normalized to user rather than rejected', async () => {
-  // A documented, deliberate divergence from the direct APIs: the normalizer is
-  // permissive so local tools with their own role vocabularies still work. A
-  // one-line throw in the normalizer would turn this promise into a 400.
-  const { status } = await call(
+// --- input parity: roles and content are validated as the direct APIs validate
+// them. The permissive normalization these replace rewrote an unknown or missing
+// role to `user` — a typo'd `assistantt` became a user turn with no error
+// anywhere, and a client that worked here failed on the direct API.
+
+test('an unknown role is rejected, naming the field', async () => {
+  const { status, text } = await call(
     backendThat({}),
     '/v1/chat/completions',
     { model: 'a-model', messages: [{ role: 'future_role', content: 'hello' }] },
   );
+  assert.equal(status, 400);
+  const body = JSON.parse(text);
+  assert.equal(body.error.param, 'messages[0].role');
+});
+
+test('a message with no role is rejected as missing, not defaulted', async () => {
+  const { status, text } = await call(
+    backendThat({}),
+    '/v1/chat/completions',
+    { model: 'a-model', messages: [{ content: 'hello' }] },
+  );
+  assert.equal(status, 400);
+  const body = JSON.parse(text);
+  assert.equal(body.error.code, 'missing_required_parameter');
+  assert.equal(body.error.param, 'messages[0].role');
+});
+
+for (const [label, content] of [['null', null], ['a number', 42], ['a bare object', { type: 'text', text: 'x' }]]) {
+  test(`chat content ${label} is rejected, as on the direct API`, async () => {
+    const { status, text } = await call(
+      backendThat({}),
+      '/v1/chat/completions',
+      { model: 'a-model', messages: [{ role: 'user', content }] },
+    );
+    assert.equal(status, 400, `content=${JSON.stringify(content)} must be a string or array`);
+    assert.equal(JSON.parse(text).error.param, 'messages[0].content');
+  });
+}
+
+test('a user message with no content is rejected as missing', async () => {
+  const { status, text } = await call(
+    backendThat({}),
+    '/v1/chat/completions',
+    { model: 'a-model', messages: [{ role: 'user' }] },
+  );
+  assert.equal(status, 400);
+  assert.equal(JSON.parse(text).error.code, 'missing_required_parameter');
+});
+
+test('an assistant tool-call turn needs no content, as on the direct API', async () => {
+  // "Required unless tool_calls or function_call is specified" — a client
+  // replaying an agent conversation sends exactly this shape, so rejecting it
+  // breaks every multi-turn tool loop.
+  const { status } = await call(
+    backendThat({}),
+    '/v1/chat/completions',
+    {
+      model: 'a-model',
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'w', arguments: '{}' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: 'sunny' },
+      ],
+    },
+  );
   assert.equal(status, 200);
+});
+
+test('an assistant message with neither content nor tool calls is rejected', async () => {
+  const { status } = await call(
+    backendThat({}),
+    '/v1/chat/completions',
+    { model: 'a-model', messages: [{ role: 'assistant' }] },
+  );
+  assert.equal(status, 400);
+});
+
+test('the deprecated function role is accepted and treated as a tool result', async () => {
+  // Still in the direct schema; dropping it would reject histories that older
+  // clients replay.
+  const { status } = await call(
+    backendThat({}),
+    '/v1/chat/completions',
+    {
+      model: 'a-model',
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'function', name: 'w', content: 'sunny' },
+      ],
+    },
+  );
+  assert.equal(status, 200);
+});
+
+test('/v1/messages: a system role inside messages is rejected, naming the mistake', async () => {
+  // `system` is a top-level field on the Anthropic API, not a role. Rewriting it
+  // to `user` hid exactly that mistake.
+  const { status, text } = await call(
+    backendThat({}),
+    '/v1/messages',
+    { model: 'a-model', max_tokens: 16, messages: [{ role: 'system', content: 'be terse' }] },
+  );
+  assert.equal(status, 400);
+  const body = JSON.parse(text);
+  assert.equal(body.type, 'error');
+  assert.match(body.error.message, /must be user or assistant/);
+});
+
+for (const [label, content] of [['null', null], ['a number', 7]]) {
+  test(`/v1/messages: content ${label} is rejected`, async () => {
+    const { status } = await call(
+      backendThat({}),
+      '/v1/messages',
+      { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content }] },
+    );
+    assert.equal(status, 400);
+  });
+}
+
+test('/v1/responses: a primitive input item is rejected', async () => {
+  const { status, text } = await call(
+    backendThat({}),
+    '/v1/responses',
+    { model: 'a-model', input: [7] },
+  );
+  assert.equal(status, 400);
+  assert.match(JSON.parse(text).error.message, /input\[0\] must be an object/);
+});
+
+test('/v1/responses: a message item with no role is rejected, a typed item needs none', async () => {
+  // Items are polymorphic: `function_call` has no role and is valid without
+  // one. Only something claiming to be a message must say whose turn it is.
+  const missing = await call(
+    backendThat({}),
+    '/v1/responses',
+    { model: 'a-model', input: [{ content: 'hi' }] },
+  );
+  assert.equal(missing.status, 400);
+  assert.equal(JSON.parse(missing.text).error.param, 'input[0].role');
+
+  const typed = await call(
+    backendThat({}),
+    '/v1/responses',
+    {
+      model: 'a-model',
+      input: [
+        { role: 'user', content: 'weather?' },
+        { type: 'function_call', call_id: 'c1', name: 'w', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'c1', output: 'sunny' },
+      ],
+    },
+  );
+  assert.equal(typed.status, 200);
 });
 
 // --- round 38: promises the inventory showed nothing would catch breaking ---
