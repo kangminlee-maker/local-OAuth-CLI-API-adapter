@@ -1433,22 +1433,20 @@ function parseMultipartFormData(
   return output;
 }
 
-function multipartBoundary(contentType: string): string | null {
-  // Parameters are walked with quote awareness: a `;` inside a quoted value
-  // does not separate, and `boundary=` inside ANOTHER parameter's quoted value
-  // is text — the naive regex picked a decoy out of `note="x;boundary=bogus"`
-  // and stopped at the closing quote of `boundary="B"junk`, silently accepting
-  // a malformed parameter.
-  const semi = contentType.indexOf(';');
-  if (semi === -1) return null;
+/**
+ * Quote-aware parameter splitting, shared by the content-type and
+ * content-disposition parsers: a `;` inside a quoted value is data, and a
+ * quoted-pair (`\"`) neither closes the quote nor separates. Naive
+ * splitting let `filename="x; name=bogus"` fabricate — or overwrite — a
+ * parameter.
+ */
+function splitHeaderParameters(value: string): string[] {
   const params: string[] = [];
   let current = '';
   let inQuotes = false;
   let escaped = false;
-  for (const ch of contentType.slice(semi + 1)) {
+  for (const ch of value) {
     if (escaped) {
-      // A quoted-pair: the escaped character is literal — `\"` neither closes
-      // the quote nor `\;` separates.
       current += ch;
       escaped = false;
       continue;
@@ -1467,7 +1465,18 @@ function multipartBoundary(contentType: string): string | null {
     }
   }
   params.push(current);
-  for (const param of params) {
+  return params;
+}
+
+function multipartBoundary(contentType: string): string | null {
+  // Parameters are walked with quote awareness: a `;` inside a quoted value
+  // does not separate, and `boundary=` inside ANOTHER parameter's quoted value
+  // is text — the naive regex picked a decoy out of `note="x;boundary=bogus"`
+  // and stopped at the closing quote of `boundary="B"junk`, silently accepting
+  // a malformed parameter.
+  const semi = contentType.indexOf(';');
+  if (semi === -1) return null;
+  for (const param of splitHeaderParameters(contentType.slice(semi + 1))) {
     const eq = param.indexOf('=');
     if (eq === -1) continue;
     // OWS only — String.trim also eats U+00A0, which under latin1 header
@@ -1511,12 +1520,14 @@ function parseContentDisposition(value: string | undefined): {
 } {
   if (!value) return {};
   const out: Record<string, string> = {};
-  for (const part of value.split(';').slice(1)) {
+  for (const part of splitHeaderParameters(value).slice(1)) {
     const index = part.indexOf('=');
     if (index === -1) continue;
     // Parameter names are case-insensitive; `NAME="image"` names the part.
-    const key = part.slice(0, index).trim().toLowerCase();
-    let val = part.slice(index + 1).trim();
+    // OWS only — String.trim also eats U+00A0, a real latin1 header byte that
+    // makes the name NOT `name`.
+    const key = stripOws(part.slice(0, index)).toLowerCase();
+    let val = stripOws(part.slice(index + 1));
     if (val.startsWith('"') && val.endsWith('"')) {
       // Quoted-pairs decode here as they do in the boundary parameter:
       // `name="im\age"` names `image`.

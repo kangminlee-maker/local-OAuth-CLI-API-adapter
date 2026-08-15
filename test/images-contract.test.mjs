@@ -1820,3 +1820,68 @@ test('a non-OWS byte before the boundary parameter name is not trimmed away', as
     await started.close();
   }
 });
+
+// --- round 54 ---
+
+test('a semicolon inside a quoted filename cannot overwrite the field name', async () => {
+  const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B', 'Content-Disposition: form-data; name="image"; filename="x; name=bogus.png"', 'Content-Type: image/png', '', png,
+    '--B--', '',
+  ], 'boundary=B', '/v1/images/variations');
+  assert.match(status, /200/, `the quoted semicolon is filename data: ${status}`);
+});
+
+test('a quoted filename cannot fabricate a name the part never had', async () => {
+  const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
+  const status = await rawMultipart([
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B', 'Content-Disposition: form-data; filename="x; name=image; z"', 'Content-Type: image/png', '', png,
+    '--B--', '',
+  ], 'boundary=B', '/v1/images/variations');
+  assert.match(status, /400/, `an unnamed part names nothing — the image is missing: ${status}`);
+});
+
+test('a non-OWS byte before a disposition parameter name is not trimmed away', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const target = new URL(started.url);
+  try {
+    const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
+    const head = [
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+      '--B',
+    ].join('\r\n');
+    const tail = [
+      '', 'Content-Type: image/png', '', png,
+      '--B--', '',
+    ].join('\r\n');
+    const disposition = Buffer.concat([
+      Buffer.from('Content-Disposition: form-data;', 'latin1'),
+      Buffer.from([0xa0]),
+      Buffer.from('name="image"; filename="x.png"', 'latin1'),
+    ]);
+    const body = Buffer.concat([
+      Buffer.from(head + '\r\n', 'latin1'), disposition, Buffer.from(tail, 'latin1'),
+    ]);
+    const raw = await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
+        Buffer.from(
+          'POST /v1/images/variations HTTP/1.1\r\nHost: h\r\n'
+          + 'Content-Type: multipart/form-data; boundary=B\r\n'
+          + `Content-Length: ${body.byteLength}\r\nConnection: close\r\n\r\n`, 'latin1'),
+        body,
+      ])));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data.split('\r\n')[0]));
+      conn.on('error', reject);
+    });
+    assert.match(raw, /400/, `<0xA0>name is not the name parameter: ${raw}`);
+  } finally {
+    await started.close();
+  }
+});
