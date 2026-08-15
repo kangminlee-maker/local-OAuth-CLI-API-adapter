@@ -1293,3 +1293,175 @@ test('/v1/responses: a non-streaming tool call is reported as a function_call ou
   assert.equal(call_.arguments, '{"city":"Seoul"}');
   assert.ok(call_.call_id, 'a call_id is what the client replays back');
 });
+
+// --- round 40: gate byte semantics, preflight strictness, dispatch identity ---
+
+async function rawStatusWith(authKey, payload) {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000, authKey,
+  });
+  const target = new URL(started.url);
+  try {
+    return await new Promise((resolve, reject) => {
+      const conn = net.connect(Number(target.port), target.hostname, () => conn.write(payload));
+      let data = '';
+      conn.on('data', (chunk) => { data += chunk; });
+      conn.on('end', () => resolve(data));
+      conn.on('error', reject);
+    });
+  } finally {
+    await started.close();
+  }
+}
+
+test('an empty preflight-method header does not make OPTIONS a preflight', async () => {
+  // The presence check let `Access-Control-Request-Method:` (empty) take the
+  // ungated 204 — an unauthenticated probe for served paths. A preflight names
+  // the method it is asking about, or it is not a preflight.
+  const res = await rawStatusWith('secret', Buffer.from(
+    'OPTIONS /v1/nope HTTP/1.1\r\nHost: h\r\nAccess-Control-Request-Method: \r\nConnection: close\r\n\r\n',
+  ));
+  assert.match(res.split('\r\n')[0], /401/, res.slice(0, 40));
+});
+
+test('a Bearer key whose UTF-8 bytes end in 0xA0 authenticates', async () => {
+  // U+00E0 encodes as C3 A0; latin1 decoding makes the A0 byte U+00A0, which
+  // String.trim eats — the Authorization branch was still doing that after the
+  // x-api-key branch was fixed, so this valid credential got 401.
+  const res = await rawStatusWith('\u00e0', Buffer.concat([
+    Buffer.from('GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nAuthorization: Bearer '),
+    Buffer.from('\u00e0', 'utf8'),
+    Buffer.from('\r\n\r\n'),
+  ]));
+  assert.match(res.split('\r\n')[0], /200/, res.slice(0, 40));
+});
+
+test('a Bearer credential with a trailing 0xA0 junk byte is NOT the key', async () => {
+  // The same trim, other direction: the junk byte was silently removed and a
+  // WRONG credential authorized.
+  const res = await rawStatusWith('secret', Buffer.concat([
+    Buffer.from('GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nAuthorization: Bearer secret'),
+    Buffer.from([0xa0]),
+    Buffer.from('\r\n\r\n'),
+  ]));
+  assert.match(res.split('\r\n')[0], /401/, res.slice(0, 40));
+});
+
+test('a latin1-range key is its UTF-8 bytes, not its latin1 byte', async () => {
+  // é: UTF-8 C3 A9 must authenticate; the single latin1 byte E9 must not.
+  const ok = await rawStatusWith('\u00e9', Buffer.concat([
+    Buffer.from('GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nx-api-key: '),
+    Buffer.from([0xc3, 0xa9]),
+    Buffer.from('\r\n\r\n'),
+  ]));
+  assert.match(ok.split('\r\n')[0], /200/, ok.slice(0, 40));
+  const wrong = await rawStatusWith('\u00e9', Buffer.concat([
+    Buffer.from('GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nx-api-key: '),
+    Buffer.from([0xe9]),
+    Buffer.from('\r\n\r\n'),
+  ]));
+  assert.match(wrong.split('\r\n')[0], /401/, wrong.slice(0, 40));
+});
+
+test('tab-padded credentials are trimmed as OWS in both headers', async () => {
+  const viaKey = await rawStatusWith('secret', Buffer.from(
+    'GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nx-api-key: \tsecret\t\r\n\r\n',
+  ));
+  assert.match(viaKey.split('\r\n')[0], /200/, viaKey.slice(0, 40));
+  const viaBearer = await rawStatusWith('secret', Buffer.from(
+    'GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nAuthorization: Bearer\tsecret\t\r\n\r\n',
+  ));
+  assert.match(viaBearer.split('\r\n')[0], /200/, viaBearer.slice(0, 40));
+});
+
+test('an authKey with an unpaired surrogate is a configuration error, not a lookalike key', async () => {
+  // \uD800 has no UTF-8 encoding; Buffer.from replaces it with U+FFFD, so the
+  // DIFFERENT credential \uFFFD compared equal and authorized.
+  const res = await rawStatusWith('\ud800', Buffer.concat([
+    Buffer.from('GET /v1/models HTTP/1.1\r\nHost: h\r\nConnection: close\r\nx-api-key: '),
+    Buffer.from([0xef, 0xbf, 0xbd]),
+    Buffer.from('\r\n\r\n'),
+  ]));
+  assert.match(res.split('\r\n')[0], /500/, res.slice(0, 40));
+});
+
+test('a configuration-error response never echoes the configured key', async () => {
+  const sentinel = 'SENTINEL-9c41';
+  for (const path of ['/v1/models', '/v1/messages']) {
+    const started = await startLocalApiProxy({
+      backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+      authKey: ` ${sentinel} `,
+    });
+    try {
+      const res = await fetch(`${started.url}${path}`, path === '/v1/messages'
+        ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(MESSAGES) }
+        : {});
+      assert.equal(res.status, 500);
+      const body = await res.text();
+      assert.ok(!body.includes(sentinel), `the key must not be echoed: ${body.slice(0, 120)}`);
+    } finally {
+      await started.close();
+    }
+  }
+});
+
+test('case variants and encoded separators are different, unknown paths', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    for (const path of ['/V1/MODELS', '/v1/models/', '/v1%2Fmodels']) {
+      const res = await fetch(`${started.url}${path}`);
+      assert.equal(res.status, 404, `${path} is not /v1/models`);
+    }
+  } finally {
+    await started.close();
+  }
+});
+
+test('the 413 limit answers /v1/messages in the Anthropic envelope', async () => {
+  const started = await startLocalApiProxy({
+    backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: Buffer.alloc(50_000_001, 0x61),
+    });
+    assert.equal(res.status, 413);
+    const body = await res.json();
+    assert.equal(body.type, 'error', `expected the Anthropic shape: ${JSON.stringify(body).slice(0, 120)}`);
+    assert.equal(body.error.param, undefined);
+  } finally {
+    await started.close();
+  }
+});
+
+test('/v1/responses: an unknown role on a message item is rejected there too', async () => {
+  // The chat surface pins its own unknown-role rejection; the Responses message
+  // role set is narrower (no tool), and only the missing-role case was pinned.
+  for (const item of [{ role: 'tool', content: 'hi' }, { type: 'message', role: 'tool', content: 'hi' }]) {
+    const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input: [item] });
+    assert.equal(status, 400, `role tool is not in the Responses message set: ${JSON.stringify(item)}`);
+    assert.equal(JSON.parse(text).error.param, 'input[0].role');
+  }
+});
+
+test('/v1/responses: instructions reach the backend as an instruction message', async () => {
+  let seen;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request) { seen = request.messages; return ok(); },
+    async *stream() {},
+    async close() {},
+  };
+  const { status } = await call(backend, '/v1/responses', {
+    model: 'a-model', input: 'hi', instructions: 'Answer in French.',
+  });
+  assert.equal(status, 200);
+  assert.ok(
+    seen.some((m) => m.role === 'system' && m.content.includes('Answer in French.')),
+    `instructions must be lifted into the conversation: ${JSON.stringify(seen)}`,
+  );
+});

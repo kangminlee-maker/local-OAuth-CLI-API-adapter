@@ -137,7 +137,7 @@ async function handleRequest(
   // before it will attach credentials, which is why it bypasses the gate. A
   // preflight always names the method it is asking about; a bare OPTIONS does
   // not, is an ordinary request, and goes through dispatch like any other.
-  if (req.method === 'OPTIONS' && req.headers['access-control-request-method'] !== undefined) {
+  if (req.method === 'OPTIONS' && stripOws(headerValue(req.headers['access-control-request-method'])) !== '') {
     res.writeHead(204).end();
     return;
   }
@@ -159,7 +159,15 @@ async function handleRequest(
       await handleLocalCliChatRequest(req, res, options, path);
       return;
     }
-    const isGetRoute = path === '/v1/models' || path.startsWith('/v1/images/generated/');
+    // The generated route is exactly one nonempty, slash-free id segment. A
+    // doubled slash or a deeper path is a DIFFERENT path, which the dispatch
+    // row promises is a 404 whatever the method — prefix matching was
+    // classifying it as served and answering 405.
+    const generatedId = path.startsWith('/v1/images/generated/')
+      ? path.slice('/v1/images/generated/'.length)
+      : null;
+    const isGetRoute = path === '/v1/models'
+      || (generatedId !== null && generatedId !== '' && !generatedId.includes('/'));
     // Path first, method second: `GET /v1/nope` is an unknown endpoint, not an
     // unsupported method. 405 is reserved for a path this proxy does serve —
     // including the GET routes, so `POST /v1/models` is a method problem, not a
@@ -275,6 +283,13 @@ function requireAuthorizedRequest(
   if (authKey !== authKey.trim()) {
     throw new Error('authKey has leading or trailing whitespace, which no request can present');
   }
+  // An unpaired surrogate has no UTF-8 encoding: Buffer.from replaces it with
+  // U+FFFD, so the DIFFERENT credential \uFFFD would compare equal. A key that
+  // does not survive the encoding round-trip is a configuration mistake, not a
+  // key — no client could present it faithfully.
+  if (Buffer.from(authKey, 'utf8').toString('utf8') !== authKey) {
+    throw new Error('authKey contains unpaired surrogates, which cannot be encoded as UTF-8 bytes');
+  }
   if (presentedAuthKeys(req).some((candidate) => safeKeyEqual(candidate, authKey))) return;
   const provider = path === '/v1/messages' ? 'anthropic' : 'openai';
   throw new ProxyRequestError(
@@ -307,14 +322,26 @@ function presentedAuthKeys(req: IncomingMessage): string[] {
     if (raw[i].toLowerCase() !== 'x-api-key') continue;
     // OWS only (space/tab, per RFC 7230) — String.trim also eats U+00A0, which
     // under latin1 header decoding is a real byte of a multibyte key.
-    const trimmed = raw[i + 1].replace(/^[ \t]+|[ \t]+$/g, '');
+    const trimmed = stripOws(raw[i + 1]);
     if (trimmed) presented.push(trimmed);
   }
   const headers = req.headers;
-  const authorization = headerValue(headers.authorization).trim();
-  const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
-  if (bearer) presented.push(bearer[1].trim());
+  // OWS only, same as the x-api-key lines above. `String.trim()` and `\s` both
+  // eat U+00A0, which under latin1 header decoding is a real byte — of the key
+  // (a valid credential was rejected) or of trailing junk (an INVALID credential
+  // was accepted, because the junk was silently removed before comparing).
+  const authorization = stripOws(headerValue(headers.authorization));
+  const bearer = /^Bearer[ \t]+(.+)$/i.exec(authorization);
+  if (bearer) {
+    const token = stripOws(bearer[1]);
+    if (token) presented.push(token);
+  }
   return presented;
+}
+
+// RFC 7230 optional whitespace: ASCII space and horizontal tab, nothing else.
+function stripOws(value: string): string {
+  return value.replace(/^[ \t]+|[ \t]+$/g, '');
 }
 
 function safeKeyEqual(presented: string, expected: string): boolean {
@@ -447,6 +474,11 @@ function normalizeOpenAiImageRequest(
   const proxyRoute = optionalImageProxyRoute(input.x_proxy_image_route);
   const outputFormat = optionalEnum(input.output_format, 'output_format', ['png', 'jpeg', 'webp'])
     ?? proxyRoute?.outputFormat;
+  // Explicit null is a value the client chose, not omission — the rule `n` and
+  // `partial_images` already follow.
+  if (input.output_compression === null) {
+    throw new ProxyRequestError('output_compression must be an integer between 0 and 100.', 400);
+  }
   const outputCompression = optionalInteger(input.output_compression, 'output_compression', 0, 100)
     ?? proxyRoute?.outputCompression;
   const request: OpenAiImageGenerationRequest = {

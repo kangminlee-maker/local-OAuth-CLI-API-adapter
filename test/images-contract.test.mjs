@@ -747,3 +747,85 @@ test('generations: an explicit partial_images null is rejected, like n', async (
   });
   assert.equal(status, 400, `null is a value the client chose: ${JSON.stringify(payload)}`);
 });
+
+// --- round 40 ---
+
+test('a generated id with an encoded question mark is path data, not a query', async () => {
+  // Only the first LITERAL `?` starts the query. `%3F` is part of the raw path,
+  // so appending it to a valid id must produce a different, unknown id.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
+    });
+    const url = (await res.json()).data[0].url;
+    assert.equal((await fetch(`${url}%3Fjunk`)).status, 404, 'the encoded ? extends the id');
+    assert.equal((await fetch(`${url}?junk`)).status, 200, 'a literal ? starts an ignored query');
+  } finally {
+    await started.close();
+  }
+});
+
+test('a generated path with extra separators is an unknown endpoint, whatever the method', async () => {
+  // The route is one nonempty, slash-free id segment. Prefix matching used to
+  // classify `//missing` as served and answer 405 to a POST.
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    for (const [path, method] of [
+      ['/v1/images/generated//missing', 'POST'],
+      ['/v1/images/generated//missing', 'GET'],
+      ['/v1/images/generated/a/b', 'GET'],
+      ['/v1/images/generated/', 'GET'],
+    ]) {
+      const res = await fetch(`${started.url}${path}`, { method });
+      assert.equal(res.status, 404, `${method} ${path} is not the generated route`);
+      assert.match((await res.json()).error.message, /Unknown endpoint/);
+    }
+  } finally {
+    await started.close();
+  }
+});
+
+test('generations: an explicit output_compression null is rejected, like n', async () => {
+  const { status } = await postImages(GEN, {
+    model: 'gpt-image-1', prompt: 'a dot', output_compression: null,
+  });
+  assert.equal(status, 400);
+});
+
+test('generations: standard output_compression wins over the route hint', async () => {
+  // The extension applies only when the standard field is omitted.
+  let seen;
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate(request) {
+      seen = request.outputCompression;
+      return { created: 0, images: [{ b64Json: 'iVBORw0KGgo=', revisedPrompt: null }] };
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'image-2', prompt: 'a dot', output_format: 'jpeg', output_compression: 80,
+        x_proxy_image_route: { output_compression: 20 },
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.equal(seen, 80, 'the standard field decides when both are present');
+  } finally {
+    await started.close();
+  }
+});
