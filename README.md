@@ -29,15 +29,15 @@ pnpm pack:adapter
 The command writes and verifies a standalone package:
 
 ```text
-artifacts/local-oauth-cli-api-adapter-0.1.0.tgz
+artifacts/local-oauth-cli-api-adapter-0.2.0.tgz
 ```
 
 Install that tarball from any other repository:
 
 ```bash
-pnpm add -D /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
+pnpm add -D /path/to/local-oauth-cli-api-adapter-0.2.0.tgz
 # or
-pnpm add -g /path/to/local-oauth-cli-api-adapter-0.1.0.tgz
+pnpm add -g /path/to/local-oauth-cli-api-adapter-0.2.0.tgz
 ```
 
 Start the proxy from the consumer repository:
@@ -103,13 +103,13 @@ lives in [`docs/api-interface-contract.md`](docs/api-interface-contract.md).
 
 | Surface | Endpoint | Status |
 | --- | --- | --- |
-| OpenAI Models | `GET /v1/models` | Supported local model list |
+| OpenAI Models | `GET /v1/models` | Configured model plus models the local runtime advertises |
 | OpenAI Chat Completions | `POST /v1/chat/completions` | Text, tools, JSON mode/schema, streaming, image inputs |
 | OpenAI Responses | `POST /v1/responses` | Text, function calls, function outputs, streaming, image inputs |
 | OpenAI Images | `POST /v1/images/generations` | `image-2` via local Codex image generation |
 | OpenAI Images | `POST /v1/images/edits` | JSON image references and multipart edits |
 | OpenAI Images | `POST /v1/images/variations` | Multipart variations |
-| Anthropic Messages | `POST /v1/messages` | Text, tools, images, streaming |
+| Anthropic Messages | `POST /v1/messages` | Text, tools, images, streaming, `thinking`/`output_config` tuning |
 
 Planned local CLI chat sessions are intentionally separate from the
 provider-compatible API surface. That design lives in
@@ -141,8 +141,33 @@ Common supported features:
 - Anthropic Messages image blocks
 - image sources as remote URLs, data URLs/base64, local `file://` URLs, and
   multipart files where the endpoint supports multipart
+- Images `response_format` `b64_json` or `url`; URL responses are served from
+  `/v1/images/generated/<id>` out of an in-memory store bounded by a one-hour
+  TTL, 128 MiB, and 10,000 entries
+- Anthropic `thinking` and `output_config` (effort, JSON-schema format, task
+  budget) mapped to Claude CLI controls where the model supports them
 - provider token usage details when the CLI exposes them, with estimated usage
   only as a fallback
+
+## Model Selection
+
+`model` is required on every text surface and validated exactly as on the
+direct APIs. Which model executes is controlled by
+`modelSelection.honorRequestModel` in the packaged `settings.json`:
+
+- `false` (default): no existence check is applied, and what executes depends
+  on the runtime — the `codex-backend` transport forwards the request model,
+  `app-server` uses the configured model (the request model only when none is
+  configured), and `claude` ignores the request model.
+- `true`: every runtime behaves the same — the request model executes, and a
+  model the local runtime cannot run returns 404 `model_not_found`. Codex
+  models are checked against `codex debug models` (cached per credentials; an
+  unavailable list passes models through rather than failing them), Claude
+  models by the CLI's own refusal.
+
+`/v1/images/*` is exempt: the Images `model` (`image-2`, `dall-e-2`,
+`gpt-image-*`) is a route selector with its own validation, and the Codex
+model that actually runs image turns is `codexProxy.imageModel`.
 
 ## Important Differences From Full Provider APIs
 
@@ -152,8 +177,9 @@ OpenAI or Anthropic APIs.
 | Area | Difference |
 | --- | --- |
 | Runtime authority | Local proxy requests never call direct OpenAI or Anthropic APIs. |
-| Model list | `GET /v1/models` returns the configured local backend model, not the full provider catalog. |
-| Model execution | The request `model` is accepted, but execution is constrained by the selected local CLI backend. |
+| Model list | `GET /v1/models` returns the configured model plus models the local runtime advertises — not the full provider catalog. |
+| Model execution | Governed by `modelSelection.honorRequestModel`; see Model Selection above. Off, execution is runtime-dependent with no existence check; on, the request model executes and an unrunnable one is a 404 `model_not_found`, never a silent replacement. |
+| Thinking budget | Anthropic `thinking.budget_tokens` is validated to the direct domain (required for `enabled`, integer ≥ 1024, `< max_tokens`) but not forwarded: the local runtime governs its own thinking budget. |
 | Context | Codex proxy runs with isolated home/workspace settings so ambient project context does not leak into API requests. |
 | Codex transport | `codexProxy.transport` defaults to `codex-backend`; text/tool uses ChatGPT Codex backend directly. |
 | Codex image transport | `codexProxy.imageTransport` defaults to `codex-backend`; Images API uses backend `image_generation` tool results, while native chat uses app-server. |
@@ -198,6 +224,13 @@ OpenAI paths, `authentication_error` for `/v1/messages`). The key gates proxy
 access only; the local CLI backend still authenticates with its own OAuth
 session.
 
+A key that is configured but could never be presented — empty (for example, a
+deployment secret that expanded to nothing) or carrying leading/trailing
+whitespace — is a configuration error, not an open gate: the proxy answers
+every request with a fixed 500 and writes the specific cause to its own
+stderr. Only true absence of both the flag and the environment variable
+disables the gate.
+
 To reach the proxy from the internet, keep it on `127.0.0.1` and front it with a
 tunnel — no router changes and your home IP stays hidden:
 
@@ -219,7 +252,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer local' \
   -d '{
-    "model": "codex-app-server",
+    "model": "gpt-5.5",
     "messages": [
       { "role": "user", "content": "Reply with exactly: OK" }
     ]
@@ -233,7 +266,7 @@ curl http://127.0.0.1:8787/v1/responses \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer local' \
   -d '{
-    "model": "codex-app-server",
+    "model": "gpt-5.5",
     "input": "Reply with exactly: OK"
   }'
 ```
@@ -298,7 +331,7 @@ curl http://127.0.0.1:8788/v1/messages \
   -H 'x-api-key: local' \
   -H 'anthropic-version: 2023-06-01' \
   -d '{
-    "model": "claude-code",
+    "model": "claude-opus-5",
     "max_tokens": 64,
     "messages": [
       { "role": "user", "content": "Reply with exactly: OK" }
@@ -470,6 +503,9 @@ enhanced rows. Provider parity rows should omit proxy-only extension fields.
   periodic validity check and LLM-assisted update process for the runtime map
 - [`docs/optimization-learnings.md`](docs/optimization-learnings.md): lessons
   from proxy optimization work
+- [`docs/review-defect-criteria.md`](docs/review-defect-criteria.md): defect
+  classification used by the review process (behavioral defect vs coverage gap
+  vs doc gap) and what each class gates
 
 ## Runtime Notes
 
@@ -488,5 +524,6 @@ enhanced rows. Provider parity rows should omit proxy-only extension fields.
 - Claude Code text streaming maps Claude stream-json text deltas to the local
   API stream.
 - Plain text Claude requests use one long-lived process and clear context after
-  each request. Tool-call, JSON-schema, and image requests use one-shot Claude
-  processes where needed for per-request schema or attachment isolation.
+  each request. Tool-call, JSON-schema, image, per-request tuning
+  (effort/thinking/task budget), and honored non-default-model requests use
+  one-shot Claude processes, because those controls live on the spawned argv.
