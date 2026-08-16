@@ -1,6 +1,22 @@
 {
   "name": "local-oauth-cli-api-adapter",
   "version": "0.2.0",
+  "description": "Local OpenAI/Anthropic-compatible API proxy backed by logged-in Codex CLI or Claude Code OAuth sessions — chat completions, responses, messages, and images without provider API keys.",
+  "keywords": [
+    "openai",
+    "anthropic",
+    "chatgpt",
+    "claude",
+    "claude-code",
+    "codex",
+    "openai-api",
+    "anthropic-api",
+    "openai-compatible",
+    "api-proxy",
+    "llm",
+    "oauth",
+    "cli"
+  ],
   "private": true,
   "type": "module",
   "bin": {
