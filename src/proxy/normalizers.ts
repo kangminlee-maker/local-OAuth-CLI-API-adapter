@@ -24,7 +24,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const tools = readOpenAiTools(input.tools);
   return {
     shape: 'openai-chat',
-    model: readString(input.model, 'codex-app-server'),
+    model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
     temperature: readOptionalNumber(input.temperature),
@@ -54,7 +54,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const reasoning = asRecord(input.reasoning);
   return {
     shape: 'openai-responses',
-    model: readString(input.model, 'codex-app-server'),
+    model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_output_tokens),
     temperature: readOptionalNumber(input.temperature),
@@ -99,7 +99,13 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const system = flattenAnthropicSystem(input.system);
   if (system) messages.push({ role: 'system', content: system, images: [] });
   messages.push(...readAnthropicMessages(input.messages));
+  // The CONTAINER is not nullable on the direct API — its leaves are. A
+  // present non-object here silently disabled every output control.
+  if (input.output_config !== undefined && !asRecord(input.output_config)) {
+    throw new ProxyRequestError('output_config must be an object.', 400, 'anthropic');
+  }
   const outputConfig = asRecord(input.output_config);
+  const maxTokens = readRequiredMaxTokens(input.max_tokens);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
   if (outputFormat !== undefined && tools.length > 0) {
@@ -114,13 +120,13 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   }
   return {
     shape: 'anthropic-messages',
-    model: readString(input.model, 'codex-app-server'),
+    model: readRequiredModel(input.model, 'anthropic'),
     messages,
-    maxTokens: readOptionalNumber(input.max_tokens),
+    maxTokens,
     temperature: readOptionalNumber(input.temperature),
     effort: readAnthropicEffort(outputConfig?.effort),
     taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
-    thinking: readAnthropicThinking(input.thinking),
+    thinking: readAnthropicThinking(input.thinking, maxTokens),
     stream: input.stream === true,
     streamOptions: readStreamOptions(undefined),
     jsonMode: outputFormat !== undefined,
@@ -135,8 +141,20 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
 // (accepts a nested `json_schema.schema` variant). A json_schema format with no
 // resolvable schema is malformed input, not absence — reject it (fail-loud).
 function readAnthropicOutputFormat(value: unknown): unknown {
+  // `format?: JSONOutputFormat | null` on the direct API: null IS omission for
+  // this LEAF (the output_config container is what rejects null). A non-null
+  // non-object is malformed.
+  if (value === undefined || value === null) return undefined;
   const format = asRecord(value);
-  if (!format) return undefined;
+  // `"json_schema"` the STRING is a present, malformed value — treating it as
+  // omission executed the request without the structured output it asked for.
+  if (!format) {
+    throw new ProxyRequestError(
+      'output_config.format must be an object.',
+      400,
+      'anthropic',
+    );
+  }
   if (format.type !== 'json_schema') {
     throw new ProxyRequestError(
       'output_config.format.type must be json_schema.',
@@ -179,6 +197,8 @@ function readAnthropicEffort(value: unknown): NormalizedAnthropicEffort | undefi
 const ANTHROPIC_TASK_BUDGET_MIN_TOKENS = 20_000;
 
 function readAnthropicTaskBudget(value: unknown): number | undefined {
+  // A proxy/CLI extension field; its null rule follows its nullable siblings
+  // (`effort`, `format`) so one output_config rule holds for every leaf.
   if (value === undefined || value === null) return undefined;
   const budget = asRecord(value);
   const total = budget?.total;
@@ -197,10 +217,16 @@ function readAnthropicTaskBudget(value: unknown): number | undefined {
   return total as number;
 }
 
-function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
-  if (value === undefined || value === null) return undefined;
+function readAnthropicThinking(value: unknown, maxTokens: number): NormalizedThinking | undefined {
+  if (value === undefined) return undefined;
   const thinking = asRecord(value);
-  const type = thinking?.type;
+  // The container is `thinking?: ThinkingConfigParam` on the direct API — the
+  // union has no null member, so `thinking: null` is malformed input, not
+  // omission. (Its LEAF `display` is declared nullable; the container is not.)
+  if (!thinking) {
+    throw new ProxyRequestError('thinking must be an object.', 400, 'anthropic');
+  }
+  const type = thinking.type;
   if (type !== 'adaptive' && type !== 'enabled' && type !== 'disabled') {
     throw new ProxyRequestError(
       'thinking.type must be one of adaptive, enabled, or disabled.',
@@ -208,10 +234,48 @@ function readAnthropicThinking(value: unknown): NormalizedThinking | undefined {
       'anthropic',
     );
   }
-  const display = thinking?.display;
+  // `display?: 'summarized' | 'omitted' | null` — null IS omission here, per
+  // the direct type. A defined non-null value outside the enum is invalid.
+  const display = thinking.display === null ? undefined : thinking.display;
+  if (display !== undefined && display !== 'summarized' && display !== 'omitted') {
+    throw new ProxyRequestError(
+      'thinking.display must be summarized or omitted.',
+      400,
+      'anthropic',
+    );
+  }
+  // The `enabled` variant requires budget_tokens: ≥ 1024 and less than
+  // max_tokens, per the direct schema. The number is validated for parity and
+  // then deliberately NOT carried on the normalized request: no backend
+  // consumes it. The local runtime governs its own thinking budget — the
+  // pinned CLI registers numeric budget controls (`--max-thinking-tokens`,
+  // the `MAX_THINKING_TOKENS` variable) but both are inert at runtime, probed
+  // with values the direct API would reject (100 and 10^7) executing while
+  // thinking engages. Carrying the number would let a mock assert a delivery
+  // no real backend performs; the contract's `thinking` row documents the
+  // divergence instead.
+  if (type === 'enabled') {
+    const budget = thinking.budget_tokens;
+    if (typeof budget !== 'number' || !Number.isInteger(budget)) {
+      throw new ProxyRequestError(
+        'thinking.budget_tokens is required for enabled thinking.',
+        400,
+        'anthropic',
+      );
+    }
+    if (budget < 1024) {
+      throw new ProxyRequestError('thinking.budget_tokens must be at least 1024.', 400, 'anthropic');
+    }
+    if (budget >= maxTokens) {
+      throw new ProxyRequestError(
+        'thinking.budget_tokens must be less than max_tokens.',
+        400,
+        'anthropic',
+      );
+    }
+  }
   return {
     type,
-    // display governs visibility of thinking blocks, which disabled never produces.
     display: type !== 'disabled' && (display === 'summarized' || display === 'omitted')
       ? display
       : undefined,
@@ -228,11 +292,17 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
   if (!Array.isArray(value)) {
     throw new ProxyRequestError('messages must be an array.', 400);
   }
-  return value.map((item) => {
+  // `minItems: 1` on the direct API. An empty conversation was reaching the
+  // runtime as a turn with nothing in it.
+  if (value.length === 0) {
+    throw new ProxyRequestError('messages must contain at least one message.', 400);
+  }
+  return value.map((item, index) => {
     const msg = asRecord(item);
     if (!msg) throw new ProxyRequestError('Each message must be an object.', 400);
-    const role = readRole(msg.role);
-    const content = flattenOpenAiMessage(msg);
+    const role = readOpenAiChatRole(msg.role, index);
+    requireOpenAiChatContent(msg, index);
+    const content = flattenOpenAiMessage(msg, role);
     return {
       role,
       content: content.text,
@@ -241,42 +311,187 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
   });
 }
 
+/**
+ * The direct API's role set, enforced as it enforces it: `role` is the
+ * discriminator of every message schema, so a missing or unknown role is a 400
+ * there — never a silent rewrite. The proxy used to normalize unknowns to
+ * `user`, which turned a typo'd `assistantt` into a user turn: no error
+ * anywhere, just a conversation whose meaning quietly changed.
+ *
+ * `function` is deprecated on the direct API but still in its schema; it
+ * carries a tool result, which is what `tool` means here.
+ */
+function readOpenAiChatRole(value: unknown, index: number): NormalizedMessage['role'] {
+  if (
+    value === 'system'
+    || value === 'developer'
+    || value === 'user'
+    || value === 'assistant'
+    || value === 'tool'
+  ) {
+    return value;
+  }
+  if (value === 'function') return 'tool';
+  const missing = value === undefined || value === null;
+  throw new ProxyRequestError(
+    missing
+      ? `messages[${index}].role is required.`
+      : `messages[${index}].role must be one of system, developer, user, assistant, tool or function.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    `messages[${index}].role`,
+    missing ? 'missing_required_parameter' : null,
+  );
+}
+
+/**
+ * `content` as the direct API accepts it: a string or an array of parts.
+ * An assistant message may omit it (or send null) when it carries `tool_calls`
+ * or the deprecated `function_call` instead — the message the client is
+ * replaying is the model's own tool-call turn, which has no text. A deprecated
+ * `function` message's content is nullable there too.
+ */
+function requireOpenAiChatContent(msg: Record<string, unknown>, index: number): void {
+  const content = msg.content;
+  if (typeof content === 'string' || Array.isArray(content)) return;
+  const absent = content === undefined || content === null;
+  if (absent && msg.role === 'assistant') {
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return;
+    if (asRecord(msg.function_call)) return;
+  }
+  if (content === null && msg.role === 'function') return;
+  throw new ProxyRequestError(
+    absent
+      ? `messages[${index}].content is required.`
+      : `messages[${index}].content must be a string or an array of content parts.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    `messages[${index}].content`,
+    absent ? 'missing_required_parameter' : null,
+  );
+}
+
 function readResponsesInput(value: unknown): NormalizedMessage[] {
   if (typeof value === 'string') return [{ role: 'user', content: value, images: [] }];
-  if (!Array.isArray(value)) return [{ role: 'user', content: '', images: [] }];
-  return value.map((item) => {
+  // Omission is one thing; a defined value of the wrong shape is another. The
+  // direct API takes a string or an array — a number or `null` used to be
+  // silently replaced with an empty user message, which committed a 200 for a
+  // request the direct API rejects.
+  if (value === undefined) return [{ role: 'user', content: '', images: [] }];
+  if (!Array.isArray(value)) {
+    throw new ProxyRequestError(
+      'input must be a string or an array of input items.',
+      400,
+      'openai',
+      'invalid_request_error',
+      'input',
+    );
+  }
+  return value.map((item, index) => {
     const msg = asRecord(item);
     if (!msg) {
-      return { role: 'user' as const, content: String(item ?? ''), images: [] };
+      throw new ProxyRequestError(`input[${index}] must be an object.`, 400);
     }
     const content = flattenResponsesMessage(msg);
     return {
-      role: readRole(msg.role ?? 'user'),
+      role: readResponsesRole(msg, index),
       content: content.text,
       images: content.images,
     };
   });
+}
+
+/**
+ * Responses input items are polymorphic: typed items (`function_call`,
+ * `function_call_output`, `reasoning`, ...) have no `role` and are valid
+ * without one. Only a message item — no `type`, or `type: "message"` — carries
+ * a role, and there the direct API requires it. So absence of `role` is only an
+ * error where the item claims to be a message.
+ */
+function readResponsesRole(msg: Record<string, unknown>, index: number): NormalizedMessage['role'] {
+  // `type` is the item discriminator and the direct API only accepts strings
+  // there — `type: null` is not a typed item, it is malformed input, and
+  // letting it take the typed-item exemption skipped role validation entirely.
+  // Unknown STRING types are deliberately not rejected: the direct item union
+  // grows with the API, and pinning it here would 400 tomorrow's valid items.
+  if (msg.type !== undefined && typeof msg.type !== 'string') {
+    throw new ProxyRequestError(
+      `input[${index}].type must be a string.`,
+      400,
+      'openai',
+      'invalid_request_error',
+      `input[${index}].type`,
+    );
+  }
+  const isMessage = msg.type === undefined || msg.type === 'message';
+  if (!isMessage) return msg.role === 'assistant' ? 'assistant' : 'user';
+  const value = msg.role;
+  if (
+    value === 'system'
+    || value === 'developer'
+    || value === 'user'
+    || value === 'assistant'
+  ) {
+    return value;
+  }
+  const missing = value === undefined || value === null;
+  throw new ProxyRequestError(
+    missing
+      ? `input[${index}].role is required.`
+      : `input[${index}].role must be one of system, developer, user or assistant.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    `input[${index}].role`,
+    missing ? 'missing_required_parameter' : null,
+  );
 }
 
 function readAnthropicMessages(value: unknown): NormalizedMessage[] {
   if (!Array.isArray(value)) {
     throw new ProxyRequestError('messages must be an array.', 400, 'anthropic');
   }
-  return value.map((item) => {
+  if (value.length === 0) {
+    throw new ProxyRequestError('messages must contain at least one message.', 400, 'anthropic');
+  }
+  return value.map((item, index) => {
     const msg = asRecord(item);
     if (!msg) throw new ProxyRequestError('Each message must be an object.', 400, 'anthropic');
-    const role = msg.role === 'assistant' ? 'assistant' : 'user';
-    const content = flattenAnthropicMessage(msg);
+    const role = msg.role;
+    if (role !== 'user' && role !== 'assistant') {
+      // The direct API's whole role set for messages[]; `system` in particular
+      // is a top-level field there, not a role, and rewriting it to `user`
+      // hid that mistake instead of reporting it.
+      throw new ProxyRequestError(
+        role === undefined || role === null
+          ? `messages.${index}.role is required.`
+          : `messages.${index}.role must be user or assistant.`,
+        400,
+        'anthropic',
+      );
+    }
+    const content = msg.content;
+    if (typeof content !== 'string' && !Array.isArray(content)) {
+      throw new ProxyRequestError(
+        content === undefined || content === null
+          ? `messages.${index}.content is required.`
+          : `messages.${index}.content must be a string or an array of content blocks.`,
+        400,
+        'anthropic',
+      );
+    }
+    const flattened = flattenAnthropicMessage(msg);
     return {
       role,
-      content: content.text,
-      images: content.images,
+      content: flattened.text,
+      images: flattened.images,
     };
   });
 }
 
-function flattenOpenAiMessage(msg: Record<string, unknown>): NormalizedContent {
-  const role = readRole(msg.role);
+function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMessage['role']): NormalizedContent {
   const content = flattenOpenAiContent(msg.content);
   const toolCalls = Array.isArray(msg.tool_calls)
     ? msg.tool_calls.map((toolCall) => {
@@ -644,17 +859,38 @@ function readOptionalBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
 }
 
-function readRole(value: unknown): NormalizedMessage['role'] {
-  if (
-    value === 'system'
-    || value === 'developer'
-    || value === 'user'
-    || value === 'assistant'
-    || value === 'tool'
-  ) {
-    return value;
-  }
-  return 'user';
+/**
+ * `model` is required on every provider surface, so an absent or empty value is
+ * a client error rather than something to substitute a default for. Matching the
+ * providers here keeps the proxy's input contract identical to theirs: a request
+ * that direct APIs reject must not quietly succeed against the proxy.
+ */
+/**
+ * `max_tokens` on `/v1/messages`, which the direct Anthropic API requires — the
+ * proxy accepts exactly what it accepts. `0` is a documented value there (it
+ * pre-warms the prompt cache without generating), so the floor is 0, not 1.
+ */
+function readRequiredMaxTokens(value: unknown): number {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 0) return value;
+  const message = value === undefined || value === null
+    ? 'max_tokens is required.'
+    : 'max_tokens must be a non-negative integer.';
+  throw new ProxyRequestError(message, 400, 'anthropic');
+}
+
+function readRequiredModel(value: unknown, provider: 'openai' | 'anthropic'): string {
+  if (typeof value === 'string' && value.trim()) return value;
+  const message = value === undefined || value === null
+    ? 'model is required.'
+    : 'model must be a non-empty string.';
+  throw new ProxyRequestError(
+    message,
+    400,
+    provider,
+    'invalid_request_error',
+    'model',
+    provider === 'openai' ? 'missing_required_parameter' : null,
+  );
 }
 
 function readString(value: unknown, fallback: string): string {

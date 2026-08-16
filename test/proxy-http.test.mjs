@@ -1595,11 +1595,29 @@ test('auth-key gate: x-api-key passes and anthropic 401 keeps provider error sha
   }
 });
 
-test('auth-key gate: CORS preflight bypasses the gate', async () => {
+test('auth-key gate: a real CORS preflight bypasses the gate', async () => {
+  // A preflight is the browser's permission question, sent before it will
+  // attach credentials — which is why it is exempt. It always names the method
+  // it is asking about; that header is what identifies it.
+  const proxy = await startAuthProxy('secret-key');
+  try {
+    const res = await fetch(`${proxy.url}/v1/chat/completions`, {
+      method: 'OPTIONS',
+      headers: { 'access-control-request-method': 'POST', origin: 'http://localhost:3000' },
+    });
+    assert.equal(res.status, 204);
+  } finally {
+    await proxy.close();
+  }
+});
+
+test('auth-key gate: a bare OPTIONS is an ordinary request and does not skip the gate', async () => {
+  // Without the preflight header this is just a request with an unusual method.
+  // Answering 204 let an unauthenticated caller distinguish served paths.
   const proxy = await startAuthProxy('secret-key');
   try {
     const res = await fetch(`${proxy.url}/v1/chat/completions`, { method: 'OPTIONS' });
-    assert.equal(res.status, 204);
+    assert.equal(res.status, 401);
   } finally {
     await proxy.close();
   }

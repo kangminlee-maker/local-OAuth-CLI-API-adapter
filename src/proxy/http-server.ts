@@ -23,7 +23,9 @@ import type {
   OpenAiImageProxyRoute,
   ProxyServerOptions,
 } from './types.js';
-import { ProxyRequestError } from './types.js';
+import { honorRequestModel } from '../settings.js';
+import {
+  GeneratedImageStoreLike, BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { missingToolCallArgumentDelta } from './tool-call-stream.js';
@@ -45,7 +47,7 @@ export interface StartedProxyServer {
   close(): Promise<void>;
 }
 
-type ErrorResponseShape = 'openai' | 'openai-chat' | 'openai-responses' | 'anthropic';
+type ErrorResponseShape = 'openai' | 'openai-chat' | 'openai-responses' | 'anthropic' | 'local-cli';
 type OpenAiImageOperation = OpenAiImageGenerationRequest['operation'];
 
 const DEFAULT_IMAGE_GENERATION_SIZE = 'auto';
@@ -53,6 +55,13 @@ const DEFAULT_IMAGE_GENERATION_QUALITY = 'auto';
 const DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT = 'png';
 const DEFAULT_IMAGE_GENERATION_BACKGROUND = 'auto';
 const GENERATED_IMAGE_TTL_MS = 60 * 60 * 1000;
+// Expiry alone bounds nothing: a client generating images for an hour grows the
+// store without limit. Bytes, not entries, are what runs the machine out.
+const GENERATED_IMAGE_MAX_BYTES = 128 * 1024 * 1024;
+// The byte budget bounds payloads, not Map overhead: a flood of 1-byte images
+// would grow keys and entry metadata with almost no counted bytes. Entries are
+// bounded separately.
+const GENERATED_IMAGE_MAX_ENTRIES = 10_000;
 const IMAGE_PROXY_VISUAL_CLASSES = [
   'primitive_flat_shape',
   'geometric_icon',
@@ -72,9 +81,32 @@ interface ParsedImageRequestBody {
 export async function startLocalApiProxy(
   options: ProxyServerOptions,
 ): Promise<StartedProxyServer> {
-  const generatedImages = new GeneratedImageStore();
+  // Injectable like the backends: the store's budgets are real behaviour
+  // (eviction, pinning) that HTTP-level tests cannot exercise against the
+  // production 128 MiB constant.
+  const generatedImages = options.generatedImageStore ?? new GeneratedImageStore();
   const server = createServer((req, res) => {
     void handleRequest(req, res, options, generatedImages);
+  });
+  // Node routes CONNECT to this event and, with no listener, destroys the
+  // socket — the one method that got no HTTP answer at all. It is a tunnel
+  // request this proxy does not serve; say so in the promised shape.
+  server.on('connect', (_req, socket) => {
+    const body = JSON.stringify({
+      error: {
+        message: 'Unsupported method.',
+        type: 'invalid_request_error',
+        param: null,
+        code: null,
+      },
+    });
+    socket.end(
+      'HTTP/1.1 405 Method Not Allowed\r\n'
+      + 'content-type: application/json; charset=utf-8\r\n'
+      + `content-length: ${Buffer.byteLength(body)}\r\n`
+      + 'connection: close\r\n\r\n'
+      + body,
+    );
   });
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
@@ -87,7 +119,7 @@ export async function startLocalApiProxy(
   const actualPort = address && isAddressInfo(address) ? address.port : options.port;
   return {
     server,
-    url: `http://${options.host}:${actualPort}`,
+    url: `http://${urlHostname(options.host)}:${actualPort}`,
     async close() {
       await Promise.all([
         new Promise<void>((resolve, reject) => {
@@ -109,36 +141,81 @@ async function closeImageGenerationClient(options: ProxyServerOptions): Promise<
   await imageClient.close();
 }
 
+// Every endpoint this server answers with POST. Consulted before the method
+// check so an unknown path is a 404 whatever method it arrives with.
+const POST_ENDPOINTS = new Set([
+  '/v1/chat/completions',
+  '/v1/responses',
+  '/v1/messages',
+  '/v1/images/generations',
+  '/v1/images/edits',
+  '/v1/images/variations',
+]);
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
 ): Promise<void> {
   const { backend, requestTimeoutMs } = options;
   setCorsHeaders(res);
   let errorShape: ErrorResponseShape = 'openai';
-  if (req.method === 'OPTIONS') {
+  // 204 is for a real CORS preflight — the browser's permission question, sent
+  // before it will attach credentials, which is why it bypasses the gate. A
+  // preflight always names the method it is asking about; a bare OPTIONS does
+  // not, is an ordinary request, and goes through dispatch like any other.
+  if (req.method === 'OPTIONS' && isHttpMethodToken(stripOws(headerValue(req.headers['access-control-request-method'])))) {
     res.writeHead(204).end();
     return;
   }
   try {
-    const path = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
+    // The raw request target with only the query removed — NOT a parsed URL.
+    // WHATWG parsing normalizes dot segments and backslashes, so
+    // `/x/../v1/chat/completions` silently became a routable path, breaking the
+    // exact-match promise; and a target it cannot parse (`//host:99999/...`)
+    // threw before the gate ran.
+    const rawTarget = req.url ?? '/';
+    const queryIndex = rawTarget.indexOf('?');
+    const path = queryIndex === -1 ? rawTarget : rawTarget.slice(0, queryIndex);
+    // The caller's envelope is decided by the path alone, before anything can
+    // fail: a method rejection, a body-parse failure or a configuration error
+    // on /v1/messages must already answer in the Anthropic shape.
+    if (path === '/v1/messages') errorShape = 'anthropic';
+    if (path === '/local/cli/sessions' || path.startsWith('/local/cli/sessions/')) {
+      errorShape = 'local-cli';
+    }
     requireAuthorizedRequest(req, path, options.authKey);
     if (path === '/local/cli/sessions' || path.startsWith('/local/cli/sessions/')) {
       await handleLocalCliChatRequest(req, res, options, path);
       return;
     }
-    if (req.method === 'GET' && path === '/v1/models') {
-      writeJson(res, 200, openAiModelsResponse(backend));
+    // The generated route is exactly one nonempty, slash-free id segment. A
+    // doubled slash or a deeper path is a DIFFERENT path, which the dispatch
+    // row promises is a 404 whatever the method — prefix matching was
+    // classifying it as served and answering 405.
+    const generatedId = path.startsWith('/v1/images/generated/')
+      ? path.slice('/v1/images/generated/'.length)
+      : null;
+    const isGetRoute = path === '/v1/models'
+      || (generatedId !== null && generatedId !== '' && !generatedId.includes('/'));
+    // Path first, method second: `GET /v1/nope` is an unknown endpoint, not an
+    // unsupported method. 405 is reserved for a path this proxy does serve —
+    // including the GET routes, so `POST /v1/models` is a method problem, not a
+    // missing endpoint.
+    if (!isGetRoute && !POST_ENDPOINTS.has(path)) {
+      throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
+    }
+    if (req.method !== (isGetRoute ? 'GET' : 'POST')) {
+      throw new ProxyRequestError('Unsupported method.', 405);
+    }
+    if (path === '/v1/models') {
+      writeJson(res, 200, await openAiModelsResponse(backend));
       return;
     }
-    if (req.method === 'GET' && path.startsWith('/v1/images/generated/')) {
+    if (path.startsWith('/v1/images/generated/')) {
       writeGeneratedImage(res, generatedImages, path);
       return;
-    }
-    if (req.method !== 'POST') {
-      throw new ProxyRequestError('Unsupported method.', 405);
     }
 
     if (path === '/v1/images/generations') {
@@ -165,9 +242,13 @@ async function handleRequest(
       const normalized = normalizeOpenAiChatRequest(body);
       rejectDeferredFeatures(normalized);
       if (normalized.stream) {
-        await writeOpenAiChatStream(res, runStreamWithTimeout(backend, normalized, requestTimeoutMs), normalized);
+        await writeOpenAiChatStream(
+          res,
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await requestReportingExecutedModel(backend, normalized),
+        );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
+        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
         writeJson(res, 200, openAiChatResponse(result));
       }
       return;
@@ -177,9 +258,13 @@ async function handleRequest(
       const normalized = normalizeOpenAiResponsesRequest(body);
       rejectDeferredFeatures(normalized);
       if (normalized.stream) {
-        await writeOpenAiResponsesStream(res, runStreamWithTimeout(backend, normalized, requestTimeoutMs), normalized);
+        await writeOpenAiResponsesStream(
+          res,
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await requestReportingExecutedModel(backend, normalized),
+        );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
+        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
         writeJson(res, 200, openAiResponsesResponse(result, normalized));
       }
       return;
@@ -189,9 +274,13 @@ async function handleRequest(
       const normalized = normalizeAnthropicMessagesRequest(body);
       rejectDeferredFeatures(normalized, 'anthropic');
       if (normalized.stream) {
-        await writeAnthropicMessagesStream(res, runStreamWithTimeout(backend, normalized, requestTimeoutMs), normalized);
+        await writeAnthropicMessagesStream(
+          res,
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await requestReportingExecutedModel(backend, normalized),
+        );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs);
+        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
         writeJson(res, 200, anthropicMessagesResponse(result));
       }
       return;
@@ -214,9 +303,41 @@ function requireAuthorizedRequest(
   path: string,
   authKey: string | undefined,
 ): void {
-  if (!authKey) return;
-  const presented = presentedAuthKey(req.headers);
-  if (presented !== undefined && safeKeyEqual(presented, authKey)) return;
+  // An empty configured key is a configuration mistake, not "no gate": treating
+  // it as off silently opens a proxy its operator believed was closed.
+  if (authKey === undefined) return;
+  // Each rejected class below is a key no request could ever present: empty;
+  // edge whitespace (presented values are trimmed); unpaired surrogates (no
+  // UTF-8 encoding — the U+FFFD replacement would make a DIFFERENT credential
+  // compare equal); control bytes (the HTTP parser rejects the presenting
+  // request before the gate sees it). The proxy would answer 401 to everyone,
+  // including its operator.
+  //
+  // The SPECIFIC cause goes to the operator's stderr only. The response gets
+  // one fixed sentence: which class of mistake was made is configuration
+  // state, and an unauthenticated caller has no business learning it.
+  const configurationMistake = (): never => {
+    throw new Error('the access gate is misconfigured; see the proxy log');
+  };
+  if (!authKey) {
+    process.stderr.write('authKey is configured but empty; refusing to serve unauthenticated\n');
+    configurationMistake();
+  }
+  if (authKey !== authKey.trim()) {
+    process.stderr.write('authKey has leading or trailing whitespace, which no request can present\n');
+    configurationMistake();
+  }
+  if (Buffer.from(authKey, 'utf8').toString('utf8') !== authKey) {
+    process.stderr.write('authKey contains unpaired surrogates, which cannot be encoded as UTF-8 bytes\n');
+    configurationMistake();
+  }
+  for (const byte of Buffer.from(authKey, 'utf8')) {
+    if ((byte < 0x20 && byte !== 0x09) || byte === 0x7f) {
+      process.stderr.write('authKey contains control bytes that HTTP forbids in header values\n');
+      configurationMistake();
+    }
+  }
+  if (presentedAuthKeys(req).some((candidate) => safeKeyEqual(candidate, authKey))) return;
   const provider = path === '/v1/messages' ? 'anthropic' : 'openai';
   throw new ProxyRequestError(
     'Unauthorized: missing or invalid API key.',
@@ -228,18 +349,63 @@ function requireAuthorizedRequest(
   );
 }
 
-function presentedAuthKey(headers: IncomingMessage['headers']): string | undefined {
-  const apiKey = headerValue(headers['x-api-key']).trim();
-  if (apiKey) return apiKey;
-  const authorization = headerValue(headers.authorization).trim();
-  if (!authorization) return undefined;
-  const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
-  return (bearer ? bearer[1] : authorization).trim();
+/**
+ * The credentials a request presents, in the two documented forms. Both are
+ * returned, not the first non-empty one: they are alternatives, so a stale
+ * `x-api-key` beside a valid `Authorization: Bearer` must not decide the answer.
+ *
+ * A bare `Authorization: <key>` is NOT a credential. The contract names the
+ * Bearer form, and accepting the raw value silently widened what counts.
+ */
+function presentedAuthKeys(req: IncomingMessage): string[] {
+  const presented: string[] = [];
+  // From `rawHeaders`, which keeps each physical header line. Node folds repeated
+  // `x-api-key` lines into one comma-joined value, and splitting THAT on commas
+  // cannot tell two headers apart from one key that contains a comma — a key the
+  // contract puts no character restriction on. Reading the raw lines answers both
+  // without guessing.
+  const raw = req.rawHeaders;
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    if (raw[i].toLowerCase() !== 'x-api-key') continue;
+    // OWS only (space/tab, per RFC 7230) — String.trim also eats U+00A0, which
+    // under latin1 header decoding is a real byte of a multibyte key.
+    const trimmed = stripOws(raw[i + 1]);
+    if (trimmed) presented.push(trimmed);
+  }
+  const headers = req.headers;
+  // OWS only, same as the x-api-key lines above. `String.trim()` and `\s` both
+  // eat U+00A0, which under latin1 header decoding is a real byte — of the key
+  // (a valid credential was rejected) or of trailing junk (an INVALID credential
+  // was accepted, because the junk was silently removed before comparing).
+  const authorization = stripOws(headerValue(headers.authorization));
+  const bearer = /^Bearer[ \t]+(.+)$/i.exec(authorization);
+  if (bearer) {
+    const token = stripOws(bearer[1]);
+    if (token) presented.push(token);
+  }
+  return presented;
+}
+
+// RFC 9110 token grammar. The preflight exemption is for a request that NAMES
+// the method it is asking about; `P OST` or `,` names none, and treating mere
+// non-emptiness as a name let malformed OPTIONS skip the gate.
+function isHttpMethodToken(value: string): boolean {
+  return /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value);
+}
+
+// RFC 7230 optional whitespace: ASCII space and horizontal tab, nothing else.
+function stripOws(value: string): string {
+  return value.replace(/^[ \t]+|[ \t]+$/g, '');
 }
 
 function safeKeyEqual(presented: string, expected: string): boolean {
-  const presentedBytes = Buffer.from(presented);
-  const expectedBytes = Buffer.from(expected);
+  // Node decodes header bytes as latin1, so a client that sent the UTF-8 bytes
+  // of a non-ASCII key arrives here as that byte sequence read as latin1.
+  // Re-encoding the candidate as latin1 recovers the wire bytes; the configured
+  // key is compared as its UTF-8 bytes. Pure-ASCII keys are unaffected — the
+  // two encodings agree there.
+  const presentedBytes = Buffer.from(presented, 'latin1');
+  const expectedBytes = Buffer.from(expected, 'utf8');
   if (presentedBytes.length !== expectedBytes.length) return false;
   return timingSafeEqual(presentedBytes, expectedBytes);
 }
@@ -299,7 +465,7 @@ async function handleOpenAiImageRequest(
   req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
   const client = options.imageGenerationClient ?? unsupportedLocalOAuthImageGenerationClient();
@@ -307,7 +473,7 @@ async function handleOpenAiImageRequest(
     await writeOpenAiImageStream(
       req,
       res,
-      runImageGenerationStreamWithTimeout(client, request, options.requestTimeoutMs),
+      runImageGenerationStreamWithTimeout(client, request, options.requestTimeoutMs, res),
       generatedImages,
       request,
     );
@@ -317,6 +483,8 @@ async function handleOpenAiImageRequest(
     client,
     request,
     options.requestTimeoutMs,
+  
+    res,
   );
   writeJson(res, 200, openAiImagesGenerationResponse(req, generatedImages, result, request));
 }
@@ -327,7 +495,10 @@ function normalizeOpenAiImageRequest(
   isMultipart: boolean,
 ): OpenAiImageGenerationRequest {
   const input = asRecordPayload(body);
-  const explicitResponseFormat = Object.prototype.hasOwnProperty.call(input, 'response_format');
+  // "Explicit" means a real value: null is omission (the field is nullable on
+  // the direct API), so a GPT-image request carrying response_format: null must
+  // behave exactly like one without the property.
+  const explicitResponseFormat = input.response_format !== undefined && input.response_format !== null;
   const prompt = imagePrompt(input.prompt, operation);
   if (!prompt.trim()) {
     throw new ProxyRequestError(
@@ -342,11 +513,21 @@ function normalizeOpenAiImageRequest(
   if (prompt.length > 32_000) {
     throw new ProxyRequestError('prompt must be 32000 characters or fewer.', 400);
   }
-  const responseFormat = typeof input.response_format === 'string'
-    ? input.response_format
-    : 'b64_json';
+  // Absence and null get the default (the direct API declares the field
+  // nullable); any other present value is validated rather than silently
+  // replaced with `b64_json`.
+  const responseFormat = input.response_format === undefined || input.response_format === null
+    ? 'b64_json'
+    : input.response_format;
   if (responseFormat !== 'b64_json' && responseFormat !== 'url') {
     throw new ProxyRequestError('response_format must be one of url or b64_json.', 400);
+  }
+  // Absence and null default (the field is nullable on the direct API); a
+  // present non-string or blank string is malformed input, not a request for
+  // dall-e-2 — substituting a model the client never named ran the wrong route.
+  if (input.model !== undefined && input.model !== null
+    && (typeof input.model !== 'string' || !input.model.trim())) {
+    throw new ProxyRequestError('model must be a non-empty string.', 400, 'openai', 'invalid_request_error', 'model');
   }
   const model = typeof input.model === 'string' && input.model.trim()
     ? input.model
@@ -370,7 +551,10 @@ function normalizeOpenAiImageRequest(
     prompt,
     n: imageGenerationCount(input.n),
     images,
-    mask: optionalImageInput(input.mask),
+    // Validated only where the contract gives it meaning. On generations and
+    // variations the row says "ignored" — validating an ignored field rejected
+    // requests the contract promises succeed.
+    mask: operation === 'edit' ? requiredValidImageInput(input.mask, 'mask') : undefined,
     size: optionalImageSize(input.size),
     quality: optionalEnum(input.quality, 'quality', ['standard', 'hd', 'low', 'medium', 'high', 'auto']),
     background: optionalEnum(input.background, 'background', ['transparent', 'opaque', 'auto']),
@@ -422,8 +606,12 @@ function openAiGptImageModelPattern(): RegExp {
 }
 
 function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void {
+  // Only compression BELOW 100 needs a lossy format — 100 is "no compression",
+  // which PNG can express. The guard rejected every defined value, including the
+  // one its own message says is fine.
   if (
     request.outputCompression !== undefined
+    && request.outputCompression < 100
     && request.outputFormat !== 'jpeg'
     && request.outputFormat !== 'webp'
   ) {
@@ -434,6 +622,19 @@ function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void
       'image_generation_user_error',
       null,
       'invalid_png_output_compression',
+    );
+  }
+  if (request.inputFidelity && request.model === 'image-2') {
+    // The model-specific rejection carries its documented envelope
+    // (image_generation_user_error); the generic operation guard below used to
+    // shadow it for generations and variations.
+    throw new ProxyRequestError(
+      'input_fidelity is disabled for image-2.',
+      400,
+      'openai',
+      'image_generation_user_error',
+      'tools',
+      'invalid_input_fidelity_model',
     );
   }
   if (request.inputFidelity && request.operation !== 'edit') {
@@ -452,16 +653,6 @@ function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void
   if (request.background === 'transparent' && request.outputFormat === 'jpeg') {
     throw new ProxyRequestError('background transparent requires output_format to be png or webp.', 400);
   }
-  if (request.model === 'image-2' && request.inputFidelity) {
-    throw new ProxyRequestError(
-      'input_fidelity is disabled for image-2.',
-      400,
-      'openai',
-      'image_generation_user_error',
-      'tools',
-      'invalid_input_fidelity_model',
-    );
-  }
   if (request.style && request.operation !== 'generation') {
     throw new ProxyRequestError('style is only supported for image generations.', 400);
   }
@@ -479,16 +670,48 @@ function imageInputsForOperation(
   isMultipart: boolean,
 ): readonly NormalizedImage[] {
   if (operation === 'generation') return [];
-  const value = operation === 'edit' && !isMultipart
-    ? input.images
-    : input.image ?? input['image[]'] ?? input.images;
+  // The documented aliases hold in BOTH encodings: a JSON edit naming its
+  // image with the singular `image` field was rejected as having none.
+  const value = input.image ?? input['image[]'] ?? input.images;
   return imageInputArray(value);
 }
 
 function imageInputArray(value: unknown): readonly NormalizedImage[] {
-  if (Array.isArray(value)) return value.map(optionalImageInput).filter(isNormalizedImage);
+  if (Array.isArray(value)) {
+    // Every supplied member must be a valid image reference. Filtering the
+    // bad ones executed the request with silently altered input.
+    return value.map((member, index) => {
+      let image: NormalizedImage | undefined;
+      try {
+        image = optionalImageInput(member);
+      } catch (err) {
+        // The member parser throws its own diagnostics (`exactly one source`);
+        // the index is this function's to add, whichever path rejected.
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new ProxyRequestError(`image[${index}]: ${detail}`, 400);
+      }
+      if (!image) {
+        throw new ProxyRequestError(`image[${index}] is not a valid image reference.`, 400);
+      }
+      return image;
+    });
+  }
   const image = optionalImageInput(value);
   return image ? [image] : [];
+}
+
+/**
+ * An optional image field whose PRESENT values must be valid: omission and
+ * null pass through as absence, but `mask: 42` used to be silently dropped —
+ * executing an unmasked edit the client never asked for.
+ */
+function requiredValidImageInput(value: unknown, field: string): NormalizedImage | undefined {
+  if (value === undefined || value === null) return undefined;
+  const image = optionalImageInput(value);
+  if (!image) {
+    throw new ProxyRequestError(`${field} is not a valid image reference.`, 400);
+  }
+  return image;
 }
 
 function optionalImageInput(value: unknown): NormalizedImage | undefined {
@@ -549,9 +772,24 @@ function imageSourceFromUrlLike(
   if (!url) return null;
   const dataUrl = /^data:([^;,]+);base64,(.*)$/s.exec(url);
   if (dataUrl) {
-    const mediaType = dataUrl[1]?.trim() || 'image/png';
+    // Media-type tokens are case-insensitive; `data:IMAGE/PNG` is a PNG.
+    // The media-type token is FRAMING: per the whitespace doctrine, only
+    // ASCII OWS strips. A 0xA0 byte keeps the token malformed rather than
+    // being repaired into `image/png`.
+    // No default: the regex requires at least one media-type character, so an
+    // empty capture is impossible and an OWS-only one is present junk — the
+    // `|| 'image/png'` fallback was REPAIRING `data: \t;base64,...`.
+    const rawMediaType = stripOws(dataUrl[1] ?? '');
     const data = dataUrl[2]?.replace(/\s/g, '') ?? '';
-    if (!mediaType.startsWith('image/') || !data) return null;
+    // Validate BEFORE case-folding: RFC 2045 tokens are US-ASCII, and
+    // JavaScript toLowerCase folds Unicode — U+212A KELVIN SIGN became `k`,
+    // admitting a subtype the grammar excludes. The class carries A-Z itself.
+    // Grammar: every CHAR except SPACE, CTLs and tspecials — which PERMITS
+    // `{}` (the HTTP tchar class wrongly rejected `image/x-{foo}`).
+    if (!/^[Ii][Mm][Aa][Gg][Ee]\/[0-9A-Za-z!#$%&'*+\-.^_\`{|}~]+$/.test(rawMediaType) || !data) {
+      return null;
+    }
+    const mediaType = rawMediaType.toLowerCase();
     return {
       source: { type: 'base64', mediaType, data },
     };
@@ -564,6 +802,9 @@ function isNormalizedImage(value: NormalizedImage | undefined): value is Normali
 }
 
 function imageGenerationCount(value: unknown): number {
+  // The direct API declares `n` nullable (`Optional[int]`), so null IS
+  // omission — the earlier explicit-null rejection was anti-parity, measured
+  // against the published SDK types.
   if (value === undefined || value === null) return 1;
   const parsed = optionalInteger(value, 'n', 1, 10);
   if (parsed === undefined) {
@@ -573,6 +814,7 @@ function imageGenerationCount(value: unknown): number {
 }
 
 function partialImageCount(value: unknown): number {
+  // Nullable on the direct API, like `n`: null is omission.
   if (value === undefined || value === null) return 0;
   const parsed = optionalInteger(value, 'partial_images', 0, 3);
   if (parsed === undefined) {
@@ -600,7 +842,10 @@ function optionalEnum<T extends string>(
   field: string,
   allowed: readonly T[],
 ): T | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
+  // null is omission (these fields are nullable on the direct API); an empty
+  // string is a PRESENT value outside the enum and used to be silently
+  // dropped, running the request without the control the client sent.
+  if (value === undefined || value === null) return undefined;
   if (typeof value !== 'string' || !allowed.includes(value as T)) {
     throw new ProxyRequestError(`${field} must be one of ${allowed.join(', ')}.`, 400);
   }
@@ -613,7 +858,9 @@ function optionalInteger(
   min: number,
   max: number,
 ): number | undefined {
-  if (value === undefined || value === null || value === '') return undefined;
+  // null is omission (nullable on the direct API); an empty string is a
+  // PRESENT value that is not an integer.
+  if (value === undefined || value === null) return undefined;
   const parsed = typeof value === 'number'
     ? value
     : typeof value === 'string' && /^\d+$/.test(value.trim())
@@ -703,13 +950,13 @@ async function runImageGenerationWithTimeout(
   client: OpenAiImageGenerationClient,
   request: OpenAiImageGenerationRequest,
   requestTimeoutMs: number,
+  res: ServerResponse,
 ): Promise<OpenAiImageGenerationResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const abort = turnAbort(res, requestTimeoutMs);
   try {
-    return await client.generate(request, controller.signal);
+    return await client.generate(request, abort.signal);
   } finally {
-    clearTimeout(timer);
+    abort.release();
   }
 }
 
@@ -717,17 +964,17 @@ async function* runImageGenerationStreamWithTimeout(
   client: OpenAiImageGenerationClient,
   request: OpenAiImageGenerationRequest,
   requestTimeoutMs: number,
+  res: ServerResponse,
 ): AsyncIterable<OpenAiImageGenerationStreamEvent> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const abort = turnAbort(res, requestTimeoutMs);
   try {
     if (client.stream) {
-      for await (const event of client.stream(request, controller.signal)) {
+      for await (const event of client.stream(request, abort.signal)) {
         yield event;
       }
       return;
     }
-    const result = await client.generate(request, controller.signal);
+    const result = await client.generate(request, abort.signal);
     for (const [index, image] of result.images.entries()) {
       yield {
         type: 'completed',
@@ -742,7 +989,7 @@ async function* runImageGenerationStreamWithTimeout(
       };
     }
   } finally {
-    clearTimeout(timer);
+    abort.release();
   }
 }
 
@@ -771,17 +1018,138 @@ export function openAiImageQualityReasoningEffort(
   return image2QualityToGpt55ReasoningEffort(quality);
 }
 
+/**
+ * One abort signal per backend turn: the timeout, or the client walking away.
+ * The RESPONSE's close is the disconnect signal — `IncomingMessage` closes as
+ * soon as the body is consumed, which is every normal request; `writableEnded`
+ * separates an orderly finish from a client that left. Call `release` when the
+ * turn settles, or the listener outlives the request.
+ */
+function turnAbort(res: ServerResponse, requestTimeoutMs: number): { signal: AbortSignal; release: () => void } {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  const onClose = (): void => {
+    if (!res.writableEnded) controller.abort();
+  };
+  res.once('close', onClose);
+  return {
+    signal: controller.signal,
+    release: () => {
+      clearTimeout(timer);
+      res.removeListener('close', onClose);
+    },
+  };
+}
+
 async function runWithTimeout(
   backend: LocalCliBackend,
   request: NormalizedRequest,
   requestTimeoutMs: number,
+  res: ServerResponse,
 ): Promise<LocalCompletionResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  // The disconnect half matters even without streaming: on a serialized
+  // backend an abandoned turn kept its slot to the timeout, and the NEXT
+  // client paid for it.
+  const abort = turnAbort(res, requestTimeoutMs);
   try {
-    return await backend.generate(request, controller.signal);
+    return await backend.generate(request, abort.signal);
   } finally {
-    clearTimeout(timer);
+    abort.release();
+  }
+}
+
+/**
+ * Pulls the first event before the caller writes SSE headers.
+ *
+ * Model validation happens inside the backend — for Claude it cannot happen
+ * earlier, since only the CLI knows which models exist. Streaming responses
+ * commit a 200 the moment headers are written, so without this the contracted
+ * 404 would arrive after the response was already committed and the client would
+ * see a truncated 200 instead.
+ *
+ * Only used when the request model can be rejected at all; otherwise the stream
+ * is passed through untouched so first-byte latency is unchanged.
+ */
+export async function withFirstEventSettled(
+  events: AsyncIterable<LocalStreamEvent>,
+): Promise<AsyncIterable<LocalStreamEvent>> {
+  const iterator = events[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  return {
+    async *[Symbol.asyncIterator]() {
+      try {
+        if (first.done) return;
+        yield first.value;
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) return;
+          yield next.value;
+        }
+      } finally {
+        // The wrapper drives the backend iterator by hand, so closing early —
+        // a client disconnect after the first event — would otherwise never
+        // reach the source generator's own cleanup, leaving its timeout, CLI
+        // process, or backend lock alive.
+        await iterator.return?.();
+      }
+    },
+  };
+}
+
+/**
+ * The request, with `model` replaced by the model that will actually run.
+ *
+ * Streaming chunks carry the request's model, which is only the executed one by
+ * coincidence. With honouring on the proxy knows the real answer before the
+ * stream starts, so it reports that instead of echoing the client back to
+ * itself. With honouring off the historical echo is preserved.
+ */
+async function requestReportingExecutedModel(
+  backend: LocalCliBackend,
+  request: NormalizedRequest,
+): Promise<NormalizedRequest> {
+  if (!honorRequestModel()) return request;
+  const resolved = await backend.resolvedModel?.(request).catch(() => null) ?? null;
+  if (!resolved || resolved === request.model) return request;
+  return { ...request, model: resolved };
+}
+
+function streamEvents(
+  backend: LocalCliBackend,
+  request: NormalizedRequest,
+  requestTimeoutMs: number,
+  res: ServerResponse,
+): Promise<AsyncIterable<LocalStreamEvent>> {
+  // The disconnect signal is wired in BOTH modes and lives for the whole
+  // iteration. It used to exist only during honor-on prefetch, so a client
+  // that left mid-stream kept its backend turn running to the timeout — and on
+  // a serialized backend the next client paid for it.
+  const clientGone = new AbortController();
+  const onResponseClose = (): void => {
+    if (!res.writableEnded) clientGone.abort();
+  };
+  res.once('close', onResponseClose);
+  const release = (): void => {
+    res.removeListener('close', onResponseClose);
+  };
+  const events = releaseOnFinish(
+    runStreamWithTimeout(backend, request, requestTimeoutMs, clientGone.signal),
+    release,
+  );
+  if (!honorRequestModel()) {
+    return Promise.resolve(events);
+  }
+  return withFirstEventSettled(events);
+}
+
+async function* releaseOnFinish(
+  events: AsyncIterable<LocalStreamEvent>,
+  release: () => void,
+): AsyncIterable<LocalStreamEvent> {
+  try {
+    for await (const event of events) yield event;
+  } finally {
+    release();
   }
 }
 
@@ -789,9 +1157,15 @@ async function* runStreamWithTimeout(
   backend: LocalCliBackend,
   request: NormalizedRequest,
   requestTimeoutMs: number,
+  clientGone?: AbortSignal,
 ): AsyncIterable<LocalStreamEvent> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+  // A client that disconnects while the first event is still pending — during
+  // model validation or CLI startup — has no response writer yet to notice, so
+  // the abort has to reach the backend from here.
+  const onClientGone = () => controller.abort();
+  clientGone?.addEventListener('abort', onClientGone, { once: true });
   try {
     if (backend.stream) {
       for await (const event of backend.stream(request, controller.signal)) {
@@ -803,6 +1177,7 @@ async function* runStreamWithTimeout(
     yield { type: 'completed', result };
   } finally {
     clearTimeout(timer);
+    clientGone?.removeEventListener('abort', onClientGone);
   }
 }
 
@@ -826,29 +1201,57 @@ interface MultipartFilePart {
   readonly data: string;
 }
 
-class GeneratedImageStore {
+export class GeneratedImageStore {
   private readonly images = new Map<string, {
     readonly bytes: Buffer;
     readonly contentType: string;
     readonly expiresAt: number;
   }>();
 
-  put(b64Json: string, outputFormat: string): string {
+  private heldBytes = 0;
+
+  constructor(
+    private readonly ttlMs: number = GENERATED_IMAGE_TTL_MS,
+    private readonly maxBytes: number = GENERATED_IMAGE_MAX_BYTES,
+    private readonly maxEntries: number = GENERATED_IMAGE_MAX_ENTRIES,
+  ) {}
+
+  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string {
     this.cleanupExpired();
     const id = randomUUID();
+    const bytes = Buffer.from(b64Json, 'base64');
     this.images.set(id, {
-      bytes: Buffer.from(b64Json, 'base64'),
+      bytes,
       contentType: imageContentType(outputFormat),
-      expiresAt: Date.now() + GENERATED_IMAGE_TTL_MS,
+      expiresAt: Date.now() + this.ttlMs,
     });
+    this.heldBytes += bytes.byteLength;
+    // Map preserves insertion order, so iteration meets oldest entries first.
+    // Never evicted: the image just stored, and any id in `pinned` — the other
+    // images of the SAME response, whose URLs are about to be handed out
+    // together. Without the pin, an oversized first image was evicted by its
+    // own sibling before the response was even sent.
+    for (const [oldest] of this.images) {
+      if (this.heldBytes <= this.maxBytes && this.images.size <= this.maxEntries) break;
+      if (oldest === id) break;
+      if (pinned?.has(oldest)) continue;
+      this.drop(oldest);
+    }
     return id;
+  }
+
+  private drop(id: string): void {
+    const image = this.images.get(id);
+    if (!image) return;
+    this.heldBytes -= image.bytes.byteLength;
+    this.images.delete(id);
   }
 
   get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null {
     const image = this.images.get(id);
     if (!image) return null;
     if (image.expiresAt <= Date.now()) {
-      this.images.delete(id);
+      this.drop(id);
       return null;
     }
     return image;
@@ -856,22 +1259,28 @@ class GeneratedImageStore {
 
   clear(): void {
     this.images.clear();
+    this.heldBytes = 0;
   }
 
   private cleanupExpired(): void {
     const now = Date.now();
     for (const [id, image] of this.images.entries()) {
-      if (image.expiresAt <= now) this.images.delete(id);
+      if (image.expiresAt <= now) this.drop(id);
     }
   }
 }
 
 function writeGeneratedImage(
   res: ServerResponse,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   path: string,
 ): void {
-  const id = decodeURIComponent(path.slice('/v1/images/generated/'.length));
+  // Byte-for-byte, no percent-decoding: issued ids are plain UUIDs, so no
+  // client ever needs encoding, and decoding created aliases — `%61bc...` and
+  // `abc...` named the same image, while `%2F` decoded into a separator the
+  // route grammar had already excluded. A `%FF` or `%2F` segment is simply an
+  // id that was never issued: the ordinary miss.
+  const id = path.slice('/v1/images/generated/'.length);
   const image = generatedImages.get(id);
   if (!image) {
     writeJson(res, 404, {
@@ -891,9 +1300,33 @@ function writeGeneratedImage(
   res.end(image.bytes);
 }
 
+// An IPv6 literal needs brackets inside a URL authority — `http://::1:8080`
+// does not parse. Hostnames and IPv4 pass through untouched.
+function urlHostname(host: string): string {
+  return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+}
+
+/**
+ * The link handed back for `response_format: url`.
+ *
+ * The authority is the one the client addressed — `Host` is how it reached this
+ * proxy, and rewriting it to the bound address would break every tunnelled
+ * client. When there is no `Host` (HTTP/1.0) the bound address is the only
+ * authority we know.
+ *
+ * The scheme is NOT hard-coded: behind an HTTPS tunnel a hard-coded `http://`
+ * hands the client a link its own page will refuse as mixed content, for bytes
+ * that are on the other side of the same TLS connection.
+ */
 function generatedImageUrl(req: IncomingMessage, id: string): string {
-  const host = headerValue(req.headers.host) || '127.0.0.1';
-  return `http://${host}/v1/images/generated/${encodeURIComponent(id)}`;
+  const socket = req.socket as { encrypted?: boolean; localAddress?: string; localPort?: number };
+  const host = headerValue(req.headers.host)
+    || (socket.localAddress ? `${urlHostname(socket.localAddress)}:${socket.localPort}` : '127.0.0.1');
+  const forwarded = stripOws(headerValue(req.headers['x-forwarded-proto']).split(',')[0] ?? '').toLowerCase();
+  const scheme = forwarded === 'https' || forwarded === 'http'
+    ? forwarded
+    : (socket.encrypted ? 'https' : 'http');
+  return `${scheme}://${host}/v1/images/generated/${encodeURIComponent(id)}`;
 }
 
 function imageContentType(outputFormat: string): string {
@@ -915,7 +1348,11 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 async function readImageRequestBody(req: IncomingMessage): Promise<ParsedImageRequestBody> {
   const body = await readBodyBuffer(req);
   const contentType = headerValue(req.headers['content-type']);
-  if (contentType.toLowerCase().includes('multipart/form-data')) {
+  // The media-type ESSENCE, not a substring: `application/json;
+  // profile="...multipart/form-data..."` is JSON whose parameter happens to
+  // contain those words.
+  const essence = stripOws(contentType.split(';')[0] ?? '').toLowerCase();
+  if (essence === 'multipart/form-data') {
     return { body: parseMultipartFormData(body, contentType), isMultipart: true };
   }
   const text = body.toString('utf8');
@@ -949,16 +1386,51 @@ function parseMultipartFormData(
   if (!boundary) throw new ProxyRequestError('multipart/form-data boundary is required.', 400);
   const output: Record<string, unknown> = {};
   const binary = body.toString('latin1');
-  const parts = binary.split(`--${boundary}`);
-  for (const rawPart of parts) {
-    if (!rawPart || rawPart === '--\r\n' || rawPart === '--') continue;
-    const part = rawPart.startsWith('\r\n') ? rawPart.slice(2) : rawPart;
-    if (part.startsWith('--')) continue;
+  // A boundary DELIMITS only when the whole delimiter line matches (RFC
+  // 2046): at the start of a line AND terminated by optional whitespace plus
+  // CRLF, or by `--` for the close. Bare splitting truncated data twice —
+  // first on mid-line marker bytes, then on line-starting PREFIXES
+  // (`--BX` where the boundary is `B` is data, because `X` terminates
+  // nothing). A scanner checks both sides of every candidate.
+  const source = `\r\n${binary}`;
+  const marker = `\r\n--${boundary}`;
+  const segments: string[] = [];
+  let start = 0;
+  let cursor = 0;
+  let closed = false;
+  while (!closed) {
+    const at = source.indexOf(marker, cursor);
+    if (at === -1) break;
+    const rest = source.slice(at + marker.length);
+    const delimiter = /^[ \t]*\r\n/.exec(rest);
+    if (delimiter) {
+      segments.push(source.slice(start, at));
+      cursor = at + marker.length + delimiter[0].length;
+      start = cursor;
+    } else if (/^--[ \t]*(\r\n|$)/.test(rest)) {
+      // The CLOSE delimiter has the same whole-line rule: `--` then optional
+      // whitespace then CRLF or end of body. `--B--X` is data — the bare
+      // startsWith check truncated everything after such bytes.
+      segments.push(source.slice(start, at));
+      closed = true;
+    } else {
+      // A prefix of real data — keep scanning past it.
+      cursor = at + marker.length;
+    }
+  }
+  // segments[0] is the preamble before the opening boundary; each later one is
+  // a complete part, `headers\r\n\r\ncontent`, its delimiter CRLFs consumed.
+  for (const part of segments.slice(1)) {
+    // An empty header block ends at the part's very first CRLF — searching
+    // for CRLFCRLF from the top read the CONTENT as headers when the block
+    // was empty.
+    if (part.startsWith('\r\n')) continue;
     const headerEnd = part.indexOf('\r\n\r\n');
     if (headerEnd === -1) continue;
     const rawHeaders = part.slice(0, headerEnd);
-    let rawContent = part.slice(headerEnd + 4);
-    if (rawContent.endsWith('\r\n')) rawContent = rawContent.slice(0, -2);
+    // The delimiter's CRLF was consumed by the scanner, so the content is
+    // exactly the part's bytes.
+    const rawContent = part.slice(headerEnd + 4);
     const headers = multipartHeaders(rawHeaders);
     const disposition = parseContentDisposition(headers['content-disposition']);
     if (!disposition.name) continue;
@@ -975,17 +1447,86 @@ function parseMultipartFormData(
   return output;
 }
 
+/**
+ * Quote-aware parameter splitting, shared by the content-type and
+ * content-disposition parsers: a `;` inside a quoted value is data, and a
+ * quoted-pair (`\"`) neither closes the quote nor separates. Naive
+ * splitting let `filename="x; name=bogus"` fabricate — or overwrite — a
+ * parameter.
+ */
+function splitHeaderParameters(value: string): string[] {
+  const params: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  let escaped = false;
+  for (const ch of value) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (inQuotes && ch === '\\') {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') inQuotes = !inQuotes;
+    if (ch === ';' && !inQuotes) {
+      params.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  params.push(current);
+  return params;
+}
+
 function multipartBoundary(contentType: string): string | null {
-  const match = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType);
-  return match?.[1] ?? match?.[2]?.trim() ?? null;
+  // Parameters are walked with quote awareness: a `;` inside a quoted value
+  // does not separate, and `boundary=` inside ANOTHER parameter's quoted value
+  // is text — the naive regex picked a decoy out of `note="x;boundary=bogus"`
+  // and stopped at the closing quote of `boundary="B"junk`, silently accepting
+  // a malformed parameter.
+  const semi = contentType.indexOf(';');
+  if (semi === -1) return null;
+  for (const param of splitHeaderParameters(contentType.slice(semi + 1))) {
+    const eq = param.indexOf('=');
+    if (eq === -1) continue;
+    // OWS only — String.trim also eats U+00A0, which under latin1 header
+    // decoding is a real byte and NOT in the boundary alphabet.
+    if (stripOws(param.slice(0, eq)).toLowerCase() !== 'boundary') continue;
+    let value = stripOws(param.slice(eq + 1));
+    if (value.startsWith('"')) {
+      // A quoted value is the WHOLE value; a suffix after the closing quote is
+      // malformed, not ignorable. Quoted-pairs decode: `"B\?"` names `B?`.
+      const quoted = /^"((?:[^"\\]|\\.)*)"$/.exec(value);
+      if (!quoted) return null;
+      value = (quoted[1] ?? '').replace(/\\(.)/g, '$1');
+    }
+    // RFC 2046 bchars: 1-70 characters from a fixed alphabet, the last not a
+    // space.
+    if (!/^[0-9A-Za-z'()+_,\-./:=? ]{0,69}[0-9A-Za-z'()+_,\-./:=?]$/.test(value)) {
+      return null;
+    }
+    return value;
+  }
+  return null;
 }
 
 function multipartHeaders(raw: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const line of raw.split('\r\n')) {
+  // Unfold first: a CRLF followed by SP/HTAB continues the previous field
+  // (RFC 822 folding). The continuation line has no colon, so it was silently
+  // dropped — taking a folded Content-Disposition's `name` with it.
+  const unfolded = raw.replace(/\r\n[ \t]+/g, ' ');
+  for (const line of unfolded.split('\r\n')) {
     const index = line.indexOf(':');
     if (index === -1) continue;
-    out[line.slice(0, index).trim().toLowerCase()] = line.slice(index + 1).trim();
+    // OWS only, the multipart path's LAST remaining String.trim: a 0xA0 byte
+    // beside a field name or value is a real byte that makes the header
+    // malformed, not whitespace to forgive.
+    out[stripOws(line.slice(0, index)).toLowerCase()] = stripOws(line.slice(index + 1));
   }
   return out;
 }
@@ -995,13 +1536,25 @@ function parseContentDisposition(value: string | undefined): {
   readonly filename?: string;
 } {
   if (!value) return {};
+  const segments = splitHeaderParameters(value);
+  // The disposition TYPE is the first segment and must be `form-data` (OWS
+  // only; a 0xA0 byte keeps it malformed). It was skipped unexamined, so any
+  // junk type still named a part.
+  if (stripOws(segments[0] ?? '').toLowerCase() !== 'form-data') return {};
   const out: Record<string, string> = {};
-  for (const part of value.split(';').slice(1)) {
+  for (const part of segments.slice(1)) {
     const index = part.indexOf('=');
     if (index === -1) continue;
-    const key = part.slice(0, index).trim();
-    let val = part.slice(index + 1).trim();
-    if (val.startsWith('"') && val.endsWith('"')) val = val.slice(1, -1);
+    // Parameter names are case-insensitive; `NAME="image"` names the part.
+    // OWS only — String.trim also eats U+00A0, a real latin1 header byte that
+    // makes the name NOT `name`.
+    const key = stripOws(part.slice(0, index)).toLowerCase();
+    let val = stripOws(part.slice(index + 1));
+    if (val.startsWith('"') && val.endsWith('"')) {
+      // Quoted-pairs decode here as they do in the boundary parameter:
+      // `name="im\age"` names `image`.
+      val = val.slice(1, -1).replace(/\\(.)/g, '$1');
+    }
     out[key] = val;
   }
   return { name: out.name, filename: out.filename };
@@ -1049,29 +1602,54 @@ function headerValue(value: string | string[] | undefined): string {
   return Array.isArray(value) ? value[0] ?? '' : value ?? '';
 }
 
-function openAiModelsResponse(backend: LocalCliBackend): unknown {
+async function openAiModelsResponse(backend: LocalCliBackend): Promise<unknown> {
+  // Only advertise a choice the client can actually make. With honouring off the
+  // request model does not select anything, so listing alternatives would invite
+  // a selection the proxy then ignores.
+  const ids = honorRequestModel()
+    ? await advertisedModels(backend)
+    : (BACKEND_IDENTIFIERS.includes(backend.model) ? [] : [backend.model]);
   return {
     object: 'list',
-    data: [
-      {
-        id: backend.model,
-        object: 'model',
-        created: 0,
-        owned_by: 'local-oauth-cli',
-      },
-    ],
+    data: ids.map((id) => ({
+      id,
+      object: 'model',
+      created: 0,
+      owned_by: 'local-oauth-cli',
+    })),
   };
+}
+
+async function advertisedModels(backend: LocalCliBackend): Promise<readonly string[]> {
+  const listed = await backend.availableModels?.().catch(() => null) ?? null;
+  // A backend identifier is not a selectable model, so it is never advertised —
+  // a client that echoed one back would now be rejected.
+  const configured = BACKEND_IDENTIFIERS.includes(backend.model) ? null : backend.model;
+  const rest = (listed ?? []).filter((id) => id !== configured && !BACKEND_IDENTIFIERS.includes(id));
+  const ids = configured ? [configured, ...rest] : rest;
+  // A runtime that advertised the same slug twice would otherwise put it in the
+  // response twice; a model list with duplicate `id`s is malformed for a client
+  // whatever the runtime meant by it. First occurrence wins, so order holds.
+  return [...new Set(ids)];
 }
 
 function openAiImagesGenerationResponse(
   req: IncomingMessage,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   result: OpenAiImageGenerationResult,
   request: OpenAiImageGenerationRequest,
 ): unknown {
   return {
     created: result.created,
-    data: result.images.map((image) => openAiImageObject(req, generatedImages, image, request)),
+    // One pin set for the whole response: sibling images must not evict each
+    // other before their URLs are even sent. And at most `n` of them — the
+    // count is backend-controlled, `n` is the request's, the same rule the
+    // streamed path applies.
+    data: (() => {
+      const batch = new Set<string>();
+      return result.images.slice(0, request.n ?? 1)
+        .map((image) => openAiImageObject(req, generatedImages, image, request, batch));
+    })(),
     ...openAiImageResponseMetadata(result, request),
     ...(result.usage ? { usage: openAiImagesUsage(result.usage) } : {}),
   };
@@ -1107,15 +1685,18 @@ function responseSize(value: string | undefined): string | undefined {
 
 function openAiImageObject(
   req: IncomingMessage,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   image: OpenAiGeneratedImage,
   request: OpenAiImageGenerationRequest,
+  batch?: Set<string>,
 ): unknown {
   if (request.responseFormat === 'url') {
     const id = generatedImages.put(
       image.b64Json,
       request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+      batch,
     );
+    batch?.add(id);
     return {
       url: generatedImageUrl(req, id),
       ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
@@ -1131,13 +1712,26 @@ async function writeOpenAiImageStream(
   req: IncomingMessage,
   res: ServerResponse,
   events: AsyncIterable<OpenAiImageGenerationStreamEvent>,
-  generatedImages: GeneratedImageStore,
+  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
   writeSseHeaders(res);
+  // One pin set for the whole stream: sibling images of one response must not
+  // evict each other, exactly as in the non-streaming path.
+  const batch = new Set<string>();
+  const putPinned = (b64Json: string): string => {
+    const id = generatedImages.put(b64Json, request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
+    batch.add(id);
+    return id;
+  };
+  // The event count is backend-controlled; `n` is the request's. A runaway
+  // stream must not emit more images than were asked for — nor pin more.
+  let completedEmitted = 0;
   try {
     for await (const event of events) {
       if (event.type === 'partial_image') continue;
+      if (completedEmitted >= (request.n ?? 1)) break;
+      completedEmitted += 1;
       const type = imageStreamEventType(request.operation, event.type);
       const payload = {
         type,
@@ -1147,7 +1741,7 @@ async function writeOpenAiImageStream(
         quality: event.quality ?? request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
         size: event.size ?? request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
         ...(request.responseFormat === 'url'
-          ? { url: generatedImageUrl(req, generatedImages.put(event.image.b64Json, request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT)) }
+          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json)) }
           : { b64_json: event.image.b64Json }),
         ...(event.usage ? { usage: openAiImagesUsage(event.usage) } : {}),
       };
@@ -1155,6 +1749,9 @@ async function writeOpenAiImageStream(
     }
   } catch (err) {
     await writeSseEvent(res, 'error', streamErrorPayload(err));
+    // The OpenAI mid-stream contract: an in-band error, then `data: [DONE]` —
+    // the images stream was the one OpenAI surface that ended without it.
+    res.write('data: [DONE]\n\n');
   } finally {
     res.end();
   }
@@ -2081,25 +2678,38 @@ async function writeAnthropicMessagesStream(
           stop_sequence: result.stopSequence ?? null,
           stop_details: anthropicStopDetails(result, stopReason),
         },
-        usage: {
-          output_tokens: result.usage.outputTokens,
-        },
+        // The whole usage, not just the output count. `message_start` is written
+        // before the runtime has reported anything, so its counts are zeros; this
+        // is the first event that knows them, and without them a streaming client
+        // can never learn the input or cache tokens the contract promises.
+        usage: anthropicUsage(result.usage),
       });
       await writeSseEvent(res, 'message_stop', {
         type: 'message_stop',
       });
     }
   } catch (err) {
-    await writeSseEvent(res, 'error', {
-      type: 'error',
-      error: {
-        type: 'api_error',
-        message: errorMessage(err),
-      },
-    });
+    // Map the provider error the way every other surface does. Hard-coding
+    // `api_error` and serializing the raw throw loses the runtime's status and
+    // type, and — because the JSON travels inside the message — hands the client
+    // a truncated fragment of it instead of the diagnostic.
+    await writeSseEvent(res, 'error', anthropicStreamErrorPayload(err));
   } finally {
     res.end();
   }
+}
+
+function anthropicStreamErrorPayload(err: unknown): Record<string, unknown> {
+  const provider = err instanceof ProxyRequestError
+    ? { type: err.type, message: err.message }
+    : providerErrorFromBackendError(err);
+  return {
+    type: 'error',
+    error: {
+      type: provider?.type ?? 'api_error',
+      message: boundedErrorMessage(provider?.message ?? rawErrorMessage(err)),
+    },
+  };
 }
 
 interface AnthropicToolUseState {
@@ -2222,7 +2832,7 @@ function streamErrorPayload(err: unknown): unknown {
   if (err instanceof ProxyRequestError) {
     return {
       error: {
-        message: err.message,
+        message: boundedErrorMessage(err.message),
         type: err.type,
         param: err.param,
         code: err.code,
@@ -2233,7 +2843,7 @@ function streamErrorPayload(err: unknown): unknown {
   if (providerError) {
     return {
       error: {
-        message: providerError.message,
+        message: boundedErrorMessage(providerError.message),
         type: providerError.type,
         param: providerError.param,
         code: providerError.code,
@@ -2250,8 +2860,29 @@ function streamErrorPayload(err: unknown): unknown {
   };
 }
 
-function errorMessage(err: unknown): string {
+/**
+ * An error as a client-visible string, bounded. Both the JSON writer and every
+ * SSE error producer come through here, which is the point: the ceiling belongs
+ * where the text becomes a response, not at each of the places that can raise
+ * one.
+ */
+function rawErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * An error as a client-visible string, bounded. Both the JSON writer and every
+ * SSE error producer come through here, which is the point: the ceiling belongs
+ * where the text becomes a response.
+ *
+ * Anything that PARSES an error must use `rawErrorMessage` instead. A backend
+ * signals a provider error by carrying its JSON in the message, and truncating
+ * that before parsing turns a mapped 429 into an unmapped 500 whose body is a
+ * fragment of broken JSON — which is exactly what happened when the bound was
+ * first added here.
+ */
+function errorMessage(err: unknown): string {
+  return boundedErrorMessage(rawErrorMessage(err));
 }
 
 function writeJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -2324,6 +2955,29 @@ function isAddressInfo(value: string | AddressInfo | null): value is AddressInfo
   return Boolean(value) && typeof value === 'object';
 }
 
+// Every client-visible error message passes through here, so this is where the
+// documented ceiling belongs: one place rather than one per producer. A model
+// name a client chose, a runtime diagnostic, an upstream's prose — each reaches a
+// response through some branch below, and bounding at each source has already
+// been missed once.
+const MAX_ERROR_MESSAGE_CHARS = 500;
+const ERROR_TRUNCATION_MARKER = '...[truncated]';
+
+function boundedErrorMessage(message: string): string {
+  // A message that already fits is returned untouched. Reserving the marker
+  // unconditionally shortened messages that were never too long: anything over
+  // the budget but under the limit lost its tail to make room for a marker it
+  // did not need.
+  if (message.length <= MAX_ERROR_MESSAGE_CHARS) return message;
+  const budget = MAX_ERROR_MESSAGE_CHARS - ERROR_TRUNCATION_MARKER.length;
+  let out = '';
+  for (const ch of message) {
+    if (out.length + ch.length > budget) break;
+    out += ch;
+  }
+  return `${out}${ERROR_TRUNCATION_MARKER}`;
+}
+
 function writeError(
   res: ServerResponse,
   err: unknown,
@@ -2332,7 +2986,7 @@ function writeError(
   if (err instanceof LocalCliChatError) {
     writeJson(res, err.statusCode, {
       error: {
-        message: err.message,
+        message: boundedErrorMessage(err.message),
         type: 'local_cli_chat_error',
         param: null,
         code: err.code,
@@ -2341,19 +2995,39 @@ function writeError(
     return;
   }
   if (err instanceof ProxyRequestError) {
-    if (err.provider === 'anthropic') {
+    // The native surface promises its own envelope for everything, the gate
+    // and configuration failures included — they happen before its handler,
+    // but the caller is still a native-surface caller.
+    if (shape === 'local-cli') {
+      writeJson(res, err.statusCode, {
+        error: {
+          message: boundedErrorMessage(err.message),
+          type: 'local_cli_chat_error',
+          param: null,
+          code: err.code,
+        },
+      });
+      return;
+    }
+    // The error's own provider wins when it names one; otherwise the caller's
+    // surface decides. The shared throws — method rejections, body-parse
+    // failures, the 413 — carry the default provider, and on /v1/messages they
+    // were answered in the OpenAI shape an Anthropic client cannot parse.
+    // `invalid_request_error`, the type these throws carry, is native to both
+    // vocabularies.
+    if (err.provider === 'anthropic' || shape === 'anthropic') {
       writeJson(res, err.statusCode, {
         type: 'error',
         error: {
           type: err.type,
-          message: err.message,
+          message: boundedErrorMessage(err.message),
         },
       });
       return;
     }
     writeJson(res, err.statusCode, {
       error: {
-        message: err.message,
+        message: boundedErrorMessage(err.message),
         type: err.type,
         param: err.param,
         code: err.code,
@@ -2363,19 +3037,33 @@ function writeError(
   }
   const providerError = providerErrorFromBackendError(err);
   if (providerError) {
+    // The mapped status and message survive; the ENVELOPE belongs to the
+    // caller's surface. A 429 on the native surface is still a 429 — reported
+    // as this surface reports errors.
+    if (shape === 'local-cli') {
+      writeJson(res, providerError.statusCode, {
+        error: {
+          message: boundedErrorMessage(providerError.message),
+          type: 'local_cli_chat_error',
+          param: null,
+          code: providerError.code ?? null,
+        },
+      });
+      return;
+    }
     if (shape === 'anthropic') {
       writeJson(res, providerError.statusCode, {
         type: 'error',
         error: {
           type: providerError.type,
-          message: providerError.message,
+          message: boundedErrorMessage(providerError.message),
         },
       });
       return;
     }
     writeJson(res, providerError.statusCode, {
       error: {
-        message: providerError.message,
+        message: boundedErrorMessage(providerError.message),
         type: providerError.type,
         param: providerErrorParamForShape(providerError.param, shape),
         code: providerError.code,
@@ -2383,9 +3071,23 @@ function writeError(
     });
     return;
   }
+  // A failure with no provider mapping is still answered in the shape the caller
+  // asked in. `/v1/messages` has its own envelope and no `param`/`code`; sending
+  // the OpenAI body there hands an Anthropic client something it cannot parse.
+  const message = boundedErrorMessage(err instanceof Error ? err.message : String(err));
+  if (shape === 'local-cli') {
+    writeJson(res, 500, {
+      error: { message, type: 'local_cli_chat_error', param: null, code: null },
+    });
+    return;
+  }
+  if (shape === 'anthropic') {
+    writeJson(res, 500, { type: 'error', error: { type: 'api_error', message } });
+    return;
+  }
   writeJson(res, 500, {
     error: {
-      message: err instanceof Error ? err.message : String(err),
+      message,
       type: 'server_error',
       param: null,
       code: null,
@@ -2400,7 +3102,7 @@ function providerErrorFromBackendError(err: unknown): {
   readonly param: string | null;
   readonly code: string | null;
 } | null {
-  const outer = parseObject(errorMessage(err));
+  const outer = parseObject(rawErrorMessage(err));
   const inner = parseObject(typeof outer?.message === 'string' ? outer.message : undefined) ?? outer;
   const error = asRecordPayload(inner?.error);
   const statusCode = typeof inner?.status === 'number' ? inner.status : undefined;

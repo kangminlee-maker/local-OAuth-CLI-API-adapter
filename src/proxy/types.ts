@@ -14,6 +14,10 @@ export type NormalizedAnthropicEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'm
 export interface NormalizedThinking {
   readonly type: 'adaptive' | 'enabled' | 'disabled';
   readonly display?: 'summarized' | 'omitted';
+  // budget_tokens is validated by the normalizer and deliberately not carried:
+  // no backend consumes it — the local runtime governs its own thinking
+  // budget, and the pinned CLI's numeric budget controls are inert at runtime.
+  // The contract's `thinking` row documents the divergence.
 }
 
 export interface NormalizedMessage {
@@ -209,6 +213,23 @@ export type LocalStreamEvent =
 export interface LocalCliBackend {
   readonly name: string;
   readonly model: string;
+  /**
+   * Models this runtime can currently run, for `GET /v1/models`.
+   *
+   * Optional and best-effort: a backend that cannot enumerate returns null and
+   * the endpoint falls back to its single exposed model. Never a hard-coded
+   * list — the runtimes advertise their own, so new generations appear without
+   * a code change.
+   */
+  availableModels?(): Promise<readonly string[] | null>;
+  /**
+   * The model this request will actually run on, resolvable before execution.
+   *
+   * Lets the response report the executed model instead of echoing the request.
+   * Returns null when the runtime's own default applies and its name is unknown
+   * to the proxy.
+   */
+  resolvedModel?(request: NormalizedRequest): Promise<string | null>;
   generate(request: NormalizedRequest, signal?: AbortSignal): Promise<LocalCompletionResult>;
   stream?(
     request: NormalizedRequest,
@@ -217,10 +238,23 @@ export interface LocalCliBackend {
   close(): Promise<void>;
 }
 
+/**
+ * The generated-image store's public surface. The implementation lives with the
+ * HTTP server; this names only what the server needs, so a test can inject the
+ * same class built with smaller budgets — eviction and pinning are behaviour
+ * that HTTP-level tests cannot exercise against the production 128 MiB.
+ */
+export interface GeneratedImageStoreLike {
+  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string;
+  get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null;
+  clear(): void;
+}
+
 export interface ProxyServerOptions {
   readonly backend: LocalCliBackend;
   readonly imageGenerationClient?: OpenAiImageGenerationClient;
   readonly chatSessionManager?: LocalCliChatSessionManager;
+  readonly generatedImageStore?: GeneratedImageStoreLike;
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;
@@ -229,6 +263,18 @@ export interface ProxyServerOptions {
   // still authenticates with its own OAuth session.
   readonly authKey?: string;
 }
+
+/**
+ * Names a backend uses to identify itself when no model is configured. They are
+ * not models a client can select, so `GET /v1/models` must not advertise them —
+ * advertising a value the proxy would then reject is a contract the client
+ * cannot follow.
+ */
+export const BACKEND_IDENTIFIERS: readonly string[] = [
+  'codex-app-server',
+  'codex-backend',
+  'claude-code-cli',
+];
 
 export class ProxyRequestError extends Error {
   constructor(
@@ -241,6 +287,34 @@ export class ProxyRequestError extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * The request named a model this runtime cannot run. Reported in the error shape
+ * of the surface the client called, so an OpenAI client sees `model_not_found`
+ * and an Anthropic client sees `not_found_error`.
+ */
+export function unsupportedModelError(
+  model: string,
+  shape: ApiShape,
+  // Echo the client's own value back; never the locally configured default,
+  // which the client did not supply and should not learn about from an error.
+  fromRequest = true,
+): ProxyRequestError {
+  const message = fromRequest
+    ? `Model \`${model}\` is not available through this local CLI runtime.`
+    : 'The model configured for this local CLI runtime is not available.';
+  if (shape === 'anthropic-messages') {
+    return new ProxyRequestError(message, 404, 'anthropic', 'not_found_error');
+  }
+  return new ProxyRequestError(
+    message,
+    404,
+    'openai',
+    'invalid_request_error',
+    'model',
+    'model_not_found',
+  );
 }
 
 export function estimateTokens(text: string): number {

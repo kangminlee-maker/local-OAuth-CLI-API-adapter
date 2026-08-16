@@ -5,5 +5,8 @@
     "fallbackReasoningEffort": "medium",
     "fallbackVerbosity": "medium",
     "imageModel": "gpt-5.5"
+  },
+  "modelSelection": {
+    "honorRequestModel": false
   }
 }

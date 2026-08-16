@@ -108,7 +108,7 @@ async function proxy(args: readonly string[]): Promise<number> {
           }),
     },
   });
-  const authKey = normalizeAuthKey(options.authKey ?? process.env.LOCAL_OAUTH_PROXY_KEY);
+  const authKey = configuredAuthKey(options.authKey, process.env.LOCAL_OAUTH_PROXY_KEY);
   const started = await startLocalApiProxy({
     backend,
     imageGenerationClient,
@@ -121,7 +121,7 @@ async function proxy(args: readonly string[]): Promise<number> {
 
   process.stdout.write(`local OAuth CLI API proxy ready\n`);
   process.stdout.write(`  backend: ${backend.name}\n`);
-  process.stdout.write(`  auth: ${authKey ? 'required (Authorization: Bearer or x-api-key)' : 'open (no key gate)'}\n`);
+  process.stdout.write(`  auth: ${authGateStatus(authKey)}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexTransport: ${selectedCodexTransport}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexImageTransport: ${selectedCodexImageTransport}\n`);
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
@@ -211,10 +211,36 @@ function parseIntOption(value: string | undefined, fallback: number): number {
   return parsed;
 }
 
-function normalizeAuthKey(value: string | undefined): string | undefined {
-  if (value === undefined) return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
+/**
+ * The configured key, RAW. Only true absence — no flag, no env var — means
+ * "no gate". The old normalization trimmed and turned an empty or
+ * whitespace-only key into undefined, which read a misconfigured deployment
+ * (a secret expanding to "") as a request for an OPEN proxy and silently
+ * served everything unauthenticated; it also repaired edge-whitespace keys
+ * the server is contracted to reject as configuration errors. Every
+ * configured value now reaches the server's own checks, which answer a fixed
+ * 500 instead of opening the gate.
+ */
+export function configuredAuthKey(
+  flag: string | undefined,
+  env: string | undefined,
+): string | undefined {
+  return flag ?? env;
+}
+
+/**
+ * The startup status keys on CONFIGURED vs ABSENT, never on truthiness: an
+ * empty configured key is a gate the server refuses to serve through (a fixed
+ * 500 per request), and announcing it as "open (no key gate)" would tell the
+ * operator their proxy is intentionally unauthenticated. Whether a configured
+ * key is VALID is the server's judgment alone — its config-error checks put
+ * the specific cause on stderr at the first request — so the status claims
+ * only what the CLI knows: a gate is configured, or it is not.
+ */
+export function authGateStatus(authKey: string | undefined): string {
+  return authKey !== undefined
+    ? 'required (Authorization: Bearer or x-api-key)'
+    : 'open (no key gate)';
 }
 
 function parseCodexTransport(value: string | undefined): CodexProxyTransport {
@@ -237,19 +263,27 @@ function parseReasoningEffort(
   throw new Error('reasoning effort must be one of none, minimal, low, medium, high, or xhigh.');
 }
 
-function createCodexBackend(options: {
+export function createCodexBackend(options: {
   readonly transport: CodexProxyTransport;
   readonly command?: string;
   readonly cwd: string;
   readonly model?: string;
   readonly timeoutMs: number;
   readonly reasoningEffort?: NormalizedReasoningEffort;
+  // Left undefined in production so the backend reads settings.json; tests pass
+  // it explicitly to exercise the honour-on path without rewriting settings.
+  readonly honorRequestModel?: boolean;
 }): LocalCliBackend {
   if (options.transport === 'codex-backend') {
     return new CodexBackendTransport({
       model: options.model,
+      // The catalogue lookup must query the same Codex executable the operator
+      // selected, not whichever `codex` happens to be on PATH.
+      codexCommand: options.command,
+      cwd: options.cwd,
       timeoutMs: options.timeoutMs,
       reasoningEffort: options.reasoningEffort,
+      honorRequestModel: options.honorRequestModel,
     });
   }
   return new CodexAppServerBackend({
@@ -258,6 +292,7 @@ function createCodexBackend(options: {
     model: options.model,
     timeoutMs: options.timeoutMs,
     reasoningEffort: options.reasoningEffort,
+    honorRequestModel: options.honorRequestModel,
   });
 }
 
@@ -268,10 +303,18 @@ function createCodexImageGenerationClient(options: {
   readonly model?: string;
   readonly timeoutMs: number;
 }): OpenAiImageGenerationClient {
+  // Images are out of scope for `modelSelection.honorRequestModel`: an Images API
+  // `model` is a route selector (`image-2`, `dall-e-2`, `gpt-image-*`), not a
+  // Codex slug, and the Codex model for an image turn comes from
+  // `codexProxy.imageModel`. The image paths do not consult request models today;
+  // pinning the flag off keeps that true if they ever come to share more code.
   if (options.transport === 'codex-backend') {
     return new CodexBackendTransport({
       model: options.model,
+      codexCommand: options.command,
+      cwd: options.cwd,
       timeoutMs: options.timeoutMs,
+      honorRequestModel: false,
     });
   }
   return new CodexAppServerBackend({
@@ -280,6 +323,7 @@ function createCodexImageGenerationClient(options: {
     model: options.model,
     timeoutMs: options.timeoutMs,
     imageGeneration: true,
+    honorRequestModel: false,
   });
 }
 

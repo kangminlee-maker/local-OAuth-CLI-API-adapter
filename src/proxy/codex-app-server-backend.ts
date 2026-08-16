@@ -1,14 +1,16 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import readline from 'node:readline';
 import {
   codexProxyFallbackReasoningEffort,
   codexProxyFallbackVerbosity,
+  honorRequestModel,
 } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
+import { assertCodexModelSupported, codexModels, sourceCodexHome } from './codex-model-catalog.js';
 import {
   baseInstructions,
   buildPrompt,
@@ -40,7 +42,7 @@ import type {
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { ProxyRequestError } from './types.js';
+import { ProxyRequestError, unsupportedModelError } from './types.js';
 import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface CodexAppServerBackendOptions {
@@ -53,6 +55,7 @@ interface CodexAppServerBackendOptions {
   readonly imageGeneration?: boolean;
   readonly proxyMode?: CodexAppServerProxyMode;
   readonly onTiming?: (timing: CodexTurnTiming) => void;
+  readonly honorRequestModel?: boolean;
 }
 
 interface PendingRequest {
@@ -177,6 +180,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   private readonly command: string;
   private readonly cwd: string;
   private readonly configuredModel?: string;
+  private readonly honorRequestModel: boolean;
   private readonly timeoutMs: number;
   private readonly reasoningEffort: CodexReasoningEffort;
   private readonly verbosity: CodexVerbosity;
@@ -199,6 +203,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     this.cwd = options.cwd;
     this.model = options.model ?? 'codex-app-server';
     this.configuredModel = options.model;
+    this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
     this.timeoutMs = options.timeoutMs;
     this.reasoningEffort = options.reasoningEffort ?? codexProxyFallbackReasoningEffort();
     this.verbosity = options.verbosity ?? codexProxyFallbackVerbosity();
@@ -401,6 +406,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     try {
       [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
       const cwd = this.isolation?.workDir ?? this.cwd;
+      // Same rule as the text turn: a disconnect during the waits above must
+      // not START a turn (the once-listener was a no-op while turnId was null).
+      if (signal?.aborted) throw new Error('request aborted');
       phaseStartedAt = Date.now();
       const turn = await this.send('turn/start', {
         threadId,
@@ -417,6 +425,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       timing.turnStartMs = Date.now() - phaseStartedAt;
       turnId = readPath<string>(turn, ['result', 'turn', 'id']);
       if (!turnId) throw new Error('codex app-server did not return a turn id');
+      // The once-listener may have been consumed during the round-trip while
+      // turnId was null; deliver the interrupt it could not.
+      if (signal?.aborted) await abort();
       phaseStartedAt = Date.now();
       const result = await this.waitForImageTurn(threadId, turnId, signal);
       timing.turnWaitMs = Date.now() - phaseStartedAt;
@@ -502,6 +513,12 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     try {
       [threadId, preparedInput] = await Promise.all([threadPromise, preparedInputPromise]);
       const cwd = this.isolation?.workDir ?? this.cwd;
+      const modelOverride = await this.modelOverrideFor(request, signal);
+      // The abort listener is once-only and a no-op while turnId is null, and
+      // an aborted catalogue lookup deliberately fails open — so a client that
+      // disconnected during the waits above would otherwise still START a
+      // turn nobody is waiting for.
+      if (signal?.aborted) throw new Error('request aborted');
       phaseStartedAt = Date.now();
       const turn = await this.send('turn/start', {
         threadId,
@@ -509,7 +526,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
         runtimeWorkspaceRoots: [cwd],
         environments: [],
         input: preparedInput.input,
-        model: this.modelOverrideFor(request.model),
+        model: modelOverride,
         effort: reasoningEffort,
         summary: 'none',
         ...turnPersonalityParams(this.proxyMode),
@@ -518,6 +535,10 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       timing.turnStartMs = Date.now() - phaseStartedAt;
       turnId = readPath<string>(turn, ['result', 'turn', 'id']);
       if (!turnId) throw new Error('codex app-server did not return a turn id');
+      // The abort may have fired during the turn/start round-trip, consuming
+      // the once-listener while turnId was still null. Now that the id exists,
+      // deliver the interrupt it could not.
+      if (signal?.aborted) await abort();
       phaseStartedAt = Date.now();
       const turnResult = await this.waitForTurn(threadId, turnId, signal, observedTextDelta);
       timing.turnWaitMs = Date.now() - phaseStartedAt;
@@ -1104,12 +1125,81 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     this.clearBufferedTurnStates();
   }
 
-  private modelOverrideFor(requestModel: string): string | undefined {
-    if (this.configuredModel) return this.configuredModel;
-    if (!requestModel || requestModel === this.model || requestModel === 'codex-app-server') {
-      return undefined;
+  /**
+   * Resolves which model the turn runs on. With `modelSelection.honorRequestModel`
+   * off this keeps the historical precedence — a configured model always wins and
+   * the request model is only a fallback. With it on the request wins and the
+   * configured model becomes the default for requests that name none.
+   */
+  /** The Codex catalogue, so new model generations appear without a code change. */
+  async availableModels(): Promise<readonly string[] | null> {
+    const models = await codexModels({
+      command: this.command,
+      codexHome: this.isolation?.homeDir,
+      cwd: this.isolation?.workDir ?? this.cwd,
+      commandCwd: this.cwd,
+    });
+    return models?.map((entry) => entry.slug) ?? null;
+  }
+
+  async resolvedModel(request: NormalizedRequest): Promise<string | null> {
+    const requested = this.explicitRequestModel(request.model);
+    if (this.honorRequestModel) return requested ?? this.configuredModel ?? null;
+    return this.configuredModel ?? requested ?? null;
+  }
+
+  private async modelOverrideFor(
+    request: NormalizedRequest,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const requested = this.explicitRequestModel(request.model);
+    if (this.honorRequestModel) {
+      // Resolve first, then validate what will actually run — including the
+      // configured model when the request names none. `undefined` means no model
+      // is named at all and the CLI's own default applies, so there is nothing to
+      // check against the catalogue.
+      const effective = requested ?? this.configuredModel;
+      if (effective) {
+        await this.assertModelSupported(effective, request, requested !== undefined, signal);
+      }
+      return effective;
     }
-    return requestModel;
+    if (this.configuredModel) return this.configuredModel;
+    return requested;
+  }
+
+  /**
+   * The request model, or undefined when it carries no model choice — which over
+   * HTTP no longer happens: normalization rejects an absent or empty `model`, so
+   * only an internal caller can reach the undefined branch. The backend's own
+   * identifier (`codex-app-server`) is a model name like any other here — never
+   * a sentinel meaning "no model chosen". Whether it is then checked against the
+   * catalogue depends on honouring mode, as for any other model: on, it is; off,
+   * `modelOverrideFor` validates nothing at all.
+   *
+   * A request naming the same model as the configured one is still a choice, not
+   * an omission — otherwise it would skip validation and keep running a model the
+   * served catalogue has since dropped.
+   */
+  private explicitRequestModel(requestModel: string): string | undefined {
+    return requestModel || undefined;
+  }
+
+  private async assertModelSupported(
+    model: string,
+    request: NormalizedRequest,
+    fromRequest: boolean,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    await assertCodexModelSupported(model, request.shape, {
+      command: this.command,
+      codexHome: this.isolation?.homeDir,
+      // The same workspace the app-server turn runs in, so the lookup sees the
+      // configuration the turn will actually use.
+      cwd: this.isolation?.workDir ?? this.cwd,
+      commandCwd: this.cwd,
+      signal,
+    }, fromRequest);
   }
 
   private modelOverrideForCodexImage(): string | undefined {
@@ -1472,12 +1562,6 @@ export function minimalCodexConfigToml(options: {
     'inherit = "none"',
     '',
   ].join('\n');
-}
-
-function sourceCodexHome(): string {
-  return process.env.CODEX_HOME && process.env.CODEX_HOME.trim()
-    ? process.env.CODEX_HOME
-    : join(homedir(), '.codex');
 }
 
 async function copyCodexAuth(sourceHome: string, targetHome: string): Promise<void> {

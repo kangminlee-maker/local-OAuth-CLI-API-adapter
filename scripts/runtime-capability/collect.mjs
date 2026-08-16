@@ -93,7 +93,11 @@ export async function collectClaude() {
     {
       item: '--max-thinking-tokens',
       source: 'Binary scan (deprecated, superseded by --thinking)',
-      requiredProbe: 'Present but deprecated; the adapter does not use it.',
+      requiredProbe: 'Registered and parses ("must be a number") but inert at runtime: '
+        + 'values the direct API rejects (100, 10000000) execute while thinking engages '
+        + '(same for the MAX_THINKING_TOKENS variable). The adapter validates '
+        + 'thinking.budget_tokens for parity and deliberately does not forward it; the '
+        + 'API contract documents the divergence in its thinking row.',
     },
     {
       item: '--teammate-mode',

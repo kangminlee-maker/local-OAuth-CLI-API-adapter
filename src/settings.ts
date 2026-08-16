@@ -12,6 +12,9 @@ export interface AddonSettings {
     readonly fallbackVerbosity: NormalizedVerbosity;
     readonly imageModel: string;
   };
+  readonly modelSelection: {
+    readonly honorRequestModel: boolean;
+  };
 }
 
 const SETTINGS_URL = new URL('../settings.json', import.meta.url);
@@ -57,6 +60,16 @@ export function loadSettings(): AddonSettings {
         'codexProxy.imageModel',
       ),
     },
+    modelSelection: {
+      // Absent means the pre-existing behaviour: the configured model wins and a
+      // request model is never honoured. Installs that predate this key keep
+      // working unchanged.
+      honorRequestModel: readOptionalBooleanSetting(
+        asRecord(root?.modelSelection)?.honorRequestModel,
+        'modelSelection.honorRequestModel',
+        false,
+      ),
+    },
   };
   return cachedSettings;
 }
@@ -79,6 +92,10 @@ export function codexProxyFallbackVerbosity(): NormalizedVerbosity {
 
 export function codexProxyImageModel(): string {
   return loadSettings().codexProxy.imageModel;
+}
+
+export function honorRequestModel(): boolean {
+  return loadSettings().modelSelection.honorRequestModel;
 }
 
 export function isReasoningEffort(value: unknown): value is NormalizedReasoningEffort {
@@ -132,6 +149,16 @@ function readVerbositySetting(
 function readNonEmptyStringSetting(value: unknown, key: string): string {
   if (typeof value === 'string' && value.trim()) return value.trim();
   throw new Error(`${key} must be a non-empty string.`);
+}
+
+function readOptionalBooleanSetting(
+  value: unknown,
+  key: string,
+  fallback: boolean,
+): boolean {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === 'boolean') return value;
+  throw new Error(`${key} must be a boolean.`);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {

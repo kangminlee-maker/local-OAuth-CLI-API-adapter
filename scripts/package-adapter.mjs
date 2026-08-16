@@ -14,6 +14,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { findForbiddenReference } from './package-forbidden-patterns.mjs';
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(scriptDir, '..');
@@ -141,18 +142,10 @@ async function validateExtractedPackage(packageDir) {
     throw new Error('Installable adapter package must not declare runtime dependencies.');
   }
 
-  const forbidden = [
-    legacyBrandPattern(),
-    legacyNamespacePattern(),
-    /link:\.\.\//,
-    new RegExp(escapeRegExp(repoRoot)),
-    /mcp-server/,
-    /ui-gen/,
-  ];
   for await (const filePath of walk(packageDir)) {
     const packageRelativePath = relative(packageDir, filePath);
     const content = await readFile(filePath, 'utf8');
-    const found = forbidden.find((pattern) => pattern.test(content));
+    const found = findForbiddenReference(content, packageRelativePath, repoRoot);
     if (found) {
       throw new Error(`Package file contains forbidden reference ${found}: ${packageRelativePath}`);
     }
@@ -223,17 +216,6 @@ function sectionBetween(text, start, end) {
   return text.slice(contentStart, endIndex === -1 ? undefined : endIndex);
 }
 
-function legacyNamespacePattern() {
-  return new RegExp(`@${'g'}${'gui'}-ai/`);
-}
-
-function legacyBrandPattern() {
-  return new RegExp(`${'g'}${'gui'}`, 'i');
-}
-
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
 
 async function* walk(dir) {
   for (const name of await readdir(dir)) {
