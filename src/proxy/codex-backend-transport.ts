@@ -162,11 +162,29 @@ class CodexBackendStreamState {
   text = '';
   usage?: LocalUsage;
   readonly toolStates = new Map<number, ToolState>();
+  // Chat/Responses tool_call `index` is the position in the tool_calls array,
+  // not the backend output position: a preceding reasoning item shifts
+  // `output_index` (observed on gpt-5.6-terra), and forwarding the raw index
+  // desyncs streamed deltas from the completed result's dense positions.
+  private readonly toolOrdinals = new Map<string, number>();
+  private nextToolOrdinal = 0;
 
   constructor(
     private readonly request: NormalizedRequest,
     private readonly startedAt: number,
   ) {}
+
+  private toolOrdinal(outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
+    const keys = ids.filter((id): id is string => typeof id === 'string');
+    keys.push(`#${outputIndex}`);
+    let ordinal = keys.map((key) => this.toolOrdinals.get(key)).find((found) => found !== undefined);
+    if (ordinal === undefined) {
+      ordinal = this.nextToolOrdinal;
+      this.nextToolOrdinal += 1;
+    }
+    for (const key of keys) this.toolOrdinals.set(key, ordinal);
+    return ordinal;
+  }
 
   push(event: CodexBackendEvent): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
@@ -178,7 +196,7 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
-      const index = readOutputIndex(event);
+      const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
       const id = event.item.call_id ?? event.item.id ?? `call_${index + 1}`;
       const name = event.item.name ?? 'tool';
       const state = this.toolStates.get(index) ?? {
@@ -203,7 +221,10 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
-      const index = readOutputIndex(event);
+      const index = this.toolOrdinal(
+        readOutputIndex(event),
+        typeof event.item_id === 'string' ? event.item_id : undefined,
+      );
       const state = this.toolStates.get(index) ?? {
         id: typeof event.item_id === 'string' ? event.item_id : `call_${index + 1}`,
         name: 'tool',
@@ -232,7 +253,7 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
-      const index = readOutputIndex(event);
+      const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
       const state = this.toolStates.get(index) ?? {
         id: event.item.call_id ?? event.item.id ?? `call_${index + 1}`,
         name: event.item.name ?? 'tool',
@@ -277,9 +298,14 @@ class CodexBackendStreamState {
 
   private captureFinalOutput(output: readonly unknown[] | undefined): void {
     if (!Array.isArray(output)) return;
-    for (const [index, item] of output.entries()) {
+    for (const [outputIndex, item] of output.entries()) {
       const obj = asRecord(item);
       if (obj?.type === 'function_call') {
+        const index = this.toolOrdinal(
+          outputIndex,
+          typeof obj.id === 'string' ? obj.id : undefined,
+          typeof obj.call_id === 'string' ? obj.call_id : undefined,
+        );
         const state = this.toolStates.get(index) ?? {
           id: typeof obj.call_id === 'string' ? obj.call_id : `call_${index + 1}`,
           name: typeof obj.name === 'string' ? obj.name : 'tool',

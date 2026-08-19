@@ -406,6 +406,77 @@ test('CodexBackendTransport streams native function-call argument deltas', async
   assert.equal(events.at(-1).result.usage.source, 'provider');
 });
 
+test('tool_call_delta index stays dense when a reasoning item shifts output_index', async () => {
+  // Captured from gpt-5.6-terra (2026-08-19): a reasoning output item occupies
+  // output_index 0, the function call arrives at output_index 1, and the final
+  // response.completed output carries no function_call item. Forwarding the raw
+  // output_index desynced streamed deltas (index 1) from the completed result's
+  // dense positions (index 0), so the server re-emitted the full arguments.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { type: 'reasoning', id: 'rs_1' },
+    },
+    {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: { type: 'reasoning', id: 'rs_1' },
+    },
+    {
+      type: 'response.output_item.added',
+      output_index: 1,
+      item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' },
+    },
+    {
+      type: 'response.function_call_arguments.delta',
+      output_index: 1,
+      item_id: 'fc_1',
+      delta: '{"city"',
+    },
+    {
+      type: 'response.function_call_arguments.delta',
+      output_index: 1,
+      item_id: 'fc_1',
+      delta: ':"Seoul"}',
+    },
+    {
+      type: 'response.function_call_arguments.done',
+      output_index: 1,
+      item_id: 'fc_1',
+    },
+    {
+      type: 'response.output_item.done',
+      output_index: 1,
+      item: {
+        type: 'function_call',
+        id: 'fc_1',
+        call_id: 'call_1',
+        name: 'get_weather',
+        arguments: '{"city":"Seoul"}',
+      },
+    },
+    {
+      type: 'response.completed',
+      response: { id: 'resp_terra_tool', model: 'gpt-5.6-terra', output: [] },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const toolEvents = events.filter((event) => event.type === 'tool_call_delta');
+  assert.ok(toolEvents.length > 0);
+  for (const event of toolEvents) assert.equal(event.index, 0);
+  assert.equal(toolEvents.map((event) => event.argumentsDelta).join(''), '{"city":"Seoul"}');
+  const result = events.at(-1).result;
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].id, 'call_1');
+  assert.equal(result.toolCalls[0].arguments, '{"city":"Seoul"}');
+});
+
 test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
   // The contract exempts `/v1/images/*` from the switch: the request `model` is
   // an Images route selector (`image-2`), not a Codex slug. Honouring it would
