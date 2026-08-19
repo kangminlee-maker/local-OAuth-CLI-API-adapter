@@ -3164,6 +3164,17 @@ async function semanticReference(kind, target, index, prompt, options = {}) {
   return value;
 }
 
+/**
+ * The relative gate scores the candidate AGAINST this text, so an empty
+ * reference makes the comparison vacuous and inflates the result — measured
+ * 2026-08-19: one mediocre candidate scored 65 against an empty reference and
+ * 45 against a real one. A reference that says nothing is a reference-
+ * availability failure, not evidence about the proxy.
+ */
+function assertUsableReference(text, target) {
+  assert(typeof text === 'string' && text.trim().length > 0, `empty semantic reference from ${target}`);
+}
+
 async function safeSemanticReference(kind, target, index, prompt, options = {}) {
   try {
     return {
@@ -3215,10 +3226,12 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
       max_output_tokens: 1536,
     }, openAiHeaders(true));
     assertOpenAiResponsesShape(response.body);
+    const text = extractOpenAiResponseText(response.body) ?? '';
+    assertUsableReference(text, `openai-api:${openAiModel}:responses`);
     return {
       target: `openai-api:${openAiModel}:responses`,
       totalMs: response.totalMs,
-      text: extractOpenAiResponseText(response.body) ?? '',
+      text,
       usage: response.body.usage,
     };
   }
@@ -3231,10 +3244,12 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
   if (options.openAiReasoningEffort) body.reasoning_effort = options.openAiReasoningEffort;
   const response = await postJson('https://api.openai.com/v1/chat/completions', body, openAiHeaders(true));
   assertOpenAiChatResponseShape(response.body, 'stop');
+  const text = response.body.choices?.[0]?.message?.content ?? '';
+  assertUsableReference(text, `openai-api:${openAiModel}:chat`);
   return {
     target: `openai-api:${openAiModel}:chat`,
     totalMs: response.totalMs,
-    text: response.body.choices?.[0]?.message?.content ?? '',
+    text,
     usage: response.body.usage,
   };
 }
@@ -3246,10 +3261,12 @@ async function fetchAnthropicSemanticReference(prompt) {
     messages: [{ role: 'user', content: prompt }],
   }, anthropicHeaders(true));
   assertAnthropicMessageShape(response.body, 'end_turn');
+  const text = response.body.content?.find((block) => block.type === 'text')?.text ?? '';
+  assertUsableReference(text, `anthropic-api:${anthropicModels.opus}`);
   return {
     target: `anthropic-api:${anthropicModels.opus}`,
     totalMs: response.totalMs,
-    text: response.body.content?.find((block) => block.type === 'text')?.text ?? '',
+    text,
     usage: response.body.usage,
   };
 }
