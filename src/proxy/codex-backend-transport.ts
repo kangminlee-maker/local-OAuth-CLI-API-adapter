@@ -174,16 +174,53 @@ class CodexBackendStreamState {
     private readonly startedAt: number,
   ) {}
 
+  /**
+   * The ordinal for a tool call seen in the STREAM, keyed by item id with the
+   * stream's own `output_index` as fallback. Argument deltas arrive once per
+   * token, so a known id resolves before anything is allocated.
+   */
   private toolOrdinal(outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
-    const keys = ids.filter((id): id is string => typeof id === 'string');
-    keys.push(`#${outputIndex}`);
-    let ordinal = keys.map((key) => this.toolOrdinals.get(key)).find((found) => found !== undefined);
+    for (const id of ids) {
+      if (typeof id === 'string') {
+        const known = this.toolOrdinals.get(id);
+        if (known !== undefined) return known;
+      }
+    }
+    const positionKey = `#${outputIndex}`;
+    let ordinal = this.toolOrdinals.get(positionKey);
     if (ordinal === undefined) {
       ordinal = this.nextToolOrdinal;
       this.nextToolOrdinal += 1;
+      this.toolOrdinals.set(positionKey, ordinal);
     }
-    for (const key of keys) this.toolOrdinals.set(key, ordinal);
+    for (const id of ids) {
+      if (typeof id === 'string') this.toolOrdinals.set(id, ordinal);
+    }
     return ordinal;
+  }
+
+  /**
+   * The ordinal for a tool call seen in the COMPLETED output, which is a
+   * different coordinate system: its positions count function calls in an array
+   * that also holds reasoning and message items, while the stream's
+   * `output_index` counts every item. Feeding an array position into the
+   * stream's positional keyspace mints a second ordinal for a call already
+   * streamed, so an id-less final item would duplicate its own tool call.
+   * Without an id, the dense function-call position is what the stream ordinals
+   * already mean.
+   */
+  private finalOutputOrdinal(position: number, ...ids: ReadonlyArray<string | undefined>): number {
+    for (const id of ids) {
+      if (typeof id === 'string') {
+        const known = this.toolOrdinals.get(id);
+        if (known !== undefined) return known;
+      }
+    }
+    for (const id of ids) {
+      if (typeof id === 'string') this.toolOrdinals.set(id, position);
+    }
+    if (position >= this.nextToolOrdinal) this.nextToolOrdinal = position + 1;
+    return position;
   }
 
   push(event: CodexBackendEvent): LocalStreamEvent[] {
@@ -298,14 +335,16 @@ class CodexBackendStreamState {
 
   private captureFinalOutput(output: readonly unknown[] | undefined): void {
     if (!Array.isArray(output)) return;
-    for (const [outputIndex, item] of output.entries()) {
+    let functionCallPosition = 0;
+    for (const item of output) {
       const obj = asRecord(item);
       if (obj?.type === 'function_call') {
-        const index = this.toolOrdinal(
-          outputIndex,
+        const index = this.finalOutputOrdinal(
+          functionCallPosition,
           typeof obj.id === 'string' ? obj.id : undefined,
           typeof obj.call_id === 'string' ? obj.call_id : undefined,
         );
+        functionCallPosition += 1;
         const state = this.toolStates.get(index) ?? {
           id: typeof obj.call_id === 'string' ? obj.call_id : `call_${index + 1}`,
           name: typeof obj.name === 'string' ? obj.name : 'tool',

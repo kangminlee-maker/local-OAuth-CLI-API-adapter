@@ -67,6 +67,11 @@ async function proxy(args: readonly string[]): Promise<number> {
   if (runtimeName !== 'claude' && isolateUserSettings) {
     throw new Error('--isolate-user-settings can only be selected with --runtime claude.');
   }
+  // Extra args are appended last and win, so this pair would start a proxy that
+  // reports isolation while loading the settings it promised to keep out.
+  if (isolateUserSettings && (options.extraArg ?? []).some((arg) => arg === '--setting-sources' || arg.startsWith('--setting-sources='))) {
+    throw new Error('--isolate-user-settings conflicts with --extra-arg --setting-sources: the extra arg would override the isolation.');
+  }
   const cwd = options.cwd ?? process.cwd();
   const backend: LocalCliBackend = runtimeName === 'claude'
     ? new ClaudeCodeBackend({
@@ -133,6 +138,11 @@ async function proxy(args: readonly string[]): Promise<number> {
   process.stdout.write(`  auth: ${authGateStatus(authKey)}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexTransport: ${selectedCodexTransport}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexImageTransport: ${selectedCodexImageTransport}\n`);
+  // Stated for both values: the default runs operator hooks per API turn, and a
+  // mistyped flag would otherwise leave that on with nothing contradicting it.
+  if (runtimeName === 'claude') {
+    process.stdout.write(`  userSettings: ${isolateUserSettings ? 'isolated (no setting sources)' : 'loaded (user source: CLAUDE.md, hooks, env, permissions)'}\n`);
+  }
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
   process.stdout.write(`  openai: OPENAI_BASE_URL=${started.url}/v1\n`);
   process.stdout.write(`  anthropic: ANTHROPIC_BASE_URL=${started.url}\n`);

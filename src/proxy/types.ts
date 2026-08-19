@@ -202,6 +202,15 @@ export interface OpenAiImageGenerationClient {
 export type LocalStreamEvent =
   | { readonly type: 'text_delta'; readonly delta: string }
   | {
+      /**
+       * `index` is the tool call's DENSE position among the tool calls of this
+       * turn — the same position it will hold in the completed result's
+       * `toolCalls` array — never a backend output position. The server pairs
+       * streamed deltas with the completed result by this index and re-emits
+       * any arguments it thinks were not sent, so a backend that forwards a raw
+       * upstream index (one that also counts reasoning or message items) makes
+       * the client receive the arguments twice.
+       */
       readonly type: 'tool_call_delta';
       readonly index: number;
       readonly id?: string;

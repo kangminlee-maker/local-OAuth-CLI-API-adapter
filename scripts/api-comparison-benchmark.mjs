@@ -194,6 +194,25 @@ const imageQualityRepeats = countOption(options.imageQualityRepeats, suiteDefaul
 const cwd = options.cwd ?? process.cwd();
 const openAiModel = options.openaiModel ?? 'gpt-5.5';
 const openAiImageApiModel = options.openaiImageApiModel ?? 'gpt-image-1.5';
+const codexImageModel = options.codexImageModel ?? codexProxyImageModel();
+
+/**
+ * Fields that decide what a row MEANS rather than how it scored. A baseline
+ * captured under a different value is a different basis, so its deltas are not
+ * evidence — silence there is what lets a real regression hide inside a
+ * config difference.
+ */
+const COMPARISON_BASIS_FIELDS = [
+  'openAiModel',
+  'openAiImageApiModel',
+  'codexModel',
+  'codexImageModel',
+  'claudeCliModel',
+  'claudeIsolateUserSettings',
+  'semanticQualityJudgeModel',
+  'semanticQualitySuite',
+  'codexProxyMode',
+];
 const anthropicModels = {
   opus: options.anthropicOpusModel ?? 'claude-opus-4-8',
   haiku: options.anthropicHaikuModel ?? 'claude-haiku-4-5-20251001',
@@ -205,7 +224,11 @@ const openAiApiTarget = `openai-api:${openAiModel}`;
 const imageGenerationPairTarget = `proxy-codex-vs-openai-api:${openAiModel}`;
 // Recorded in the summary: isolation changes the proxied session's context, so
 // a baseline comparison across a differing value is not a like-for-like basis.
-const claudeIsolateUserSettings = booleanOption(options.claudeIsolateUserSettings, false);
+const claudeIsolateUserSettings = strictBooleanOption(
+  options.claudeIsolateUserSettings,
+  false,
+  '--claude-isolate-user-settings',
+);
 const outputPath = options.output;
 const baselinePath = options.baseline;
 const regressionTargets = options.regressionTargets ?? 'proxy';
@@ -251,7 +274,7 @@ try {
     });
     const proxyCodexImageBackend = selectedCodexImageTransport === 'codex-backend'
       ? new CodexBackendTransport({
-          model: options.codexImageModel ?? codexProxyImageModel(),
+          model: codexImageModel,
           timeoutMs,
           ...(codexImageAttemptDiagnosticsEnabled
             ? { onImageAttempt: (diagnostic) => recordImageAttemptDiagnostic('proxy-codex', diagnostic) }
@@ -260,7 +283,7 @@ try {
       : new CodexAppServerBackend({
           command: options.codexCommand,
           cwd,
-          model: options.codexImageModel ?? codexProxyImageModel(),
+          model: codexImageModel,
           timeoutMs,
           imageGeneration: true,
           proxyMode: codexProxyMode,
@@ -336,7 +359,9 @@ try {
         await benchmarkAnthropicCompatible(`anthropic-api:${model}`, 'https://api.anthropic.com', model, true);
       }
     }
-  } else if (Object.keys(anthropicModels).some((family) => shouldRunTarget(`anthropic-api:${family}`))) {
+    // Same selector as the run branch: a model-name target with no key must
+    // still record a skip, or the run reports success with no Anthropic rows.
+  } else if (Object.entries(anthropicModels).some(([family, model]) => shouldRunTarget(`anthropic-api:${family}`) || shouldRunTarget(`anthropic-api:${model}`))) {
     rows.push({ target: 'anthropic-api', ok: false, skipped: true, error: 'ANTHROPIC_API_KEY missing' });
   }
 } finally {
@@ -376,7 +401,11 @@ const summaryBase = {
   includeImageGeneration,
   openAiModel,
   openAiImageApiModel,
-  codexImageModel: options.codexImageModel ?? codexProxyImageModel(),
+  codexImageModel,
+  // The proxy-side models decide what the proxy rows measure, so they belong in
+  // the artifact next to the direct-side ones.
+  codexModel: options.codexBackendModel ?? options.codexModel ?? null,
+  claudeCliModel: options.claudeCliModel ?? 'opus',
   claudeIsolateUserSettings,
   anthropicModels,
   passed: rows.length - failed.length,
@@ -396,6 +425,10 @@ const summary = {
   ...(imageAttemptDiagnostics.length > 0 ? { imageAttemptDiagnostics } : {}),
   ...(regressionGate ? { regressionGate } : {}),
 };
+if (regressionGate?.basisMismatch) {
+  // Loud, because the deltas printed below look like findings and are not.
+  console.error(`\nBASELINE BASIS MISMATCH — regression deltas are not comparable: ${JSON.stringify(regressionGate.basisMismatch)}`);
+}
 if (outputPath) {
   fs.writeFileSync(outputPath, `${JSON.stringify(summary, null, 2)}\n`);
 }
@@ -3378,9 +3411,11 @@ function assertSemanticQualityShape(value) {
     assert(Number.isInteger(value[key]), `semantic judge ${key} must be integer`);
     assert(value[key] >= 0 && value[key] <= 100, `semantic judge ${key} must be 0..100`);
   }
-  // relativeQuality may exceed 100: the candidate can beat the reference.
+  // relativeQuality may exceed 100: the candidate can beat the reference, and
+  // the gate only reads a minimum — capping it here would turn a judge that
+  // over-scores into a proxy quality failure, which is the wrong blame.
   assert(Number.isInteger(value.relativeQuality), 'semantic judge relativeQuality must be integer');
-  assert(value.relativeQuality >= 0 && value.relativeQuality <= 200, 'semantic judge relativeQuality must be 0..200');
+  assert(value.relativeQuality >= 0, 'semantic judge relativeQuality must be non-negative');
   assert(typeof value.rationale === 'string', 'semantic judge rationale must be string');
   assert(Array.isArray(value.issues), 'semantic judge issues must be array');
   for (const issue of value.issues) {
@@ -3632,7 +3667,27 @@ function loadSummaryFile(path) {
   return JSON.parse(markerIndex === -1 ? text : text.slice(markerIndex + marker.length));
 }
 
+
+function basisMismatches(baseline, current) {
+  const mismatches = [];
+  for (const field of COMPARISON_BASIS_FIELDS) {
+    const before = baseline?.[field];
+    const after = current?.[field];
+    if (before === undefined && after === undefined) continue;
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      mismatches.push({ field, baseline: before ?? null, current: after ?? null });
+    }
+  }
+  const beforeAnthropic = JSON.stringify(baseline?.anthropicModels ?? null);
+  const afterAnthropic = JSON.stringify(current?.anthropicModels ?? null);
+  if (beforeAnthropic !== afterAnthropic) {
+    mismatches.push({ field: 'anthropicModels', baseline: baseline?.anthropicModels ?? null, current: current?.anthropicModels ?? null });
+  }
+  return mismatches;
+}
+
 function compareWithBaseline(baseline, current, options) {
+  const basisDrift = basisMismatches(baseline, current);
   const baselineRows = new Map(
     (baseline.rows ?? [])
       .filter((row) => row?.ok)
@@ -3671,7 +3726,9 @@ function compareWithBaseline(baseline, current, options) {
       if (delta > threshold) regressions.push(entry);
       else if (delta < -threshold) improvements.push(entry);
     }
-    for (const metric of ['quality', 'semanticQuality', 'imageQuality']) {
+    // semanticRelativeQuality is the metric the gate reads, so a baseline that
+    // does not compare it cannot see the authoritative quality drift.
+    for (const metric of ['quality', 'semanticQuality', 'semanticRelativeQuality', 'imageQuality']) {
       const qualityBefore = medianOf(baselineRow[metric]);
       const qualityAfter = medianOf(row[metric]);
       if (!Number.isFinite(qualityBefore) || !Number.isFinite(qualityAfter)) continue;
@@ -3698,6 +3755,9 @@ function compareWithBaseline(baseline, current, options) {
     qualityRegressionPoints: options.qualityRegressionPoints,
     compared: compared.length,
     skipped: skipped.length,
+    // Present only when the two runs were not measuring the same thing; the
+    // deltas below are then differences in configuration, not in behaviour.
+    ...(basisDrift.length > 0 ? { basisMismatch: basisDrift } : {}),
     regressions,
     improvements,
   };
@@ -3887,6 +3947,14 @@ function booleanOption(value, fallback) {
   if (value === true || value === 'true' || value === '1' || value === 'yes') return true;
   if (value === false || value === 'false' || value === '0' || value === 'no') return false;
   return fallback;
+}
+
+/** Like booleanOption, but an unparsable value is an error rather than the fallback. */
+function strictBooleanOption(value, fallback, flag) {
+  if (value === undefined) return fallback;
+  const parsed = booleanOption(value, undefined);
+  if (parsed === undefined) throw new Error(`${flag} expects true/false, got: ${value}`);
+  return parsed;
 }
 
 function reasoningEffort(value) {

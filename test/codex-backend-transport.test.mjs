@@ -477,6 +477,47 @@ test('tool_call_delta index stays dense when a reasoning item shifts output_inde
   assert.equal(result.toolCalls[0].arguments, '{"city":"Seoul"}');
 });
 
+test('an id-less completed function_call does not duplicate a call already streamed', async () => {
+  // The completed output is its own coordinate system: it counts function calls
+  // in an array that also holds reasoning items, while the stream's
+  // output_index counts every item. Feeding an array position into the stream's
+  // positional keyspace minted a second ordinal for the same call, so the
+  // result carried the tool call twice and the server re-emitted its arguments.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    {
+      type: 'response.output_item.added',
+      output_index: 1,
+      item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' },
+    },
+    {
+      type: 'response.function_call_arguments.delta',
+      output_index: 1,
+      item_id: 'fc_1',
+      delta: '{"city":"Seoul"}',
+    },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_idless_final',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const toolCalls = events.at(-1).result.toolCalls;
+  assert.equal(toolCalls.length, 1, `expected one tool call, got ${JSON.stringify(toolCalls)}`);
+  assert.equal(toolCalls[0].arguments, '{"city":"Seoul"}');
+  for (const event of events.filter((e) => e.type === 'tool_call_delta')) {
+    assert.equal(event.index, 0);
+  }
+});
+
 test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
   // The contract exempts `/v1/images/*` from the switch: the request `model` is
   // an Images route selector (`image-2`), not a Codex slug. Honouring it would
