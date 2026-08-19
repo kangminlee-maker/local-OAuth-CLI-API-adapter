@@ -68,6 +68,7 @@ async function proxy(args: readonly string[]): Promise<number> {
         model: options.model,
         timeoutMs,
         extraArgs: options.extraArg,
+        isolateUserSettings: options.isolateUserSettings === 'true',
       })
     : createCodexBackend({
         transport: selectedCodexTransport,
@@ -159,6 +160,7 @@ interface ParsedOptions {
   readonly transport?: string;
   readonly acceptLlmGuide?: string;
   readonly authKey?: string;
+  readonly isolateUserSettings?: string;
 }
 
 export function parseOptions(args: readonly string[]): ParsedOptions {
@@ -340,6 +342,9 @@ Options:
   --command <path>                   Override CLI binary path.
   --model <model>                    Pass a model to the selected CLI.
   --extra-arg <arg>                  Extra CLI arg, repeatable.
+  --isolate-user-settings            Claude runtime: load no CLI setting sources, so the
+                                     operator's global CLAUDE.md never enters proxied
+                                     sessions. Default: off (user settings load).
   --port <number>                    Server port. Default: 8787.
   --host <host>                      Server host. Default: 127.0.0.1.
   --timeout-ms <number>              Runtime timeout. Default: 180000.

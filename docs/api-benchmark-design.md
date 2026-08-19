@@ -49,7 +49,7 @@ Cross-provider semantic references are not valid benchmark authority: `proxy-cod
 Provider가 모델 세대별로 문서화한 호출 규약은 프롬프트 최적화가 아니라 API 표면의 일부이므로 벤치 row 정의에 반영한다. 반영은 항상 페어 양쪽에 동일하게 적용한다.
 
 - gpt-5.6 계열은 `/v1/chat/completions`에서 function tools 사용 시 `reasoning_effort: 'none'`을 요구한다(`/v1/responses`는 reasoning과 tools 동시 지원). chat tool rows는 이 규약대로 `reasoning_effort: 'none'`을 보낸다 — gpt-5.5에서도 유효한 일반 규칙이다.
-- 미결 설계 결정: 규약 위반 요청(5.6 + chat tools + effort 미지정)을 direct는 400으로 거절하지만 proxy는 Responses 변환 경로라 통과시킨다. proxy가 이 오류 표면을 미러링할지는 runtime 설계 결정으로 남아 있다(error-parity negative row는 결정 후 추가).
+- 규약 위반 요청(5.6 + chat tools + effort 미지정)은 direct가 400으로 거절하지만 proxy는 Responses 변환 경로라 성공시킨다. 이 관대함은 문서화된 proxy-enhanced 동작으로 유지한다(2026-08-19 결정, `docs/api-interface-contract.md` 구현 차이 표 참조) — provider parity row가 아니므로 error-parity negative row는 두지 않는다.
 - family-5 Anthropic 모델은 응답이 길어 구세대 기준 fixture 토큰 예산에 잘린다. multimodal rows와 semantic reference의 max tokens는 완주 가능한 상한으로 유지한다(현재 256/2048; 상한 완화는 완주하던 행에 영향이 없다).
 
 If a direct semantic reference fails, the benchmark records `referenceErrors` and fails that row as a reference-availability problem rather than treating it as proxy output quality. This distinction matters for provider `max_tokens` failures: `max_tokens` is the per-request output cap, not subscription or credit exhaustion.

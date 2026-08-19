@@ -292,6 +292,7 @@ try {
       cwd,
       model: options.claudeCliModel ?? 'opus',
       timeoutMs,
+      isolateUserSettings: booleanOption(options.claudeIsolateUserSettings, false),
     }));
   }
 

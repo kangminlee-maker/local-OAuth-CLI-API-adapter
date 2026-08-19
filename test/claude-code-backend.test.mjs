@@ -304,6 +304,27 @@ function anthropicTuningRequest(overrides) {
   };
 }
 
+test('default: the user setting source loads', async () => {
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+  );
+  const i = argv.indexOf('--setting-sources');
+  assert.ok(i !== -1, `expected --setting-sources in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], 'user');
+});
+
+test('isolateUserSettings loads no setting source, so the operator CLAUDE.md stays out', async () => {
+  const argv = await spawnedArgv(
+    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
+    'claude-opus-4-8',
+    { isolateUserSettings: true },
+  );
+  const i = argv.indexOf('--setting-sources');
+  assert.ok(i !== -1, `expected --setting-sources in argv: ${argv.join(' ')}`);
+  assert.equal(argv[i + 1], '');
+});
+
 test('honorRequestModel off: the request model never reaches --model', async () => {
   const argv = await spawnedArgv(
     anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
