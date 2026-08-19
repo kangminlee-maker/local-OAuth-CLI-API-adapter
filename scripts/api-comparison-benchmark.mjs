@@ -44,8 +44,6 @@ const imageGenerationCaseNames = {
 
 const imageGenerationSuiteCaseNames = Object.values(imageGenerationCaseNames)
   .filter((caseName) => caseName !== imageGenerationCaseNames.generationStreamPaired);
-const openAiApiTarget = 'openai-api:gpt-5.5';
-const imageGenerationPairTarget = 'proxy-codex-vs-openai-api:gpt-5.5';
 const originalFetch = globalThis.fetch.bind(globalThis);
 let currentBenchmarkContext = null;
 let activeProxyProviderEgressGuard = null;
@@ -200,6 +198,11 @@ const anthropicModels = {
   opus: options.anthropicOpusModel ?? 'claude-opus-4-8',
   haiku: options.anthropicHaikuModel ?? 'claude-haiku-4-5-20251001',
 };
+// Row labels carry the model that actually ran, so artifacts self-describe.
+// Target selection matches by substring, so `--targets=openai-api` selects the
+// direct target regardless of the model override.
+const openAiApiTarget = `openai-api:${openAiModel}`;
+const imageGenerationPairTarget = `proxy-codex-vs-openai-api:${openAiModel}`;
 const outputPath = options.output;
 const baselinePath = options.baseline;
 const regressionTargets = options.regressionTargets ?? 'proxy';
@@ -324,9 +327,9 @@ try {
   if (proxyClaude) await benchmarkAnthropicCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   if (process.env.ANTHROPIC_API_KEY) {
     for (const [family, model] of Object.entries(anthropicModels)) {
-      const target = `anthropic-api:${family}`;
-      if (shouldRunTarget(target)) {
-        await benchmarkAnthropicCompatible(target, 'https://api.anthropic.com', model, true);
+      // Select by family alias or by model name; label rows with the model that ran.
+      if (shouldRunTarget(`anthropic-api:${family}`) || shouldRunTarget(`anthropic-api:${model}`)) {
+        await benchmarkAnthropicCompatible(`anthropic-api:${model}`, 'https://api.anthropic.com', model, true);
       }
     }
   } else if (Object.keys(anthropicModels).some((family) => shouldRunTarget(`anthropic-api:${family}`))) {
@@ -369,6 +372,7 @@ const summaryBase = {
   includeImageGeneration,
   openAiModel,
   openAiImageApiModel,
+  codexImageModel: options.codexImageModel ?? codexProxyImageModel(),
   anthropicModels,
   passed: rows.length - failed.length,
   failed: failed.length,
@@ -506,6 +510,9 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
       messages: [{ role: 'user', content: 'Use get_weather for Seoul. Return a tool call only.' }],
       tools: [openAiChatWeatherTool()],
       tool_choice: 'required',
+      // gpt-5.6+ rejects function tools on /v1/chat/completions unless
+      // reasoning_effort is 'none'; sent to both sides to keep the pair identical.
+      reasoning_effort: 'none',
       max_completion_tokens: 128,
     }, openAiHeaders(isApi));
     assertOpenAiChatResponseShape(response.body, 'tool_calls');
@@ -524,6 +531,9 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
       messages: [{ role: 'user', content: 'Use get_weather for Seoul. Return a tool call only.' }],
       tools: [openAiChatWeatherTool()],
       tool_choice: 'required',
+      // gpt-5.6+ rejects function tools on /v1/chat/completions unless
+      // reasoning_effort is 'none'; sent to both sides to keep the pair identical.
+      reasoning_effort: 'none',
       max_completion_tokens: 128,
     }, openAiHeaders(isApi), () => '', (_event, payload) => {
       const calls = payload?.choices?.[0]?.delta?.tool_calls;
@@ -552,6 +562,7 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
       ],
       tools: [openAiChatWeatherTool()],
       tool_choice: 'auto',
+      reasoning_effort: 'none',
       max_completion_tokens: 128,
     }, openAiHeaders(isApi));
     assertOpenAiChatResponseShape(response.body, 'stop');
@@ -1889,7 +1900,7 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
     await benchmarkCase(target, 'anthropic.messages.image.schema_exact', repeats, async () => {
       const response = await postJson(`${baseUrl}/v1/messages`, {
         model,
-        max_tokens: 32,
+        max_tokens: 256,
         messages: [{
           role: 'user',
           content: [
@@ -1914,7 +1925,7 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
     await benchmarkCase(target, 'anthropic.messages.multi_image.schema_exact', repeats, async () => {
       const response = await postJson(`${baseUrl}/v1/messages`, {
         model,
-        max_tokens: 32,
+        max_tokens: 256,
         messages: [{
           role: 'user',
           content: [
@@ -2068,6 +2079,10 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
   };
   const semanticScores = samples.map((sample) => sample.semanticQuality?.score).filter(Number.isFinite);
   if (semanticScores.length > 0) row.semanticQuality = summarize(semanticScores);
+  const relativeScores = samples
+    .map((sample) => sample.semanticQuality?.relativeQuality ?? sample.semanticQuality?.score)
+    .filter(Number.isFinite);
+  if (relativeScores.length > 0) row.semanticRelativeQuality = summarize(relativeScores);
   const judgeMs = samples.map((sample) => sample.judgeMs).filter(Number.isFinite);
   if (judgeMs.length > 0) row.judgeMs = summarize(judgeMs);
   const backendTiming = summarizeBackendTimings(samples);
@@ -2080,10 +2095,14 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
     row.ok = false;
     row.error = `semantic reference failed: ${referenceErrors[0]}`;
   }
-  const lowestSemanticScore = Math.min(...semanticScores);
-  if (row.ok && semanticScores.length > 0 && minSemanticQuality > 0 && lowestSemanticScore < minSemanticQuality) {
+  // The gate is relative to the same-model direct reference: minSemanticQuality
+  // means "at least N% of the reference's quality for this request", not an
+  // absolute exam score. Absolute scores stay recorded for diagnosis.
+  const lowestRelative = Math.min(...relativeScores);
+  if (row.ok && relativeScores.length > 0 && minSemanticQuality > 0 && lowestRelative < minSemanticQuality) {
     row.ok = false;
-    row.error = `semantic quality below ${minSemanticQuality}: ${lowestSemanticScore}`;
+    const lowestAbsolute = semanticScores.length > 0 ? Math.min(...semanticScores) : null;
+    row.error = `semantic quality below ${minSemanticQuality}: relative ${lowestRelative}${lowestAbsolute === null ? '' : ` (absolute ${lowestAbsolute})`}`;
   }
   rows.push(row);
 }
@@ -3186,7 +3205,9 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
     const response = await postJson('https://api.openai.com/v1/responses', {
       model: openAiModel,
       input: prompt,
-      max_output_tokens: 640,
+      // Reference validity cap, not a quality target: newer/more verbose model
+      // generations must finish naturally or the row loses its reference.
+      max_output_tokens: 1536,
     }, openAiHeaders(true));
     assertOpenAiResponsesShape(response.body);
     return {
@@ -3200,7 +3221,7 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
   const body = {
     model: openAiModel,
     messages: [{ role: 'user', content: prompt }],
-    max_completion_tokens: 640,
+    max_completion_tokens: 1536,
   };
   if (options.openAiReasoningEffort) body.reasoning_effort = options.openAiReasoningEffort;
   const response = await postJson('https://api.openai.com/v1/chat/completions', body, openAiHeaders(true));
@@ -3216,7 +3237,7 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
 async function fetchAnthropicSemanticReference(prompt) {
   const response = await postJson('https://api.anthropic.com/v1/messages', {
     model: anthropicModels.opus,
-    max_tokens: 1024,
+    max_tokens: 2048,
     messages: [{ role: 'user', content: prompt }],
   }, anthropicHeaders(true));
   assertAnthropicMessageShape(response.body, 'end_turn');
@@ -3289,6 +3310,7 @@ function semanticJudgePrompt({ target, caseName, prompt, text, reference }) {
       '- semanticRelevance: usefulness, correctness, and operational value for the requested local OAuth CLI API proxy scenario.',
       '- conciseness: dense, non-fluffy, and no extra headings, caveats, or follow-up questions unless the request asks for them.',
       '- providerSimilarity: if a reference is present, semantic similarity to the direct provider output; otherwise plausibility as a direct provider API answer.',
+      '- relativeQuality: how well the candidate satisfies the original request RELATIVE to how well the reference satisfies it, as an integer percentage. 100 = meaningfully equivalent, above 100 = clearly better than the reference, below 100 = worse. Judge task outcome, not stylistic identity: a candidate that satisfies the request as fully as the reference scores 100 even when phrased differently. When no reference is present, set relativeQuality equal to score.',
       'Do not reward reference similarity when both the reference and candidate violate the explicit original request.',
       'Do not treat the reference as a style template when the candidate better satisfies the original request.',
       'For improvement-direction table cells, accept compact concrete mechanisms when they clearly express the direction and keep impact size separate.',
@@ -3304,6 +3326,7 @@ function semanticQualityScoreSchema() {
     additionalProperties: false,
     properties: {
       score: { type: 'integer' },
+      relativeQuality: { type: 'integer' },
       requirementFit: { type: 'integer' },
       semanticRelevance: { type: 'integer' },
       conciseness: { type: 'integer' },
@@ -3316,6 +3339,7 @@ function semanticQualityScoreSchema() {
     },
     required: [
       'score',
+      'relativeQuality',
       'requirementFit',
       'semanticRelevance',
       'conciseness',
@@ -3332,6 +3356,9 @@ function assertSemanticQualityShape(value) {
     assert(Number.isInteger(value[key]), `semantic judge ${key} must be integer`);
     assert(value[key] >= 0 && value[key] <= 100, `semantic judge ${key} must be 0..100`);
   }
+  // relativeQuality may exceed 100: the candidate can beat the reference.
+  assert(Number.isInteger(value.relativeQuality), 'semantic judge relativeQuality must be integer');
+  assert(value.relativeQuality >= 0 && value.relativeQuality <= 200, 'semantic judge relativeQuality must be 0..200');
   assert(typeof value.rationale === 'string', 'semantic judge rationale must be string');
   assert(Array.isArray(value.issues), 'semantic judge issues must be array');
   for (const issue of value.issues) {
