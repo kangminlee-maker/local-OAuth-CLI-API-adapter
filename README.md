@@ -181,6 +181,7 @@ OpenAI or Anthropic APIs.
 | Model execution | Governed by `modelSelection.honorRequestModel`; see Model Selection above. Off, execution is runtime-dependent with no existence check; on, the request model executes and an unrunnable one is a 404 `model_not_found`, never a silent replacement. |
 | Thinking budget | Anthropic `thinking.budget_tokens` is validated to the direct domain (required for `enabled`, integer ≥ 1024, `< max_tokens`) but not forwarded: the local runtime governs its own thinking budget. |
 | Context | Codex proxy runs with isolated home/workspace settings so ambient project context does not leak into API requests. |
+| Claude user settings | By default the Claude runtime loads your `user` settings into every spawned child, so your global CLAUDE.md enters each request's context and your configured hooks run once per API turn. Start the proxy with `--isolate-user-settings` to load no setting source instead (keychain OAuth still works; credentials supplied through the settings file do not). |
 | Codex transport | `codexProxy.transport` defaults to `codex-backend`; text/tool uses ChatGPT Codex backend directly. |
 | Codex image transport | `codexProxy.imageTransport` defaults to `codex-backend`; Images API uses backend `image_generation` tool results, while native chat uses app-server. |
 | Images `image-2` | Implemented through the local Codex `gpt-5.5` image-generation route. |

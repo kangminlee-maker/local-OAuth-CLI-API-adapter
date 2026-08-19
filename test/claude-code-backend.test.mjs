@@ -304,26 +304,32 @@ function anthropicTuningRequest(overrides) {
   };
 }
 
-test('default: the user setting source loads', async () => {
-  const argv = await spawnedArgv(
-    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
-    'claude-opus-4-8',
-  );
-  const i = argv.indexOf('--setting-sources');
-  assert.ok(i !== -1, `expected --setting-sources in argv: ${argv.join(' ')}`);
-  assert.equal(argv[i + 1], 'user');
-});
+// Both spawn paths carry the setting sources: `effort` routes to the one-shot
+// child, a plain request to the persistent one, which serves ordinary text
+// turns — the hot path, and the one a value-only regression would hide in.
+const ONE_SHOT = anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' });
+const PERSISTENT = anthropicTuningRequest({ model: 'claude-sonnet-5' });
 
-test('isolateUserSettings loads no setting source, so the operator CLAUDE.md stays out', async () => {
-  const argv = await spawnedArgv(
-    anthropicTuningRequest({ model: 'claude-sonnet-5', effort: 'low' }),
-    'claude-opus-4-8',
-    { isolateUserSettings: true },
-  );
+function settingSourcesIn(argv) {
   const i = argv.indexOf('--setting-sources');
   assert.ok(i !== -1, `expected --setting-sources in argv: ${argv.join(' ')}`);
-  assert.equal(argv[i + 1], '');
-});
+  return argv[i + 1];
+}
+
+for (const [pathName, request] of [['one-shot', ONE_SHOT], ['persistent', PERSISTENT]]) {
+  test(`default (${pathName} child): the user setting source loads`, async () => {
+    const argv = await spawnedArgv(request, 'claude-opus-4-8');
+    assert.equal(settingSourcesIn(argv), 'user');
+  });
+
+  test(`isolateUserSettings (${pathName} child): no setting source, so the operator CLAUDE.md stays out`, async () => {
+    const argv = await spawnedArgv(request, 'claude-opus-4-8', { isolateUserSettings: true });
+    // The empty value, not an omitted flag: probed against claude 2.1.235,
+    // omitting `--setting-sources` loads user settings exactly as `user` does,
+    // so dropping the flag would silently defeat the isolation.
+    assert.equal(settingSourcesIn(argv), '');
+  });
+}
 
 test('honorRequestModel off: the request model never reaches --model', async () => {
   const argv = await spawnedArgv(

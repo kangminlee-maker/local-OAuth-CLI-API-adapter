@@ -203,6 +203,9 @@ const anthropicModels = {
 // direct target regardless of the model override.
 const openAiApiTarget = `openai-api:${openAiModel}`;
 const imageGenerationPairTarget = `proxy-codex-vs-openai-api:${openAiModel}`;
+// Recorded in the summary: isolation changes the proxied session's context, so
+// a baseline comparison across a differing value is not a like-for-like basis.
+const claudeIsolateUserSettings = booleanOption(options.claudeIsolateUserSettings, false);
 const outputPath = options.output;
 const baselinePath = options.baseline;
 const regressionTargets = options.regressionTargets ?? 'proxy';
@@ -292,7 +295,7 @@ try {
       cwd,
       model: options.claudeCliModel ?? 'opus',
       timeoutMs,
-      isolateUserSettings: booleanOption(options.claudeIsolateUserSettings, false),
+      isolateUserSettings: claudeIsolateUserSettings,
     }));
   }
 
@@ -374,6 +377,7 @@ const summaryBase = {
   openAiModel,
   openAiImageApiModel,
   codexImageModel: options.codexImageModel ?? codexProxyImageModel(),
+  claudeIsolateUserSettings,
   anthropicModels,
   passed: rows.length - failed.length,
   failed: failed.length,

@@ -22,6 +22,7 @@ export interface ClaudeNativeCliChatSessionOptions {
   readonly model?: string;
   readonly timeoutMs: number;
   readonly extraArgs?: readonly string[];
+  readonly isolateUserSettings?: boolean;
 }
 
 export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
@@ -33,6 +34,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   private readonly model: string;
   private readonly timeoutMs: number;
   private readonly extraArgs: readonly string[];
+  private readonly isolateUserSettings: boolean;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
   private stderr = '';
@@ -44,6 +46,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.model = options.model;
     this.timeoutMs = options.timeoutMs;
     this.extraArgs = options.extraArgs;
+    this.isolateUserSettings = options.isolateUserSettings;
     this.native = {
       input_format: 'stream-json',
       output_format: 'stream-json',
@@ -59,6 +62,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       model: options.model ?? 'claude-code-cli',
       timeoutMs: options.timeoutMs,
       extraArgs: options.extraArgs ?? [],
+      isolateUserSettings: options.isolateUserSettings ?? false,
     });
     await session.start();
     return session;
@@ -132,7 +136,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       '--mcp-config',
       '{"mcpServers":{}}',
       '--setting-sources',
-      'user',
+      this.isolateUserSettings ? '' : 'user',
       '--tools',
       '',
       '--no-session-persistence',

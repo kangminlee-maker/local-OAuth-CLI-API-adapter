@@ -63,3 +63,26 @@ test('the startup auth status never announces an open gate for a configured key'
   assert.equal(authGateStatus(' padded '), 'required (Authorization: Bearer or x-api-key)');
   assert.equal(authGateStatus('real-key'), 'required (Authorization: Bearer or x-api-key)');
 });
+
+// A privacy switch that fails open is worse than one that refuses to start:
+// `--isolate-user-settings=1` used to mean "off", silently, because only the
+// exact string 'true' enabled it.
+test('--isolate-user-settings refuses an unparsable value instead of falling back to off', () => {
+  const result = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'claude', '--isolate-user-settings=1'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.notEqual(result.status, 0, `expected a startup failure, got stdout: ${result.stdout}`);
+  assert.match(result.stderr, /--isolate-user-settings takes no value or true\/false, got: 1/);
+});
+
+test('--isolate-user-settings is rejected on a runtime that cannot honour it', () => {
+  const result = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'codex', '--isolate-user-settings'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.notEqual(result.status, 0, `expected a startup failure, got stdout: ${result.stdout}`);
+  assert.match(result.stderr, /--isolate-user-settings can only be selected with --runtime claude\./);
+});

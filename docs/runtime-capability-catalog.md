@@ -345,7 +345,7 @@ root command는 62개 option 항목(장문 flag 65개)을 광고한다. 그룹�
 | `--permission-mode` | `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan` | L1 help choices |
 | `--prompt-suggestions` | `true`, `false`, `1`, `0`, `yes`, `no`, `on`, `off` | L1 help choices |
 | `--effort` | `low`, `medium`, `high`, `xhigh`, `max` | L4 probe. 알 수 없는 값은 **거부되지 않고 경고 후 기본값으로 무시**되므로 proxy가 상류에서 검증해야 한다 |
-| `--setting-sources` | `user`, `project`, `local` | L4 probe |
+| `--setting-sources` | `user`, `project`, `local`, 그리고 빈 값 `''` | L4 probe. 오류 메시지가 안내하는 유효 값은 셋뿐이지만, 빈 값은 거부되지 않고 **어떤 source도 로드하지 않는 상태**로 동작한다(2.1.235 실측). proxy의 `--isolate-user-settings`가 이 동작에 의존한다. 플래그 **생략은 `user`와 동일**하게 사용자 설정을 로드하므로 격리 수단이 아니다 |
 | `--max-budget-usd` | 0보다 큰 수 | L4 probe |
 | `--session-id` | 유효한 UUID | L4 probe |
 
