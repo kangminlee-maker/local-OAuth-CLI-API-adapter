@@ -182,8 +182,17 @@ Output:
 
 Runtime mapping:
 
-- Codex: `turn/interrupt`.
+- Codex: `turn/interrupt`, and the turn's event queue is failed so the caller's
+  iteration ends — the queue otherwise closes only on `turn/completed`, which a
+  child that stopped answering never sends.
 - Claude: process signal or CLI-supported interruption when available.
+
+A turn is also bounded by the server's `--timeout-ms`: when it elapses the turn
+is aborted through the same path and reported in-band (`cli.error`, and
+`status: "error"` on the non-streaming result), which returns the session to
+`ready`. Closing a session gives the child a short grace period for its
+best-effort `thread/archive` rather than the whole turn budget — a child that
+has stopped answering must not hold `DELETE` or server shutdown for minutes.
 
 ### Close session
 

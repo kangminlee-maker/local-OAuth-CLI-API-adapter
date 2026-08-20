@@ -1175,6 +1175,57 @@ test('CodexBackendTransport refreshes an expired Codex OAuth token before reques
   assert.equal(typeof persisted.last_refresh, 'string');
 });
 
+test('turns that expire together refresh the Codex token once, not once each', async () => {
+  // A refresh token is single-use and rotates: two turns that refresh
+  // concurrently would spend it twice, and the second exchange invalidates the
+  // credential the first one just wrote. The lock and the re-read inside it are
+  // what makes the second caller adopt the first's result — nothing tested
+  // that, so removing either left the whole suite green.
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'single-use-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  let refreshes = 0;
+  const refreshTokensSeen = [];
+  const backendTokens = [];
+  globalThis.fetch = async (url, init) => {
+    if (url === 'https://auth.openai.com/oauth/token') {
+      refreshes += 1;
+      refreshTokensSeen.push(JSON.parse(init.body).refresh_token);
+      // Long enough that a second caller reaches the refresh path while this
+      // one is still in flight — the race the guard exists for.
+      await new Promise((resolve) => { setTimeout(resolve, 50); });
+      return Response.json({
+        id_token: idTokenForAccount('account-1'),
+        access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600, jti: 'refreshed' }),
+        refresh_token: 'rotated-refresh-token',
+      });
+    }
+    backendTokens.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.output_text.delta', delta: 'OK' },
+      { type: 'response.completed', response: { id: 'resp_concurrent', model: 'gpt-5.5' } },
+    ]), { status: 200 });
+  };
+  const first = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const second = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const results = await Promise.all([
+    first.generate(textRequest()),
+    second.generate(textRequest()),
+  ]);
+  await first.close();
+  await second.close();
+
+  assert.deepEqual(results.map((result) => result.text), ['OK', 'OK']);
+  assert.equal(refreshes, 1, `expected one refresh, got ${refreshes} (${refreshTokensSeen.join(', ')})`);
+  assert.deepEqual(refreshTokensSeen, ['single-use-refresh-token']);
+  assert.equal(new Set(backendTokens).size, 1, 'both turns should carry the same refreshed token');
+  const persisted = JSON.parse(await readFile(join(codexHome, 'auth.json'), 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'rotated-refresh-token');
+});
+
 test('CodexBackendTransport refreshes after backend unauthorized and retries once', async () => {
   const codexHome = await createCodexHome({
     accessToken: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }),

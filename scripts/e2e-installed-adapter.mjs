@@ -110,6 +110,11 @@ function startProxy(consumerDir, codexHome, fakeCodexPath, port) {
     'app-server',
     '--codex-image-transport',
     'app-server',
+    // A backend identifier is a transport name, not a model: `/v1/models` drops
+    // it from every position, so a consumer configuring the proxy has to name a
+    // real slug — one the fake CLI's own catalogue advertises.
+    '--model',
+    'gpt-5.5',
     '--command',
     fakeCodexPath,
     '--port',
@@ -125,8 +130,16 @@ function startProxy(consumerDir, codexHome, fakeCodexPath, port) {
       ...process.env,
       ANTHROPIC_API_KEY: 'fake-anthropic-key',
       ANTHROPIC_BASE_URL: 'https://api.anthropic.com',
+      // Names an exact-name blocklist missed: a header set, the AWS and Google
+      // credential chains the CLIs' SDKs resolve, and the switch that puts a
+      // child on Bedrock with them.
+      ANTHROPIC_CUSTOM_HEADERS: 'x-leak: 1',
+      AWS_ACCESS_KEY_ID: 'fake-aws-key-id',
+      AWS_SECRET_ACCESS_KEY: 'fake-aws-secret',
+      CLAUDE_CODE_USE_BEDROCK: '1',
       CODEX_HOME: codexHome,
       FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV: '1',
+      GOOGLE_APPLICATION_CREDENTIALS: '/tmp/fake-gcloud.json',
       OPENAI_API_KEY: 'fake-openai-key',
       OPENAI_BASE_URL: 'https://api.openai.com/v1',
     },
@@ -190,13 +203,13 @@ async function assertModels(baseUrl) {
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.object, 'list');
-  assert.equal(body.data[0].id, 'codex-app-server');
+  assert.equal(body.data[0].id, 'gpt-5.5');
   assert.equal(body.data[0].owned_by, 'local-oauth-cli');
 }
 
 async function assertChatCompletion(baseUrl) {
   const res = await postJson(`${baseUrl}/chat/completions`, {
-    model: 'codex-app-server',
+    model: 'gpt-5.5',
     messages: [{ role: 'user', content: 'Say OK' }],
   });
   assert.equal(res.status, 200);
@@ -212,7 +225,7 @@ async function assertChatCompletion(baseUrl) {
 
 async function assertChatStream(baseUrl) {
   const res = await postJson(`${baseUrl}/chat/completions`, {
-    model: 'codex-app-server',
+    model: 'gpt-5.5',
     stream: true,
     stream_options: { include_usage: true },
     messages: [{ role: 'user', content: 'EARLY_DELTA' }],
@@ -473,10 +486,14 @@ function assertNoDirectProviderEnv() {
   }
 }
 
+// Kept in step with src/proxy/process-env.ts: this fake asserts the boundary
+// from inside a real installed child, so it has to classify names the same way.
 function isDirectProviderEnvName(name) {
-  const prefixes = [
+  const namespaces = [
     'ANTHROPIC',
-    'AZURE_OPENAI',
+    'AWS',
+    'AZURE',
+    'BEDROCK',
     'COHERE',
     'DEEPSEEK',
     'GEMINI',
@@ -487,20 +504,12 @@ function isDirectProviderEnvName(name) {
     'OPENROUTER',
     'PERPLEXITY',
     'TOGETHER',
+    'VERTEX',
     'XAI',
+    'CLAUDE_CODE_USE',
+    'CLAUDE_CODE_API_KEY',
   ];
-  const suffixes = [
-    'ACCESS_TOKEN',
-    'API_BASE',
-    'API_KEY',
-    'AUTH_TOKEN',
-    'BASE_URL',
-    'ENDPOINT',
-    'ORG_ID',
-    'ORGANIZATION',
-    'PROJECT',
-  ];
-  return prefixes.some((prefix) => suffixes.some((suffix) => name === prefix + '_' + suffix));
+  return namespaces.some((namespace) => name === namespace || name.startsWith(namespace + '_'));
 }
 `;
 }

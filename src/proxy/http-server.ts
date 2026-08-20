@@ -451,10 +451,14 @@ async function handleLocalCliChatRequest(
   }
   if (action === 'turns' && req.method === 'POST') {
     const body = await readJsonBody(req) as LocalCliChatTurnInput;
+    // The turn belongs to the session and survives a client disconnect — that
+    // is what `interrupt` is for — but it does not survive the request's own
+    // deadline: an unanswered turn used to hold the socket with no end.
+    const turnOptions = { timeoutMs: options.requestTimeoutMs };
     if (body.stream) {
-      await writeLocalCliChatStream(res, manager.streamTurn(sessionId, body));
+      await writeLocalCliChatStream(res, manager.streamTurn(sessionId, body, turnOptions));
     } else {
-      writeJson(res, 200, await manager.runTurn(sessionId, body));
+      writeJson(res, 200, await manager.runTurn(sessionId, body, turnOptions));
     }
     return;
   }

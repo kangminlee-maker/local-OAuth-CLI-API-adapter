@@ -18,6 +18,15 @@ export interface LocalCliChatSessionManagerOptions {
   readonly runtimes: Partial<Record<LocalCliChatRuntime, LocalCliChatRuntimeFactory>>;
 }
 
+export interface LocalCliChatTurnOptions {
+  /**
+   * How long the caller will wait for the turn. The surface that accepted the
+   * request owns this number — the session outlives the socket, but a turn that
+   * produces nothing must not outlive the request that asked for it.
+   */
+  readonly timeoutMs?: number;
+}
+
 interface ManagedSession {
   readonly id: string;
   readonly runtime: LocalCliChatRuntime;
@@ -100,6 +109,7 @@ export class LocalCliChatSessionManager {
   async *streamTurn(
     sessionId: string,
     input: LocalCliChatTurnInput,
+    options: LocalCliChatTurnOptions = {},
   ): AsyncIterable<LocalCliChatEvent> {
     const session = this.requireSession(sessionId);
     if (session.status === 'closed') {
@@ -113,6 +123,13 @@ export class LocalCliChatSessionManager {
     session.status = 'running';
     const abort = new AbortController();
     session.currentAbort = abort;
+    // The caller's deadline reaches the runtime through the turn's own signal —
+    // the same mechanism `interrupt` uses. Without it a child that stopped
+    // answering held the HTTP request open with no end, and left the session
+    // `running`, so every later turn was refused with 409.
+    const deadline = options.timeoutMs !== undefined && options.timeoutMs > 0
+      ? setTimeout(() => abort.abort(), options.timeoutMs)
+      : undefined;
     try {
       for await (const runtimeEvent of session.nativeSession.startTurn(input, abort.signal)) {
         yield {
@@ -143,6 +160,7 @@ export class LocalCliChatSessionManager {
         },
       };
     } finally {
+      if (deadline) clearTimeout(deadline);
       if (session.currentAbort === abort) session.currentAbort = undefined;
       if (session.status === 'running') session.status = 'ready';
     }
@@ -151,11 +169,12 @@ export class LocalCliChatSessionManager {
   async runTurn(
     sessionId: string,
     input: LocalCliChatTurnInput,
+    options: LocalCliChatTurnOptions = {},
   ): Promise<LocalCliChatTurnResult> {
     const events: LocalCliChatEvent[] = [];
     let text = '';
     let usage: LocalCliChatEvent['usage'];
-    for await (const event of this.streamTurn(sessionId, input)) {
+    for await (const event of this.streamTurn(sessionId, input, options)) {
       events.push(event);
       if (event.text_delta) text += event.text_delta;
       if (event.usage !== undefined) usage = event.usage;

@@ -245,6 +245,9 @@ rl.on('line', (line) => {
     result(payload.id, { thread: { id: `thread_${threadSeq}` } });
     return;
   }
+  // A child that started and then stopped answering — a real failure mode the
+  // proxy has to survive without waiting out a turn timeout on shutdown.
+  if (process.env.FAKE_CODEX_SILENT_AFTER_START === '1') return;
   if (payload.method === 'turn/start') {
     turnSeq += 1;
     const threadId = payload.params?.threadId ?? `thread_${threadSeq}`;
@@ -293,6 +296,12 @@ rl.on('line', (line) => {
       : effort === 'medium'
         ? 'MEDIUM_OK'
         : 'OK';
+    // A turn that opens and then produces nothing: the child accepted the work
+    // and stopped answering, so nothing ever closes the turn.
+    if (process.env.FAKE_CODEX_NO_TURN_COMPLETION === '1') {
+      result(payload.id, { turn: { id: turnId } });
+      return;
+    }
     result(payload.id, { turn: { id: turnId } });
     setTimeout(() => emitTurn(threadId, turnId, text), 0);
     return;
