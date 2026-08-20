@@ -42,6 +42,16 @@ Input/output interface contract의 단일 문서는 `docs/api-interface-contract
 
 Cross-provider semantic references are not valid benchmark authority: `proxy-codex`, `proxy-codex-app-server`, and `proxy-codex-backend` quality are compared only with OpenAI direct API, and `proxy-claude` quality is compared only with Anthropic direct API. The benchmark runner therefore does not execute OpenAI-shaped quality rows for `proxy-claude` or Anthropic quality rows for Codex targets.
 
+모든 판정은 **같은 모델의 proxy↔direct 페어** 안에서 이뤄진다. 별도의 통제군 모델은 없다: 모델 X의 proxy 사용 가능 판정은 ① 응답특성 동일(contract rows) ② direct X 대비 상대 품질 ③ direct X 대비 상대 지연, 세 축으로 한다. 한 row 안에서 proxy와 direct는 항상 동일 요청을 받는다(페어 불변식). direct row 라벨은 실제 실행 모델에서 파생된다(`openai-api:<model>`, `anthropic-api:<model>`); target 선택은 부분 문자열 매칭이라 `--targets=openai-api` 또는 family alias(`anthropic-api:opus`)로 지정한다.
+
+### 모델군별 호출 규약
+
+Provider가 모델 세대별로 문서화한 호출 규약은 프롬프트 최적화가 아니라 API 표면의 일부이므로 벤치 row 정의에 반영한다. 반영은 항상 페어 양쪽에 동일하게 적용한다.
+
+- gpt-5.6 계열은 `/v1/chat/completions`에서 function tools 사용 시 `reasoning_effort: 'none'`을 요구한다(`/v1/responses`는 reasoning과 tools 동시 지원). chat tool rows는 이 규약대로 `reasoning_effort: 'none'`을 보낸다 — gpt-5.5에서도 유효한 일반 규칙이다. **측정 기반 변경 주의:** 이 값은 페어 양쪽에 동일하게 가지만 proxy 런타임의 실행 모드(reasoning off)도 바꾸므로, 2026-08-19 이전 baseline과 chat tool 행의 지연을 직접 비교하면 안 된다. baseline 비교는 측정 기반(모델·격리·judge 등)이 다르면 `regressionGate.basisMismatch`로 표시되고 stderr에 경고가 나간다.
+- 규약 위반 요청(5.6 + chat tools + effort 미지정)은 direct가 400으로 거절하지만 proxy는 Responses 변환 경로라 성공시킨다. 이 관대함은 문서화된 proxy-enhanced 동작으로 유지한다(2026-08-19 결정, `docs/api-interface-contract.md` 구현 차이 표 참조) — provider parity row가 아니므로 error-parity negative row는 두지 않는다.
+- family-5 Anthropic 모델은 응답이 길어 구세대 기준 fixture 토큰 예산에 잘린다. multimodal rows와 semantic reference의 max tokens는 완주 가능한 상한으로 유지한다(현재 256/2048; 상한 완화는 완주하던 행에 영향이 없다).
+
 If a direct semantic reference fails, the benchmark records `referenceErrors` and fails that row as a reference-availability problem rather than treating it as proxy output quality. This distinction matters for provider `max_tokens` failures: `max_tokens` is the per-request output cap, not subscription or credit exhaustion.
 
 ## Suite 계층
@@ -92,8 +102,9 @@ Direct GPT image model positive rows do not send `response_format`; GPT image mo
 
 Gate:
 
-- semantic quality score: minimum 95
-- direct-provider similarity: judge가 “meaningfully equivalent or better”로 판정
+- 품질 게이트는 같은 모델의 direct reference 대비 **상대** 기준이다: judge가 내는 `relativeQuality`(reference 대비 요구 충족도 %) 최저값이 `--min-semantic-quality`(기본 95) 이상이어야 한다. 100 = meaningfully equivalent, 100 초과 = reference보다 우수.
+- 절대 `score`는 진단용으로 계속 기록되며(`semanticQuality`), 게이트 실패 메시지에 relative/absolute가 병기된다.
+- direct reference 자체가 실패하면 그 row는 proxy 품질 실패가 아니라 reference 무효(`referenceErrors`)로 기록된다. reference 예산(max tokens)은 완주 가능하도록 잡되, 종료 조건은 "direct가 유효한 reference"이지 "proxy 통과"가 아니다.
 - hard fail: required term 누락, 숫자/식별자 왜곡, schema contract 위반
 
 ### Image quality
@@ -164,7 +175,7 @@ pnpm bench:api -- --suite=contract-smoke --targets=proxy-codex-app-server,proxy-
 Provider parity:
 
 ```bash
-pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --repeats 3 --output /tmp/api-provider-parity.json
+pnpm bench:api -- --suite=provider-parity --targets=proxy-codex,proxy-claude,openai-api,anthropic-api:opus --repeats 3 --output /tmp/api-provider-parity.json
 ```
 
 Semantic quality:
@@ -176,13 +187,13 @@ pnpm bench:api -- --suite=quality-realistic --targets=proxy-codex,proxy-claude -
 Image API/detail parity:
 
 ```bash
-pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api:gpt-5.5 --image-quality-repeats 1 --min-image-quality=90 --repeats 1 --output /tmp/api-image-parity.json
+pnpm bench:api -- --suite=image-realistic --targets=proxy-codex,openai-api --image-quality-repeats 1 --min-image-quality=90 --repeats 1 --output /tmp/api-image-parity.json
 ```
 
 Release gate:
 
 ```bash
-pnpm bench:api -- --suite=release-gate --targets=proxy-codex,proxy-claude,openai-api:gpt-5.5,anthropic-api:opus --semantic-quality-repeats 3 --min-semantic-quality=95 --repeats 5 --output /tmp/api-release-gate.json
+pnpm bench:api -- --suite=release-gate --targets=proxy-codex,proxy-claude,openai-api,anthropic-api:opus --semantic-quality-repeats 3 --min-semantic-quality=95 --repeats 5 --output /tmp/api-release-gate.json
 ```
 
 Suite 기본값:

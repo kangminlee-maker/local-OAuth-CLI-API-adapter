@@ -63,3 +63,59 @@ test('the startup auth status never announces an open gate for a configured key'
   assert.equal(authGateStatus(' padded '), 'required (Authorization: Bearer or x-api-key)');
   assert.equal(authGateStatus('real-key'), 'required (Authorization: Bearer or x-api-key)');
 });
+
+// A privacy switch that fails open is worse than one that refuses to start:
+// `--isolate-user-settings=1` used to mean "off", silently, because only the
+// exact string 'true' enabled it.
+test('--isolate-user-settings refuses an unparsable value instead of falling back to off', () => {
+  const result = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'claude', '--isolate-user-settings=1'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.notEqual(result.status, 0, `expected a startup failure, got stdout: ${result.stdout}`);
+  assert.match(result.stderr, /--isolate-user-settings takes no value or true\/false, got: 1/);
+});
+
+test('--isolate-user-settings is rejected on a runtime that cannot honour it', () => {
+  const result = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'codex', '--isolate-user-settings'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.notEqual(result.status, 0, `expected a startup failure, got stdout: ${result.stdout}`);
+  assert.match(result.stderr, /--isolate-user-settings can only be selected with --runtime claude\./);
+});
+
+// The flag is only worth anything if it reaches the constructed backend. That
+// seam is a single argument in proxy-cli.ts, and every other isolation test
+// constructs the backend directly, so deleting it changed nothing anyone could
+// see. The ready banner reports the effective state, so it is the observable.
+test('--isolate-user-settings reaches the runtime: the banner reports the effective state', () => {
+  // A nonexistent binary makes the proxy start and report without spawning a
+  // child; the port must still be free, since the CLI treats `--port 0` as
+  // invalid and falls back to its default.
+  const isolated = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'claude', '--isolate-user-settings', '--port', String(20000 + (process.pid % 20000)), '--command', '/nonexistent-claude-binary'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.match(isolated.stdout, /userSettings: isolated \(no setting sources\)/);
+
+  const loaded = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'claude', '--port', String(20000 + (process.pid % 20000)), '--command', '/nonexistent-claude-binary'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.match(loaded.stdout, /userSettings: loaded \(user source/);
+});
+
+test('--isolate-user-settings refuses --extra-arg --settings, which would load them back', () => {
+  const result = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'claude', '--isolate-user-settings', '--extra-arg', '--settings', '--extra-arg', '/tmp/x.json'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.notEqual(result.status, 0, `expected a startup failure, got stdout: ${result.stdout}`);
+  assert.match(result.stderr, /conflicts with --extra-arg --settings/);
+});

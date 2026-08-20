@@ -31,6 +31,11 @@ interface ClaudeCodeBackendOptions {
   readonly timeoutMs: number;
   readonly extraArgs?: readonly string[];
   readonly honorRequestModel?: boolean;
+  // Off by default: the CLI's `user` setting source carries the operator's
+  // global CLAUDE.md bundle into every proxied session, which taxes latency
+  // and lets personal instructions color provider-like API responses. Opting
+  // in loads no setting source at all.
+  readonly isolateUserSettings?: boolean;
 }
 
 interface ClaudeWaiter {
@@ -72,6 +77,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   private readonly honorRequestModel: boolean;
   private readonly timeoutMs: number;
   private readonly extraArgs: readonly string[];
+  private readonly isolateUserSettings: boolean;
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: NdjsonReader | null = null;
   private initialized: Promise<void> | null = null;
@@ -115,6 +121,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
     this.timeoutMs = options.timeoutMs;
     this.extraArgs = options.extraArgs ?? [];
+    this.isolateUserSettings = options.isolateUserSettings ?? false;
   }
 
   /**
@@ -396,7 +403,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       'stream-json',
       '--verbose',
       ...(includePartialMessages ? ['--include-partial-messages'] : []),
-      ...claudeContextIsolationArgs(),
+      ...claudeContextIsolationArgs(this.isolateUserSettings),
       '--tools',
       '',
       '--no-session-persistence',
@@ -515,7 +522,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       'stream-json',
       '--verbose',
       '--include-partial-messages',
-      ...claudeContextIsolationArgs(),
+      ...claudeContextIsolationArgs(this.isolateUserSettings),
       '--tools',
       '',
       '--no-session-persistence',
@@ -735,7 +742,7 @@ function readClaudeStopSequence(message: JsonObject): string | null {
   return typeof message.stop_sequence === 'string' ? message.stop_sequence : null;
 }
 
-function claudeContextIsolationArgs(): string[] {
+function claudeContextIsolationArgs(isolateUserSettings: boolean): string[] {
   return [
     '--system-prompt',
     claudeSystemPrompt(),
@@ -743,8 +750,10 @@ function claudeContextIsolationArgs(): string[] {
     '--strict-mcp-config',
     '--mcp-config',
     '{"mcpServers":{}}',
+    // The `user` source loads the operator's global CLAUDE.md bundle into the
+    // session; an empty source list loads none while OAuth auth still works.
     '--setting-sources',
-    'user',
+    isolateUserSettings ? '' : 'user',
   ];
 }
 

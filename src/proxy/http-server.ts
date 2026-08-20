@@ -1581,6 +1581,12 @@ function asMultipartFile(value: unknown): MultipartFilePart | null {
     typeof obj.filename === 'string'
     && typeof obj.mediaType === 'string'
     && typeof obj.data === 'string'
+    // An empty upload is not an image, and neither is a part that says it is
+    // something else. Every other encoding of an image input enforces both;
+    // this one accepted them and sent `data:text/plain;base64,…` upstream as
+    // though it were a picture.
+    && obj.data !== ''
+    && /^image\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(obj.mediaType)
   ) {
     return {
       filename: obj.filename,
@@ -1648,7 +1654,7 @@ function openAiImagesGenerationResponse(
     data: (() => {
       const batch = new Set<string>();
       return result.images.slice(0, request.n ?? 1)
-        .map((image) => openAiImageObject(req, generatedImages, image, request, batch));
+        .map((image) => openAiImageObject(req, generatedImages, image, request, batch, result.outputFormat));
     })(),
     ...openAiImageResponseMetadata(result, request),
     ...(result.usage ? { usage: openAiImagesUsage(result.usage) } : {}),
@@ -1689,11 +1695,15 @@ function openAiImageObject(
   image: OpenAiGeneratedImage,
   request: OpenAiImageGenerationRequest,
   batch?: Set<string>,
+  producedFormat?: string,
 ): unknown {
   if (request.responseFormat === 'url') {
     const id = generatedImages.put(
       image.b64Json,
-      request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+      // What the bytes ARE, not what was asked for: the JSON body already
+      // reports the produced format, so labelling the stored bytes from the
+      // request let one response advertise webp and serve image/png.
+      producedFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
       batch,
     );
     batch?.add(id);
@@ -1719,8 +1729,8 @@ async function writeOpenAiImageStream(
   // One pin set for the whole stream: sibling images of one response must not
   // evict each other, exactly as in the non-streaming path.
   const batch = new Set<string>();
-  const putPinned = (b64Json: string): string => {
-    const id = generatedImages.put(b64Json, request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
+  const putPinned = (b64Json: string, outputFormat?: string): string => {
+    const id = generatedImages.put(b64Json, outputFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
     batch.add(id);
     return id;
   };
@@ -1741,8 +1751,11 @@ async function writeOpenAiImageStream(
         quality: event.quality ?? request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
         size: event.size ?? request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
         ...(request.responseFormat === 'url'
-          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json)) }
+          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json, event.outputFormat)) }
           : { b64_json: event.image.b64Json }),
+        // The provider's rewrite of the prompt, which the non-streaming
+        // response carries: a client comparing the two modes saw it vanish.
+        ...(event.image.revisedPrompt ? { revised_prompt: event.image.revisedPrompt } : {}),
         ...(event.usage ? { usage: openAiImagesUsage(event.usage) } : {}),
       };
       await writeSseEvent(res, type, payload);
@@ -1781,7 +1794,9 @@ function openAiChatResponse(result: LocalCompletionResult): unknown {
         index: 0,
         message: hasToolCalls ? {
           role: 'assistant',
-          content: null,
+          // Narration that accompanied the tool call, as the provider returns
+          // it; `null` only when the turn really said nothing.
+          content: result.text ? result.text : null,
           tool_calls: result.toolCalls.map(openAiToolCall),
           refusal: null,
           annotations: [],
@@ -1791,7 +1806,11 @@ function openAiChatResponse(result: LocalCompletionResult): unknown {
           refusal: null,
           annotations: [],
         },
-        finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
+        // `length` is how the chat surface says "stopped at the cap"; the
+        // Anthropic surface already passes `max_tokens` through as a stop reason.
+        finish_reason: hasToolCalls
+          ? 'tool_calls'
+          : result.stopReason === 'max_tokens' ? 'length' : 'stop',
       },
     ],
     usage: openAiChatUsage(result.usage),
@@ -1805,7 +1824,12 @@ function openAiResponsesResponse(
   request: NormalizedRequest,
 ): unknown {
   const output = result.toolCalls.length > 0
-    ? result.toolCalls.map(openAiResponseToolCall)
+    ? [
+        ...(result.text
+          ? [openAiResponseReasoningItem(), openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)]
+          : []),
+        ...result.toolCalls.map(openAiResponseToolCall),
+      ]
     : [
         openAiResponseReasoningItem(),
         openAiResponseMessageItem(`msg_${randomUUID()}`, result.text),
@@ -1827,7 +1851,10 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
   const content = stopReason === 'refusal'
     ? (result.text ? [{ type: 'text', text: result.text }] : [])
     : hasToolCalls
-    ? result.toolCalls.map(anthropicToolUse)
+    ? [
+        ...(result.text ? [{ type: 'text', text: result.text }] : []),
+        ...result.toolCalls.map(anthropicToolUse),
+      ]
     : [
         {
           type: 'text',
@@ -2311,7 +2338,16 @@ async function writeOpenAiResponsesStream(
     completed: false,
     includeBilling: false,
   });
-  const toolState = new OpenAiResponsesToolStreamState(writeResponseEvent);
+  // Output positions are allocated in emission order, so the reasoning item,
+  // the message item and every function_call each hold a distinct index.
+  let nextOutputIndex = 0;
+  let messageOutputIndex = -1;
+  const allocateOutputIndex = (): number => {
+    const allocated = nextOutputIndex;
+    nextOutputIndex += 1;
+    return allocated;
+  };
+  const toolState = new OpenAiResponsesToolStreamState(writeResponseEvent, allocateOutputIndex);
 
   try {
     await writeResponseEvent('response.created', {
@@ -2327,21 +2363,23 @@ async function writeOpenAiResponsesStream(
       if (textStarted) return;
       if (!reasoningEmitted) {
         reasoningEmitted = true;
+        const reasoningOutputIndex = allocateOutputIndex();
         await writeResponseEvent('response.output_item.added', {
           type: 'response.output_item.added',
-          output_index: 0,
+          output_index: reasoningOutputIndex,
           item: reasoningItem,
         });
         await writeResponseEvent('response.output_item.done', {
           type: 'response.output_item.done',
-          output_index: 0,
+          output_index: reasoningOutputIndex,
           item: reasoningItem,
         });
       }
       textStarted = true;
+      messageOutputIndex = allocateOutputIndex();
       await writeResponseEvent('response.output_item.added', {
         type: 'response.output_item.added',
-        output_index: 1,
+        output_index: messageOutputIndex,
         item: {
           id: itemId,
           type: 'message',
@@ -2354,7 +2392,7 @@ async function writeOpenAiResponsesStream(
       await writeResponseEvent('response.content_part.added', {
         type: 'response.content_part.added',
         item_id: itemId,
-        output_index: 1,
+        output_index: messageOutputIndex,
         content_index: 0,
         part: { type: 'output_text', text: '', annotations: [] },
       });
@@ -2368,7 +2406,7 @@ async function writeOpenAiResponsesStream(
         await writeResponseEvent('response.output_text.delta', {
           type: 'response.output_text.delta',
           item_id: itemId,
-          output_index: 1,
+          output_index: messageOutputIndex,
           content_index: 0,
           delta: event.delta,
           logprobs: [],
@@ -2382,7 +2420,35 @@ async function writeOpenAiResponsesStream(
 
       const result = event.result;
       if (result.toolCalls.length > 0) {
-        finalOutput = await toolState.finish(result.toolCalls);
+        const toolItems = await toolState.finish(result.toolCalls);
+        // Narration streamed before the call belongs in the completed output
+        // too, or the stream's own summary contradicts the deltas it sent.
+        if (streamedText) {
+          const messageItem = openAiResponseMessageItem(itemId, streamedText);
+          await writeResponseEvent('response.output_text.done', {
+            type: 'response.output_text.done',
+            item_id: itemId,
+            output_index: messageOutputIndex,
+            content_index: 0,
+            logprobs: [],
+            text: streamedText,
+          });
+          await writeResponseEvent('response.content_part.done', {
+            type: 'response.content_part.done',
+            item_id: itemId,
+            output_index: messageOutputIndex,
+            content_index: 0,
+            part: { type: 'output_text', text: streamedText, annotations: [], logprobs: [] },
+          });
+          await writeResponseEvent('response.output_item.done', {
+            type: 'response.output_item.done',
+            output_index: messageOutputIndex,
+            item: messageItem,
+          });
+          finalOutput = [reasoningItem, messageItem, ...toolItems];
+        } else {
+          finalOutput = toolItems;
+        }
       } else {
         await ensureTextStarted();
         if (!streamedText && result.text) {
@@ -2391,7 +2457,7 @@ async function writeOpenAiResponsesStream(
             await writeResponseEvent('response.output_text.delta', {
               type: 'response.output_text.delta',
               item_id: itemId,
-              output_index: 1,
+              output_index: messageOutputIndex,
               content_index: 0,
               delta: chunk,
               logprobs: [],
@@ -2401,7 +2467,7 @@ async function writeOpenAiResponsesStream(
         await writeResponseEvent('response.output_text.done', {
           type: 'response.output_text.done',
           item_id: itemId,
-          output_index: 1,
+          output_index: messageOutputIndex,
           content_index: 0,
           logprobs: [],
           text: result.text,
@@ -2409,7 +2475,7 @@ async function writeOpenAiResponsesStream(
         await writeResponseEvent('response.content_part.done', {
           type: 'response.content_part.done',
           item_id: itemId,
-          output_index: 1,
+          output_index: messageOutputIndex,
           content_index: 0,
           part: { type: 'output_text', text: result.text, annotations: [], logprobs: [] },
         });
@@ -2417,7 +2483,7 @@ async function writeOpenAiResponsesStream(
         finalOutput = [reasoningItem, item];
         await writeResponseEvent('response.output_item.done', {
           type: 'response.output_item.done',
-          output_index: 1,
+          output_index: messageOutputIndex,
           item,
         });
       }
@@ -2440,6 +2506,8 @@ interface OpenAiResponseToolItemState {
   callId: string;
   name: string;
   arguments: string;
+  /** The position this item occupies in the response's output array. */
+  readonly outputIndex: number;
 }
 
 type OpenAiResponseEventWriter = (event: string, payload: Record<string, unknown>) => Promise<void>;
@@ -2447,7 +2515,17 @@ type OpenAiResponseEventWriter = (event: string, payload: Record<string, unknown
 class OpenAiResponsesToolStreamState {
   private readonly items = new Map<number, OpenAiResponseToolItemState>();
 
-  constructor(private readonly writeResponseEvent: OpenAiResponseEventWriter) {}
+  /**
+   * `output_index` addresses the response's output array, which also holds the
+   * reasoning and message items. Using the dense tool ordinal put a
+   * function_call at the same index as the reasoning item whenever a turn both
+   * narrated and called a tool, so a client assembling `response.output` by
+   * index overwrote one with the other.
+   */
+  constructor(
+    private readonly writeResponseEvent: OpenAiResponseEventWriter,
+    private readonly allocateOutputIndex: () => number,
+  ) {}
 
   async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
     const state = await this.ensureStarted(
@@ -2475,13 +2553,13 @@ class OpenAiResponsesToolStreamState {
       output.push(item);
       await this.writeResponseEvent('response.function_call_arguments.done', {
         type: 'response.function_call_arguments.done',
-        output_index: index,
+        output_index: state.outputIndex,
         item_id: state.itemId,
         arguments: call.arguments,
       });
       await this.writeResponseEvent('response.output_item.done', {
         type: 'response.output_item.done',
-        output_index: index,
+        output_index: state.outputIndex,
         item,
       });
     }
@@ -2500,11 +2578,12 @@ class OpenAiResponsesToolStreamState {
       callId,
       name,
       arguments: '',
+      outputIndex: this.allocateOutputIndex(),
     };
     this.items.set(index, state);
     await this.writeResponseEvent('response.output_item.added', {
       type: 'response.output_item.added',
-      output_index: index,
+      output_index: state.outputIndex,
       item: {
         id: state.itemId,
         type: 'function_call',
@@ -2525,7 +2604,7 @@ class OpenAiResponsesToolStreamState {
     state.arguments += delta;
     await this.writeResponseEvent('response.function_call_arguments.delta', {
       type: 'response.function_call_arguments.delta',
-      output_index: index,
+      output_index: state.outputIndex,
       item_id: state.itemId,
       delta,
     });
@@ -2584,7 +2663,16 @@ async function writeAnthropicMessagesStream(
   let textStarted = false;
   let textBlockClosed = false;
   let streamedText = '';
-  const toolState = new AnthropicToolUseStreamState(res);
+  // Content block indices are wire positions: whichever block opens next takes
+  // the next one, whether that is the text block or a tool_use block.
+  let nextBlockIndex = 0;
+  let textBlockIndex = -1;
+  const allocateBlockIndex = (): number => {
+    const allocated = nextBlockIndex;
+    nextBlockIndex += 1;
+    return allocated;
+  };
+  const toolState = new AnthropicToolUseStreamState(res, allocateBlockIndex);
 
   try {
     await writeSseEvent(res, 'message_start', {
@@ -2607,9 +2695,10 @@ async function writeAnthropicMessagesStream(
     const ensureTextStarted = async (): Promise<void> => {
       if (textStarted) return;
       textStarted = true;
+      textBlockIndex = allocateBlockIndex();
       await writeSseEvent(res, 'content_block_start', {
         type: 'content_block_start',
-        index: 0,
+        index: textBlockIndex,
         content_block: { type: 'text', text: '' },
       });
     };
@@ -2620,8 +2709,7 @@ async function writeAnthropicMessagesStream(
     const closeOpenTextBlock = async (): Promise<void> => {
       if (!textStarted || textBlockClosed) return;
       textBlockClosed = true;
-      toolState.setBaseIndex(1);
-      await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+      await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
     };
 
     for await (const event of events) {
@@ -2631,7 +2719,7 @@ async function writeAnthropicMessagesStream(
         streamedText += event.delta;
         await writeSseEvent(res, 'content_block_delta', {
           type: 'content_block_delta',
-          index: 0,
+          index: textBlockIndex,
           delta: { type: 'text_delta', text: event.delta },
         });
         continue;
@@ -2658,15 +2746,16 @@ async function writeAnthropicMessagesStream(
             streamedText += chunk;
             await writeSseEvent(res, 'content_block_delta', {
               type: 'content_block_delta',
-              index: 0,
+              index: textBlockIndex,
               delta: { type: 'text_delta', text: chunk },
             });
           }
         }
-        if (textStarted) {
+        if (textStarted && !textBlockClosed) {
+          textBlockClosed = true;
           await writeSseEvent(res, 'content_block_stop', {
             type: 'content_block_stop',
-            index: 0,
+            index: textBlockIndex,
           });
         }
       }
@@ -2716,18 +2805,20 @@ interface AnthropicToolUseState {
   id: string;
   name: string;
   arguments: string;
+  /** The content block index this call occupies on the wire. */
+  blockIndex: number;
 }
 
 class AnthropicToolUseStreamState {
   private readonly states = new Map<number, AnthropicToolUseState>();
-  // Wire-level offset so tool_use blocks can follow an already-open text block.
-  private baseIndex = 0;
 
-  constructor(private readonly res: ServerResponse) {}
-
-  setBaseIndex(baseIndex: number): void {
-    this.baseIndex = baseIndex;
-  }
+  /**
+   * Content block indices are wire positions, allocated in the order blocks
+   * open. A fixed offset only worked when text opened first: with a tool call
+   * ahead of the text, both claimed index 0, and the turn ended by stopping an
+   * index that was never started — which the Anthropic SDK rejects outright.
+   */
+  constructor(private readonly res: ServerResponse, private readonly allocateBlockIndex: () => number) {}
 
   async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
     const state = await this.ensureStarted(
@@ -2745,7 +2836,7 @@ class AnthropicToolUseStreamState {
       if (rest) await this.writeArgumentsDelta(index, state, rest);
       await writeSseEvent(this.res, 'content_block_stop', {
         type: 'content_block_stop',
-        index: this.baseIndex + index,
+        index: state.blockIndex,
       });
     }
   }
@@ -2757,11 +2848,11 @@ class AnthropicToolUseStreamState {
   ): Promise<AnthropicToolUseState> {
     const existing = this.states.get(index);
     if (existing) return existing;
-    const state = { id, name, arguments: '' };
+    const state = { id, name, arguments: '', blockIndex: this.allocateBlockIndex() };
     this.states.set(index, state);
     await writeSseEvent(this.res, 'content_block_start', {
       type: 'content_block_start',
-      index: this.baseIndex + index,
+      index: state.blockIndex,
       content_block: {
         type: 'tool_use',
         id: state.id,
@@ -2780,7 +2871,7 @@ class AnthropicToolUseStreamState {
     state.arguments += delta;
     await writeSseEvent(this.res, 'content_block_delta', {
       type: 'content_block_delta',
-      index: this.baseIndex + index,
+      index: state.blockIndex,
       delta: {
         type: 'input_json_delta',
         partial_json: delta,
@@ -2911,8 +3002,22 @@ async function writeSseEvent(
 
 async function writeSseData(res: ServerResponse, payload: unknown): Promise<void> {
   const line = `data: ${JSON.stringify(payload)}\n\n`;
+  if (res.writableEnded || res.destroyed) return;
   if (!res.write(line)) {
-    await new Promise<void>((resolve) => res.once('drain', resolve));
+    // A destroyed socket never drains. Awaiting it froze the writer forever,
+    // and with it the turn, its cleanup, and the session — which then refused
+    // every later turn.
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        res.off('drain', done);
+        res.off('close', done);
+        res.off('error', done);
+        resolve();
+      };
+      res.once('drain', done);
+      res.once('close', done);
+      res.once('error', done);
+    });
   }
 }
 
@@ -2927,10 +3032,20 @@ async function writeLocalCliChatStream(
   }>,
 ): Promise<void> {
   writeSseHeaders(res);
-  for await (const event of events) {
-    await writeSseEvent(res, event.event, event);
+  try {
+    for await (const event of events) {
+      await writeSseEvent(res, event.event, event);
+    }
+  } catch (err) {
+    // The status is already committed, so this is an in-band error like every
+    // other surface's. Letting it escape reached `writeError`, whose
+    // `writeHead` threw ERR_HTTP_HEADERS_SENT, and that rejection killed the
+    // process — one request ended the proxy for everyone.
+    if (!res.writableEnded) {
+      await writeSseEvent(res, 'cli.error', { event: 'cli.error', error: streamErrorPayload(err) });
+    }
   }
-  res.end();
+  if (!res.writableEnded) res.end();
 }
 
 function chunkText(text: string): string[] {

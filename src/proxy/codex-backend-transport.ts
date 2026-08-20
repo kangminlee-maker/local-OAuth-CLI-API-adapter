@@ -145,7 +145,11 @@ interface CodexBackendEvent {
     readonly model?: string;
     readonly usage?: unknown;
     readonly output?: readonly unknown[];
+    readonly status?: string;
+    readonly error?: { readonly code?: string; readonly message?: string } | null;
+    readonly incomplete_details?: { readonly reason?: string } | null;
   };
+  readonly error?: { readonly code?: string; readonly message?: string } | string | null;
 }
 
 interface ToolState {
@@ -153,6 +157,13 @@ interface ToolState {
   name: string;
   arguments: string;
   started: boolean;
+  /**
+   * Whether the backend has actually named this call. Until it has, `id` and
+   * `name` are placeholders, and announcing them would tell the client an
+   * identity that the completed result then contradicts — the client cannot
+   * rename a call it has already been told about.
+   */
+  identified: boolean;
 }
 
 class CodexBackendStreamState {
@@ -162,11 +173,88 @@ class CodexBackendStreamState {
   text = '';
   usage?: LocalUsage;
   readonly toolStates = new Map<number, ToolState>();
+  // Chat/Responses tool_call `index` is the position in the tool_calls array,
+  // not the backend output position: a preceding reasoning item shifts
+  // `output_index` (observed on gpt-5.6-terra), and forwarding the raw index
+  // desyncs streamed deltas from the completed result's dense positions.
+  private readonly toolOrdinals = new Map<string, number>();
+  private nextToolOrdinal = 0;
+  private failure?: string;
+  private settled = false;
+  private stopReason?: string;
 
   constructor(
     private readonly request: NormalizedRequest,
     private readonly startedAt: number,
   ) {}
+
+  /**
+   * The ordinal for a tool call seen in the STREAM, keyed by item id with the
+   * stream's own `output_index` as fallback. Argument deltas arrive once per
+   * token, so a known id resolves before anything is allocated.
+   */
+  private toolOrdinal(outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
+    const known = this.knownOrdinal(ids);
+    if (known !== undefined) return known;
+    // An event that names an unfamiliar call is a new call: it must not INHERIT
+    // the ordinal an earlier call bound to this position, or a stream whose
+    // events omit `output_index` (`readOutputIndex` reports 0 for those) would
+    // merge every call into one. It does still CLAIM the position, so the
+    // anonymous argument deltas that follow — the ones carrying only an
+    // `output_index` — reach the call that most recently occupied it.
+    const identified = ids.some((id) => typeof id === 'string');
+    const positionKey = `#${outputIndex}`;
+    let ordinal = identified ? undefined : this.toolOrdinals.get(positionKey);
+    if (ordinal === undefined) {
+      ordinal = this.nextToolOrdinal;
+      this.nextToolOrdinal += 1;
+    }
+    this.toolOrdinals.set(positionKey, ordinal);
+    this.bindOrdinal(ordinal, ids);
+    return ordinal;
+  }
+
+  private knownOrdinal(ids: ReadonlyArray<string | undefined>): number | undefined {
+    for (const id of ids) {
+      if (typeof id === 'string') {
+        const known = this.toolOrdinals.get(id);
+        if (known !== undefined) return known;
+      }
+    }
+    return undefined;
+  }
+
+  private bindOrdinal(ordinal: number, ids: ReadonlyArray<string | undefined>): void {
+    for (const id of ids) {
+      if (typeof id === 'string') this.toolOrdinals.set(id, ordinal);
+    }
+  }
+
+  /**
+   * The ordinal for a tool call seen in the COMPLETED output, which is a
+   * different coordinate system: its positions count function calls in an array
+   * that also holds reasoning and message items, while the stream's
+   * `output_index` counts every item. Feeding an array position into the
+   * stream's positional keyspace mints a second ordinal for a call already
+   * streamed, so an id-less final item would duplicate its own tool call.
+   * Without an id, the dense function-call position is what the stream ordinals
+   * already mean.
+   */
+  private finalOutputOrdinal(position: number, ...ids: ReadonlyArray<string | undefined>): number {
+    const known = this.knownOrdinal(ids);
+    if (known !== undefined) return known;
+    // An item that names an unfamiliar call is a call the stream never
+    // announced, and it still belongs to the client: taking a position some
+    // other call already holds would replace that call instead of adding this
+    // one. An anonymous item has nothing but its position, so there the dense
+    // position IS the correlation — `captureFinalOutput` only reaches here for
+    // one when the two views agree on how many calls there are.
+    const identified = ids.some((id) => typeof id === 'string');
+    const ordinal = identified && this.toolStates.has(position) ? this.nextToolOrdinal : position;
+    this.bindOrdinal(ordinal, ids);
+    if (ordinal >= this.nextToolOrdinal) this.nextToolOrdinal = ordinal + 1;
+    return ordinal;
+  }
 
   push(event: CodexBackendEvent): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
@@ -178,7 +266,7 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
-      const index = readOutputIndex(event);
+      const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
       const id = event.item.call_id ?? event.item.id ?? `call_${index + 1}`;
       const name = event.item.name ?? 'tool';
       const state = this.toolStates.get(index) ?? {
@@ -186,42 +274,37 @@ class CodexBackendStreamState {
         name,
         arguments: '',
         started: false,
+        identified: false,
       };
       state.id = id;
       state.name = name;
-      if (!state.started) {
-        state.started = true;
-        out.push({
-          type: 'tool_call_delta',
-          index,
-          id: state.id,
-          name: state.name,
-          argumentsDelta: '',
-        });
-      }
+      // `call_id` is the identity the client echoes back with the tool result;
+      // an item id is not interchangeable with it, so a call is only worth
+      // announcing once the backend has supplied one.
+      state.identified = event.item.call_id !== undefined;
       this.toolStates.set(index, state);
+      if (state.identified) out.push(...this.announce(index, state));
       return out;
     }
     if (event.type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
-      const index = readOutputIndex(event);
+      const index = this.toolOrdinal(
+        readOutputIndex(event),
+        typeof event.item_id === 'string' ? event.item_id : undefined,
+      );
       const state = this.toolStates.get(index) ?? {
         id: typeof event.item_id === 'string' ? event.item_id : `call_${index + 1}`,
         name: 'tool',
         arguments: '',
         started: false,
+        identified: false,
       };
-      if (!state.started) {
-        state.started = true;
-        out.push({
-          type: 'tool_call_delta',
-          index,
-          id: state.id,
-          name: state.name,
-          argumentsDelta: '',
-        });
-      }
       state.arguments += event.delta;
       this.toolStates.set(index, state);
+      // Arguments that arrive before the call is named are held: the server
+      // re-sends whatever the client has not seen once the call is announced,
+      // so nothing is lost by waiting for a name worth sending.
+      if (!state.identified) return out;
+      out.push(...this.announce(index, state));
       out.push({
         type: 'tool_call_delta',
         index,
@@ -232,25 +315,93 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
-      const index = readOutputIndex(event);
+      const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
       const state = this.toolStates.get(index) ?? {
         id: event.item.call_id ?? event.item.id ?? `call_${index + 1}`,
         name: event.item.name ?? 'tool',
         arguments: '',
-        started: true,
+        started: false,
+        identified: false,
       };
+      // Never downgrade an announced call_id to an item id: the client echoes
+      // this value back, and the two surfaces would disagree about the call.
       state.id = event.item.call_id ?? state.id;
       state.name = event.item.name ?? state.name;
+      if (event.item.call_id !== undefined) state.identified = true;
       if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
       this.toolStates.set(index, state);
+      if (state.identified) {
+        const announced = this.announce(index, state);
+        if (announced.length > 0 && state.arguments) {
+          announced.push({
+            type: 'tool_call_delta',
+            index,
+            id: state.id,
+            name: state.name,
+            argumentsDelta: state.arguments,
+          });
+        }
+        out.push(...announced);
+      }
       return out;
     }
     if (event.type === 'response.completed') {
       const usage = usageFromResponses(event.response?.usage);
       if (usage) this.usage = usage;
       this.captureFinalOutput(event.response?.output);
+      // A completed turn is finished, whatever noise follows or preceded it.
+      this.failure = undefined;
+      this.settled = true;
+    }
+    // A truncated turn is a finished turn with a reason, not an error: the
+    // output that was generated is returned, the way the provider returns it,
+    // and the stop reason says why it stopped. Discarding it made a request
+    // that deterministically hits the cap look retryable.
+    if (event.type === 'response.incomplete') {
+      const usage = usageFromResponses(event.response?.usage);
+      if (usage) this.usage = usage;
+      this.captureFinalOutput(event.response?.output);
+      this.stopReason = event.response?.incomplete_details?.reason === 'content_filter'
+        ? 'refusal'
+        : 'max_tokens';
+      this.settled = true;
+    }
+    // A turn that failed upstream is not a turn that finished. Without this the
+    // deltas already forwarded were served as a complete answer: HTTP 200,
+    // `finish_reason: "stop"`, and whatever text arrived before the failure.
+    // Recorded only while the turn is unsettled, so a frame arriving after the
+    // turn completed cannot discard a finished answer.
+    if ((event.type === 'response.failed' || event.type === 'error') && !this.settled) {
+      this.failure = terminalFailureMessage(event);
+      this.settled = true;
     }
     return out;
+  }
+
+  /**
+   * Emits the call's opening delta the first time it is announced, carrying the
+   * identity the backend gave it. Returns nothing once announced.
+   */
+  private announce(index: number, state: ToolState): LocalStreamEvent[] {
+    if (state.started) return [];
+    state.started = true;
+    return [{
+      type: 'tool_call_delta',
+      index,
+      id: state.id,
+      name: state.name,
+      argumentsDelta: '',
+    }];
+  }
+
+  /** The failure the backend reported, if it reported one. */
+  terminalFailure(): string | undefined {
+    return this.failure;
+  }
+
+  /** Whether the backend ever said how the turn ended. */
+  isSettled(): boolean {
+    return this.settled;
   }
 
   completed(): LocalCompletionResult {
@@ -258,7 +409,12 @@ class CodexBackendStreamState {
     return {
       id: this.responseId ?? this.id,
       model: this.model ?? this.request.model,
-      text: toolCalls.length > 0 ? '' : this.text.trim(),
+      // Text and tool calls coexist upstream — a model that narrates before
+      // calling a tool sends both — and the streamed deltas already delivered
+      // the narration, so dropping it here made streaming and non-streaming
+      // clients disagree about what the model said.
+      text: this.text.trim(),
+      ...(this.stopReason ? { stopReason: this.stopReason } : {}),
       toolCalls,
       usage: this.usage ?? usageFor(this.request, this.text, toolCalls),
       latencyMs: Date.now() - this.startedAt,
@@ -277,18 +433,49 @@ class CodexBackendStreamState {
 
   private captureFinalOutput(output: readonly unknown[] | undefined): void {
     if (!Array.isArray(output)) return;
-    for (const [index, item] of output.entries()) {
+    const finalCalls = output.filter((item) => asRecord(item)?.type === 'function_call');
+    // Positional alignment is only meaningful when the two views agree on how
+    // many calls there are. When they disagree, an id-less final item would
+    // land on whichever streamed call happens to share its position and
+    // overwrite that call's name and arguments — turning one tool call into a
+    // second copy of another. The streamed state is the one the client already
+    // acted on, so it wins.
+    const alignable = this.toolStates.size === 0 || finalCalls.length === this.toolStates.size;
+    let functionCallPosition = 0;
+    for (const item of output) {
       const obj = asRecord(item);
       if (obj?.type === 'function_call') {
-        const state = this.toolStates.get(index) ?? {
+        const anonymous = typeof obj.id !== 'string' && typeof obj.call_id !== 'string';
+        if (anonymous && !alignable) {
+          functionCallPosition += 1;
+          continue;
+        }
+        const index = this.finalOutputOrdinal(
+          functionCallPosition,
+          typeof obj.id === 'string' ? obj.id : undefined,
+          typeof obj.call_id === 'string' ? obj.call_id : undefined,
+        );
+        functionCallPosition += 1;
+        const existing = this.toolStates.get(index);
+        const state = existing ?? {
           id: typeof obj.call_id === 'string' ? obj.call_id : `call_${index + 1}`,
           name: typeof obj.name === 'string' ? obj.name : 'tool',
           arguments: '',
           started: true,
+          identified: typeof obj.call_id === 'string',
         };
+        // An anonymous item is matched by position alone, and position is not
+        // proof of identity: with two calls listed in an order the stream did
+        // not use, overwriting here gave each streamed call the OTHER call's
+        // name and arguments under its own id, so tool results came back
+        // answering the wrong call. It may fill in what the stream never
+        // delivered; it may not replace what it did.
+        const mayReplace = !anonymous || existing === undefined;
         if (typeof obj.call_id === 'string') state.id = obj.call_id;
-        if (typeof obj.name === 'string') state.name = obj.name;
-        if (typeof obj.arguments === 'string') state.arguments = obj.arguments;
+        if (typeof obj.name === 'string' && (mayReplace || state.name === 'tool')) state.name = obj.name;
+        if (typeof obj.arguments === 'string' && (mayReplace || state.arguments === '')) {
+          state.arguments = obj.arguments;
+        }
         this.toolStates.set(index, state);
       }
     }
@@ -498,6 +685,12 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     for await (const event of this.responseEvents(request, signal)) {
       for (const local of state.push(event)) yield local;
     }
+    // A turn only finished if the backend said so. A reported failure, or a
+    // stream that simply stopped, was previously yielded as a completed result
+    // — the client received a 200 whose content was whatever had arrived.
+    const failure = state.terminalFailure();
+    if (failure) throw new Error(failure);
+    if (!state.isSettled()) throw new Error('codex backend stream ended without a terminal event');
     yield { type: 'completed', result: state.completed() };
   }
 
@@ -508,12 +701,26 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     signal?: AbortSignal,
   ): Promise<OpenAiImageGenerationResult> {
     const startedAt = Date.now();
-    const results = await Promise.all(
-      Array.from(
-        { length: request.n },
-        (_, index) => this.runSingleImageRequest(request, index, signal),
-      ),
-    );
+    // Siblings of a failed turn are already-lost work: the caller has its
+    // error, and every one still running is a full billed image generation
+    // whose result nothing will read. Cancel them with the first failure.
+    const fanOut = new AbortController();
+    const abortFanOut = (): void => fanOut.abort();
+    signal?.addEventListener('abort', abortFanOut, { once: true });
+    let results: CodexBackendImageTurnResult[];
+    try {
+      results = await Promise.all(
+        Array.from(
+          { length: request.n },
+          (_, index) => this.runSingleImageRequest(request, index, fanOut.signal).catch((err) => {
+            fanOut.abort();
+            throw err;
+          }),
+        ),
+      );
+    } finally {
+      signal?.removeEventListener('abort', abortFanOut);
+    }
     let usage: LocalUsage | undefined;
     const images: OpenAiGeneratedImage[] = [];
     for (const result of results) {
@@ -925,7 +1132,22 @@ async function requestChatgptTokenRefresh(refreshToken: string): Promise<CodexRe
     }),
   });
   if (response.ok) {
-    return await response.json() as CodexRefreshResponse;
+    // A 200 carrying no usable token is a failed refresh, not a silent no-op:
+    // merging it kept the expired token AND rewrote `last_refresh`, destroying
+    // the staleness signal the fallback refresh depends on, so the next request
+    // went out with an expired token and the operator saw the backend's
+    // complaint instead of "log out and sign in again". A gateway's HTML page
+    // is the same failure, and used to surface as a 500 SyntaxError.
+    let refreshed: CodexRefreshResponse;
+    try {
+      refreshed = await response.json() as CodexRefreshResponse;
+    } catch {
+      throw codexRefreshError('Codex OAuth token refresh returned a response that is not JSON.');
+    }
+    if (!refreshed?.access_token) {
+      throw codexRefreshError('Codex OAuth token refresh returned no access token. Please log out and sign in again.');
+    }
+    return refreshed;
   }
   const raw = await response.text().catch(() => '');
   throw codexRefreshError(refreshFailureMessage(raw), refreshFailureCode(raw));
@@ -1511,13 +1733,31 @@ function isInstructionMessage(message: NormalizedMessage): boolean {
     && (message.images ?? []).length === 0;
 }
 
+/**
+ * Tool arguments as JSON. An absent value is an empty argument object — the
+ * shape a no-parameter tool expects — not a phantom `input` property, which a
+ * strict schema rejects and a loose one silently accepts.
+ */
 function ensureJsonString(value: string): string {
+  if (value.trim() === '') return '{}';
   try {
     JSON.parse(value);
     return value;
   } catch {
     return JSON.stringify({ input: value });
   }
+}
+
+/** The message a terminal failure frame carries, whatever shape it arrives in. */
+function terminalFailureMessage(event: CodexBackendEvent): string {
+  const responseError = event.response?.error;
+  const frameError = event.error;
+  const detail = (typeof frameError === 'string' ? frameError : frameError?.message)
+    ?? responseError?.message
+    ?? event.response?.incomplete_details?.reason
+    ?? event.response?.status;
+  const kind = event.type === 'response.incomplete' ? 'incomplete' : 'failed';
+  return `codex backend turn ${kind}${detail ? `: ${detail}` : ''}`;
 }
 
 function mediaTypeForPath(path: string): string {

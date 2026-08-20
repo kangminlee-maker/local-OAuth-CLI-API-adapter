@@ -10,6 +10,14 @@ import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js'
 import { openAiImageQualityReasoningEffort, startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { image2ViaGpt55Prompt } from '../dist/proxy/image2-via-gpt55.js';
 import { codexProxyImageModel, isReasoningEffort } from '../dist/settings.js';
+import {
+  basisMismatches,
+  basisVoidsRow,
+  matchesFilter,
+  mergeFilters,
+  nonNegativeNumberOption,
+  readFilters,
+} from './lib/benchmark-verdict.mjs';
 
 loadEnvFile('.env');
 
@@ -44,8 +52,6 @@ const imageGenerationCaseNames = {
 
 const imageGenerationSuiteCaseNames = Object.values(imageGenerationCaseNames)
   .filter((caseName) => caseName !== imageGenerationCaseNames.generationStreamPaired);
-const openAiApiTarget = 'openai-api:gpt-5.5';
-const imageGenerationPairTarget = 'proxy-codex-vs-openai-api:gpt-5.5';
 const originalFetch = globalThis.fetch.bind(globalThis);
 let currentBenchmarkContext = null;
 let activeProxyProviderEgressGuard = null;
@@ -196,10 +202,24 @@ const imageQualityRepeats = countOption(options.imageQualityRepeats, suiteDefaul
 const cwd = options.cwd ?? process.cwd();
 const openAiModel = options.openaiModel ?? 'gpt-5.5';
 const openAiImageApiModel = options.openaiImageApiModel ?? 'gpt-image-1.5';
+const codexImageModel = options.codexImageModel ?? codexProxyImageModel();
+
 const anthropicModels = {
   opus: options.anthropicOpusModel ?? 'claude-opus-4-8',
   haiku: options.anthropicHaikuModel ?? 'claude-haiku-4-5-20251001',
 };
+// Row labels carry the model that actually ran, so artifacts self-describe.
+// Target selection matches by substring, so `--targets=openai-api` selects the
+// direct target regardless of the model override.
+const openAiApiTarget = `openai-api:${openAiModel}`;
+const imageGenerationPairTarget = `proxy-codex-vs-openai-api:${openAiModel}`;
+// Recorded in the summary: isolation changes the proxied session's context, so
+// a baseline comparison across a differing value is not a like-for-like basis.
+const claudeIsolateUserSettings = strictBooleanOption(
+  options.claudeIsolateUserSettings,
+  false,
+  '--claude-isolate-user-settings',
+);
 const outputPath = options.output;
 const baselinePath = options.baseline;
 const regressionTargets = options.regressionTargets ?? 'proxy';
@@ -211,8 +231,8 @@ const semanticQualityJudgeModel = options.semanticQualityJudgeModel ?? openAiMod
 const imageQualityJudgeModel = options.imageQualityJudgeModel ?? semanticQualityJudgeModel;
 const semanticQualityReference = booleanOption(options.semanticQualityReference, true);
 const semanticQualitySuite = options.semanticQualitySuite ?? 'realistic';
-const minSemanticQuality = nonNegativeNumberOption(options.minSemanticQuality, 0);
-const minImageQuality = nonNegativeNumberOption(options.minImageQuality, suiteDefaults.minImageQuality);
+const minSemanticQuality = nonNegativeNumberOption(options.minSemanticQuality, suiteDefaults.minSemanticQuality, '--min-semantic-quality');
+const minImageQuality = nonNegativeNumberOption(options.minImageQuality, suiteDefaults.minImageQuality, '--min-image-quality');
 const expectProviderErrors = booleanOption(options.expectProviderErrors, false);
 const requestReasoningEffort = optionalReasoningEffort(options.requestReasoningEffort);
 const codexProxyMode = codexAppServerProxyMode(options.codexProxyMode ?? options.codexProbeMode);
@@ -225,6 +245,15 @@ const codexImageAttemptDiagnosticsEnabled = booleanOption(
 );
 
 const rows = [];
+// A target selected under one label can be reported under another — the
+// Anthropic family aliases resolve to model names. Recording the filter that
+// made the selection keeps the unmatched-target check from re-reporting it.
+const claimedTargetFilters = new Set();
+function claimTargetFilters(...labels) {
+  for (const filter of targetFilters ?? []) {
+    if (labels.some((label) => matchesFilter(label, filter))) claimedTargetFilters.add(filter);
+  }
+}
 const servers = [];
 const semanticReferenceCache = new Map();
 const imageFixtureCache = new Map();
@@ -245,7 +274,7 @@ try {
     });
     const proxyCodexImageBackend = selectedCodexImageTransport === 'codex-backend'
       ? new CodexBackendTransport({
-          model: options.codexImageModel ?? codexProxyImageModel(),
+          model: codexImageModel,
           timeoutMs,
           ...(codexImageAttemptDiagnosticsEnabled
             ? { onImageAttempt: (diagnostic) => recordImageAttemptDiagnostic('proxy-codex', diagnostic) }
@@ -254,7 +283,7 @@ try {
       : new CodexAppServerBackend({
           command: options.codexCommand,
           cwd,
-          model: options.codexImageModel ?? codexProxyImageModel(),
+          model: codexImageModel,
           timeoutMs,
           imageGeneration: true,
           proxyMode: codexProxyMode,
@@ -289,6 +318,7 @@ try {
       cwd,
       model: options.claudeCliModel ?? 'opus',
       timeoutMs,
+      isolateUserSettings: claudeIsolateUserSettings,
     }));
   }
 
@@ -324,16 +354,42 @@ try {
   if (proxyClaude) await benchmarkAnthropicCompatible('proxy-claude', proxyClaude.url, proxyClaude.model, false);
   if (process.env.ANTHROPIC_API_KEY) {
     for (const [family, model] of Object.entries(anthropicModels)) {
-      const target = `anthropic-api:${family}`;
-      if (shouldRunTarget(target)) {
-        await benchmarkAnthropicCompatible(target, 'https://api.anthropic.com', model, true);
+      // Select by family alias or by model name; label rows with the model that ran.
+      if (shouldRunTarget(`anthropic-api:${family}`) || shouldRunTarget(`anthropic-api:${model}`)) {
+        claimTargetFilters(`anthropic-api:${family}`, `anthropic-api:${model}`);
+        await benchmarkAnthropicCompatible(`anthropic-api:${model}`, 'https://api.anthropic.com', model, true);
       }
     }
-  } else if (Object.keys(anthropicModels).some((family) => shouldRunTarget(`anthropic-api:${family}`))) {
-    rows.push({ target: 'anthropic-api', ok: false, skipped: true, error: 'ANTHROPIC_API_KEY missing' });
+    // Same selector as the run branch: a model-name target with no key must
+    // still record a skip, or the run reports success with no Anthropic rows.
+    // The skip carries the model label the run branch would have used, so the
+    // requested target is visibly accounted for rather than merely absent.
+  } else {
+    for (const [family, model] of Object.entries(anthropicModels)) {
+      if (shouldRunTarget(`anthropic-api:${family}`) || shouldRunTarget(`anthropic-api:${model}`)) {
+        claimTargetFilters(`anthropic-api:${family}`, `anthropic-api:${model}`);
+        rows.push({ target: `anthropic-api:${model}`, ok: false, skipped: true, error: 'ANTHROPIC_API_KEY missing' });
+      }
+    }
   }
 } finally {
   for (const server of servers.reverse()) await server.close().catch(() => undefined);
+}
+
+// A requested target that produced neither a measurement nor a skip is a
+// selection that silently did nothing — which is how a renamed target (the
+// direct labels carry the model now) deletes half a comparison while the run
+// still exits 0.
+for (const filter of targetFilters ?? []) {
+  if (filter === 'all') continue;
+  if (claimedTargetFilters.has(filter)) continue;
+  if (rows.some((row) => matchesFilter(row.target, filter))) continue;
+  rows.push({
+    target: filter,
+    case: 'selection',
+    ok: false,
+    error: `Requested target matched no benchmark rows: ${filter}`,
+  });
 }
 
 if (rows.length === 0) {
@@ -342,6 +398,18 @@ if (rows.length === 0) {
     case: 'selection',
     ok: false,
     error: `No benchmark rows selected. targets=${filterLabel(targetFilters)} cases=${filterLabel(caseFilters)}`,
+  });
+}
+
+// A run whose every row was skipped measured nothing, so it cannot report
+// success: `passed` counted skips, and the exit code ignored them.
+const executed = rows.filter((row) => !row.skipped);
+if (executed.length === 0) {
+  rows.push({
+    target: 'benchmark',
+    case: 'selection',
+    ok: false,
+    error: `Every selected row was skipped: ${rows.filter((row) => row.skipped).map((row) => row.error ?? row.target).join('; ')}`,
   });
 }
 
@@ -357,8 +425,10 @@ const summaryBase = {
   semanticQualityReference,
   semanticQualityReferenceMode: 'proxy-provider',
   semanticQualitySuite,
-  minSemanticQuality,
-  minImageQuality,
+  // Reported as applied only when rows existed for it to gate; advertising a
+  // threshold no row was measured against reads as a gate that ran.
+  minSemanticQuality: semanticQualityRepeats > 0 ? minSemanticQuality : null,
+  minImageQuality: imageQualityRepeats > 0 ? minImageQuality : null,
   expectProviderErrors,
   requestReasoningEffort,
   codexProxyMode: codexProxyMode ?? 'api-isolated',
@@ -369,13 +439,33 @@ const summaryBase = {
   includeImageGeneration,
   openAiModel,
   openAiImageApiModel,
+  codexImageModel,
+  // The proxy-side models decide what the proxy rows measure, so they belong in
+  // the artifact next to the direct-side ones.
+  codexModel: options.codexBackendModel ?? options.codexModel ?? null,
+  claudeCliModel: options.claudeCliModel ?? 'opus',
+  claudeIsolateUserSettings,
   anthropicModels,
-  passed: rows.length - failed.length,
+  // A skipped row measured nothing, so it is neither a pass nor a failure.
+  passed: rows.filter((row) => row.ok && !row.skipped).length,
+  skipped: rows.filter((row) => row.skipped).length,
   failed: failed.length,
   rows,
 };
-const regressionGate = baselinePath
-  ? compareWithBaseline(loadSummaryFile(baselinePath), summaryBase, {
+// Read after the run, but never fatally: the measurements are already paid
+// for, and an unreadable baseline is a comparison problem, not a reason to
+// discard them.
+let baselineLoadError;
+const baselineSummary = baselinePath ? (() => {
+  try {
+    return loadSummaryFile(baselinePath);
+  } catch (err) {
+    baselineLoadError = errorMessage(err);
+    return null;
+  }
+})() : null;
+const regressionGate = baselineSummary
+  ? compareWithBaseline(baselineSummary, summaryBase, {
       regressionTargets,
       latencyRegressionPct,
       latencyRegressionMs,
@@ -384,9 +474,20 @@ const regressionGate = baselinePath
   : null;
 const summary = {
   ...summaryBase,
+  ...(baselineLoadError ? { baselineError: baselineLoadError } : {}),
   ...(imageAttemptDiagnostics.length > 0 ? { imageAttemptDiagnostics } : {}),
   ...(regressionGate ? { regressionGate } : {}),
 };
+if (baselineLoadError) {
+  console.error(`\nBASELINE UNREADABLE — results kept, comparison skipped: ${baselineLoadError}`);
+}
+if (regressionGate?.basisMismatch) {
+  // Loud, because the rows it governs were dropped from the comparison.
+  console.error(`\nBASELINE BASIS MISMATCH — deltas withheld for the affected targets: ${JSON.stringify(regressionGate.basisMismatch)}`);
+}
+if (regressionGate?.basisUnknown) {
+  console.error(`\nBASELINE recorded no value for: ${regressionGate.basisUnknown.map((entry) => entry.field).join(', ')} — comparison proceeded`);
+}
 if (outputPath) {
   fs.writeFileSync(outputPath, `${JSON.stringify(summary, null, 2)}\n`);
 }
@@ -506,6 +607,9 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
       messages: [{ role: 'user', content: 'Use get_weather for Seoul. Return a tool call only.' }],
       tools: [openAiChatWeatherTool()],
       tool_choice: 'required',
+      // gpt-5.6+ rejects function tools on /v1/chat/completions unless
+      // reasoning_effort is 'none'; sent to both sides to keep the pair identical.
+      reasoning_effort: 'none',
       max_completion_tokens: 128,
     }, openAiHeaders(isApi));
     assertOpenAiChatResponseShape(response.body, 'tool_calls');
@@ -524,6 +628,9 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
       messages: [{ role: 'user', content: 'Use get_weather for Seoul. Return a tool call only.' }],
       tools: [openAiChatWeatherTool()],
       tool_choice: 'required',
+      // gpt-5.6+ rejects function tools on /v1/chat/completions unless
+      // reasoning_effort is 'none'; sent to both sides to keep the pair identical.
+      reasoning_effort: 'none',
       max_completion_tokens: 128,
     }, openAiHeaders(isApi), () => '', (_event, payload) => {
       const calls = payload?.choices?.[0]?.delta?.tool_calls;
@@ -552,6 +659,7 @@ async function benchmarkOpenAiChatCompatible(target, baseUrl, model, isApi) {
       ],
       tools: [openAiChatWeatherTool()],
       tool_choice: 'auto',
+      reasoning_effort: 'none',
       max_completion_tokens: 128,
     }, openAiHeaders(isApi));
     assertOpenAiChatResponseShape(response.body, 'stop');
@@ -1889,7 +1997,7 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
     await benchmarkCase(target, 'anthropic.messages.image.schema_exact', repeats, async () => {
       const response = await postJson(`${baseUrl}/v1/messages`, {
         model,
-        max_tokens: 32,
+        max_tokens: 256,
         messages: [{
           role: 'user',
           content: [
@@ -1914,7 +2022,7 @@ async function benchmarkAnthropicCompatible(target, baseUrl, model, isApi) {
     await benchmarkCase(target, 'anthropic.messages.multi_image.schema_exact', repeats, async () => {
       const response = await postJson(`${baseUrl}/v1/messages`, {
         model,
-        max_tokens: 32,
+        max_tokens: 256,
         messages: [{
           role: 'user',
           content: [
@@ -2012,7 +2120,7 @@ async function benchmarkCase(target, caseName, count, fn) {
     firstToolArgumentMs: summarize(samples.map((sample) => sample.firstToolArgumentMs).filter(Number.isFinite)),
     firstImageMs: summarize(samples.map((sample) => sample.firstImageMs).filter(Number.isFinite)),
     chunks: samples.map((sample) => sample.chunks).filter(Number.isFinite),
-    sample: samples.at(-1),
+    sample: decidingSample(samples),
   };
   const backendTiming = summarizeBackendTimings(samples);
   if (backendTiming) row.backendTiming = backendTiming;
@@ -2064,10 +2172,14 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
     ok: true,
     totalMs: summarize(samples.map((sample) => sample.totalMs)),
     quality: summarize(samples.map((sample) => sample.quality.score)),
-    sample: samples.at(-1),
+    sample: decidingSample(samples),
   };
   const semanticScores = samples.map((sample) => sample.semanticQuality?.score).filter(Number.isFinite);
   if (semanticScores.length > 0) row.semanticQuality = summarize(semanticScores);
+  const relativeScores = samples
+    .map((sample) => sample.semanticQuality?.relativeQuality ?? sample.semanticQuality?.score)
+    .filter(Number.isFinite);
+  if (relativeScores.length > 0) row.semanticRelativeQuality = summarize(relativeScores);
   const judgeMs = samples.map((sample) => sample.judgeMs).filter(Number.isFinite);
   if (judgeMs.length > 0) row.judgeMs = summarize(judgeMs);
   const backendTiming = summarizeBackendTimings(samples);
@@ -2080,10 +2192,14 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
     row.ok = false;
     row.error = `semantic reference failed: ${referenceErrors[0]}`;
   }
-  const lowestSemanticScore = Math.min(...semanticScores);
-  if (row.ok && semanticScores.length > 0 && minSemanticQuality > 0 && lowestSemanticScore < minSemanticQuality) {
+  // The gate is relative to the same-model direct reference: minSemanticQuality
+  // means "at least N% of the reference's quality for this request", not an
+  // absolute exam score. Absolute scores stay recorded for diagnosis.
+  const lowestRelative = Math.min(...relativeScores);
+  if (row.ok && relativeScores.length > 0 && minSemanticQuality > 0 && lowestRelative < minSemanticQuality) {
     row.ok = false;
-    row.error = `semantic quality below ${minSemanticQuality}: ${lowestSemanticScore}`;
+    const lowestAbsolute = semanticScores.length > 0 ? Math.min(...semanticScores) : null;
+    row.error = `semantic quality below ${minSemanticQuality}: relative ${lowestRelative}${lowestAbsolute === null ? '' : ` (absolute ${lowestAbsolute})`}`;
   }
   rows.push(row);
 }
@@ -3131,13 +3247,32 @@ async function semanticReference(kind, target, index, prompt, options = {}) {
   if (!semanticQualityReference || target.includes('-api:')) return null;
   const provider = semanticReferenceProvider(target);
   if (!provider) return null;
-  if (provider === 'openai' && !process.env.OPENAI_API_KEY) return null;
-  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) return null;
+  // A key that is absent means the reference could not be fetched. Returning
+  // null here made the row look fully measured while the judge, told to fall
+  // back to the absolute score, quietly graded it against an absolute bar —
+  // and the summary still asserted a reference was used.
+  if (provider === 'openai' && !process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY missing: no direct reference for the relative gate');
+  }
+  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
+    throw new Error('ANTHROPIC_API_KEY missing: no direct reference for the relative gate');
+  }
   const key = `${provider}:${kind}:${index}:${hashString(prompt)}:${options.openAiReasoningEffort ?? ''}`;
   if (semanticReferenceCache.has(key)) return semanticReferenceCache.get(key);
   const value = await fetchSemanticReference(provider, kind, prompt, options);
   semanticReferenceCache.set(key, value);
   return value;
+}
+
+/**
+ * The relative gate scores the candidate AGAINST this text, so an empty
+ * reference makes the comparison vacuous and inflates the result — measured
+ * 2026-08-19: one mediocre candidate scored 65 against an empty reference and
+ * 45 against a real one. A reference that says nothing is a reference-
+ * availability failure, not evidence about the proxy.
+ */
+function assertUsableReference(text, target) {
+  assert(typeof text === 'string' && text.trim().length > 0, `empty semantic reference from ${target}`);
 }
 
 async function safeSemanticReference(kind, target, index, prompt, options = {}) {
@@ -3186,13 +3321,22 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
     const response = await postJson('https://api.openai.com/v1/responses', {
       model: openAiModel,
       input: prompt,
-      max_output_tokens: 640,
+      // Reference validity cap, not a quality target: newer/more verbose model
+      // generations must finish naturally or the row loses its reference.
+      max_output_tokens: 1536,
     }, openAiHeaders(true));
     assertOpenAiResponsesShape(response.body);
+    // The chat and Anthropic reference paths reject a truncated answer through
+    // their stop reasons; Responses reports it in `status`, and a half-written
+    // reference is a worse denominator than a missing one because it still
+    // looks usable.
+    assertEqual(response.body.status, 'completed', 'responses semantic reference status');
+    const text = extractOpenAiResponseText(response.body) ?? '';
+    assertUsableReference(text, `openai-api:${openAiModel}:responses`);
     return {
       target: `openai-api:${openAiModel}:responses`,
       totalMs: response.totalMs,
-      text: extractOpenAiResponseText(response.body) ?? '',
+      text,
       usage: response.body.usage,
     };
   }
@@ -3200,15 +3344,17 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
   const body = {
     model: openAiModel,
     messages: [{ role: 'user', content: prompt }],
-    max_completion_tokens: 640,
+    max_completion_tokens: 1536,
   };
   if (options.openAiReasoningEffort) body.reasoning_effort = options.openAiReasoningEffort;
   const response = await postJson('https://api.openai.com/v1/chat/completions', body, openAiHeaders(true));
   assertOpenAiChatResponseShape(response.body, 'stop');
+  const text = response.body.choices?.[0]?.message?.content ?? '';
+  assertUsableReference(text, `openai-api:${openAiModel}:chat`);
   return {
     target: `openai-api:${openAiModel}:chat`,
     totalMs: response.totalMs,
-    text: response.body.choices?.[0]?.message?.content ?? '',
+    text,
     usage: response.body.usage,
   };
 }
@@ -3216,14 +3362,16 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
 async function fetchAnthropicSemanticReference(prompt) {
   const response = await postJson('https://api.anthropic.com/v1/messages', {
     model: anthropicModels.opus,
-    max_tokens: 1024,
+    max_tokens: 2048,
     messages: [{ role: 'user', content: prompt }],
   }, anthropicHeaders(true));
   assertAnthropicMessageShape(response.body, 'end_turn');
+  const text = response.body.content?.find((block) => block.type === 'text')?.text ?? '';
+  assertUsableReference(text, `anthropic-api:${anthropicModels.opus}`);
   return {
     target: `anthropic-api:${anthropicModels.opus}`,
     totalMs: response.totalMs,
-    text: response.body.content?.find((block) => block.type === 'text')?.text ?? '',
+    text,
     usage: response.body.usage,
   };
 }
@@ -3289,6 +3437,7 @@ function semanticJudgePrompt({ target, caseName, prompt, text, reference }) {
       '- semanticRelevance: usefulness, correctness, and operational value for the requested local OAuth CLI API proxy scenario.',
       '- conciseness: dense, non-fluffy, and no extra headings, caveats, or follow-up questions unless the request asks for them.',
       '- providerSimilarity: if a reference is present, semantic similarity to the direct provider output; otherwise plausibility as a direct provider API answer.',
+      '- relativeQuality: how well the candidate satisfies the original request RELATIVE to how well the reference satisfies it, as an integer percentage. 100 = meaningfully equivalent, above 100 = clearly better than the reference, below 100 = worse. Judge task outcome, not stylistic identity: a candidate that satisfies the request as fully as the reference scores 100 even when phrased differently. When no reference is present, set relativeQuality equal to score.',
       'Do not reward reference similarity when both the reference and candidate violate the explicit original request.',
       'Do not treat the reference as a style template when the candidate better satisfies the original request.',
       'For improvement-direction table cells, accept compact concrete mechanisms when they clearly express the direction and keep impact size separate.',
@@ -3304,6 +3453,7 @@ function semanticQualityScoreSchema() {
     additionalProperties: false,
     properties: {
       score: { type: 'integer' },
+      relativeQuality: { type: 'integer' },
       requirementFit: { type: 'integer' },
       semanticRelevance: { type: 'integer' },
       conciseness: { type: 'integer' },
@@ -3316,6 +3466,7 @@ function semanticQualityScoreSchema() {
     },
     required: [
       'score',
+      'relativeQuality',
       'requirementFit',
       'semanticRelevance',
       'conciseness',
@@ -3332,6 +3483,11 @@ function assertSemanticQualityShape(value) {
     assert(Number.isInteger(value[key]), `semantic judge ${key} must be integer`);
     assert(value[key] >= 0 && value[key] <= 100, `semantic judge ${key} must be 0..100`);
   }
+  // relativeQuality may exceed 100: the candidate can beat the reference, and
+  // the gate only reads a minimum — capping it here would turn a judge that
+  // over-scores into a proxy quality failure, which is the wrong blame.
+  assert(Number.isInteger(value.relativeQuality), 'semantic judge relativeQuality must be integer');
+  assert(value.relativeQuality >= 0, 'semantic judge relativeQuality must be non-negative');
   assert(typeof value.rationale === 'string', 'semantic judge rationale must be string');
   assert(Array.isArray(value.issues), 'semantic judge issues must be array');
   for (const issue of value.issues) {
@@ -3583,7 +3739,10 @@ function loadSummaryFile(path) {
   return JSON.parse(markerIndex === -1 ? text : text.slice(markerIndex + marker.length));
 }
 
+
+
 function compareWithBaseline(baseline, current, options) {
+  const basisDrift = basisMismatches(baseline, current);
   const baselineRows = new Map(
     (baseline.rows ?? [])
       .filter((row) => row?.ok)
@@ -3596,6 +3755,12 @@ function compareWithBaseline(baseline, current, options) {
   for (const row of current.rows.filter((item) => item.ok)) {
     if (!shouldCompareRegressionTarget(row.target, options.regressionTargets)) {
       skipped.push({ target: row.target, case: row.case, reason: 'target-filter' });
+      continue;
+    }
+    // Only the rows a differing field actually governs lose their comparison;
+    // a Claude-side difference says nothing about an OpenAI row.
+    if (basisVoidsRow(basisDrift.mismatched, row.target)) {
+      skipped.push({ target: row.target, case: row.case, reason: 'basis-mismatch' });
       continue;
     }
     const baselineRow = baselineRows.get(rowKey(row));
@@ -3622,7 +3787,9 @@ function compareWithBaseline(baseline, current, options) {
       if (delta > threshold) regressions.push(entry);
       else if (delta < -threshold) improvements.push(entry);
     }
-    for (const metric of ['quality', 'semanticQuality', 'imageQuality']) {
+    // semanticRelativeQuality is the metric the gate reads, so a baseline that
+    // does not compare it cannot see the authoritative quality drift.
+    for (const metric of ['quality', 'semanticQuality', 'semanticRelativeQuality', 'imageQuality']) {
       const qualityBefore = medianOf(baselineRow[metric]);
       const qualityAfter = medianOf(row[metric]);
       if (!Number.isFinite(qualityBefore) || !Number.isFinite(qualityAfter)) continue;
@@ -3649,9 +3816,36 @@ function compareWithBaseline(baseline, current, options) {
     qualityRegressionPoints: options.qualityRegressionPoints,
     compared: compared.length,
     skipped: skipped.length,
+    // A differing basis does not weaken the deltas, it voids them: they are
+    // differences in configuration. Reporting them as regressions or
+    // improvements would be a finding about nothing, so the comparison is
+    // withheld and only the mismatch is reported.
+    ...(basisDrift.mismatched.length > 0 ? { basisMismatch: basisDrift.mismatched } : {}),
+    // Fields this run records that the baseline never did: not evidence that
+    // the basis differed, but worth seeing before trusting a delta.
+    ...(basisDrift.unknown.length > 0 ? { basisUnknown: basisDrift.unknown } : {}),
     regressions,
     improvements,
   };
+}
+
+/**
+ * The sample the gates actually read. Quality gates take the minimum across
+ * repeats, so retaining the last sample left artifacts whose kept rationale
+ * praised an answer the row was failed for — the failing text, its issues and
+ * its reference were gone.
+ */
+function decidingSample(samples) {
+  const scored = samples.filter((sample) => Number.isFinite(sample?.semanticQuality?.relativeQuality)
+    || Number.isFinite(sample?.semanticQuality?.score)
+    || Number.isFinite(sample?.imageQuality?.score));
+  if (scored.length === 0) return samples.at(-1);
+  const rank = (sample) => Math.min(
+    sample?.semanticQuality?.relativeQuality ?? Infinity,
+    sample?.semanticQuality?.score ?? Infinity,
+    sample?.imageQuality?.score ?? Infinity,
+  );
+  return scored.reduce((worst, sample) => (rank(sample) < rank(worst) ? sample : worst));
 }
 
 function rowKey(row) {
@@ -3698,18 +3892,6 @@ function matchesFilters(value, filters) {
   return filters.some((filter) => matchesFilter(value, filter));
 }
 
-function matchesFilter(value, filter) {
-  if (filter === 'all') return true;
-  if (filter.includes('*')) {
-    const pattern = filter
-      .split('*')
-      .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, '\\$&'))
-      .join('.*');
-    return new RegExp(`^${pattern}$`).test(value);
-  }
-  return value === filter || value.includes(filter);
-}
-
 function exactOrWildcardFilterMatches(value, filters) {
   if (!filters) return false;
   return filters.some((filter) => {
@@ -3721,15 +3903,6 @@ function exactOrWildcardFilterMatches(value, filters) {
       .join('.*');
     return new RegExp(`^${pattern}$`).test(value);
   });
-}
-
-function readFilters(value) {
-  if (value === undefined || value === null || value === '' || value === 'all') return null;
-  const filters = String(value)
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-  return filters.length > 0 ? filters : null;
 }
 
 function readBenchmarkSuites(value) {
@@ -3755,14 +3928,11 @@ function benchmarkSuiteDefaults(names) {
     semanticQualityRepeats: has('quality-realistic') || has('release-gate') ? 1 : 0,
     imageQualityRepeats: has('image-realistic') || has('release-gate') ? 1 : 0,
     minImageQuality: has('image-realistic') || has('release-gate') ? 90 : 0,
+    // A suite that scores semantic quality carries its gate, the way the image
+    // suites carry theirs: the documented 95 was otherwise only in effect when
+    // the operator remembered the flag.
+    minSemanticQuality: has('quality-realistic') || has('release-gate') ? 95 : 0,
   };
-}
-
-function mergeFilters(...groups) {
-  const filters = uniqueFilters(groups.flatMap((group) => group ?? []));
-  if (filters.length === 0) return null;
-  if (filters.includes('all')) return ['all'];
-  return filters;
 }
 
 function uniqueFilters(filters) {
@@ -3827,17 +3997,19 @@ function countOption(value, fallback) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
-function nonNegativeNumberOption(value, fallback) {
-  if (value === undefined) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-}
-
 function booleanOption(value, fallback) {
   if (value === undefined) return fallback;
   if (value === true || value === 'true' || value === '1' || value === 'yes') return true;
   if (value === false || value === 'false' || value === '0' || value === 'no') return false;
   return fallback;
+}
+
+/** Like booleanOption, but an unparsable value is an error rather than the fallback. */
+function strictBooleanOption(value, fallback, flag) {
+  if (value === undefined) return fallback;
+  const parsed = booleanOption(value, undefined);
+  if (parsed === undefined) throw new Error(`${flag} expects true/false, got: ${value}`);
+  return parsed;
 }
 
 function reasoningEffort(value) {

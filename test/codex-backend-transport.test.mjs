@@ -406,6 +406,363 @@ test('CodexBackendTransport streams native function-call argument deltas', async
   assert.equal(events.at(-1).result.usage.source, 'provider');
 });
 
+test('tool_call_delta index stays dense when a reasoning item shifts output_index', async () => {
+  // Captured from gpt-5.6-terra (2026-08-19): a reasoning output item occupies
+  // output_index 0, the function call arrives at output_index 1, and the final
+  // response.completed output carries no function_call item. Forwarding the raw
+  // output_index desynced streamed deltas (index 1) from the completed result's
+  // dense positions (index 0), so the server re-emitted the full arguments.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { type: 'reasoning', id: 'rs_1' },
+    },
+    {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item: { type: 'reasoning', id: 'rs_1' },
+    },
+    {
+      type: 'response.output_item.added',
+      output_index: 1,
+      item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' },
+    },
+    {
+      type: 'response.function_call_arguments.delta',
+      output_index: 1,
+      item_id: 'fc_1',
+      delta: '{"city"',
+    },
+    {
+      type: 'response.function_call_arguments.delta',
+      output_index: 1,
+      item_id: 'fc_1',
+      delta: ':"Seoul"}',
+    },
+    {
+      type: 'response.function_call_arguments.done',
+      output_index: 1,
+      item_id: 'fc_1',
+    },
+    {
+      type: 'response.output_item.done',
+      output_index: 1,
+      item: {
+        type: 'function_call',
+        id: 'fc_1',
+        call_id: 'call_1',
+        name: 'get_weather',
+        arguments: '{"city":"Seoul"}',
+      },
+    },
+    {
+      type: 'response.completed',
+      response: { id: 'resp_terra_tool', model: 'gpt-5.6-terra', output: [] },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const toolEvents = events.filter((event) => event.type === 'tool_call_delta');
+  assert.ok(toolEvents.length > 0);
+  for (const event of toolEvents) assert.equal(event.index, 0);
+  assert.equal(toolEvents.map((event) => event.argumentsDelta).join(''), '{"city":"Seoul"}');
+  const result = events.at(-1).result;
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].id, 'call_1');
+  assert.equal(result.toolCalls[0].arguments, '{"city":"Seoul"}');
+});
+
+test('an id-less completed function_call does not duplicate a call already streamed', async () => {
+  // The completed output is its own coordinate system: it counts function calls
+  // in an array that also holds reasoning items, while the stream's
+  // output_index counts every item. Feeding an array position into the stream's
+  // positional keyspace minted a second ordinal for the same call, so the
+  // result carried the tool call twice and the server re-emitted its arguments.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    {
+      type: 'response.output_item.added',
+      output_index: 1,
+      item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' },
+    },
+    {
+      type: 'response.function_call_arguments.delta',
+      output_index: 1,
+      item_id: 'fc_1',
+      delta: '{"city":"Seoul"}',
+    },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_idless_final',
+        model: 'gpt-5.5',
+        // The reasoning item is what makes the two views disagree: the call is
+        // at array position 1 here and at dense tool position 0 in the stream.
+        output: [
+          { type: 'reasoning', id: 'rs_1' },
+          { type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+        ],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const toolCalls = events.at(-1).result.toolCalls;
+  assert.equal(toolCalls.length, 1, `expected one tool call, got ${JSON.stringify(toolCalls)}`);
+  assert.equal(toolCalls[0].arguments, '{"city":"Seoul"}');
+  for (const event of events.filter((e) => e.type === 'tool_call_delta')) {
+    assert.equal(event.index, 0);
+  }
+});
+
+test('calls with ids stay separate when the stream omits output_index', async () => {
+  // `readOutputIndex` reports 0 for an absent `output_index`, so a positional
+  // fallback that identified events could inherit collapsed every call in such
+  // a stream into one — the client saw a single call whose arguments were both
+  // calls' JSON concatenated.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_2', delta: '{"tz":"KST"}' },
+    { type: 'response.completed', response: { id: 'resp_no_output_index', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_2', 'get_time', '{"tz":"KST"}']],
+  );
+  const perIndex = new Map();
+  for (const event of events.filter((e) => e.type === 'tool_call_delta')) {
+    perIndex.set(event.index, `${perIndex.get(event.index) ?? ''}${event.argumentsDelta ?? ''}`);
+  }
+  assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}'], [1, '{"tz":"KST"}']]);
+});
+
+test('a completed call the stream never announced is added, not swapped in', async () => {
+  // Its ids are unfamiliar, so it is a call of its own; taking the dense
+  // position a streamed call already holds would drop that call instead.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_unseen_call',
+        model: 'gpt-5.5',
+        output: [
+          { type: 'function_call', id: 'fc_9', call_id: 'call_9', name: 'get_time', arguments: '{"tz":"KST"}' },
+          { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+        ],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_9', 'get_time', '{"tz":"KST"}']],
+  );
+});
+
+for (const [label, terminal] of [
+  ['response.failed', { type: 'response.failed', response: { id: 'r', error: { code: 'server_error', message: 'upstream exploded' } } }],
+  ['an SSE error frame', { type: 'error', error: { message: 'stream aborted upstream' } }],
+]) {
+  test(`a turn ending in ${label} is a failure, not a finished answer`, async () => {
+    // The deltas already forwarded used to be served as a complete answer:
+    // HTTP 200, finish_reason "stop", and whatever text arrived before the
+    // failure — indistinguishable from a turn that actually finished.
+    const codexHome = await createCodexHome();
+    globalThis.fetch = async () => new Response(sse([
+      { type: 'response.output_text.delta', delta: 'The answer is ' },
+      { type: 'response.output_text.delta', delta: '4' },
+      terminal,
+    ]), { status: 200 });
+    const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+    await assert.rejects(() => backend.generate(textRequest()), /codex backend turn failed/);
+  });
+}
+
+test('a truncated turn returns what it generated, with a stop reason', async () => {
+  // `response.incomplete` means the cap was hit, not that the turn broke: the
+  // output is real and the provider returns it. Failing the request discarded
+  // every generated token and, being a 500, invited a retry that would
+  // deterministically hit the same cap.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_text.delta', delta: 'Here is the first half' },
+    {
+      type: 'response.incomplete',
+      response: { id: 'r', model: 'gpt-5.5', output: [], incomplete_details: { reason: 'max_output_tokens' } },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const result = await backend.generate(textRequest());
+  assert.equal(result.text, 'Here is the first half');
+  assert.equal(result.stopReason, 'max_tokens');
+});
+
+test('a turn that completed is not undone by a later error frame', async () => {
+  // Noise after the terminal frame — or a warning the backend recovered from —
+  // used to discard a finished, correct answer as a 500.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_text.delta', delta: 'complete answer' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+    { type: 'error', error: { message: 'post-completion noise' } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const result = await backend.generate(textRequest());
+  assert.equal(result.text, 'complete answer');
+});
+
+test('a stream that ends with no terminal event is a failure', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_text.delta', delta: 'partial' },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  await assert.rejects(() => backend.generate(textRequest()), /ended without a terminal event/);
+});
+
+test('a tool call carrying no arguments reports an empty object', async () => {
+  // `{"input":""}` invents a property: a strict schema rejects the call and a
+  // loose one hands the tool a parameter the model never sent.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_time' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_time' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const result = await backend.generate(toolRequest());
+  assert.deepEqual(result.toolCalls.map((call) => [call.name, call.arguments]), [['get_time', '{}']]);
+});
+
+test('an anonymous completed call cannot rewrite what the stream already delivered', async () => {
+  // Position is not identity. With two calls listed in an order the stream did
+  // not use, overwriting gave each streamed call the other call's name and
+  // arguments under its own id, so a client answered the wrong call.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.added', output_index: 2, item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 2, item_id: 'fc_2', delta: '{"tz":"KST"}' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'r',
+        model: 'gpt-5.5',
+        output: [
+          { type: 'function_call', name: 'get_time', arguments: '{"tz":"KST"}' },
+          { type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+        ],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_2', 'get_time', '{"tz":"KST"}']],
+  );
+});
+
+test('a call is announced with the id the client must echo, not a placeholder', async () => {
+  // When `call_id` only arrives on `output_item.done`, announcing at `added`
+  // told the streaming client `fc_1` while the completed result said `call_1`.
+  // A client cannot rename a call it already reported, so it answers under an
+  // id the model never used.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const announced = events.filter((event) => event.type === 'tool_call_delta' && event.id);
+  assert.ok(announced.length > 0);
+  for (const event of announced) {
+    assert.equal(event.id, 'call_1', 'streamed identity must match the completed result');
+  }
+  const streamedArguments = events
+    .filter((event) => event.type === 'tool_call_delta')
+    .map((event) => event.argumentsDelta ?? '')
+    .join('');
+  assert.equal(streamedArguments, '{"city":"Seoul"}', 'arguments held before naming are still delivered');
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.arguments]),
+    [['call_1', '{"city":"Seoul"}']],
+  );
+});
+
+test('an id-less completed call never overwrites a different streamed call', async () => {
+  // When the completed output holds fewer function calls than the stream did,
+  // positional alignment would land an anonymous item on whichever streamed
+  // call shares its position — replacing that call's name and arguments with
+  // another call's payload. A client would then run the wrong tool, twice.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'delete_file' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_2', delta: '{"path":"/tmp/x"}' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_mismatched_counts',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', name: 'delete_file', arguments: '{"path":"/tmp/x"}' }],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const toolCalls = events.at(-1).result.toolCalls;
+  assert.deepEqual(
+    toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [
+      ['call_1', 'get_weather', '{"city":"Seoul"}'],
+      ['call_2', 'delete_file', '{"path":"/tmp/x"}'],
+    ],
+  );
+});
+
 test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
   // The contract exempts `/v1/images/*` from the switch: the request `model` is
   // an Images route selector (`image-2`), not a Codex slug. Honouring it would

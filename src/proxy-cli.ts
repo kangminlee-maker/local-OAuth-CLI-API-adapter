@@ -60,6 +60,24 @@ async function proxy(args: readonly string[]): Promise<number> {
   if (runtimeName !== 'codex' && options.codexImageTransport) {
     throw new Error('codex image transport can only be selected with --runtime codex.');
   }
+  // A privacy switch must never fail open: an unparsable value is an error, not
+  // "off", and asking for it on a runtime that cannot honour it is a mistake
+  // worth reporting rather than a flag consumed by nothing.
+  const isolateUserSettings = parseBooleanFlag(options.isolateUserSettings, '--isolate-user-settings');
+  if (runtimeName !== 'claude' && isolateUserSettings) {
+    throw new Error('--isolate-user-settings can only be selected with --runtime claude.');
+  }
+  // Extra args are appended last and win, so these would start a proxy that
+  // reports isolation while loading the settings it promised to keep out.
+  // `--settings` is a separate CLI flag that loads additional settings — hooks,
+  // env, permissions — so it defeats the switch just as directly.
+  const settingsOverrideFlags = ['--setting-sources', '--settings'];
+  const conflicting = (options.extraArg ?? []).find(
+    (arg) => settingsOverrideFlags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)),
+  );
+  if (isolateUserSettings && conflicting) {
+    throw new Error(`--isolate-user-settings conflicts with --extra-arg ${conflicting}: the extra arg would override the isolation.`);
+  }
   const cwd = options.cwd ?? process.cwd();
   const backend: LocalCliBackend = runtimeName === 'claude'
     ? new ClaudeCodeBackend({
@@ -68,6 +86,7 @@ async function proxy(args: readonly string[]): Promise<number> {
         model: options.model,
         timeoutMs,
         extraArgs: options.extraArg,
+        isolateUserSettings,
       })
     : createCodexBackend({
         transport: selectedCodexTransport,
@@ -96,6 +115,7 @@ async function proxy(args: readonly string[]): Promise<number> {
             model: input.model ?? options.model,
             timeoutMs,
             extraArgs: options.extraArg,
+            isolateUserSettings,
           })
         : CodexNativeCliChatSession.create({
             command: options.command,
@@ -124,6 +144,11 @@ async function proxy(args: readonly string[]): Promise<number> {
   process.stdout.write(`  auth: ${authGateStatus(authKey)}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexTransport: ${selectedCodexTransport}\n`);
   if (runtimeName === 'codex') process.stdout.write(`  codexImageTransport: ${selectedCodexImageTransport}\n`);
+  // Stated for both values: the default runs operator hooks per API turn, and a
+  // mistyped flag would otherwise leave that on with nothing contradicting it.
+  if (runtimeName === 'claude') {
+    process.stdout.write(`  userSettings: ${isolateUserSettings ? 'isolated (no setting sources)' : 'loaded (user source: CLAUDE.md, hooks, env, permissions)'}\n`);
+  }
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
   process.stdout.write(`  openai: OPENAI_BASE_URL=${started.url}/v1\n`);
   process.stdout.write(`  anthropic: ANTHROPIC_BASE_URL=${started.url}\n`);
@@ -159,6 +184,7 @@ interface ParsedOptions {
   readonly transport?: string;
   readonly acceptLlmGuide?: string;
   readonly authKey?: string;
+  readonly isolateUserSettings?: string;
 }
 
 export function parseOptions(args: readonly string[]): ParsedOptions {
@@ -197,6 +223,14 @@ export function parseOptions(args: readonly string[]): ParsedOptions {
 
 function asExtraArgs(value: string | string[] | undefined): string[] {
   return Array.isArray(value) ? value : [];
+}
+
+/** Bare flag or an explicit `true`/`false`; anything else is a usage error. */
+function parseBooleanFlag(value: string | undefined, flag: string): boolean {
+  if (value === undefined) return false;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`${flag} takes no value or true/false, got: ${value}`);
 }
 
 function parseProxyRuntimeName(value: string): 'codex' | 'claude' {
@@ -340,6 +374,11 @@ Options:
   --command <path>                   Override CLI binary path.
   --model <model>                    Pass a model to the selected CLI.
   --extra-arg <arg>                  Extra CLI arg, repeatable.
+  --isolate-user-settings            Claude runtime: load no CLI setting sources for
+                                     spawned children (API backend and native chat
+                                     sessions alike), so the operator's global CLAUDE.md,
+                                     hooks, permissions and env settings stay out of them.
+                                     Default: off (user settings load).
   --port <number>                    Server port. Default: 8787.
   --host <host>                      Server host. Default: 127.0.0.1.
   --timeout-ms <number>              Runtime timeout. Default: 180000.
