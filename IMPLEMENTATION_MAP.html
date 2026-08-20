@@ -714,6 +714,27 @@
       </thead>
       <tbody>
         <tr>
+          <td>R6-1</td>
+          <td><strong>벤치 판정이 아직 조용히 녹색이 되는 다섯 경로를 닫습니다.</strong> ①읽을 수 없는 <code>--baseline</code>이 exit 0 — 실패를 실행에서 떼어냈는데 종료 코드가 <code>baselineLoadError</code>를 보지 않습니다. ②basis 불일치로 전 행이 void되면 <code>compared: 0</code>·<code>regressions: []</code>로 녹색입니다. ③<code>countOption</code>은 여전히 <code>0.9</code>→0이라 <code>--semantic-quality-repeats=0.9</code>가 quality 행을 전멸시킵니다(<code>nonNegativeNumberOption</code>만 강화됨). ④<code>decidingSample</code>이 <code>relativeQuality</code>·<code>score</code>·<code>imageQuality.score</code> 세 스케일을 함께 min으로 비교합니다. ⑤<code>repeats</code>와 <code>--codex-image-transport</code>가 basis 필드가 아닙니다.</td>
+          <td>없음. 판정 규칙이며 런타임과 무관합니다.</td>
+          <td class="ok">높음. 캠페인이 닫은 "측정하지 않고 통과" 부류의 잔여분입니다.</td>
+          <td>다섯 경로 각각에 <code>test/benchmark-verdict.test.mjs</code> 케이스가 있고, 읽을 수 없는 baseline과 전 행 void가 exit 1</td>
+        </tr>
+        <tr>
+          <td>R6-2</td>
+          <td><strong>보류된 툴 인자와 완료 출력 순서를 마무리합니다.</strong> ⑥<code>output_item.added</code> 이전에 온 인자 델타는 보류되지만 <code>announce()</code>가 flush하지 않아(<code>done</code> 경로만 flush) 스트리밍 클라이언트가 접두사를 잃습니다. ⑦그 변형(<code>item_id</code> 없음)은 별도 서수로 갈라져 <code>tool</code>이라는 이름의 유령 툴콜을 만듭니다. ⑧Responses <code>completed.output</code>이 고정 순서라 툴이 텍스트보다 먼저 오면 emission-order 인덱스와 모순됩니다. ⑨같은 형태에서 <code>/v1/messages</code> 스트림과 비스트림의 블록 순서가 다릅니다. ⑩익명 완료 항목이 잘린 접두사를 고치지 못해 <code>{"input":"&lt;partial&gt;"}</code> 형태가 남습니다.</td>
+          <td>낮음.</td>
+          <td class="ok">높음. ⑥⑦은 클라이언트가 잘못된 인자로 툴을 실행하는 경로입니다.</td>
+          <td>다섯 형태 각각에 재현 테스트가 있고, <code>test/tool-stream-surface-parity.test.mjs</code>가 스트림·최종·세 표면의 일치를 단언</td>
+        </tr>
+        <tr>
+          <td>R6-3</td>
+          <td><strong>격리와 수명주기의 남은 구멍을 막습니다.</strong> ⑪자식 env 자격증명 차단이 prefix×suffix 정확 매칭이라 <code>AWS_*</code>·<code>GOOGLE_APPLICATION_CREDENTIALS</code>·<code>CLAUDE_CODE_USE_BEDROCK</code>·<code>ANTHROPIC_CUSTOM_HEADERS</code> 등이 자식에 전달됩니다(설치된 CLI 2.1.237에 실재하는 스위치들). ⑫네이티브 채팅 표면이 <code>requestTimeoutMs</code>를 읽지 않아 응답 없는 턴이 무한 대기합니다. ⑬응답 없는 codex 자식의 <code>close()</code>가 <code>thread/archive</code>를 기다려 턴 타임아웃 전체를 소모합니다. ⑭동시 refresh dedup 가드는 제거해도 스위트가 전부 통과합니다.</td>
+          <td>⑬만 종료 지연에 직접 영향.</td>
+          <td class="warn">⑪은 보안 경계(<code>docs/direct-api-transport-handoff.md</code>의 "자식은 direct provider 자격증명을 상속하지 않는다")를 실제로 뚫습니다.</td>
+          <td>⑪이 접두사 기반 차단으로 바뀌고 대표 이름들에 테스트, ⑫⑬에 타임아웃, ⑭에 뮤테이션으로 확인되는 테스트</td>
+        </tr>
+        <tr>
           <td>신규</td>
           <td>semantic 품질 게이트 기준을 결정합니다. 2026-06-22 ×3 재측정에서 median은 대부분 ≥ 95이나 min-of-3은 판정자 stochastic dip을 잡아 <code>proxy-codex</code> 15/20·<code>proxy-claude</code> 5/10만 통과합니다. min 유지 시 반복 수를 올려 변동을 줄일지, median 기준으로 완화할지 정하고, <code>korean_incident_report</code>·<code>provider_error_policy</code>(median 94)는 일반 규칙으로 보강합니다.</td>
           <td>낮음. 게이트 기준 변경은 측정 해석이며 런타임 속도와 무관합니다.</td>
