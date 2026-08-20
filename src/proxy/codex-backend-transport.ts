@@ -157,6 +157,13 @@ interface ToolState {
   name: string;
   arguments: string;
   started: boolean;
+  /**
+   * Whether the backend has actually named this call. Until it has, `id` and
+   * `name` are placeholders, and announcing them would tell the client an
+   * identity that the completed result then contradicts — the client cannot
+   * rename a call it has already been told about.
+   */
+  identified: boolean;
 }
 
 class CodexBackendStreamState {
@@ -266,20 +273,16 @@ class CodexBackendStreamState {
         name,
         arguments: '',
         started: false,
+        identified: false,
       };
       state.id = id;
       state.name = name;
-      if (!state.started) {
-        state.started = true;
-        out.push({
-          type: 'tool_call_delta',
-          index,
-          id: state.id,
-          name: state.name,
-          argumentsDelta: '',
-        });
-      }
+      // `call_id` is the identity the client echoes back with the tool result;
+      // an item id is not interchangeable with it, so a call is only worth
+      // announcing once the backend has supplied one.
+      state.identified = event.item.call_id !== undefined;
       this.toolStates.set(index, state);
+      if (state.identified) out.push(...this.announce(index, state));
       return out;
     }
     if (event.type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
@@ -292,19 +295,15 @@ class CodexBackendStreamState {
         name: 'tool',
         arguments: '',
         started: false,
+        identified: false,
       };
-      if (!state.started) {
-        state.started = true;
-        out.push({
-          type: 'tool_call_delta',
-          index,
-          id: state.id,
-          name: state.name,
-          argumentsDelta: '',
-        });
-      }
       state.arguments += event.delta;
       this.toolStates.set(index, state);
+      // Arguments that arrive before the call is named are held: the server
+      // re-sends whatever the client has not seen once the call is announced,
+      // so nothing is lost by waiting for a name worth sending.
+      if (!state.identified) return out;
+      out.push(...this.announce(index, state));
       out.push({
         type: 'tool_call_delta',
         index,
@@ -320,12 +319,27 @@ class CodexBackendStreamState {
         id: event.item.call_id ?? event.item.id ?? `call_${index + 1}`,
         name: event.item.name ?? 'tool',
         arguments: '',
-        started: true,
+        started: false,
+        identified: false,
       };
-      state.id = event.item.call_id ?? state.id;
+      state.id = event.item.call_id ?? event.item.id ?? state.id;
       state.name = event.item.name ?? state.name;
+      if (event.item.call_id !== undefined) state.identified = true;
       if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
       this.toolStates.set(index, state);
+      if (state.identified) {
+        const announced = this.announce(index, state);
+        if (announced.length > 0 && state.arguments) {
+          announced.push({
+            type: 'tool_call_delta',
+            index,
+            id: state.id,
+            name: state.name,
+            argumentsDelta: state.arguments,
+          });
+        }
+        out.push(...announced);
+      }
       return out;
     }
     if (event.type === 'response.completed') {
@@ -344,6 +358,22 @@ class CodexBackendStreamState {
     return out;
   }
 
+  /**
+   * Emits the call's opening delta the first time it is announced, carrying the
+   * identity the backend gave it. Returns nothing once announced.
+   */
+  private announce(index: number, state: ToolState): LocalStreamEvent[] {
+    if (state.started) return [];
+    state.started = true;
+    return [{
+      type: 'tool_call_delta',
+      index,
+      id: state.id,
+      name: state.name,
+      argumentsDelta: '',
+    }];
+  }
+
   /** The failure the backend reported, if it reported one. */
   terminalFailure(): string | undefined {
     return this.failure;
@@ -359,7 +389,11 @@ class CodexBackendStreamState {
     return {
       id: this.responseId ?? this.id,
       model: this.model ?? this.request.model,
-      text: toolCalls.length > 0 ? '' : this.text.trim(),
+      // Text and tool calls coexist upstream — a model that narrates before
+      // calling a tool sends both — and the streamed deltas already delivered
+      // the narration, so dropping it here made streaming and non-streaming
+      // clients disagree about what the model said.
+      text: this.text.trim(),
       toolCalls,
       usage: this.usage ?? usageFor(this.request, this.text, toolCalls),
       latencyMs: Date.now() - this.startedAt,
@@ -407,6 +441,7 @@ class CodexBackendStreamState {
           name: typeof obj.name === 'string' ? obj.name : 'tool',
           arguments: '',
           started: true,
+          identified: typeof obj.call_id === 'string',
         };
         // An anonymous item is matched by position alone, and position is not
         // proof of identity: with two calls listed in an order the stream did

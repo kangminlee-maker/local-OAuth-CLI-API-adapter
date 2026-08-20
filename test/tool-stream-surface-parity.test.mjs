@@ -185,3 +185,112 @@ for (const [label, finalOutput] of FINAL_OUTPUTS) {
     });
   });
 }
+
+// A turn that narrates and then calls a tool exercises the wire positions:
+// output items and content blocks are addressed by index, and two items at the
+// same index make an SDK accumulator overwrite one with the other.
+function narrateThenCallEvents() {
+  return [
+    { type: 'response.output_text.delta', delta: 'Let me check the weather. ' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+function callThenNarrateEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', delta: 'Checking now.' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+test('responses stream gives every output item its own index', async () => {
+  await withProxy(narrateThenCallEvents(), async (url) => {
+    const res = await realFetch(`${url}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        stream: true,
+        input: 'w',
+        tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+      }),
+    });
+    const itemsByIndex = new Map();
+    for (const event of sseEvents(await res.text())) {
+      if (event.type !== 'response.output_item.added') continue;
+      const seen = itemsByIndex.get(event.output_index);
+      assert.ok(
+        seen === undefined || seen === event.item?.type,
+        `output_index ${event.output_index} used by both ${seen} and ${event.item?.type}`,
+      );
+      itemsByIndex.set(event.output_index, event.item?.type);
+    }
+    assert.deepEqual([...itemsByIndex.values()].sort(), ['function_call', 'message', 'reasoning']);
+  });
+});
+
+test('messages stream opens each content block once and stops only what it opened', async () => {
+  await withProxy(callThenNarrateEvents(), async (url) => {
+    const res = await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        stream: true,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    });
+    const opened = new Set();
+    const stopped = [];
+    for (const event of sseEvents(await res.text())) {
+      if (event.type === 'content_block_start') {
+        assert.ok(!opened.has(event.index), `content block ${event.index} started twice`);
+        opened.add(event.index);
+      }
+      if (event.type === 'content_block_delta') {
+        assert.ok(opened.has(event.index), `delta for unopened content block ${event.index}`);
+      }
+      if (event.type === 'content_block_stop') {
+        assert.ok(opened.has(event.index), `stop for unopened content block ${event.index}`);
+        stopped.push(event.index);
+      }
+    }
+    assert.deepEqual([...opened].sort(), [0, 1]);
+    assert.deepEqual(stopped.sort(), [0, 1]);
+  });
+});
+
+test('narration accompanying a tool call survives on every surface', async () => {
+  await withProxy(narrateThenCallEvents(), async (url) => {
+    const chat = await (await realFetch(`${url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true } }],
+      }),
+    })).json();
+    assert.match(chat.choices[0].message.content ?? '', /Let me check the weather/);
+    assert.equal(chat.choices[0].message.tool_calls.length, 1);
+
+    const messages = await (await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    })).json();
+    assert.deepEqual(messages.content.map((block) => block.type), ['text', 'tool_use']);
+  });
+});

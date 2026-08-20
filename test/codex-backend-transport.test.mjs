@@ -661,6 +661,39 @@ test('an anonymous completed call cannot rewrite what the stream already deliver
   );
 });
 
+test('a call is announced with the id the client must echo, not a placeholder', async () => {
+  // When `call_id` only arrives on `output_item.done`, announcing at `added`
+  // told the streaming client `fc_1` while the completed result said `call_1`.
+  // A client cannot rename a call it already reported, so it answers under an
+  // id the model never used.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const announced = events.filter((event) => event.type === 'tool_call_delta' && event.id);
+  assert.ok(announced.length > 0);
+  for (const event of announced) {
+    assert.equal(event.id, 'call_1', 'streamed identity must match the completed result');
+  }
+  const streamedArguments = events
+    .filter((event) => event.type === 'tool_call_delta')
+    .map((event) => event.argumentsDelta ?? '')
+    .join('');
+  assert.equal(streamedArguments, '{"city":"Seoul"}', 'arguments held before naming are still delivered');
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.arguments]),
+    [['call_1', '{"city":"Seoul"}']],
+  );
+});
+
 test('an id-less completed call never overwrites a different streamed call', async () => {
   // When the completed output holds fewer function calls than the stream did,
   // positional alignment would land an anonymous item on whichever streamed
