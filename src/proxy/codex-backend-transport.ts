@@ -180,23 +180,40 @@ class CodexBackendStreamState {
    * token, so a known id resolves before anything is allocated.
    */
   private toolOrdinal(outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
+    const known = this.knownOrdinal(ids);
+    if (known !== undefined) return known;
+    // An event that names an unfamiliar call is a new call: it must not INHERIT
+    // the ordinal an earlier call bound to this position, or a stream whose
+    // events omit `output_index` (`readOutputIndex` reports 0 for those) would
+    // merge every call into one. It does still CLAIM the position, so the
+    // anonymous argument deltas that follow — the ones carrying only an
+    // `output_index` — reach the call that most recently occupied it.
+    const identified = ids.some((id) => typeof id === 'string');
+    const positionKey = `#${outputIndex}`;
+    let ordinal = identified ? undefined : this.toolOrdinals.get(positionKey);
+    if (ordinal === undefined) {
+      ordinal = this.nextToolOrdinal;
+      this.nextToolOrdinal += 1;
+    }
+    this.toolOrdinals.set(positionKey, ordinal);
+    this.bindOrdinal(ordinal, ids);
+    return ordinal;
+  }
+
+  private knownOrdinal(ids: ReadonlyArray<string | undefined>): number | undefined {
     for (const id of ids) {
       if (typeof id === 'string') {
         const known = this.toolOrdinals.get(id);
         if (known !== undefined) return known;
       }
     }
-    const positionKey = `#${outputIndex}`;
-    let ordinal = this.toolOrdinals.get(positionKey);
-    if (ordinal === undefined) {
-      ordinal = this.nextToolOrdinal;
-      this.nextToolOrdinal += 1;
-      this.toolOrdinals.set(positionKey, ordinal);
-    }
+    return undefined;
+  }
+
+  private bindOrdinal(ordinal: number, ids: ReadonlyArray<string | undefined>): void {
     for (const id of ids) {
       if (typeof id === 'string') this.toolOrdinals.set(id, ordinal);
     }
-    return ordinal;
   }
 
   /**
@@ -210,17 +227,19 @@ class CodexBackendStreamState {
    * already mean.
    */
   private finalOutputOrdinal(position: number, ...ids: ReadonlyArray<string | undefined>): number {
-    for (const id of ids) {
-      if (typeof id === 'string') {
-        const known = this.toolOrdinals.get(id);
-        if (known !== undefined) return known;
-      }
-    }
-    for (const id of ids) {
-      if (typeof id === 'string') this.toolOrdinals.set(id, position);
-    }
-    if (position >= this.nextToolOrdinal) this.nextToolOrdinal = position + 1;
-    return position;
+    const known = this.knownOrdinal(ids);
+    if (known !== undefined) return known;
+    // An item that names an unfamiliar call is a call the stream never
+    // announced, and it still belongs to the client: taking a position some
+    // other call already holds would replace that call instead of adding this
+    // one. An anonymous item has nothing but its position, so there the dense
+    // position IS the correlation — `captureFinalOutput` only reaches here for
+    // one when the two views agree on how many calls there are.
+    const identified = ids.some((id) => typeof id === 'string');
+    const ordinal = identified && this.toolStates.has(position) ? this.nextToolOrdinal : position;
+    this.bindOrdinal(ordinal, ids);
+    if (ordinal >= this.nextToolOrdinal) this.nextToolOrdinal = ordinal + 1;
+    return ordinal;
   }
 
   push(event: CodexBackendEvent): LocalStreamEvent[] {

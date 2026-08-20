@@ -523,6 +523,65 @@ test('an id-less completed function_call does not duplicate a call already strea
   }
 });
 
+test('calls with ids stay separate when the stream omits output_index', async () => {
+  // `readOutputIndex` reports 0 for an absent `output_index`, so a positional
+  // fallback that identified events could inherit collapsed every call in such
+  // a stream into one — the client saw a single call whose arguments were both
+  // calls' JSON concatenated.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_2', delta: '{"tz":"KST"}' },
+    { type: 'response.completed', response: { id: 'resp_no_output_index', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_2', 'get_time', '{"tz":"KST"}']],
+  );
+  const perIndex = new Map();
+  for (const event of events.filter((e) => e.type === 'tool_call_delta')) {
+    perIndex.set(event.index, `${perIndex.get(event.index) ?? ''}${event.argumentsDelta ?? ''}`);
+  }
+  assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}'], [1, '{"tz":"KST"}']]);
+});
+
+test('a completed call the stream never announced is added, not swapped in', async () => {
+  // Its ids are unfamiliar, so it is a call of its own; taking the dense
+  // position a streamed call already holds would drop that call instead.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_unseen_call',
+        model: 'gpt-5.5',
+        output: [
+          { type: 'function_call', id: 'fc_9', call_id: 'call_9', name: 'get_time', arguments: '{"tz":"KST"}' },
+          { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+        ],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_9', 'get_time', '{"tz":"KST"}']],
+  );
+});
+
 test('an id-less completed call never overwrites a different streamed call', async () => {
   // When the completed output holds fewer function calls than the stream did,
   // positional alignment would land an anonymous item on whichever streamed
