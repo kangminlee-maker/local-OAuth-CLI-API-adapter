@@ -10,6 +10,14 @@ import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js'
 import { openAiImageQualityReasoningEffort, startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { image2ViaGpt55Prompt } from '../dist/proxy/image2-via-gpt55.js';
 import { codexProxyImageModel, isReasoningEffort } from '../dist/settings.js';
+import {
+  basisMismatches,
+  basisVoidsRow,
+  matchesFilter,
+  mergeFilters,
+  nonNegativeNumberOption,
+  readFilters,
+} from './lib/benchmark-verdict.mjs';
 
 loadEnvFile('.env');
 
@@ -196,23 +204,6 @@ const openAiModel = options.openaiModel ?? 'gpt-5.5';
 const openAiImageApiModel = options.openaiImageApiModel ?? 'gpt-image-1.5';
 const codexImageModel = options.codexImageModel ?? codexProxyImageModel();
 
-/**
- * Fields that decide what a row MEANS rather than how it scored. A baseline
- * captured under a different value is a different basis, so its deltas are not
- * evidence — silence there is what lets a real regression hide inside a
- * config difference.
- */
-const COMPARISON_BASIS_FIELDS = [
-  'openAiModel',
-  'openAiImageApiModel',
-  'codexModel',
-  'codexImageModel',
-  'claudeCliModel',
-  'claudeIsolateUserSettings',
-  'semanticQualityJudgeModel',
-  'semanticQualitySuite',
-  'codexProxyMode',
-];
 const anthropicModels = {
   opus: options.anthropicOpusModel ?? 'claude-opus-4-8',
   haiku: options.anthropicHaikuModel ?? 'claude-haiku-4-5-20251001',
@@ -240,8 +231,8 @@ const semanticQualityJudgeModel = options.semanticQualityJudgeModel ?? openAiMod
 const imageQualityJudgeModel = options.imageQualityJudgeModel ?? semanticQualityJudgeModel;
 const semanticQualityReference = booleanOption(options.semanticQualityReference, true);
 const semanticQualitySuite = options.semanticQualitySuite ?? 'realistic';
-const minSemanticQuality = nonNegativeNumberOption(options.minSemanticQuality, suiteDefaults.minSemanticQuality);
-const minImageQuality = nonNegativeNumberOption(options.minImageQuality, suiteDefaults.minImageQuality);
+const minSemanticQuality = nonNegativeNumberOption(options.minSemanticQuality, suiteDefaults.minSemanticQuality, '--min-semantic-quality');
+const minImageQuality = nonNegativeNumberOption(options.minImageQuality, suiteDefaults.minImageQuality, '--min-image-quality');
 const expectProviderErrors = booleanOption(options.expectProviderErrors, false);
 const requestReasoningEffort = optionalReasoningEffort(options.requestReasoningEffort);
 const codexProxyMode = codexAppServerProxyMode(options.codexProxyMode ?? options.codexProbeMode);
@@ -434,8 +425,10 @@ const summaryBase = {
   semanticQualityReference,
   semanticQualityReferenceMode: 'proxy-provider',
   semanticQualitySuite,
-  minSemanticQuality,
-  minImageQuality,
+  // Reported as applied only when rows existed for it to gate; advertising a
+  // threshold no row was measured against reads as a gate that ran.
+  minSemanticQuality: semanticQualityRepeats > 0 ? minSemanticQuality : null,
+  minImageQuality: imageQualityRepeats > 0 ? minImageQuality : null,
   expectProviderErrors,
   requestReasoningEffort,
   codexProxyMode: codexProxyMode ?? 'api-isolated',
@@ -459,8 +452,20 @@ const summaryBase = {
   failed: failed.length,
   rows,
 };
-const regressionGate = baselinePath
-  ? compareWithBaseline(loadSummaryFile(baselinePath), summaryBase, {
+// Read after the run, but never fatally: the measurements are already paid
+// for, and an unreadable baseline is a comparison problem, not a reason to
+// discard them.
+let baselineLoadError;
+const baselineSummary = baselinePath ? (() => {
+  try {
+    return loadSummaryFile(baselinePath);
+  } catch (err) {
+    baselineLoadError = errorMessage(err);
+    return null;
+  }
+})() : null;
+const regressionGate = baselineSummary
+  ? compareWithBaseline(baselineSummary, summaryBase, {
       regressionTargets,
       latencyRegressionPct,
       latencyRegressionMs,
@@ -469,12 +474,19 @@ const regressionGate = baselinePath
   : null;
 const summary = {
   ...summaryBase,
+  ...(baselineLoadError ? { baselineError: baselineLoadError } : {}),
   ...(imageAttemptDiagnostics.length > 0 ? { imageAttemptDiagnostics } : {}),
   ...(regressionGate ? { regressionGate } : {}),
 };
+if (baselineLoadError) {
+  console.error(`\nBASELINE UNREADABLE — results kept, comparison skipped: ${baselineLoadError}`);
+}
 if (regressionGate?.basisMismatch) {
-  // Loud, because the deltas printed below look like findings and are not.
-  console.error(`\nBASELINE BASIS MISMATCH — regression deltas are not comparable: ${JSON.stringify(regressionGate.basisMismatch)}`);
+  // Loud, because the rows it governs were dropped from the comparison.
+  console.error(`\nBASELINE BASIS MISMATCH — deltas withheld for the affected targets: ${JSON.stringify(regressionGate.basisMismatch)}`);
+}
+if (regressionGate?.basisUnknown) {
+  console.error(`\nBASELINE recorded no value for: ${regressionGate.basisUnknown.map((entry) => entry.field).join(', ')} — comparison proceeded`);
 }
 if (outputPath) {
   fs.writeFileSync(outputPath, `${JSON.stringify(summary, null, 2)}\n`);
@@ -2108,7 +2120,7 @@ async function benchmarkCase(target, caseName, count, fn) {
     firstToolArgumentMs: summarize(samples.map((sample) => sample.firstToolArgumentMs).filter(Number.isFinite)),
     firstImageMs: summarize(samples.map((sample) => sample.firstImageMs).filter(Number.isFinite)),
     chunks: samples.map((sample) => sample.chunks).filter(Number.isFinite),
-    sample: samples.at(-1),
+    sample: decidingSample(samples),
   };
   const backendTiming = summarizeBackendTimings(samples);
   if (backendTiming) row.backendTiming = backendTiming;
@@ -2160,7 +2172,7 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
     ok: true,
     totalMs: summarize(samples.map((sample) => sample.totalMs)),
     quality: summarize(samples.map((sample) => sample.quality.score)),
-    sample: samples.at(-1),
+    sample: decidingSample(samples),
   };
   const semanticScores = samples.map((sample) => sample.semanticQuality?.score).filter(Number.isFinite);
   if (semanticScores.length > 0) row.semanticQuality = summarize(semanticScores);
@@ -3235,8 +3247,16 @@ async function semanticReference(kind, target, index, prompt, options = {}) {
   if (!semanticQualityReference || target.includes('-api:')) return null;
   const provider = semanticReferenceProvider(target);
   if (!provider) return null;
-  if (provider === 'openai' && !process.env.OPENAI_API_KEY) return null;
-  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) return null;
+  // A key that is absent means the reference could not be fetched. Returning
+  // null here made the row look fully measured while the judge, told to fall
+  // back to the absolute score, quietly graded it against an absolute bar —
+  // and the summary still asserted a reference was used.
+  if (provider === 'openai' && !process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY missing: no direct reference for the relative gate');
+  }
+  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) {
+    throw new Error('ANTHROPIC_API_KEY missing: no direct reference for the relative gate');
+  }
   const key = `${provider}:${kind}:${index}:${hashString(prompt)}:${options.openAiReasoningEffort ?? ''}`;
   if (semanticReferenceCache.has(key)) return semanticReferenceCache.get(key);
   const value = await fetchSemanticReference(provider, kind, prompt, options);
@@ -3720,26 +3740,6 @@ function loadSummaryFile(path) {
 }
 
 
-function basisMismatches(baseline, current) {
-  const mismatches = [];
-  for (const field of COMPARISON_BASIS_FIELDS) {
-    // An older summary simply lacks the key; absent and null both mean "not
-    // recorded", and reporting one against the other is a false alarm — the
-    // kind that trains the warning away before it ever catches something.
-    const before = baseline?.[field] ?? null;
-    const after = current?.[field] ?? null;
-    if (before === null && after === null) continue;
-    if (JSON.stringify(before) !== JSON.stringify(after)) {
-      mismatches.push({ field, baseline: before, current: after });
-    }
-  }
-  const beforeAnthropic = JSON.stringify(baseline?.anthropicModels ?? null);
-  const afterAnthropic = JSON.stringify(current?.anthropicModels ?? null);
-  if (beforeAnthropic !== afterAnthropic) {
-    mismatches.push({ field: 'anthropicModels', baseline: baseline?.anthropicModels ?? null, current: current?.anthropicModels ?? null });
-  }
-  return mismatches;
-}
 
 function compareWithBaseline(baseline, current, options) {
   const basisDrift = basisMismatches(baseline, current);
@@ -3755,6 +3755,12 @@ function compareWithBaseline(baseline, current, options) {
   for (const row of current.rows.filter((item) => item.ok)) {
     if (!shouldCompareRegressionTarget(row.target, options.regressionTargets)) {
       skipped.push({ target: row.target, case: row.case, reason: 'target-filter' });
+      continue;
+    }
+    // Only the rows a differing field actually governs lose their comparison;
+    // a Claude-side difference says nothing about an OpenAI row.
+    if (basisVoidsRow(basisDrift.mismatched, row.target)) {
+      skipped.push({ target: row.target, case: row.case, reason: 'basis-mismatch' });
       continue;
     }
     const baselineRow = baselineRows.get(rowKey(row));
@@ -3808,16 +3814,38 @@ function compareWithBaseline(baseline, current, options) {
     latencyRegressionPct: options.latencyRegressionPct,
     latencyRegressionMs: options.latencyRegressionMs,
     qualityRegressionPoints: options.qualityRegressionPoints,
-    compared: basisDrift.length > 0 ? 0 : compared.length,
+    compared: compared.length,
     skipped: skipped.length,
     // A differing basis does not weaken the deltas, it voids them: they are
     // differences in configuration. Reporting them as regressions or
     // improvements would be a finding about nothing, so the comparison is
     // withheld and only the mismatch is reported.
-    ...(basisDrift.length > 0
-      ? { basisMismatch: basisDrift, comparisonWithheld: true, regressions: [], improvements: [] }
-      : { regressions, improvements }),
+    ...(basisDrift.mismatched.length > 0 ? { basisMismatch: basisDrift.mismatched } : {}),
+    // Fields this run records that the baseline never did: not evidence that
+    // the basis differed, but worth seeing before trusting a delta.
+    ...(basisDrift.unknown.length > 0 ? { basisUnknown: basisDrift.unknown } : {}),
+    regressions,
+    improvements,
   };
+}
+
+/**
+ * The sample the gates actually read. Quality gates take the minimum across
+ * repeats, so retaining the last sample left artifacts whose kept rationale
+ * praised an answer the row was failed for — the failing text, its issues and
+ * its reference were gone.
+ */
+function decidingSample(samples) {
+  const scored = samples.filter((sample) => Number.isFinite(sample?.semanticQuality?.relativeQuality)
+    || Number.isFinite(sample?.semanticQuality?.score)
+    || Number.isFinite(sample?.imageQuality?.score));
+  if (scored.length === 0) return samples.at(-1);
+  const rank = (sample) => Math.min(
+    sample?.semanticQuality?.relativeQuality ?? Infinity,
+    sample?.semanticQuality?.score ?? Infinity,
+    sample?.imageQuality?.score ?? Infinity,
+  );
+  return scored.reduce((worst, sample) => (rank(sample) < rank(worst) ? sample : worst));
 }
 
 function rowKey(row) {
@@ -3864,18 +3892,6 @@ function matchesFilters(value, filters) {
   return filters.some((filter) => matchesFilter(value, filter));
 }
 
-function matchesFilter(value, filter) {
-  if (filter === 'all') return true;
-  if (filter.includes('*')) {
-    const pattern = filter
-      .split('*')
-      .map((part) => part.replace(/[|\\{}()[\]^$+?.]/g, '\\$&'))
-      .join('.*');
-    return new RegExp(`^${pattern}$`).test(value);
-  }
-  return value === filter || value.includes(filter);
-}
-
 function exactOrWildcardFilterMatches(value, filters) {
   if (!filters) return false;
   return filters.some((filter) => {
@@ -3887,15 +3903,6 @@ function exactOrWildcardFilterMatches(value, filters) {
       .join('.*');
     return new RegExp(`^${pattern}$`).test(value);
   });
-}
-
-function readFilters(value) {
-  if (value === undefined || value === null || value === '' || value === 'all') return null;
-  const filters = String(value)
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-  return filters.length > 0 ? filters : null;
 }
 
 function readBenchmarkSuites(value) {
@@ -3926,13 +3933,6 @@ function benchmarkSuiteDefaults(names) {
     // the operator remembered the flag.
     minSemanticQuality: has('quality-realistic') || has('release-gate') ? 95 : 0,
   };
-}
-
-function mergeFilters(...groups) {
-  const filters = uniqueFilters(groups.flatMap((group) => group ?? []));
-  if (filters.length === 0) return null;
-  if (filters.includes('all')) return ['all'];
-  return filters;
 }
 
 function uniqueFilters(filters) {
@@ -3992,12 +3992,6 @@ function numberOption(value, fallback) {
 }
 
 function countOption(value, fallback) {
-  if (value === undefined) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-}
-
-function nonNegativeNumberOption(value, fallback) {
   if (value === undefined) return fallback;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
