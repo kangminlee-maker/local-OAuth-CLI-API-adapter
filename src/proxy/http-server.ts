@@ -1824,12 +1824,13 @@ function openAiResponsesResponse(
   request: NormalizedRequest,
 ): unknown {
   const output = result.toolCalls.length > 0
-    ? [
-        ...(result.text
+    ? orderedByEmission(result, {
+        // The reasoning item introduces the message, so it travels with it.
+        text: result.text
           ? [openAiResponseReasoningItem(), openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)]
-          : []),
-        ...result.toolCalls.map(openAiResponseToolCall),
-      ]
+          : [],
+        toolCalls: result.toolCalls.map(openAiResponseToolCall),
+      })
     : [
         openAiResponseReasoningItem(),
         openAiResponseMessageItem(`msg_${randomUUID()}`, result.text),
@@ -1845,16 +1846,30 @@ function openAiResponsesResponse(
   });
 }
 
+/**
+ * The turn's parts in the order they were produced. A tool call that arrived
+ * before any text is streamed as the first block, so the completed body has to
+ * report it as the first block too — the two surfaces describe one turn.
+ */
+function orderedByEmission(
+  result: LocalCompletionResult,
+  parts: { readonly text: readonly unknown[]; readonly toolCalls: readonly unknown[] },
+): unknown[] {
+  return result.toolCallsBeforeText
+    ? [...parts.toolCalls, ...parts.text]
+    : [...parts.text, ...parts.toolCalls];
+}
+
 function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
   const hasToolCalls = result.toolCalls.length > 0;
   const stopReason = anthropicStopReason(result, hasToolCalls);
   const content = stopReason === 'refusal'
     ? (result.text ? [{ type: 'text', text: result.text }] : [])
     : hasToolCalls
-    ? [
-        ...(result.text ? [{ type: 'text', text: result.text }] : []),
-        ...result.toolCalls.map(anthropicToolUse),
-      ]
+    ? orderedByEmission(result, {
+        text: result.text ? [{ type: 'text', text: result.text }] : [],
+        toolCalls: result.toolCalls.map(anthropicToolUse),
+      })
     : [
         {
           type: 'text',
@@ -2319,7 +2334,11 @@ async function writeOpenAiResponsesStream(
   let textStarted = false;
   let reasoningEmitted = false;
   let streamedText = '';
-  let finalOutput: unknown[] = [];
+  // Keyed by the position each item was announced at, so the completed array
+  // reads the same way the stream did. Assembling it in a fixed order made
+  // `output[0]` the reasoning item on a turn whose `output_index: 0` had
+  // already named a function_call.
+  const finalItems = new Map<number, unknown>();
   let sequenceNumber = -1;
   const writeResponseEvent: OpenAiResponseEventWriter = async (event, payload) => {
     sequenceNumber += 1;
@@ -2364,6 +2383,7 @@ async function writeOpenAiResponsesStream(
       if (!reasoningEmitted) {
         reasoningEmitted = true;
         const reasoningOutputIndex = allocateOutputIndex();
+        finalItems.set(reasoningOutputIndex, reasoningItem);
         await writeResponseEvent('response.output_item.added', {
           type: 'response.output_item.added',
           output_index: reasoningOutputIndex,
@@ -2420,7 +2440,9 @@ async function writeOpenAiResponsesStream(
 
       const result = event.result;
       if (result.toolCalls.length > 0) {
-        const toolItems = await toolState.finish(result.toolCalls);
+        for (const { outputIndex, item } of await toolState.finish(result.toolCalls)) {
+          finalItems.set(outputIndex, item);
+        }
         // Narration streamed before the call belongs in the completed output
         // too, or the stream's own summary contradicts the deltas it sent.
         if (streamedText) {
@@ -2440,14 +2462,12 @@ async function writeOpenAiResponsesStream(
             content_index: 0,
             part: { type: 'output_text', text: streamedText, annotations: [], logprobs: [] },
           });
+          finalItems.set(messageOutputIndex, messageItem);
           await writeResponseEvent('response.output_item.done', {
             type: 'response.output_item.done',
             output_index: messageOutputIndex,
             item: messageItem,
           });
-          finalOutput = [reasoningItem, messageItem, ...toolItems];
-        } else {
-          finalOutput = toolItems;
         }
       } else {
         await ensureTextStarted();
@@ -2480,13 +2500,16 @@ async function writeOpenAiResponsesStream(
           part: { type: 'output_text', text: result.text, annotations: [], logprobs: [] },
         });
         const item = openAiResponseMessageItem(itemId, result.text);
-        finalOutput = [reasoningItem, item];
+        finalItems.set(messageOutputIndex, item);
         await writeResponseEvent('response.output_item.done', {
           type: 'response.output_item.done',
           output_index: messageOutputIndex,
           item,
         });
       }
+      const finalOutput = [...finalItems.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, item]) => item);
       await writeResponseEvent('response.completed', {
         type: 'response.completed',
         response: openAiResponsesCompletedResponse(responseId, result, request, finalOutput),
@@ -2536,8 +2559,11 @@ class OpenAiResponsesToolStreamState {
     if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
   }
 
-  async finish(toolCalls: readonly LocalToolCall[]): Promise<unknown[]> {
-    const output: unknown[] = [];
+  /** The finished items with the output position each was announced at. */
+  async finish(
+    toolCalls: readonly LocalToolCall[],
+  ): Promise<ReadonlyArray<{ readonly outputIndex: number; readonly item: unknown }>> {
+    const output: Array<{ outputIndex: number; item: unknown }> = [];
     for (const [index, call] of toolCalls.entries()) {
       const state = await this.ensureStarted(index, call.id, call.name);
       const rest = missingToolCallArgumentDelta(state.arguments, call);
@@ -2550,7 +2576,7 @@ class OpenAiResponsesToolStreamState {
         name: state.name,
         arguments: call.arguments,
       };
-      output.push(item);
+      output.push({ outputIndex: state.outputIndex, item });
       await this.writeResponseEvent('response.function_call_arguments.done', {
         type: 'response.function_call_arguments.done',
         output_index: state.outputIndex,

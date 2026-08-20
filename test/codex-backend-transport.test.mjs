@@ -552,6 +552,34 @@ test('calls with ids stay separate when the stream omits output_index', async ()
   assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}'], [1, '{"tz":"KST"}']]);
 });
 
+test('arguments that arrive before the call is named belong to that call', async () => {
+  // These deltas carry nothing but an output position, so the item that names
+  // the position is the call they belong to. Splitting them onto an ordinal of
+  // their own invented a second call — named `tool`, holding a fragment of the
+  // real arguments — and held the fragment back from the real one.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.completed', response: { id: 'resp_early_args', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}']],
+  );
+  const perIndex = new Map();
+  for (const event of events.filter((e) => e.type === 'tool_call_delta')) {
+    perIndex.set(event.index, `${perIndex.get(event.index) ?? ''}${event.argumentsDelta ?? ''}`);
+  }
+  assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}']]);
+});
+
 test('a completed call the stream never announced is added, not swapped in', async () => {
   // Its ids are unfamiliar, so it is a call of its own; taking the dense
   // position a streamed call already holds would drop that call instead.

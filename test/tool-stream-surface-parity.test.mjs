@@ -186,6 +186,216 @@ for (const [label, finalOutput] of FINAL_OUTPUTS) {
   });
 }
 
+/**
+ * Every surface's view of one turn's tool calls, so a scenario can assert that
+ * the stream and the completed body say the same thing rather than checking one
+ * surface and hoping.
+ */
+async function toolSurfaces(events) {
+  const surfaces = {};
+  await withProxy(events, async (url) => {
+    const chatStream = await realFetch(`${url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        stream: true,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true } }],
+      }),
+    });
+    const chatCalls = new Map();
+    for (const chunk of sseEvents(await chatStream.text())) {
+      for (const call of chunk.choices?.[0]?.delta?.tool_calls ?? []) {
+        const seen = chatCalls.get(call.index) ?? { name: undefined, arguments: '' };
+        chatCalls.set(call.index, {
+          name: call.function?.name ?? seen.name,
+          arguments: `${seen.arguments}${call.function?.arguments ?? ''}`,
+        });
+      }
+    }
+    surfaces.chatStream = [...chatCalls.values()];
+
+    const responsesStream = await realFetch(`${url}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        stream: true,
+        input: 'w',
+        tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+      }),
+    });
+    const responseCalls = new Map();
+    const announcedTypes = new Map();
+    let completedOutput = [];
+    for (const event of sseEvents(await responsesStream.text())) {
+      if (event.type === 'response.output_item.added') {
+        announcedTypes.set(event.output_index, event.item?.type);
+        if (event.item?.type === 'function_call') {
+          responseCalls.set(event.item_id ?? event.item?.id, { name: event.item?.name, arguments: '' });
+        }
+      }
+      if (event.type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
+        const seen = responseCalls.get(event.item_id) ?? { name: undefined, arguments: '' };
+        responseCalls.set(event.item_id, { name: seen.name, arguments: `${seen.arguments}${event.delta}` });
+      }
+      if (event.type === 'response.completed') completedOutput = event.response?.output ?? [];
+    }
+    surfaces.responsesStream = [...responseCalls.values()];
+    surfaces.responsesAnnouncedTypes = announcedTypes;
+    surfaces.responsesStreamCompletedTypes = completedOutput.map((item) => item.type);
+
+    const messagesStream = await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        stream: true,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    });
+    const blocks = new Map();
+    for (const event of sseEvents(await messagesStream.text())) {
+      if (event.type === 'content_block_start') {
+        blocks.set(event.index, { type: event.content_block?.type, name: event.content_block?.name, json: '' });
+      }
+      if (event.type === 'content_block_delta') {
+        const block = blocks.get(event.index);
+        if (block) block.json += event.delta?.partial_json ?? event.delta?.text ?? '';
+      }
+    }
+    surfaces.messagesStreamBlocks = [...blocks.entries()].sort(([a], [b]) => a - b).map(([, block]) => block);
+
+    const chatFinal = await (await realFetch(`${url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ type: 'function', function: { name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true } }],
+      }),
+    })).json();
+    surfaces.chatFinal = (chatFinal.choices?.[0]?.message?.tool_calls ?? [])
+      .map((call) => ({ name: call.function?.name, arguments: call.function?.arguments }));
+
+    const responsesFinal = await (await realFetch(`${url}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        input: 'w',
+        tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+      }),
+    })).json();
+    surfaces.responsesFinalTypes = (responsesFinal.output ?? []).map((item) => item.type);
+
+    const messagesFinal = await (await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    })).json();
+    surfaces.messagesFinalBlocks = (messagesFinal.content ?? []).map((block) => ({
+      type: block.type,
+      name: block.name,
+      input: block.input,
+    }));
+  });
+  return surfaces;
+}
+
+/**
+ * Captured shape: argument deltas can arrive BEFORE the item that names the
+ * call. The transport holds them until the call has a `call_id` worth
+ * announcing — the client cannot rename a call it was already told about.
+ */
+function earlyArgumentEvents({ anonymousPrefix }) {
+  return [
+    {
+      type: 'response.function_call_arguments.delta',
+      output_index: 0,
+      ...(anonymousPrefix ? {} : { item_id: 'fc_1' }),
+      delta: '{"city":',
+    },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+test('arguments held until the call is named still reach the client', async () => {
+  // The held prefix was never flushed when `output_item.added` announced the
+  // call, so the client assembled `"Seoul"}` — a fragment it cannot parse — and
+  // the completed body disagreed with the stream it had just sent.
+  const surfaces = await toolSurfaces(earlyArgumentEvents({ anonymousPrefix: false }));
+  assert.deepEqual(surfaces.chatStream, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.responsesStream, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.messagesStreamBlocks, [{ type: 'tool_use', name: 'get_weather', json: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.chatFinal, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.messagesFinalBlocks, [{ type: 'tool_use', name: 'get_weather', input: { city: 'Seoul' } }]);
+});
+
+test('an id-less early argument delta does not become a second tool call', async () => {
+  // Anonymous deltas are correlated by output position. Splitting them onto
+  // their own ordinal invented a call named `tool` that the model never made,
+  // and the client would execute it.
+  const surfaces = await toolSurfaces(earlyArgumentEvents({ anonymousPrefix: true }));
+  assert.deepEqual(surfaces.chatFinal, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.chatStream, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.messagesFinalBlocks, [{ type: 'tool_use', name: 'get_weather', input: { city: 'Seoul' } }]);
+});
+
+test('a truncated streamed prefix is repaired by the completed item', async () => {
+  // The stream stopped mid-argument and the completed output names no id, so
+  // position is the only correlation. Refusing it left the client with
+  // `{"city":` — unparseable, and surfaced as `{"input":"<partial>"}`.
+  const surfaces = await toolSurfaces([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'r',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+      },
+    },
+  ]);
+  assert.deepEqual(surfaces.chatFinal, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.messagesFinalBlocks, [{ type: 'tool_use', name: 'get_weather', input: { city: 'Seoul' } }]);
+  assert.deepEqual(surfaces.chatStream, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+});
+
+test('the completed output array agrees with the indices its items were announced at', async () => {
+  // `output_index` is allocated in emission order, but the completed array was
+  // assembled in a fixed one: with the call ahead of the narration, position 0
+  // named the function_call on the wire and the reasoning item in the summary.
+  const surfaces = await toolSurfaces(callThenNarrateEvents());
+  const announced = [...surfaces.responsesAnnouncedTypes.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, type]) => type);
+  assert.deepEqual(surfaces.responsesStreamCompletedTypes, announced);
+});
+
+test('messages blocks come in the same order streamed and not', async () => {
+  // Same turn, two surfaces: the stream opened tool_use first because that is
+  // when the call arrived, while the non-streaming body always put text first.
+  const surfaces = await toolSurfaces(callThenNarrateEvents());
+  assert.deepEqual(
+    surfaces.messagesFinalBlocks.map((block) => block.type),
+    surfaces.messagesStreamBlocks.map((block) => block.type),
+  );
+  assert.deepEqual(surfaces.responsesFinalTypes, surfaces.responsesStreamCompletedTypes);
+});
+
 // A turn that narrates and then calls a tool exercises the wire positions:
 // output items and content blocks are addressed by index, and two items at the
 // same index make an SDK accumulator overwrite one with the other.

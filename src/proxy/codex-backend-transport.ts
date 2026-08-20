@@ -157,6 +157,8 @@ interface ToolState {
   name: string;
   arguments: string;
   started: boolean;
+  /** The arguments already sent to the client, so nothing is sent twice. */
+  streamed: string;
   /**
    * Whether the backend has actually named this call. Until it has, `id` and
    * `name` are placeholders, and announcing them would tell the client an
@@ -164,6 +166,12 @@ interface ToolState {
    * rename a call it has already been told about.
    */
   identified: boolean;
+  /**
+   * Whether this state was opened by events carrying no id at all. Such a state
+   * holds its output position on nothing but that position, so the call that
+   * later names the position owns it — see `toolOrdinal`.
+   */
+  anonymous: boolean;
 }
 
 class CodexBackendStreamState {
@@ -182,6 +190,7 @@ class CodexBackendStreamState {
   private failure?: string;
   private settled = false;
   private stopReason?: string;
+  private toolCallsBeforeText = false;
 
   constructor(
     private readonly request: NormalizedRequest,
@@ -197,14 +206,21 @@ class CodexBackendStreamState {
     const known = this.knownOrdinal(ids);
     if (known !== undefined) return known;
     // An event that names an unfamiliar call is a new call: it must not INHERIT
-    // the ordinal an earlier call bound to this position, or a stream whose
-    // events omit `output_index` (`readOutputIndex` reports 0 for those) would
-    // merge every call into one. It does still CLAIM the position, so the
+    // the ordinal an earlier NAMED call bound to this position, or a stream
+    // whose events omit `output_index` (`readOutputIndex` reports 0 for those)
+    // would merge every call into one. It does still CLAIM the position, so the
     // anonymous argument deltas that follow — the ones carrying only an
     // `output_index` — reach the call that most recently occupied it.
+    //
+    // An ANONYMOUS holder is the other way round: argument deltas that arrive
+    // before the call is named have nothing but the position, so they belong to
+    // the call that names it. Splitting them off invented a second call — named
+    // `tool`, carrying a fragment of the real call's arguments — that the model
+    // never made and the client would have executed.
     const identified = ids.some((id) => typeof id === 'string');
     const positionKey = `#${outputIndex}`;
-    let ordinal = identified ? undefined : this.toolOrdinals.get(positionKey);
+    const claimed = this.toolOrdinals.get(positionKey);
+    let ordinal = identified ? this.adoptableOrdinal(claimed) : claimed;
     if (ordinal === undefined) {
       ordinal = this.nextToolOrdinal;
       this.nextToolOrdinal += 1;
@@ -212,6 +228,12 @@ class CodexBackendStreamState {
     this.toolOrdinals.set(positionKey, ordinal);
     this.bindOrdinal(ordinal, ids);
     return ordinal;
+  }
+
+  /** The ordinal at a position, when nothing named has claimed it yet. */
+  private adoptableOrdinal(claimed: number | undefined): number | undefined {
+    if (claimed === undefined) return undefined;
+    return this.toolStates.get(claimed)?.anonymous ? claimed : undefined;
   }
 
   private knownOrdinal(ids: ReadonlyArray<string | undefined>): number | undefined {
@@ -269,80 +291,49 @@ class CodexBackendStreamState {
       const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
       const id = event.item.call_id ?? event.item.id ?? `call_${index + 1}`;
       const name = event.item.name ?? 'tool';
-      const state = this.toolStates.get(index) ?? {
-        id,
-        name,
-        arguments: '',
-        started: false,
-        identified: false,
-      };
+      const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name });
       state.id = id;
       state.name = name;
+      if (event.item.id !== undefined || event.item.call_id !== undefined) state.anonymous = false;
       // `call_id` is the identity the client echoes back with the tool result;
       // an item id is not interchangeable with it, so a call is only worth
       // announcing once the backend has supplied one.
       state.identified = event.item.call_id !== undefined;
       this.toolStates.set(index, state);
-      if (state.identified) out.push(...this.announce(index, state));
+      if (state.identified) out.push(...this.emitPending(index, state));
       return out;
     }
     if (event.type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
-      const index = this.toolOrdinal(
-        readOutputIndex(event),
-        typeof event.item_id === 'string' ? event.item_id : undefined,
-      );
-      const state = this.toolStates.get(index) ?? {
-        id: typeof event.item_id === 'string' ? event.item_id : `call_${index + 1}`,
-        name: 'tool',
-        arguments: '',
-        started: false,
-        identified: false,
-      };
+      const itemId = typeof event.item_id === 'string' ? event.item_id : undefined;
+      const index = this.toolOrdinal(readOutputIndex(event), itemId);
+      const state = this.toolStates.get(index) ?? this.newToolState(index, {
+        id: itemId,
+        anonymous: itemId === undefined,
+      });
       state.arguments += event.delta;
       this.toolStates.set(index, state);
-      // Arguments that arrive before the call is named are held: the server
-      // re-sends whatever the client has not seen once the call is announced,
-      // so nothing is lost by waiting for a name worth sending.
+      // Arguments that arrive before the call is named are held, because
+      // announcing a placeholder identity is worse than waiting for the real
+      // one. `emitPending` sends them the moment the name arrives.
       if (!state.identified) return out;
-      out.push(...this.announce(index, state));
-      out.push({
-        type: 'tool_call_delta',
-        index,
-        id: state.id,
-        name: state.name,
-        argumentsDelta: event.delta,
-      });
+      out.push(...this.emitPending(index, state));
       return out;
     }
     if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
       const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
-      const state = this.toolStates.get(index) ?? {
-        id: event.item.call_id ?? event.item.id ?? `call_${index + 1}`,
-        name: event.item.name ?? 'tool',
-        arguments: '',
-        started: false,
-        identified: false,
-      };
+      const state = this.toolStates.get(index) ?? this.newToolState(index, {
+        id: event.item.call_id ?? event.item.id,
+        name: event.item.name,
+      });
       // Never downgrade an announced call_id to an item id: the client echoes
       // this value back, and the two surfaces would disagree about the call.
       state.id = event.item.call_id ?? state.id;
       state.name = event.item.name ?? state.name;
+      if (event.item.id !== undefined || event.item.call_id !== undefined) state.anonymous = false;
       if (event.item.call_id !== undefined) state.identified = true;
       if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
       this.toolStates.set(index, state);
-      if (state.identified) {
-        const announced = this.announce(index, state);
-        if (announced.length > 0 && state.arguments) {
-          announced.push({
-            type: 'tool_call_delta',
-            index,
-            id: state.id,
-            name: state.name,
-            argumentsDelta: state.arguments,
-          });
-        }
-        out.push(...announced);
-      }
+      if (state.identified) out.push(...this.emitPending(index, state));
       return out;
     }
     if (event.type === 'response.completed') {
@@ -378,20 +369,60 @@ class CodexBackendStreamState {
     return out;
   }
 
+  private newToolState(
+    index: number,
+    seed: { id?: string; name?: string; anonymous?: boolean },
+  ): ToolState {
+    // The first tool call of a turn that has produced no text yet came BEFORE
+    // the text, and the ordered surfaces (`response.output`, Anthropic content
+    // blocks) have to place it that way in the completed body too.
+    if (this.toolStates.size === 0 && this.text === '') this.toolCallsBeforeText = true;
+    return {
+      id: seed.id ?? `call_${index + 1}`,
+      name: seed.name ?? 'tool',
+      arguments: '',
+      streamed: '',
+      started: false,
+      identified: false,
+      anonymous: seed.anonymous ?? false,
+    };
+  }
+
   /**
-   * Emits the call's opening delta the first time it is announced, carrying the
-   * identity the backend gave it. Returns nothing once announced.
+   * Emits what the client has not been told yet: the call's identity the first
+   * time, then any arguments buffered while the call was still unnamed. Those
+   * held deltas have no other way out — nothing re-sends them — so a call
+   * announced after its arguments arrived reached the client as a fragment it
+   * could not parse.
    */
-  private announce(index: number, state: ToolState): LocalStreamEvent[] {
-    if (state.started) return [];
-    state.started = true;
-    return [{
-      type: 'tool_call_delta',
-      index,
-      id: state.id,
-      name: state.name,
-      argumentsDelta: '',
-    }];
+  private emitPending(index: number, state: ToolState): LocalStreamEvent[] {
+    const out: LocalStreamEvent[] = [];
+    if (!state.started) {
+      state.started = true;
+      out.push({
+        type: 'tool_call_delta',
+        index,
+        id: state.id,
+        name: state.name,
+        argumentsDelta: '',
+      });
+    }
+    // Only an extension of what was sent may be sent. A final value that
+    // CONTRADICTS the streamed prefix is not a continuation of it, and
+    // appending the difference would leave the client with two spliced
+    // fragments; the completed result carries the authoritative arguments.
+    if (state.arguments.startsWith(state.streamed) && state.arguments !== state.streamed) {
+      const pending = state.arguments.slice(state.streamed.length);
+      state.streamed = state.arguments;
+      out.push({
+        type: 'tool_call_delta',
+        index,
+        id: state.id,
+        name: state.name,
+        argumentsDelta: pending,
+      });
+    }
+    return out;
   }
 
   /** The failure the backend reported, if it reported one. */
@@ -415,6 +446,10 @@ class CodexBackendStreamState {
       // clients disagree about what the model said.
       text: this.text.trim(),
       ...(this.stopReason ? { stopReason: this.stopReason } : {}),
+      // The completed result flattens the turn's text into one string, so this
+      // is the one ordering a non-streaming client cannot reconstruct — and
+      // both ordered surfaces need it to agree with the stream.
+      ...(this.toolCallsBeforeText && toolCalls.length > 0 ? { toolCallsBeforeText: true } : {}),
       toolCalls,
       usage: this.usage ?? usageFor(this.request, this.text, toolCalls),
       latencyMs: Date.now() - this.startedAt,
@@ -458,9 +493,10 @@ class CodexBackendStreamState {
         functionCallPosition += 1;
         const existing = this.toolStates.get(index);
         const state = existing ?? {
-          id: typeof obj.call_id === 'string' ? obj.call_id : `call_${index + 1}`,
-          name: typeof obj.name === 'string' ? obj.name : 'tool',
-          arguments: '',
+          ...this.newToolState(index, {
+            id: typeof obj.call_id === 'string' ? obj.call_id : undefined,
+            name: typeof obj.name === 'string' ? obj.name : undefined,
+          }),
           started: true,
           identified: typeof obj.call_id === 'string',
         };
@@ -473,7 +509,12 @@ class CodexBackendStreamState {
         const mayReplace = !anonymous || existing === undefined;
         if (typeof obj.call_id === 'string') state.id = obj.call_id;
         if (typeof obj.name === 'string' && (mayReplace || state.name === 'tool')) state.name = obj.name;
-        if (typeof obj.arguments === 'string' && (mayReplace || state.arguments === '')) {
+        // An anonymous item may still COMPLETE what the stream started: a turn
+        // that ended mid-argument leaves a prefix that parses as nothing, and
+        // arguments the streamed text is a prefix of are that same call's
+        // finished value, not another call's payload. Anything that
+        // contradicts the prefix is refused, as before.
+        if (typeof obj.arguments === 'string' && (mayReplace || obj.arguments.startsWith(state.arguments))) {
           state.arguments = obj.arguments;
         }
         this.toolStates.set(index, state);
