@@ -582,6 +582,85 @@ test('a completed call the stream never announced is added, not swapped in', asy
   );
 });
 
+for (const [label, terminal] of [
+  ['response.failed', { type: 'response.failed', response: { id: 'r', error: { code: 'server_error', message: 'upstream exploded' } } }],
+  ['response.incomplete', { type: 'response.incomplete', response: { id: 'r', incomplete_details: { reason: 'max_output_tokens' } } }],
+  ['an SSE error frame', { type: 'error', error: { message: 'stream aborted upstream' } }],
+]) {
+  test(`a turn ending in ${label} is a failure, not a finished answer`, async () => {
+    // The deltas already forwarded used to be served as a complete answer:
+    // HTTP 200, finish_reason "stop", and whatever text arrived before the
+    // failure — indistinguishable from a turn that actually finished.
+    const codexHome = await createCodexHome();
+    globalThis.fetch = async () => new Response(sse([
+      { type: 'response.output_text.delta', delta: 'The answer is ' },
+      { type: 'response.output_text.delta', delta: '4' },
+      terminal,
+    ]), { status: 200 });
+    const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+    await assert.rejects(() => backend.generate(textRequest()), /codex backend turn (failed|incomplete)/);
+  });
+}
+
+test('a stream that ends with no terminal event is a failure', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_text.delta', delta: 'partial' },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  await assert.rejects(() => backend.generate(textRequest()), /ended without a terminal event/);
+});
+
+test('a tool call carrying no arguments reports an empty object', async () => {
+  // `{"input":""}` invents a property: a strict schema rejects the call and a
+  // loose one hands the tool a parameter the model never sent.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_time' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_time' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const result = await backend.generate(toolRequest());
+  assert.deepEqual(result.toolCalls.map((call) => [call.name, call.arguments]), [['get_time', '{}']]);
+});
+
+test('an anonymous completed call cannot rewrite what the stream already delivered', async () => {
+  // Position is not identity. With two calls listed in an order the stream did
+  // not use, overwriting gave each streamed call the other call's name and
+  // arguments under its own id, so a client answered the wrong call.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.added', output_index: 2, item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 2, item_id: 'fc_2', delta: '{"tz":"KST"}' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'r',
+        model: 'gpt-5.5',
+        output: [
+          { type: 'function_call', name: 'get_time', arguments: '{"tz":"KST"}' },
+          { type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+        ],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_2', 'get_time', '{"tz":"KST"}']],
+  );
+});
+
 test('an id-less completed call never overwrites a different streamed call', async () => {
   // When the completed output holds fewer function calls than the stream did,
   // positional alignment would land an anonymous item on whichever streamed

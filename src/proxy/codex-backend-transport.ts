@@ -145,7 +145,11 @@ interface CodexBackendEvent {
     readonly model?: string;
     readonly usage?: unknown;
     readonly output?: readonly unknown[];
+    readonly status?: string;
+    readonly error?: { readonly code?: string; readonly message?: string } | null;
+    readonly incomplete_details?: { readonly reason?: string } | null;
   };
+  readonly error?: { readonly code?: string; readonly message?: string } | string | null;
 }
 
 interface ToolState {
@@ -168,6 +172,8 @@ class CodexBackendStreamState {
   // desyncs streamed deltas from the completed result's dense positions.
   private readonly toolOrdinals = new Map<string, number>();
   private nextToolOrdinal = 0;
+  private failure?: string;
+  private settled = false;
 
   constructor(
     private readonly request: NormalizedRequest,
@@ -326,8 +332,26 @@ class CodexBackendStreamState {
       const usage = usageFromResponses(event.response?.usage);
       if (usage) this.usage = usage;
       this.captureFinalOutput(event.response?.output);
+      this.settled = true;
+    }
+    // A turn that failed upstream is not a turn that finished. Without this the
+    // deltas already forwarded were served as a complete answer: HTTP 200,
+    // `finish_reason: "stop"`, and whatever text arrived before the failure.
+    if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') {
+      this.failure = terminalFailureMessage(event);
+      this.settled = true;
     }
     return out;
+  }
+
+  /** The failure the backend reported, if it reported one. */
+  terminalFailure(): string | undefined {
+    return this.failure;
+  }
+
+  /** Whether the backend ever said how the turn ended. */
+  isSettled(): boolean {
+    return this.settled;
   }
 
   completed(): LocalCompletionResult {
@@ -377,15 +401,25 @@ class CodexBackendStreamState {
           typeof obj.call_id === 'string' ? obj.call_id : undefined,
         );
         functionCallPosition += 1;
-        const state = this.toolStates.get(index) ?? {
+        const existing = this.toolStates.get(index);
+        const state = existing ?? {
           id: typeof obj.call_id === 'string' ? obj.call_id : `call_${index + 1}`,
           name: typeof obj.name === 'string' ? obj.name : 'tool',
           arguments: '',
           started: true,
         };
+        // An anonymous item is matched by position alone, and position is not
+        // proof of identity: with two calls listed in an order the stream did
+        // not use, overwriting here gave each streamed call the OTHER call's
+        // name and arguments under its own id, so tool results came back
+        // answering the wrong call. It may fill in what the stream never
+        // delivered; it may not replace what it did.
+        const mayReplace = !anonymous || existing === undefined;
         if (typeof obj.call_id === 'string') state.id = obj.call_id;
-        if (typeof obj.name === 'string') state.name = obj.name;
-        if (typeof obj.arguments === 'string') state.arguments = obj.arguments;
+        if (typeof obj.name === 'string' && (mayReplace || state.name === 'tool')) state.name = obj.name;
+        if (typeof obj.arguments === 'string' && (mayReplace || state.arguments === '')) {
+          state.arguments = obj.arguments;
+        }
         this.toolStates.set(index, state);
       }
     }
@@ -595,6 +629,12 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     for await (const event of this.responseEvents(request, signal)) {
       for (const local of state.push(event)) yield local;
     }
+    // A turn only finished if the backend said so. A reported failure, or a
+    // stream that simply stopped, was previously yielded as a completed result
+    // — the client received a 200 whose content was whatever had arrived.
+    const failure = state.terminalFailure();
+    if (failure) throw new Error(failure);
+    if (!state.isSettled()) throw new Error('codex backend stream ended without a terminal event');
     yield { type: 'completed', result: state.completed() };
   }
 
@@ -1608,13 +1648,31 @@ function isInstructionMessage(message: NormalizedMessage): boolean {
     && (message.images ?? []).length === 0;
 }
 
+/**
+ * Tool arguments as JSON. An absent value is an empty argument object — the
+ * shape a no-parameter tool expects — not a phantom `input` property, which a
+ * strict schema rejects and a loose one silently accepts.
+ */
 function ensureJsonString(value: string): string {
+  if (value.trim() === '') return '{}';
   try {
     JSON.parse(value);
     return value;
   } catch {
     return JSON.stringify({ input: value });
   }
+}
+
+/** The message a terminal failure frame carries, whatever shape it arrives in. */
+function terminalFailureMessage(event: CodexBackendEvent): string {
+  const responseError = event.response?.error;
+  const frameError = event.error;
+  const detail = (typeof frameError === 'string' ? frameError : frameError?.message)
+    ?? responseError?.message
+    ?? event.response?.incomplete_details?.reason
+    ?? event.response?.status;
+  const kind = event.type === 'response.incomplete' ? 'incomplete' : 'failed';
+  return `codex backend turn ${kind}${detail ? `: ${detail}` : ''}`;
 }
 
 function mediaTypeForPath(path: string): string {
