@@ -596,6 +596,26 @@ async function postWith(backend, path, init) {
   }
 }
 
+test('edits: an empty multipart upload is rejected, like every other empty image input', async () => {
+  // The JSON encodings all reject an empty image; the multipart path accepted
+  // one and sent `data:image/png;base64,` upstream as though it were a picture.
+  const form = new FormData();
+  form.set('model', 'image-2');
+  form.set('prompt', 'make it blue');
+  form.set('image', new Blob([], { type: 'image/png' }), 'empty.png');
+  const { status } = await postWith(streamingImageBackend(), '/v1/images/edits', { method: 'POST', body: form });
+  assert.equal(status, 400);
+});
+
+test('edits: a multipart part that is not an image is rejected', async () => {
+  const form = new FormData();
+  form.set('model', 'image-2');
+  form.set('prompt', 'make it blue');
+  form.set('image', new Blob([Buffer.from('hello world')], { type: 'text/plain' }), 'notes.txt');
+  const { status } = await postWith(streamingImageBackend(), '/v1/images/edits', { method: 'POST', body: form });
+  assert.equal(status, 400);
+});
+
 function multipart(fields) {
   const form = new FormData();
   for (const [k, v] of Object.entries(fields)) form.set(k, v);

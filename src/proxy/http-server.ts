@@ -1581,6 +1581,12 @@ function asMultipartFile(value: unknown): MultipartFilePart | null {
     typeof obj.filename === 'string'
     && typeof obj.mediaType === 'string'
     && typeof obj.data === 'string'
+    // An empty upload is not an image, and neither is a part that says it is
+    // something else. Every other encoding of an image input enforces both;
+    // this one accepted them and sent `data:text/plain;base64,…` upstream as
+    // though it were a picture.
+    && obj.data !== ''
+    && /^image\/[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(obj.mediaType)
   ) {
     return {
       filename: obj.filename,
@@ -1648,7 +1654,7 @@ function openAiImagesGenerationResponse(
     data: (() => {
       const batch = new Set<string>();
       return result.images.slice(0, request.n ?? 1)
-        .map((image) => openAiImageObject(req, generatedImages, image, request, batch));
+        .map((image) => openAiImageObject(req, generatedImages, image, request, batch, result.outputFormat));
     })(),
     ...openAiImageResponseMetadata(result, request),
     ...(result.usage ? { usage: openAiImagesUsage(result.usage) } : {}),
@@ -1689,11 +1695,15 @@ function openAiImageObject(
   image: OpenAiGeneratedImage,
   request: OpenAiImageGenerationRequest,
   batch?: Set<string>,
+  producedFormat?: string,
 ): unknown {
   if (request.responseFormat === 'url') {
     const id = generatedImages.put(
       image.b64Json,
-      request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
+      // What the bytes ARE, not what was asked for: the JSON body already
+      // reports the produced format, so labelling the stored bytes from the
+      // request let one response advertise webp and serve image/png.
+      producedFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
       batch,
     );
     batch?.add(id);
@@ -1719,8 +1729,8 @@ async function writeOpenAiImageStream(
   // One pin set for the whole stream: sibling images of one response must not
   // evict each other, exactly as in the non-streaming path.
   const batch = new Set<string>();
-  const putPinned = (b64Json: string): string => {
-    const id = generatedImages.put(b64Json, request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
+  const putPinned = (b64Json: string, outputFormat?: string): string => {
+    const id = generatedImages.put(b64Json, outputFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
     batch.add(id);
     return id;
   };
@@ -1741,8 +1751,11 @@ async function writeOpenAiImageStream(
         quality: event.quality ?? request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
         size: event.size ?? request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
         ...(request.responseFormat === 'url'
-          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json)) }
+          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json, event.outputFormat)) }
           : { b64_json: event.image.b64Json }),
+        // The provider's rewrite of the prompt, which the non-streaming
+        // response carries: a client comparing the two modes saw it vanish.
+        ...(event.image.revisedPrompt ? { revised_prompt: event.image.revisedPrompt } : {}),
         ...(event.usage ? { usage: openAiImagesUsage(event.usage) } : {}),
       };
       await writeSseEvent(res, type, payload);

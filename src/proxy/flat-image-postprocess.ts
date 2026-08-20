@@ -197,7 +197,18 @@ function dominantBorderColor(
       addColorBin(bins, rgba, offset);
     }
   }
-  return [...bins.values()].sort((a, b) => b.count - a.count)[0] ?? null;
+  // A bin accumulates channel SUMS; a colour is the average. Returning the bin
+  // as-is put a value in the hundreds of thousands where 0-255 was expected, so
+  // every distance test against it passed and the background pass flattened
+  // nothing — it ran on every eligible image and did no work.
+  const dominant = [...bins.values()].sort((a, b) => b.count - a.count)[0];
+  if (!dominant) return null;
+  return {
+    count: dominant.count,
+    r: Math.round(dominant.r / dominant.count),
+    g: Math.round(dominant.g / dominant.count),
+    b: Math.round(dominant.b / dominant.count),
+  };
 }
 
 function quantizeOpaquePixels(

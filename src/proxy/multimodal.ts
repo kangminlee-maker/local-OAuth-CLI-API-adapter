@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
+import { ProxyRequestError } from './types.js';
 import type {
   NormalizedImage,
   NormalizedImageDetail,
@@ -93,7 +94,16 @@ async function codexImageInput(
       path,
     };
   }
-  throw new Error('file_id image sources are not supported by local CLI backends');
+  // A request the proxy cannot serve is the caller's problem, not the server's:
+  // the codex-backend transport already rejects this as a 400, and an SDK
+  // retries a 500 it should not.
+  throw new ProxyRequestError(
+    'file_id image sources are not supported by local CLI backends',
+    400,
+    'openai',
+    'invalid_request_error',
+    'image',
+  );
 }
 
 async function claudeImageBlock(image: NormalizedImage): Promise<unknown> {

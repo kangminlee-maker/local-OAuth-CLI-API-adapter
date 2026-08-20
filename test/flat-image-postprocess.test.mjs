@@ -55,6 +55,57 @@ test('flat graphic postprocess leaves non-reference or non-PNG requests untouche
   }, image), image);
 });
 
+test('flat graphic postprocess flattens a shaded background to one colour', () => {
+  // The background pass is what the module exists for, and nothing pinned it:
+  // the dominant border colour was returned as channel SUMS where a 0-255
+  // colour was expected, so every distance test against it passed and no pixel
+  // was ever flattened. The pass ran on every eligible image and did nothing.
+  const source = vignetteBackgroundPngBase64();
+  const result = postprocessFlatGraphicImageIfNeeded({
+    ...flatReferenceRequest(),
+    // Generations carry no input images, so an edit is the shape that reaches
+    // this code from the HTTP surface.
+    operation: 'edit',
+    prompt: 'Use the attached style reference image to create a flat vector icon. No text.',
+  }, { b64Json: source });
+
+  const before = uniqueOpaqueColorCount(source);
+  const after = uniqueOpaqueColorCount(result.b64Json);
+  assert.ok(before > 8, `fixture should be shaded, saw ${before} colours`);
+  assert.ok(after <= 3, `background should flatten to a couple of colours, saw ${after}`);
+  // The subject survives the flattening.
+  assert.equal(hasColorLike(result.b64Json, ({ r, g, b }) => r > 180 && g < 90 && b < 90), true);
+});
+
+/** A grey vignette background — many near-identical shades — behind a solid square. */
+function vignetteBackgroundPngBase64() {
+  const width = 64;
+  const height = 64;
+  const stride = 1 + width * 4;
+  const pixels = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * stride;
+    pixels[row] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const offset = row + 1 + x * 4;
+      const inSquare = x >= 20 && x < 44 && y >= 20 && y < 44;
+      if (inSquare) {
+        pixels[offset] = 220;
+        pixels[offset + 1] = 30;
+        pixels[offset + 2] = 25;
+      } else {
+        const distance = Math.hypot(x - width / 2, y - height / 2) / (width * 0.7);
+        const shade = Math.round(255 - 40 * distance);
+        pixels[offset] = shade;
+        pixels[offset + 1] = shade;
+        pixels[offset + 2] = shade;
+      }
+      pixels[offset + 3] = 255;
+    }
+  }
+  return pngFromFilteredRgbaRows(width, height, pixels).toString('base64');
+}
+
 function flatReferenceRequest() {
   return {
     operation: 'generation',

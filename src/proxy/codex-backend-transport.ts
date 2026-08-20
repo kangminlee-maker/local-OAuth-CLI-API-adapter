@@ -680,12 +680,26 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     signal?: AbortSignal,
   ): Promise<OpenAiImageGenerationResult> {
     const startedAt = Date.now();
-    const results = await Promise.all(
-      Array.from(
-        { length: request.n },
-        (_, index) => this.runSingleImageRequest(request, index, signal),
-      ),
-    );
+    // Siblings of a failed turn are already-lost work: the caller has its
+    // error, and every one still running is a full billed image generation
+    // whose result nothing will read. Cancel them with the first failure.
+    const fanOut = new AbortController();
+    const abortFanOut = (): void => fanOut.abort();
+    signal?.addEventListener('abort', abortFanOut, { once: true });
+    let results: CodexBackendImageTurnResult[];
+    try {
+      results = await Promise.all(
+        Array.from(
+          { length: request.n },
+          (_, index) => this.runSingleImageRequest(request, index, fanOut.signal).catch((err) => {
+            fanOut.abort();
+            throw err;
+          }),
+        ),
+      );
+    } finally {
+      signal?.removeEventListener('abort', abortFanOut);
+    }
     let usage: LocalUsage | undefined;
     const images: OpenAiGeneratedImage[] = [];
     for (const result of results) {
