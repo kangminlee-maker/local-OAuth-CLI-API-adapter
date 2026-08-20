@@ -181,6 +181,7 @@ class CodexBackendStreamState {
   private nextToolOrdinal = 0;
   private failure?: string;
   private settled = false;
+  private stopReason?: string;
 
   constructor(
     private readonly request: NormalizedRequest,
@@ -322,7 +323,9 @@ class CodexBackendStreamState {
         started: false,
         identified: false,
       };
-      state.id = event.item.call_id ?? event.item.id ?? state.id;
+      // Never downgrade an announced call_id to an item id: the client echoes
+      // this value back, and the two surfaces would disagree about the call.
+      state.id = event.item.call_id ?? state.id;
       state.name = event.item.name ?? state.name;
       if (event.item.call_id !== undefined) state.identified = true;
       if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
@@ -346,12 +349,29 @@ class CodexBackendStreamState {
       const usage = usageFromResponses(event.response?.usage);
       if (usage) this.usage = usage;
       this.captureFinalOutput(event.response?.output);
+      // A completed turn is finished, whatever noise follows or preceded it.
+      this.failure = undefined;
+      this.settled = true;
+    }
+    // A truncated turn is a finished turn with a reason, not an error: the
+    // output that was generated is returned, the way the provider returns it,
+    // and the stop reason says why it stopped. Discarding it made a request
+    // that deterministically hits the cap look retryable.
+    if (event.type === 'response.incomplete') {
+      const usage = usageFromResponses(event.response?.usage);
+      if (usage) this.usage = usage;
+      this.captureFinalOutput(event.response?.output);
+      this.stopReason = event.response?.incomplete_details?.reason === 'content_filter'
+        ? 'refusal'
+        : 'max_tokens';
       this.settled = true;
     }
     // A turn that failed upstream is not a turn that finished. Without this the
     // deltas already forwarded were served as a complete answer: HTTP 200,
     // `finish_reason: "stop"`, and whatever text arrived before the failure.
-    if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') {
+    // Recorded only while the turn is unsettled, so a frame arriving after the
+    // turn completed cannot discard a finished answer.
+    if ((event.type === 'response.failed' || event.type === 'error') && !this.settled) {
       this.failure = terminalFailureMessage(event);
       this.settled = true;
     }
@@ -394,6 +414,7 @@ class CodexBackendStreamState {
       // the narration, so dropping it here made streaming and non-streaming
       // clients disagree about what the model said.
       text: this.text.trim(),
+      ...(this.stopReason ? { stopReason: this.stopReason } : {}),
       toolCalls,
       usage: this.usage ?? usageFor(this.request, this.text, toolCalls),
       latencyMs: Date.now() - this.startedAt,
@@ -1111,7 +1132,22 @@ async function requestChatgptTokenRefresh(refreshToken: string): Promise<CodexRe
     }),
   });
   if (response.ok) {
-    return await response.json() as CodexRefreshResponse;
+    // A 200 carrying no usable token is a failed refresh, not a silent no-op:
+    // merging it kept the expired token AND rewrote `last_refresh`, destroying
+    // the staleness signal the fallback refresh depends on, so the next request
+    // went out with an expired token and the operator saw the backend's
+    // complaint instead of "log out and sign in again". A gateway's HTML page
+    // is the same failure, and used to surface as a 500 SyntaxError.
+    let refreshed: CodexRefreshResponse;
+    try {
+      refreshed = await response.json() as CodexRefreshResponse;
+    } catch {
+      throw codexRefreshError('Codex OAuth token refresh returned a response that is not JSON.');
+    }
+    if (!refreshed?.access_token) {
+      throw codexRefreshError('Codex OAuth token refresh returned no access token. Please log out and sign in again.');
+    }
+    return refreshed;
   }
   const raw = await response.text().catch(() => '');
   throw codexRefreshError(refreshFailureMessage(raw), refreshFailureCode(raw));

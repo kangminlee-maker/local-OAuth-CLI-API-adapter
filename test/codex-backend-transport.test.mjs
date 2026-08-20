@@ -584,7 +584,6 @@ test('a completed call the stream never announced is added, not swapped in', asy
 
 for (const [label, terminal] of [
   ['response.failed', { type: 'response.failed', response: { id: 'r', error: { code: 'server_error', message: 'upstream exploded' } } }],
-  ['response.incomplete', { type: 'response.incomplete', response: { id: 'r', incomplete_details: { reason: 'max_output_tokens' } } }],
   ['an SSE error frame', { type: 'error', error: { message: 'stream aborted upstream' } }],
 ]) {
   test(`a turn ending in ${label} is a failure, not a finished answer`, async () => {
@@ -599,9 +598,44 @@ for (const [label, terminal] of [
     ]), { status: 200 });
     const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
-    await assert.rejects(() => backend.generate(textRequest()), /codex backend turn (failed|incomplete)/);
+    await assert.rejects(() => backend.generate(textRequest()), /codex backend turn failed/);
   });
 }
+
+test('a truncated turn returns what it generated, with a stop reason', async () => {
+  // `response.incomplete` means the cap was hit, not that the turn broke: the
+  // output is real and the provider returns it. Failing the request discarded
+  // every generated token and, being a 500, invited a retry that would
+  // deterministically hit the same cap.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_text.delta', delta: 'Here is the first half' },
+    {
+      type: 'response.incomplete',
+      response: { id: 'r', model: 'gpt-5.5', output: [], incomplete_details: { reason: 'max_output_tokens' } },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const result = await backend.generate(textRequest());
+  assert.equal(result.text, 'Here is the first half');
+  assert.equal(result.stopReason, 'max_tokens');
+});
+
+test('a turn that completed is not undone by a later error frame', async () => {
+  // Noise after the terminal frame — or a warning the backend recovered from —
+  // used to discard a finished, correct answer as a 500.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_text.delta', delta: 'complete answer' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+    { type: 'error', error: { message: 'post-completion noise' } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const result = await backend.generate(textRequest());
+  assert.equal(result.text, 'complete answer');
+});
 
 test('a stream that ends with no terminal event is a failure', async () => {
   const codexHome = await createCodexHome();

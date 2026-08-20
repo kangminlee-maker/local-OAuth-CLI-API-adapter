@@ -90,7 +90,15 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       imageGeneration: options.imageGeneration ?? false,
       proxyMode: options.proxyMode ?? 'no-instructions',
     });
-    await session.start();
+    try {
+      await session.start();
+    } catch (err) {
+      // The isolation directory holds a copy of the operator's real
+      // credentials and the child may already be running: a failed start left
+      // both behind, one more of each per retry.
+      await session.close().catch(() => undefined);
+      throw err;
+    }
     return session;
   }
 

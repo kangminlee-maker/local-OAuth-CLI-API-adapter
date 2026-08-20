@@ -1806,7 +1806,11 @@ function openAiChatResponse(result: LocalCompletionResult): unknown {
           refusal: null,
           annotations: [],
         },
-        finish_reason: hasToolCalls ? 'tool_calls' : 'stop',
+        // `length` is how the chat surface says "stopped at the cap"; the
+        // Anthropic surface already passes `max_tokens` through as a stop reason.
+        finish_reason: hasToolCalls
+          ? 'tool_calls'
+          : result.stopReason === 'max_tokens' ? 'length' : 'stop',
       },
     ],
     usage: openAiChatUsage(result.usage),
@@ -2998,8 +3002,22 @@ async function writeSseEvent(
 
 async function writeSseData(res: ServerResponse, payload: unknown): Promise<void> {
   const line = `data: ${JSON.stringify(payload)}\n\n`;
+  if (res.writableEnded || res.destroyed) return;
   if (!res.write(line)) {
-    await new Promise<void>((resolve) => res.once('drain', resolve));
+    // A destroyed socket never drains. Awaiting it froze the writer forever,
+    // and with it the turn, its cleanup, and the session — which then refused
+    // every later turn.
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        res.off('drain', done);
+        res.off('close', done);
+        res.off('error', done);
+        resolve();
+      };
+      res.once('drain', done);
+      res.once('close', done);
+      res.once('error', done);
+    });
   }
 }
 
@@ -3014,10 +3032,20 @@ async function writeLocalCliChatStream(
   }>,
 ): Promise<void> {
   writeSseHeaders(res);
-  for await (const event of events) {
-    await writeSseEvent(res, event.event, event);
+  try {
+    for await (const event of events) {
+      await writeSseEvent(res, event.event, event);
+    }
+  } catch (err) {
+    // The status is already committed, so this is an in-band error like every
+    // other surface's. Letting it escape reached `writeError`, whose
+    // `writeHead` threw ERR_HTTP_HEADERS_SENT, and that rejection killed the
+    // process — one request ended the proxy for everyone.
+    if (!res.writableEnded) {
+      await writeSseEvent(res, 'cli.error', { event: 'cli.error', error: streamErrorPayload(err) });
+    }
   }
-  res.end();
+  if (!res.writableEnded) res.end();
 }
 
 function chunkText(text: string): string[] {

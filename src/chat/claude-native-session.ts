@@ -78,6 +78,11 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     const timer = setTimeout(() => {
       queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms`));
       this.activeTurn = null;
+      // The child is still working on the abandoned prompt, and every line it
+      // writes goes to whatever turn is active when it arrives — including the
+      // `result` that closes a queue as a success. A timed-out turn's answer
+      // was delivered to the NEXT turn as its own. Retire the child instead.
+      void this.restartChild();
     }, this.timeoutMs);
     const abort = (): void => {
       queue.fail(new Error('request aborted'));
@@ -108,9 +113,29 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   }
 
   async interrupt(): Promise<void> {
+    const hadTurn = this.activeTurn !== null;
     this.activeTurn?.queue.fail(new Error('request interrupted'));
     this.activeTurn = null;
-    this.child?.kill('SIGINT');
+    // SIGINT ends this CLI, so interrupting is a restart, not a signal it
+    // survives: without one the session reported `ready` while every later
+    // turn answered "session is not running". An idle session has nothing to
+    // interrupt, so it is left alone.
+    if (hadTurn) await this.restartChild();
+  }
+
+  /** Replaces the child so the session stays usable after an abandoned turn. */
+  private async restartChild(): Promise<void> {
+    const previous = this.child;
+    this.child = null;
+    this.lineReader?.close();
+    this.lineReader = null;
+    previous?.kill('SIGTERM');
+    try {
+      await this.start();
+    } catch {
+      // Left not-running: the next turn reports that plainly rather than
+      // hanging against a child that no longer exists.
+    }
   }
 
   async close(): Promise<void> {
