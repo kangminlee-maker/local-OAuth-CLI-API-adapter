@@ -67,10 +67,16 @@ async function proxy(args: readonly string[]): Promise<number> {
   if (runtimeName !== 'claude' && isolateUserSettings) {
     throw new Error('--isolate-user-settings can only be selected with --runtime claude.');
   }
-  // Extra args are appended last and win, so this pair would start a proxy that
+  // Extra args are appended last and win, so these would start a proxy that
   // reports isolation while loading the settings it promised to keep out.
-  if (isolateUserSettings && (options.extraArg ?? []).some((arg) => arg === '--setting-sources' || arg.startsWith('--setting-sources='))) {
-    throw new Error('--isolate-user-settings conflicts with --extra-arg --setting-sources: the extra arg would override the isolation.');
+  // `--settings` is a separate CLI flag that loads additional settings — hooks,
+  // env, permissions — so it defeats the switch just as directly.
+  const settingsOverrideFlags = ['--setting-sources', '--settings'];
+  const conflicting = (options.extraArg ?? []).find(
+    (arg) => settingsOverrideFlags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)),
+  );
+  if (isolateUserSettings && conflicting) {
+    throw new Error(`--isolate-user-settings conflicts with --extra-arg ${conflicting}: the extra arg would override the isolation.`);
   }
   const cwd = options.cwd ?? process.cwd();
   const backend: LocalCliBackend = runtimeName === 'claude'

@@ -84,7 +84,11 @@ async function withProxy(events, run) {
 
 const FINAL_OUTPUTS = [
   ['no function_call in the completed output', []],
-  ['an id-less function_call in the completed output', [
+  // The reasoning item makes the completed array's positions disagree with the
+  // stream's dense tool positions, which is the case positional alignment gets
+  // wrong; without it the two coincide at 0 and the check proves nothing.
+  ['an id-less function_call after a reasoning item in the completed output', [
+    { type: 'reasoning', id: 'rs_1' },
     { type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' },
   ]],
 ];

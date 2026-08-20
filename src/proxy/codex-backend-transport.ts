@@ -335,10 +335,23 @@ class CodexBackendStreamState {
 
   private captureFinalOutput(output: readonly unknown[] | undefined): void {
     if (!Array.isArray(output)) return;
+    const finalCalls = output.filter((item) => asRecord(item)?.type === 'function_call');
+    // Positional alignment is only meaningful when the two views agree on how
+    // many calls there are. When they disagree, an id-less final item would
+    // land on whichever streamed call happens to share its position and
+    // overwrite that call's name and arguments — turning one tool call into a
+    // second copy of another. The streamed state is the one the client already
+    // acted on, so it wins.
+    const alignable = this.toolStates.size === 0 || finalCalls.length === this.toolStates.size;
     let functionCallPosition = 0;
     for (const item of output) {
       const obj = asRecord(item);
       if (obj?.type === 'function_call') {
+        const anonymous = typeof obj.id !== 'string' && typeof obj.call_id !== 'string';
+        if (anonymous && !alignable) {
+          functionCallPosition += 1;
+          continue;
+        }
         const index = this.finalOutputOrdinal(
           functionCallPosition,
           typeof obj.id === 'string' ? obj.id : undefined,

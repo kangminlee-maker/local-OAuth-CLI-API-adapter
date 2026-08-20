@@ -240,7 +240,7 @@ const semanticQualityJudgeModel = options.semanticQualityJudgeModel ?? openAiMod
 const imageQualityJudgeModel = options.imageQualityJudgeModel ?? semanticQualityJudgeModel;
 const semanticQualityReference = booleanOption(options.semanticQualityReference, true);
 const semanticQualitySuite = options.semanticQualitySuite ?? 'realistic';
-const minSemanticQuality = nonNegativeNumberOption(options.minSemanticQuality, 0);
+const minSemanticQuality = nonNegativeNumberOption(options.minSemanticQuality, suiteDefaults.minSemanticQuality);
 const minImageQuality = nonNegativeNumberOption(options.minImageQuality, suiteDefaults.minImageQuality);
 const expectProviderErrors = booleanOption(options.expectProviderErrors, false);
 const requestReasoningEffort = optionalReasoningEffort(options.requestReasoningEffort);
@@ -254,6 +254,15 @@ const codexImageAttemptDiagnosticsEnabled = booleanOption(
 );
 
 const rows = [];
+// A target selected under one label can be reported under another — the
+// Anthropic family aliases resolve to model names. Recording the filter that
+// made the selection keeps the unmatched-target check from re-reporting it.
+const claimedTargetFilters = new Set();
+function claimTargetFilters(...labels) {
+  for (const filter of targetFilters ?? []) {
+    if (labels.some((label) => matchesFilter(label, filter))) claimedTargetFilters.add(filter);
+  }
+}
 const servers = [];
 const semanticReferenceCache = new Map();
 const imageFixtureCache = new Map();
@@ -356,16 +365,40 @@ try {
     for (const [family, model] of Object.entries(anthropicModels)) {
       // Select by family alias or by model name; label rows with the model that ran.
       if (shouldRunTarget(`anthropic-api:${family}`) || shouldRunTarget(`anthropic-api:${model}`)) {
+        claimTargetFilters(`anthropic-api:${family}`, `anthropic-api:${model}`);
         await benchmarkAnthropicCompatible(`anthropic-api:${model}`, 'https://api.anthropic.com', model, true);
       }
     }
     // Same selector as the run branch: a model-name target with no key must
     // still record a skip, or the run reports success with no Anthropic rows.
-  } else if (Object.entries(anthropicModels).some(([family, model]) => shouldRunTarget(`anthropic-api:${family}`) || shouldRunTarget(`anthropic-api:${model}`))) {
-    rows.push({ target: 'anthropic-api', ok: false, skipped: true, error: 'ANTHROPIC_API_KEY missing' });
+    // The skip carries the model label the run branch would have used, so the
+    // requested target is visibly accounted for rather than merely absent.
+  } else {
+    for (const [family, model] of Object.entries(anthropicModels)) {
+      if (shouldRunTarget(`anthropic-api:${family}`) || shouldRunTarget(`anthropic-api:${model}`)) {
+        claimTargetFilters(`anthropic-api:${family}`, `anthropic-api:${model}`);
+        rows.push({ target: `anthropic-api:${model}`, ok: false, skipped: true, error: 'ANTHROPIC_API_KEY missing' });
+      }
+    }
   }
 } finally {
   for (const server of servers.reverse()) await server.close().catch(() => undefined);
+}
+
+// A requested target that produced neither a measurement nor a skip is a
+// selection that silently did nothing — which is how a renamed target (the
+// direct labels carry the model now) deletes half a comparison while the run
+// still exits 0.
+for (const filter of targetFilters ?? []) {
+  if (filter === 'all') continue;
+  if (claimedTargetFilters.has(filter)) continue;
+  if (rows.some((row) => matchesFilter(row.target, filter))) continue;
+  rows.push({
+    target: filter,
+    case: 'selection',
+    ok: false,
+    error: `Requested target matched no benchmark rows: ${filter}`,
+  });
 }
 
 if (rows.length === 0) {
@@ -374,6 +407,18 @@ if (rows.length === 0) {
     case: 'selection',
     ok: false,
     error: `No benchmark rows selected. targets=${filterLabel(targetFilters)} cases=${filterLabel(caseFilters)}`,
+  });
+}
+
+// A run whose every row was skipped measured nothing, so it cannot report
+// success: `passed` counted skips, and the exit code ignored them.
+const executed = rows.filter((row) => !row.skipped);
+if (executed.length === 0) {
+  rows.push({
+    target: 'benchmark',
+    case: 'selection',
+    ok: false,
+    error: `Every selected row was skipped: ${rows.filter((row) => row.skipped).map((row) => row.error ?? row.target).join('; ')}`,
   });
 }
 
@@ -408,7 +453,9 @@ const summaryBase = {
   claudeCliModel: options.claudeCliModel ?? 'opus',
   claudeIsolateUserSettings,
   anthropicModels,
-  passed: rows.length - failed.length,
+  // A skipped row measured nothing, so it is neither a pass nor a failure.
+  passed: rows.filter((row) => row.ok && !row.skipped).length,
+  skipped: rows.filter((row) => row.skipped).length,
   failed: failed.length,
   rows,
 };
@@ -3259,6 +3306,11 @@ async function fetchOpenAiSemanticReference(kind, prompt, options = {}) {
       max_output_tokens: 1536,
     }, openAiHeaders(true));
     assertOpenAiResponsesShape(response.body);
+    // The chat and Anthropic reference paths reject a truncated answer through
+    // their stop reasons; Responses reports it in `status`, and a half-written
+    // reference is a worse denominator than a missing one because it still
+    // looks usable.
+    assertEqual(response.body.status, 'completed', 'responses semantic reference status');
     const text = extractOpenAiResponseText(response.body) ?? '';
     assertUsableReference(text, `openai-api:${openAiModel}:responses`);
     return {
@@ -3671,11 +3723,14 @@ function loadSummaryFile(path) {
 function basisMismatches(baseline, current) {
   const mismatches = [];
   for (const field of COMPARISON_BASIS_FIELDS) {
-    const before = baseline?.[field];
-    const after = current?.[field];
-    if (before === undefined && after === undefined) continue;
+    // An older summary simply lacks the key; absent and null both mean "not
+    // recorded", and reporting one against the other is a false alarm — the
+    // kind that trains the warning away before it ever catches something.
+    const before = baseline?.[field] ?? null;
+    const after = current?.[field] ?? null;
+    if (before === null && after === null) continue;
     if (JSON.stringify(before) !== JSON.stringify(after)) {
-      mismatches.push({ field, baseline: before ?? null, current: after ?? null });
+      mismatches.push({ field, baseline: before, current: after });
     }
   }
   const beforeAnthropic = JSON.stringify(baseline?.anthropicModels ?? null);
@@ -3753,13 +3808,15 @@ function compareWithBaseline(baseline, current, options) {
     latencyRegressionPct: options.latencyRegressionPct,
     latencyRegressionMs: options.latencyRegressionMs,
     qualityRegressionPoints: options.qualityRegressionPoints,
-    compared: compared.length,
+    compared: basisDrift.length > 0 ? 0 : compared.length,
     skipped: skipped.length,
-    // Present only when the two runs were not measuring the same thing; the
-    // deltas below are then differences in configuration, not in behaviour.
-    ...(basisDrift.length > 0 ? { basisMismatch: basisDrift } : {}),
-    regressions,
-    improvements,
+    // A differing basis does not weaken the deltas, it voids them: they are
+    // differences in configuration. Reporting them as regressions or
+    // improvements would be a finding about nothing, so the comparison is
+    // withheld and only the mismatch is reported.
+    ...(basisDrift.length > 0
+      ? { basisMismatch: basisDrift, comparisonWithheld: true, regressions: [], improvements: [] }
+      : { regressions, improvements }),
   };
 }
 
@@ -3864,6 +3921,10 @@ function benchmarkSuiteDefaults(names) {
     semanticQualityRepeats: has('quality-realistic') || has('release-gate') ? 1 : 0,
     imageQualityRepeats: has('image-realistic') || has('release-gate') ? 1 : 0,
     minImageQuality: has('image-realistic') || has('release-gate') ? 90 : 0,
+    // A suite that scores semantic quality carries its gate, the way the image
+    // suites carry theirs: the documented 95 was otherwise only in effect when
+    // the operator remembered the flag.
+    minSemanticQuality: has('quality-realistic') || has('release-gate') ? 95 : 0,
   };
 }
 

@@ -501,7 +501,12 @@ test('an id-less completed function_call does not duplicate a call already strea
       response: {
         id: 'resp_idless_final',
         model: 'gpt-5.5',
-        output: [{ type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+        // The reasoning item is what makes the two views disagree: the call is
+        // at array position 1 here and at dense tool position 0 in the stream.
+        output: [
+          { type: 'reasoning', id: 'rs_1' },
+          { type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+        ],
       },
     },
   ]), { status: 200 });
@@ -516,6 +521,41 @@ test('an id-less completed function_call does not duplicate a call already strea
   for (const event of events.filter((e) => e.type === 'tool_call_delta')) {
     assert.equal(event.index, 0);
   }
+});
+
+test('an id-less completed call never overwrites a different streamed call', async () => {
+  // When the completed output holds fewer function calls than the stream did,
+  // positional alignment would land an anonymous item on whichever streamed
+  // call shares its position — replacing that call's name and arguments with
+  // another call's payload. A client would then run the wrong tool, twice.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'delete_file' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_2', delta: '{"path":"/tmp/x"}' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_mismatched_counts',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', name: 'delete_file', arguments: '{"path":"/tmp/x"}' }],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const toolCalls = events.at(-1).result.toolCalls;
+  assert.deepEqual(
+    toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [
+      ['call_1', 'get_weather', '{"city":"Seoul"}'],
+      ['call_2', 'delete_file', '{"path":"/tmp/x"}'],
+    ],
+  );
 });
 
 test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
