@@ -11,12 +11,16 @@ import { openAiImageQualityReasoningEffort, startLocalApiProxy } from '../dist/p
 import { image2ViaGpt55Prompt } from '../dist/proxy/image2-via-gpt55.js';
 import { codexProxyImageModel, isReasoningEffort } from '../dist/settings.js';
 import {
-  basisMismatches,
-  basisVoidsRow,
+  benchmarkFailureReasons,
+  compareWithBaseline,
+  decidingSample,
+  imageGateScore,
   matchesFilter,
   mergeFilters,
   nonNegativeNumberOption,
   readFilters,
+  semanticGateScore,
+  shouldCompareRegressionTarget,
 } from './lib/benchmark-verdict.mjs';
 
 loadEnvFile('.env');
@@ -194,11 +198,19 @@ const suiteCaseFilters = benchmarkSuiteCaseFilters(selectedSuites);
 const suiteDefaults = benchmarkSuiteDefaults(selectedSuites);
 const timeoutMs = numberOption(options.timeoutMs, 240_000);
 const repeats = numberOption(options.repeats, 1);
-const qualityRepeats = countOption(options.qualityRepeats, 0);
-const semanticQualityRepeats = countOption(options.semanticQualityRepeats, suiteDefaults.semanticQualityRepeats);
+const qualityRepeats = nonNegativeNumberOption(options.qualityRepeats, 0, '--quality-repeats');
+const semanticQualityRepeats = nonNegativeNumberOption(
+  options.semanticQualityRepeats,
+  suiteDefaults.semanticQualityRepeats,
+  '--semantic-quality-repeats',
+);
 const includeMultimodal = booleanOption(options.includeMultimodal, suiteDefaults.includeMultimodal);
 const includeImageGeneration = booleanOption(options.includeImageGeneration, suiteDefaults.includeImageGeneration);
-const imageQualityRepeats = countOption(options.imageQualityRepeats, suiteDefaults.imageQualityRepeats);
+const imageQualityRepeats = nonNegativeNumberOption(
+  options.imageQualityRepeats,
+  suiteDefaults.imageQualityRepeats,
+  '--image-quality-repeats',
+);
 const cwd = options.cwd ?? process.cwd();
 const openAiModel = options.openaiModel ?? 'gpt-5.5';
 const openAiImageApiModel = options.openaiImageApiModel ?? 'gpt-image-1.5';
@@ -236,6 +248,10 @@ const minImageQuality = nonNegativeNumberOption(options.minImageQuality, suiteDe
 const expectProviderErrors = booleanOption(options.expectProviderErrors, false);
 const requestReasoningEffort = optionalReasoningEffort(options.requestReasoningEffort);
 const codexProxyMode = codexAppServerProxyMode(options.codexProxyMode ?? options.codexProbeMode);
+// Read here rather than where the proxy is built: the transport decides what a
+// Codex image row measured, so the summary has to record it for the baseline
+// comparison to see a run that switched transports.
+const selectedCodexImageTransport = codexImageTransport(options.codexImageTransport);
 const targetFilters = readFilters(options.targets ?? options.target);
 const caseFilters = mergeFilters(readFilters(options.cases ?? options.case), suiteCaseFilters);
 const codexImageAttemptLogPath = options.codexImageAttemptLog;
@@ -265,7 +281,6 @@ try {
   let proxyCodexAppServer = null;
   let proxyCodexBackendTransport = null;
   let proxyClaude = null;
-  const selectedCodexImageTransport = codexImageTransport(options.codexImageTransport);
   if (shouldRunTarget('proxy-codex') || shouldRunImageGenerationPairBenchmark()) {
     const proxyCodexTextBackend = new CodexBackendTransport({
       model: options.codexBackendModel ?? options.codexModel,
@@ -440,6 +455,7 @@ const summaryBase = {
   openAiModel,
   openAiImageApiModel,
   codexImageModel,
+  codexImageTransport: selectedCodexImageTransport,
   // The proxy-side models decide what the proxy rows measure, so they belong in
   // the artifact next to the direct-side ones.
   codexModel: options.codexBackendModel ?? options.codexModel ?? null,
@@ -452,9 +468,9 @@ const summaryBase = {
   failed: failed.length,
   rows,
 };
-// Read after the run, but never fatally: the measurements are already paid
-// for, and an unreadable baseline is a comparison problem, not a reason to
-// discard them.
+// Read after the run, and never as a reason to throw the measurements away:
+// they are already paid for. The failure moves into the verdict instead — a
+// comparison the operator asked for and did not get cannot exit 0.
 let baselineLoadError;
 const baselineSummary = baselinePath ? (() => {
   try {
@@ -466,20 +482,29 @@ const baselineSummary = baselinePath ? (() => {
 })() : null;
 const regressionGate = baselineSummary
   ? compareWithBaseline(baselineSummary, summaryBase, {
+      baselinePath,
       regressionTargets,
       latencyRegressionPct,
       latencyRegressionMs,
       qualityRegressionPoints,
     })
   : null;
+// Recorded next to the numbers, so an artifact read months later says why the
+// run exited as it did rather than leaving the reader to re-derive it.
+const verdictFailures = benchmarkFailureReasons({
+  failedRows: failed.length,
+  baselineLoadError,
+  regressionGate,
+});
 const summary = {
   ...summaryBase,
   ...(baselineLoadError ? { baselineError: baselineLoadError } : {}),
   ...(imageAttemptDiagnostics.length > 0 ? { imageAttemptDiagnostics } : {}),
   ...(regressionGate ? { regressionGate } : {}),
+  ...(verdictFailures.length > 0 ? { verdictFailures } : {}),
 };
 if (baselineLoadError) {
-  console.error(`\nBASELINE UNREADABLE — results kept, comparison skipped: ${baselineLoadError}`);
+  console.error(`\nBASELINE UNREADABLE — results kept, run failed: ${baselineLoadError}`);
 }
 if (regressionGate?.basisMismatch) {
   // Loud, because the rows it governs were dropped from the comparison.
@@ -492,7 +517,8 @@ if (outputPath) {
   fs.writeFileSync(outputPath, `${JSON.stringify(summary, null, 2)}\n`);
 }
 console.log(`\nAPI_COMPARISON_SUMMARY ${JSON.stringify(summary, null, 2)}`);
-process.exit(failed.length > 0 || (regressionGate?.regressions.length ?? 0) > 0 ? 1 : 0);
+for (const reason of verdictFailures) console.error(`BENCHMARK FAILED — ${reason}`);
+process.exit(verdictFailures.length > 0 ? 1 : 0);
 
 async function startProxy(backend, options = {}) {
   const server = await startLocalApiProxy({
@@ -2120,13 +2146,13 @@ async function benchmarkCase(target, caseName, count, fn) {
     firstToolArgumentMs: summarize(samples.map((sample) => sample.firstToolArgumentMs).filter(Number.isFinite)),
     firstImageMs: summarize(samples.map((sample) => sample.firstImageMs).filter(Number.isFinite)),
     chunks: samples.map((sample) => sample.chunks).filter(Number.isFinite),
-    sample: decidingSample(samples),
+    sample: decidingSample(samples, imageGateScore),
   };
   const backendTiming = summarizeBackendTimings(samples);
   if (backendTiming) row.backendTiming = backendTiming;
   const modelWorkPct = summarizeModelWorkPct(samples);
   if (modelWorkPct) row.modelWorkPct = modelWorkPct;
-  const imageQualityScores = samples.map((sample) => sample.imageQuality?.score).filter(Number.isFinite);
+  const imageQualityScores = samples.map(imageGateScore).filter(Number.isFinite);
   if (imageQualityScores.length > 0) row.imageQuality = summarize(imageQualityScores);
   const imageJudgeMs = samples.map((sample) => sample.imageQuality?.judgeMs?.median ?? sample.imageQuality?.judgeMs).filter(Number.isFinite);
   if (imageJudgeMs.length > 0) row.imageJudgeMs = summarize(imageJudgeMs);
@@ -2172,13 +2198,11 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
     ok: true,
     totalMs: summarize(samples.map((sample) => sample.totalMs)),
     quality: summarize(samples.map((sample) => sample.quality.score)),
-    sample: decidingSample(samples),
+    sample: decidingSample(samples, semanticGateScore),
   };
   const semanticScores = samples.map((sample) => sample.semanticQuality?.score).filter(Number.isFinite);
   if (semanticScores.length > 0) row.semanticQuality = summarize(semanticScores);
-  const relativeScores = samples
-    .map((sample) => sample.semanticQuality?.relativeQuality ?? sample.semanticQuality?.score)
-    .filter(Number.isFinite);
+  const relativeScores = samples.map(semanticGateScore).filter(Number.isFinite);
   if (relativeScores.length > 0) row.semanticRelativeQuality = summarize(relativeScores);
   const judgeMs = samples.map((sample) => sample.judgeMs).filter(Number.isFinite);
   if (judgeMs.length > 0) row.judgeMs = summarize(judgeMs);
@@ -3739,129 +3763,6 @@ function loadSummaryFile(path) {
   return JSON.parse(markerIndex === -1 ? text : text.slice(markerIndex + marker.length));
 }
 
-
-
-function compareWithBaseline(baseline, current, options) {
-  const basisDrift = basisMismatches(baseline, current);
-  const baselineRows = new Map(
-    (baseline.rows ?? [])
-      .filter((row) => row?.ok)
-      .map((row) => [rowKey(row), row]),
-  );
-  const regressions = [];
-  const improvements = [];
-  const compared = [];
-  const skipped = [];
-  for (const row of current.rows.filter((item) => item.ok)) {
-    if (!shouldCompareRegressionTarget(row.target, options.regressionTargets)) {
-      skipped.push({ target: row.target, case: row.case, reason: 'target-filter' });
-      continue;
-    }
-    // Only the rows a differing field actually governs lose their comparison;
-    // a Claude-side difference says nothing about an OpenAI row.
-    if (basisVoidsRow(basisDrift.mismatched, row.target)) {
-      skipped.push({ target: row.target, case: row.case, reason: 'basis-mismatch' });
-      continue;
-    }
-    const baselineRow = baselineRows.get(rowKey(row));
-    if (!baselineRow) {
-      skipped.push({ target: row.target, case: row.case, reason: 'missing-baseline' });
-      continue;
-    }
-    for (const metric of ['totalMs', 'firstDataMs', 'firstTextMs', 'firstToolArgumentMs', 'firstImageMs']) {
-      const before = medianOf(baselineRow[metric]);
-      const after = medianOf(row[metric]);
-      if (!Number.isFinite(before) || !Number.isFinite(after)) continue;
-      const delta = after - before;
-      const threshold = Math.max(options.latencyRegressionMs, Math.abs(before) * options.latencyRegressionPct / 100);
-      const entry = {
-        target: row.target,
-        case: row.case,
-        metric,
-        before,
-        after,
-        delta,
-        threshold: Math.round(threshold),
-      };
-      compared.push(entry);
-      if (delta > threshold) regressions.push(entry);
-      else if (delta < -threshold) improvements.push(entry);
-    }
-    // semanticRelativeQuality is the metric the gate reads, so a baseline that
-    // does not compare it cannot see the authoritative quality drift.
-    for (const metric of ['quality', 'semanticQuality', 'semanticRelativeQuality', 'imageQuality']) {
-      const qualityBefore = medianOf(baselineRow[metric]);
-      const qualityAfter = medianOf(row[metric]);
-      if (!Number.isFinite(qualityBefore) || !Number.isFinite(qualityAfter)) continue;
-      const delta = qualityAfter - qualityBefore;
-      const entry = {
-        target: row.target,
-        case: row.case,
-        metric,
-        before: qualityBefore,
-        after: qualityAfter,
-        delta,
-        threshold: options.qualityRegressionPoints,
-      };
-      compared.push(entry);
-      if (delta < -options.qualityRegressionPoints) regressions.push(entry);
-      else if (delta > options.qualityRegressionPoints) improvements.push(entry);
-    }
-  }
-  return {
-    baseline: baselinePath,
-    targets: options.regressionTargets,
-    latencyRegressionPct: options.latencyRegressionPct,
-    latencyRegressionMs: options.latencyRegressionMs,
-    qualityRegressionPoints: options.qualityRegressionPoints,
-    compared: compared.length,
-    skipped: skipped.length,
-    // A differing basis does not weaken the deltas, it voids them: they are
-    // differences in configuration. Reporting them as regressions or
-    // improvements would be a finding about nothing, so the comparison is
-    // withheld and only the mismatch is reported.
-    ...(basisDrift.mismatched.length > 0 ? { basisMismatch: basisDrift.mismatched } : {}),
-    // Fields this run records that the baseline never did: not evidence that
-    // the basis differed, but worth seeing before trusting a delta.
-    ...(basisDrift.unknown.length > 0 ? { basisUnknown: basisDrift.unknown } : {}),
-    regressions,
-    improvements,
-  };
-}
-
-/**
- * The sample the gates actually read. Quality gates take the minimum across
- * repeats, so retaining the last sample left artifacts whose kept rationale
- * praised an answer the row was failed for — the failing text, its issues and
- * its reference were gone.
- */
-function decidingSample(samples) {
-  const scored = samples.filter((sample) => Number.isFinite(sample?.semanticQuality?.relativeQuality)
-    || Number.isFinite(sample?.semanticQuality?.score)
-    || Number.isFinite(sample?.imageQuality?.score));
-  if (scored.length === 0) return samples.at(-1);
-  const rank = (sample) => Math.min(
-    sample?.semanticQuality?.relativeQuality ?? Infinity,
-    sample?.semanticQuality?.score ?? Infinity,
-    sample?.imageQuality?.score ?? Infinity,
-  );
-  return scored.reduce((worst, sample) => (rank(sample) < rank(worst) ? sample : worst));
-}
-
-function rowKey(row) {
-  return `${row.target}\t${row.case}`;
-}
-
-function medianOf(summary) {
-  return typeof summary?.median === 'number' ? summary.median : Number.NaN;
-}
-
-function shouldCompareRegressionTarget(target, filter) {
-  if (filter === 'all') return true;
-  if (filter === 'proxy') return target.startsWith('proxy-');
-  return target.includes(filter);
-}
-
 function shouldRunTarget(target) {
   return matchesFilters(target, targetFilters);
 }
@@ -3989,12 +3890,6 @@ function numberOption(value, fallback) {
   if (value === undefined) return fallback;
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-function countOption(value, fallback) {
-  if (value === undefined) return fallback;
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function booleanOption(value, fallback) {
