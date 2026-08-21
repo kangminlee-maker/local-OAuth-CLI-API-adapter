@@ -374,6 +374,60 @@ test('a truncated streamed prefix is repaired by the completed item', async () =
   assert.deepEqual(surfaces.chatStream, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
 });
 
+test('a call held until after the narration is reported after it', async () => {
+  // The order the client saw is the order it was TOLD, not the order the
+  // backend opened state for. Held arguments arrive before any text, but they
+  // are not announced until the call is named — by which time the narration has
+  // already streamed — so a body claiming the tool came first contradicts the
+  // stream that carried the same turn.
+  const surfaces = await toolSurfaces([
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":' },
+    { type: 'response.output_text.delta', delta: 'Let me check the weather. ' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]);
+  assert.deepEqual(surfaces.messagesStreamBlocks.map((block) => block.type), ['text', 'tool_use']);
+  assert.deepEqual(
+    surfaces.messagesFinalBlocks.map((block) => block.type),
+    surfaces.messagesStreamBlocks.map((block) => block.type),
+  );
+  assert.deepEqual(surfaces.responsesFinalTypes, surfaces.responsesStreamCompletedTypes);
+});
+
+test('an item that names nothing does not block the call that names its position', async () => {
+  // `output_item.added` can open a function_call with neither id nor call_id.
+  // Such an item holds the position on nothing but the position — like an
+  // id-less delta — so the item that finally names the call owns it. Treating
+  // it as a named holder minted a second ordinal: the phantom call again.
+  const surfaces = await toolSurfaces([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]);
+  assert.deepEqual(surfaces.chatFinal, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.chatStream, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+});
+
+test('a re-announcement without a call_id does not un-name an announced call', async () => {
+  // `identified` is a latch: once the backend has supplied the `call_id` the
+  // client echoes back, a later item that omits it cannot take the name away.
+  // Assigning instead of latching stranded every following delta in the buffer,
+  // because only an announced call is ever flushed.
+  const surfaces = await toolSurfaces([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]);
+  assert.deepEqual(surfaces.chatStream, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+  assert.deepEqual(surfaces.chatFinal, [{ name: 'get_weather', arguments: '{"city":"Seoul"}' }]);
+});
+
 test('the completed output array agrees with the indices its items were announced at', async () => {
   // `output_index` is allocated in emission order, but the completed array was
   // assembled in a fixed one: with the call ahead of the narration, position 0

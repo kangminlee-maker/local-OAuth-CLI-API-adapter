@@ -1,9 +1,16 @@
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
 import { afterEach, test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   isDirectProviderEnvName,
   proxyChildProcessEnv,
 } from '../dist/proxy/process-env.js';
+
+const fixtureRule = createRequire(import.meta.url)(
+  resolve(dirname(fileURLToPath(import.meta.url)), 'fixtures/direct-provider-env.cjs'),
+);
 
 // Names the installed CLIs actually read — probed against Claude Code 2.1.237
 // and codex 0.146.0, not taken from documentation. Each one either hands a
@@ -109,4 +116,18 @@ test('a namespace is blocked whole, not by a list of known names', () => {
   assert.equal(isDirectProviderEnvName('AWSOME_TOOL'), false);
   assert.equal(isDirectProviderEnvName('GOOGLEBOT_UA'), false);
   assert.equal(isDirectProviderEnvName('OPENAIRE_TOKEN'), false);
+});
+
+test('the fakes classify env exactly as the runtime does', () => {
+  // The fakes assert this boundary from inside a spawned child, which is the
+  // only place it can be proven — and they carried their own copy of the rule,
+  // so when the runtime moved to namespaces the copies kept asserting the
+  // boundary it had replaced. One copy remains, and this pins it.
+  for (const name of [...managed, 'AWS_BEARER_TOKEN_BEDROCK', 'AWSOME_TOOL', 'CLAUDE_CODE_USE_VERTEX', 'XAI', 'XAILINE']) {
+    assert.equal(
+      fixtureRule.isDirectProviderEnvName(name),
+      isDirectProviderEnvName(name),
+      `${name}: the fixture rule and the runtime rule disagree`,
+    );
+  }
 });

@@ -212,6 +212,55 @@ test('a native chat turn that never answers ends at the request timeout', async 
   }
 });
 
+test('a turn that keeps producing is not cut off by the deadline', async () => {
+  // The deadline bounds silence, not duration. A native turn is an agentic CLI
+  // session that legitimately runs far longer than one request budget while
+  // streaming the whole time; a total cap would kill a turn that is working.
+  const chatSessionManager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: { thread_id: 'thread_slow' },
+        async *startTurn() {
+          for (let i = 0; i < 6; i += 1) {
+            await new Promise((resolve) => { setTimeout(resolve, 120).unref(); });
+            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: `${i} ` };
+          }
+        },
+        async close() {},
+      }),
+    },
+  });
+  // Every step is inside the budget; the turn as a whole runs well past it.
+  const server = await startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 300,
+    chatSessionManager,
+    backend: { name: 'fake-backend', model: 'm', async generate() { throw new Error('unused'); }, async close() {} },
+  });
+  try {
+    const created = await fetch(`${server.url}/local/cli/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ runtime: 'codex' }),
+    });
+    const session = await created.json();
+    const turn = await fetch(`${server.url}/local/cli/sessions/${session.id}/turns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ input: 'hello' }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await turn.json();
+    assert.equal(body.status, 'completed');
+    assert.equal(body.final.text, '0 1 2 3 4 5 ');
+  } finally {
+    await server.close();
+  }
+});
+
 test('a native chat stream that never answers ends at the request timeout', async () => {
   const { server } = await startHangingChatProxy(400);
   try {

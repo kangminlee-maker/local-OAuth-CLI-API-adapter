@@ -187,10 +187,14 @@ Runtime mapping:
   child that stopped answering never sends.
 - Claude: process signal or CLI-supported interruption when available.
 
-A turn is also bounded by the server's `--timeout-ms`: when it elapses the turn
-is aborted through the same path and reported in-band (`cli.error`, and
+A turn is also bounded by the server's `--timeout-ms`, applied as an IDLE
+deadline: every event restarts it, so a long turn that keeps streaming is never
+cut off and only a turn that has stopped producing is ended. When it elapses the
+turn is aborted through the same path and reported in-band (`cli.error`, and
 `status: "error"` on the non-streaming result), which returns the session to
-`ready`. Closing a session gives the child a short grace period for its
+`ready`. A turn whose caller has already gone never starts on the child at all,
+and one abandoned while its `turn/start` is still in flight is interrupted once
+the child acknowledges it rather than left running. Closing a session gives the child a short grace period for its
 best-effort `thread/archive` rather than the whole turn budget — a child that
 has stopped answering must not hold `DELETE` or server shutdown for minutes.
 

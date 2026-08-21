@@ -127,11 +127,24 @@ export class LocalCliChatSessionManager {
     // the same mechanism `interrupt` uses. Without it a child that stopped
     // answering held the HTTP request open with no end, and left the session
     // `running`, so every later turn was refused with 409.
-    const deadline = options.timeoutMs !== undefined && options.timeoutMs > 0
-      ? setTimeout(() => abort.abort(), options.timeoutMs)
+    //
+    // It bounds SILENCE, not duration: a native turn is an agentic CLI session
+    // that legitimately runs for many minutes while streaming, and a total cap
+    // would cut a turn that is working. Every event restarts the clock, so what
+    // the deadline ends is a turn that has stopped producing.
+    const idleTimeoutMs = options.timeoutMs !== undefined && options.timeoutMs > 0
+      ? options.timeoutMs
       : undefined;
+    let deadline: NodeJS.Timeout | undefined;
+    const armDeadline = (): void => {
+      if (idleTimeoutMs === undefined) return;
+      if (deadline) clearTimeout(deadline);
+      deadline = setTimeout(() => abort.abort(), idleTimeoutMs);
+    };
+    armDeadline();
     try {
       for await (const runtimeEvent of session.nativeSession.startTurn(input, abort.signal)) {
+        armDeadline();
         yield {
           event: 'cli.event',
           session_id: session.id,

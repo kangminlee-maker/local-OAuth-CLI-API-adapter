@@ -134,10 +134,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     const onAbort = (): void => {
       void abort();
     };
-    if (signal) {
-      if (signal.aborted) await abort();
-      else signal.addEventListener('abort', onAbort, { once: true });
+    // A caller that has already left gets no turn at all. Failing the queue and
+    // then starting one anyway spent a turn on the child that nobody would read
+    // and — with no turn id yet — nothing could interrupt.
+    if (signal?.aborted) {
+      await preparedInput.cleanup();
+      throw new Error('local CLI chat turn aborted');
     }
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
       const response = await this.send('turn/start', {
         threadId: this.threadId,
@@ -153,6 +157,13 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       });
       turnId = readPath<string>(response, ['result', 'turn', 'id']) ?? '';
       if (!turnId) throw new Error('codex app-server did not return a turn id');
+      // The abort may have fired while this acknowledgement was in flight, when
+      // there was no turn id to interrupt with. Now there is one, and the turn
+      // is running on the child: interrupt it rather than walking away from it.
+      if (signal?.aborted) {
+        await this.send('turn/interrupt', { threadId: this.threadId, turnId }).catch(() => undefined);
+        throw new Error('local CLI chat turn aborted');
+      }
       this.activeTurn = { turnId, queue };
       queue.push({
         raw: {

@@ -190,7 +190,7 @@ class CodexBackendStreamState {
   private failure?: string;
   private settled = false;
   private stopReason?: string;
-  private toolCallsBeforeText = false;
+  private toolCallsBeforeText?: boolean;
 
   constructor(
     private readonly request: NormalizedRequest,
@@ -291,14 +291,22 @@ class CodexBackendStreamState {
       const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
       const id = event.item.call_id ?? event.item.id ?? `call_${index + 1}`;
       const name = event.item.name ?? 'tool';
-      const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name });
-      state.id = id;
-      state.name = name;
-      if (event.item.id !== undefined || event.item.call_id !== undefined) state.anonymous = false;
+      const named = event.item.id !== undefined || event.item.call_id !== undefined;
+      const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name, anonymous: !named });
+      // Same rule the `.done` branch states: never downgrade an announced
+      // `call_id` to an item id. A repeat of the item that omits it would
+      // otherwise rename a call the client has already reported under.
+      if (event.item.call_id !== undefined) state.id = event.item.call_id;
+      else if (!state.identified) state.id = id;
+      state.name = event.item.name ?? state.name;
+      if (named) state.anonymous = false;
       // `call_id` is the identity the client echoes back with the tool result;
       // an item id is not interchangeable with it, so a call is only worth
-      // announcing once the backend has supplied one.
-      state.identified = event.item.call_id !== undefined;
+      // announcing once the backend has supplied one. It is a latch: a repeat of
+      // the item that omits the `call_id` cannot un-name a call the client has
+      // already been told about, and un-naming it stranded every later delta in
+      // the buffer, since only an announced call is ever flushed.
+      if (event.item.call_id !== undefined) state.identified = true;
       this.toolStates.set(index, state);
       if (state.identified) out.push(...this.emitPending(index, state));
       return out;
@@ -321,15 +329,17 @@ class CodexBackendStreamState {
     }
     if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
       const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
+      const named = event.item.id !== undefined || event.item.call_id !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: event.item.call_id ?? event.item.id,
         name: event.item.name,
+        anonymous: !named,
       });
       // Never downgrade an announced call_id to an item id: the client echoes
       // this value back, and the two surfaces would disagree about the call.
       state.id = event.item.call_id ?? state.id;
       state.name = event.item.name ?? state.name;
-      if (event.item.id !== undefined || event.item.call_id !== undefined) state.anonymous = false;
+      if (named) state.anonymous = false;
       if (event.item.call_id !== undefined) state.identified = true;
       if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
       this.toolStates.set(index, state);
@@ -373,10 +383,6 @@ class CodexBackendStreamState {
     index: number,
     seed: { id?: string; name?: string; anonymous?: boolean },
   ): ToolState {
-    // The first tool call of a turn that has produced no text yet came BEFORE
-    // the text, and the ordered surfaces (`response.output`, Anthropic content
-    // blocks) have to place it that way in the completed body too.
-    if (this.toolStates.size === 0 && this.text === '') this.toolCallsBeforeText = true;
     return {
       id: seed.id ?? `call_${index + 1}`,
       name: seed.name ?? 'tool',
@@ -399,6 +405,13 @@ class CodexBackendStreamState {
     const out: LocalStreamEvent[] = [];
     if (!state.started) {
       state.started = true;
+      // Decided HERE, at the first thing the client is told about a tool, not
+      // when the backend opened state for one: arguments held until the call is
+      // named arrive before any text, but they are not announced until after
+      // whatever narration streamed while they waited. Recording the order at
+      // state creation claimed the tool came first on exactly that path — the
+      // contradiction between stream and body this whole rule exists to remove.
+      if (this.toolCallsBeforeText === undefined) this.toolCallsBeforeText = this.text === '';
       out.push({
         type: 'tool_call_delta',
         index,

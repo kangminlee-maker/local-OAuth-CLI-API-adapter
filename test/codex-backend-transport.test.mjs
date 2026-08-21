@@ -580,6 +580,38 @@ test('arguments that arrive before the call is named belong to that call', async
   assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}']]);
 });
 
+test('an item repeated without its call_id does not un-name the call', async () => {
+  // `identified` is a latch: the client has already been told `call_1`, so a
+  // later item that omits the `call_id` cannot take the name away. Assigning
+  // instead of latching sent every following delta back to the buffer, and only
+  // an announced call is ever flushed — so the transport's own stream stopped
+  // short of the arguments its completed result reports. The HTTP layer repairs
+  // that gap before a client sees it, which is exactly why it has to be caught
+  // here.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.completed', response: { id: 'resp_relabel', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const streamed = events
+    .filter((event) => event.type === 'tool_call_delta')
+    .map((event) => event.argumentsDelta ?? '')
+    .join('');
+  assert.equal(streamed, '{"city":"Seoul"}');
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.arguments]),
+    [['call_1', '{"city":"Seoul"}']],
+  );
+});
+
 test('a completed call the stream never announced is added, not swapped in', async () => {
   // Its ids are unfamiliar, so it is a call of its own; taking the dense
   // position a streamed call already holds would drop that call instead.

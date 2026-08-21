@@ -455,7 +455,12 @@ const summaryBase = {
   openAiModel,
   openAiImageApiModel,
   codexImageModel,
-  codexImageTransport: selectedCodexImageTransport,
+  // Recorded only when image rows ran. It is a basis field scoped to the
+  // OpenAI family — the finest scope the comparison has — so recording it on a
+  // text-only run let a transport that governed nothing void every text and
+  // tool row. Absent, it reads as "the baseline never recorded this", which is
+  // reported and comparison proceeds.
+  ...(shouldRunImageGenerationBenchmarks() ? { codexImageTransport: selectedCodexImageTransport } : {}),
   // The proxy-side models decide what the proxy rows measure, so they belong in
   // the artifact next to the direct-side ones.
   codexModel: options.codexBackendModel ?? options.codexModel ?? null,

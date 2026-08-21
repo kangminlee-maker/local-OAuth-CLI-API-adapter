@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 const readline = require('node:readline');
 
-assertNoDirectProviderEnv();
+require('./direct-provider-env.cjs').assertNoDirectProviderEnv('fake codex');
 
 // `codex debug models` is the proxy's authority for which models exist, so the
 // fake answers it with a fixed catalogue instead of contacting a server.
@@ -28,6 +28,19 @@ let maxActiveImageTurns = 0;
 
 function write(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+// Which requests the child actually RECEIVED, for assertions a response cannot
+// carry — a `close()` that skipped its `thread/archive` looks exactly like one
+// that sent it, from the caller's side.
+function recordMethod(method) {
+  const path = process.env.FAKE_CODEX_METHOD_LOG;
+  if (!path || !method) return;
+  try {
+    require('node:fs').appendFileSync(path, `${method}\n`);
+  } catch {
+    // A test that did not ask for the log gets no failure from it.
+  }
 }
 
 function result(id, value = {}) {
@@ -235,6 +248,7 @@ rl.on('line', (line) => {
   }
 
   if (payload.id === undefined) return;
+  recordMethod(payload.method);
   if (payload.method === 'initialize') {
     result(payload.id);
     return;
@@ -296,14 +310,16 @@ rl.on('line', (line) => {
       : effort === 'medium'
         ? 'MEDIUM_OK'
         : 'OK';
-    // A turn that opens and then produces nothing: the child accepted the work
-    // and stopped answering, so nothing ever closes the turn.
-    if (process.env.FAKE_CODEX_NO_TURN_COMPLETION === '1') {
+    // `turn/start` can take a while to be acknowledged, which is the window a
+    // caller can abandon a turn in.
+    const ackDelayMs = Number(process.env.FAKE_CODEX_TURN_START_DELAY_MS ?? 0);
+    setTimeout(() => {
       result(payload.id, { turn: { id: turnId } });
-      return;
-    }
-    result(payload.id, { turn: { id: turnId } });
-    setTimeout(() => emitTurn(threadId, turnId, text), 0);
+      // A turn that opens and then produces nothing: the child accepted the
+      // work and stopped answering, so nothing ever closes the turn.
+      if (process.env.FAKE_CODEX_NO_TURN_COMPLETION === '1') return;
+      setTimeout(() => emitTurn(threadId, turnId, text), 0);
+    }, ackDelayMs);
     return;
   }
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {
@@ -318,15 +334,6 @@ rl.on('line', (line) => {
 });
 
 rl.on('close', () => process.exit(0));
-
-function assertNoDirectProviderEnv() {
-  if (process.env.FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV !== '1') return;
-  const found = Object.keys(process.env).filter(isDirectProviderEnvName);
-  if (found.length > 0) {
-    process.stderr.write(`direct provider env leaked to fake codex: ${found.join(',')}\n`);
-    process.exit(91);
-  }
-}
 
 function debugPayload() {
   // cwd and the files visible there let a test PROVE ambient isolation end to
@@ -370,32 +377,3 @@ function pick(value, keys) {
   return out;
 }
 
-function isDirectProviderEnvName(name) {
-  const prefixes = [
-    'ANTHROPIC',
-    'AZURE_OPENAI',
-    'COHERE',
-    'DEEPSEEK',
-    'GEMINI',
-    'GOOGLE',
-    'GROQ',
-    'MISTRAL',
-    'OPENAI',
-    'OPENROUTER',
-    'PERPLEXITY',
-    'TOGETHER',
-    'XAI',
-  ];
-  const suffixes = [
-    'ACCESS_TOKEN',
-    'API_BASE',
-    'API_KEY',
-    'AUTH_TOKEN',
-    'BASE_URL',
-    'ENDPOINT',
-    'ORG_ID',
-    'ORGANIZATION',
-    'PROJECT',
-  ];
-  return prefixes.some((prefix) => suffixes.some((suffix) => name === `${prefix}_${suffix}`));
-}
