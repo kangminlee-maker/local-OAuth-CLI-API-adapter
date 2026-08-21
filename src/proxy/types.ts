@@ -108,6 +108,15 @@ export interface LocalCompletionResult {
   readonly model: string;
   readonly text: string;
   readonly toolCalls: readonly LocalToolCall[];
+  /**
+   * True when the turn's first tool call came before any text. `text` is one
+   * flattened string, so this is the only ordering a non-streaming client
+   * cannot reconstruct — and the Responses `output` array and the Anthropic
+   * `content` array are ordered surfaces, so without it the body contradicts
+   * the stream that carried the same turn. Absent means text came first, which
+   * is what a backend that cannot interleave the two always produces.
+   */
+  readonly toolCallsBeforeText?: boolean;
   readonly usage: LocalUsage;
   readonly latencyMs: number;
   // CLI-reported stop reason (e.g. end_turn, max_tokens, refusal) when available;

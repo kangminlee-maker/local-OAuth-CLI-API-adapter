@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 const readline = require('node:readline');
 
-assertNoDirectProviderEnv();
+require('./direct-provider-env.cjs').assertNoDirectProviderEnv('fake claude');
 
 const args = process.argv.slice(2);
 const isPersistent = args.includes('--input-format') && args.includes('stream-json');
@@ -250,41 +250,3 @@ function readJsonSchemaArg() {
   }
 }
 
-function assertNoDirectProviderEnv() {
-  if (process.env.FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV !== '1') return;
-  const found = Object.keys(process.env).filter(isDirectProviderEnvName);
-  if (found.length > 0) {
-    process.stderr.write(`direct provider env leaked to fake claude: ${found.join(',')}\n`);
-    process.exit(91);
-  }
-}
-
-function isDirectProviderEnvName(name) {
-  const prefixes = [
-    'ANTHROPIC',
-    'AZURE_OPENAI',
-    'COHERE',
-    'DEEPSEEK',
-    'GEMINI',
-    'GOOGLE',
-    'GROQ',
-    'MISTRAL',
-    'OPENAI',
-    'OPENROUTER',
-    'PERPLEXITY',
-    'TOGETHER',
-    'XAI',
-  ];
-  const suffixes = [
-    'ACCESS_TOKEN',
-    'API_BASE',
-    'API_KEY',
-    'AUTH_TOKEN',
-    'BASE_URL',
-    'ENDPOINT',
-    'ORG_ID',
-    'ORGANIZATION',
-    'PROJECT',
-  ];
-  return prefixes.some((prefix) => suffixes.some((suffix) => name === `${prefix}_${suffix}`));
-}

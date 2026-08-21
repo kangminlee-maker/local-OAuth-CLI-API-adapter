@@ -151,12 +151,19 @@ This is the existing addon behavior generalized as a callable helper.
 - Choose runtime by provider unless overridden:
   - OpenAI -> `--runtime codex`
   - Anthropic -> `--runtime claude`
-- Strip direct provider env from spawned child processes:
-  - `OPENAI_API_KEY`
-  - `OPENAI_BASE_URL`
-  - `ANTHROPIC_API_KEY`
-  - `ANTHROPIC_BASE_URL`
-  - consumer-supplied key/base URL env names
+- Strip direct provider env from spawned child processes by NAMESPACE, not by a
+  list of names: every variable under `ANTHROPIC_`, `OPENAI_`, `AWS_`, `AZURE_`,
+  `BEDROCK_`, `VERTEX_`, `GOOGLE_`, `GEMINI_`, `COHERE_`, `DEEPSEEK_`, `GROQ_`,
+  `MISTRAL_`, `OPENROUTER_`, `PERPLEXITY_`, `TOGETHER_`, `XAI_`, plus the switches
+  that put a child on one of those providers (`CLAUDE_CODE_USE_*`) or hand it a
+  direct-API credential (`CLAUDE_CODE_API_KEY*`). A name list could not hold this
+  boundary: the installed CLIs read `ANTHROPIC_CUSTOM_HEADERS`,
+  `AWS_BEARER_TOKEN_BEDROCK` and `GOOGLE_APPLICATION_CREDENTIALS`, and each
+  provider release adds more.
+- Do NOT strip the runtime's own local-session env (`CODEX_*`, the rest of
+  `CLAUDE_CODE_*`). That is the local OAuth path this proxy runs on, and
+  stripping a suppression flag (`CLAUDE_CODE_SKIP_*`, `CLAUDE_CODE_DISABLE_*`)
+  would turn the behaviour an operator switched off back on.
 - Ignore or reject non-loopback provider base URLs in local mode. They must not
   turn a local transport selection into a direct provider call.
 

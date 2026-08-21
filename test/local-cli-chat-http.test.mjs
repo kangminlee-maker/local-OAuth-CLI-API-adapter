@@ -136,6 +136,153 @@ test('disabled runtime returns local chat error shape', async () => {
   assert.equal(body.error.code, 'runtime_not_enabled');
 });
 
+/**
+ * A runtime whose turn produces one delta and then never finishes — the shape
+ * of a CLI child that has stopped answering. It honors the abort signal, which
+ * is the contract every backend in this proxy is held to.
+ */
+async function startHangingChatProxy(requestTimeoutMs) {
+  const state = { aborted: false };
+  const chatSessionManager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: { thread_id: 'thread_silent' },
+        async *startTurn(_input, signal) {
+          yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'thinking ' };
+          await new Promise((_resolve, reject) => {
+            const stop = () => {
+              state.aborted = true;
+              reject(new Error('turn aborted'));
+            };
+            if (signal?.aborted) stop();
+            else signal?.addEventListener('abort', stop, { once: true });
+          });
+        },
+        async close() {},
+      }),
+    },
+  });
+  const server = await startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs,
+    chatSessionManager,
+    backend: {
+      name: 'fake-backend',
+      model: 'fake-local-model',
+      async generate() { throw new Error('unused'); },
+      async close() {},
+    },
+  });
+  return { server, state };
+}
+
+test('a native chat turn that never answers ends at the request timeout', async () => {
+  // The surface applied no deadline of its own: `runTurn` was awaited with no
+  // timeout and no signal, so a child that went quiet held the HTTP request
+  // open forever AND left the session stuck in `running`, which answers every
+  // later turn with 409.
+  const { server, state } = await startHangingChatProxy(400);
+  try {
+    const created = await fetch(`${server.url}/local/cli/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ runtime: 'codex' }),
+    });
+    const session = await created.json();
+    const turn = await fetch(`${server.url}/local/cli/sessions/${session.id}/turns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ input: 'hello' }),
+      // Fails the test fast instead of hanging the suite when the deadline is
+      // missing; a passing run answers long before this.
+      signal: AbortSignal.timeout(8_000),
+    });
+    const body = await turn.json();
+    assert.equal(body.status, 'error');
+    assert.equal(state.aborted, true, 'the turn should have been aborted, not abandoned');
+    assert.match(JSON.stringify(body.events), /abort/i);
+
+    const snapshot = await (await fetch(`${server.url}/local/cli/sessions/${session.id}`)).json();
+    assert.equal(snapshot.status, 'ready', 'a timed-out turn must not leave the session running');
+  } finally {
+    await server.close();
+  }
+});
+
+test('a turn that keeps producing is not cut off by the deadline', async () => {
+  // The deadline bounds silence, not duration. A native turn is an agentic CLI
+  // session that legitimately runs far longer than one request budget while
+  // streaming the whole time; a total cap would kill a turn that is working.
+  const chatSessionManager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: { thread_id: 'thread_slow' },
+        async *startTurn() {
+          for (let i = 0; i < 6; i += 1) {
+            await new Promise((resolve) => { setTimeout(resolve, 120).unref(); });
+            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: `${i} ` };
+          }
+        },
+        async close() {},
+      }),
+    },
+  });
+  // Every step is inside the budget; the turn as a whole runs well past it.
+  const server = await startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 300,
+    chatSessionManager,
+    backend: { name: 'fake-backend', model: 'm', async generate() { throw new Error('unused'); }, async close() {} },
+  });
+  try {
+    const created = await fetch(`${server.url}/local/cli/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ runtime: 'codex' }),
+    });
+    const session = await created.json();
+    const turn = await fetch(`${server.url}/local/cli/sessions/${session.id}/turns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ input: 'hello' }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const body = await turn.json();
+    assert.equal(body.status, 'completed');
+    assert.equal(body.final.text, '0 1 2 3 4 5 ');
+  } finally {
+    await server.close();
+  }
+});
+
+test('a native chat stream that never answers ends at the request timeout', async () => {
+  const { server } = await startHangingChatProxy(400);
+  try {
+    const created = await fetch(`${server.url}/local/cli/sessions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ runtime: 'codex' }),
+    });
+    const session = await created.json();
+    const response = await fetch(`${server.url}/local/cli/sessions/${session.id}/turns`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ input: 'hello', stream: true }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    const events = parseSse(await response.text());
+    assert.equal(events.at(-1).event, 'cli.error');
+  } finally {
+    await server.close();
+  }
+});
+
 async function postJson(path, body) {
   return await fetch(`${started.url}${path}`, {
     method: 'POST',

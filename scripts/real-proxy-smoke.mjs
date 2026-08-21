@@ -11,17 +11,24 @@ const timeoutMs = numberOption(options.timeoutMs, 180_000);
 const speedRepeats = numberOption(options.speedRepeats, 0);
 const only = options.only ?? 'all';
 const cwd = options.cwd ?? process.cwd();
+// A backend identifier is not a model. With no `--model` the backends fall back
+// to their own placeholder (`codex-app-server`, `claude-code-cli`), and the
+// smoke then sent that placeholder as the request model — asking the runtime to
+// run a model by that name, which the Codex backend answers with
+// `The 'codex-app-server' model is not supported...` and every row fails. The
+// default is a real slug, the same way the benchmark defaults its models.
+const model = options.model ?? (runtime === 'claude' ? 'opus' : 'gpt-5.5');
 const backend = runtime === 'claude'
   ? new ClaudeCodeBackend({
       command: options.command,
       cwd,
-      model: options.model,
+      model,
       timeoutMs,
     })
   : new CodexAppServerBackend({
       command: options.command,
       cwd,
-      model: options.model,
+      model,
       timeoutMs,
       reasoningEffort: reasoningEffort(options.reasoningEffort),
     });
@@ -33,9 +40,7 @@ const started = await startLocalApiProxy({
   requestTimeoutMs: timeoutMs,
 });
 
-const requestModel = runtime === 'claude'
-  ? options.requestModel ?? 'claude-code-cli'
-  : options.requestModel ?? backend.model;
+const requestModel = options.requestModel ?? model;
 const rows = [];
 
 try {

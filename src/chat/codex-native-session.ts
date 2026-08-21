@@ -20,6 +20,16 @@ import type {
   LocalCliChatTurnInput,
 } from './types.js';
 
+/** How long `close()` waits for the child's best-effort thread archive. */
+const CLOSE_ARCHIVE_TIMEOUT_MS = 2_000;
+
+/** A delay that never keeps the process alive on its own. */
+function closeGraceDelay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms).unref();
+  });
+}
+
 interface PendingRequest {
   readonly method: string;
   readonly resolve: (value: JsonRpcMessage) => void;
@@ -113,16 +123,25 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
     let turnId = '';
     const abort = async (): Promise<void> => {
+      // Ending the caller's iteration is the part that must not depend on the
+      // child: the queue closes on `turn/completed`, so a child that stopped
+      // answering left an aborted turn iterating forever — the abort reached
+      // the child and nothing reached the caller.
+      queue.fail(new Error('local CLI chat turn aborted'));
       if (!turnId) return;
       await this.send('turn/interrupt', { threadId: this.threadId, turnId }).catch(() => undefined);
     };
     const onAbort = (): void => {
       void abort();
     };
-    if (signal) {
-      if (signal.aborted) await abort();
-      else signal.addEventListener('abort', onAbort, { once: true });
+    // A caller that has already left gets no turn at all. Failing the queue and
+    // then starting one anyway spent a turn on the child that nobody would read
+    // and — with no turn id yet — nothing could interrupt.
+    if (signal?.aborted) {
+      await preparedInput.cleanup();
+      throw new Error('local CLI chat turn aborted');
     }
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
       const response = await this.send('turn/start', {
         threadId: this.threadId,
@@ -138,6 +157,13 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       });
       turnId = readPath<string>(response, ['result', 'turn', 'id']) ?? '';
       if (!turnId) throw new Error('codex app-server did not return a turn id');
+      // The abort may have fired while this acknowledgement was in flight, when
+      // there was no turn id to interrupt with. Now there is one, and the turn
+      // is running on the child: interrupt it rather than walking away from it.
+      if (signal?.aborted) {
+        await this.send('turn/interrupt', { threadId: this.threadId, turnId }).catch(() => undefined);
+        throw new Error('local CLI chat turn aborted');
+      }
       this.activeTurn = { turnId, queue };
       queue.push({
         raw: {
@@ -164,7 +190,15 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.activeTurn?.queue.close();
     this.activeTurn = null;
     if (this.threadId) {
-      await this.send('thread/archive', { threadId: this.threadId }).catch(() => undefined);
+      // A courtesy call gets a courtesy budget. Archiving an ephemeral thread is
+      // best-effort cleanup, but it was awaited under the TURN timeout, so a
+      // child that had stopped answering held shutdown for minutes — the
+      // session DELETE and the server's own close both wait here. The child is
+      // killed below either way; what the deadline drops is the waiting.
+      await Promise.race([
+        this.send('thread/archive', { threadId: this.threadId }).catch(() => undefined),
+        closeGraceDelay(Math.min(CLOSE_ARCHIVE_TIMEOUT_MS, this.timeoutMs)),
+      ]);
     }
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);

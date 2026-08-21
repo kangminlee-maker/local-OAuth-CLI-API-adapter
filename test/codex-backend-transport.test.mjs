@@ -552,6 +552,66 @@ test('calls with ids stay separate when the stream omits output_index', async ()
   assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}'], [1, '{"tz":"KST"}']]);
 });
 
+test('arguments that arrive before the call is named belong to that call', async () => {
+  // These deltas carry nothing but an output position, so the item that names
+  // the position is the call they belong to. Splitting them onto an ordinal of
+  // their own invented a second call — named `tool`, holding a fragment of the
+  // real arguments — and held the fragment back from the real one.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"city":' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.completed', response: { id: 'resp_early_args', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
+    [['call_1', 'get_weather', '{"city":"Seoul"}']],
+  );
+  const perIndex = new Map();
+  for (const event of events.filter((e) => e.type === 'tool_call_delta')) {
+    perIndex.set(event.index, `${perIndex.get(event.index) ?? ''}${event.argumentsDelta ?? ''}`);
+  }
+  assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}']]);
+});
+
+test('an item repeated without its call_id does not un-name the call', async () => {
+  // `identified` is a latch: the client has already been told `call_1`, so a
+  // later item that omits the `call_id` cannot take the name away. Assigning
+  // instead of latching sent every following delta back to the buffer, and only
+  // an announced call is ever flushed — so the transport's own stream stopped
+  // short of the arguments its completed result reports. The HTTP layer repairs
+  // that gap before a client sees it, which is exactly why it has to be caught
+  // here.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '"Seoul"}' },
+    { type: 'response.completed', response: { id: 'resp_relabel', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const streamed = events
+    .filter((event) => event.type === 'tool_call_delta')
+    .map((event) => event.argumentsDelta ?? '')
+    .join('');
+  assert.equal(streamed, '{"city":"Seoul"}');
+  assert.deepEqual(
+    events.at(-1).result.toolCalls.map((call) => [call.id, call.arguments]),
+    [['call_1', '{"city":"Seoul"}']],
+  );
+});
+
 test('a completed call the stream never announced is added, not swapped in', async () => {
   // Its ids are unfamiliar, so it is a call of its own; taking the dense
   // position a streamed call already holds would drop that call instead.
@@ -1145,6 +1205,57 @@ test('CodexBackendTransport refreshes an expired Codex OAuth token before reques
   assert.equal(persisted.tokens.refresh_token, 'new-refresh-token');
   assert.equal(persisted.tokens.account_id, 'account-2');
   assert.equal(typeof persisted.last_refresh, 'string');
+});
+
+test('turns that expire together refresh the Codex token once, not once each', async () => {
+  // A refresh token is single-use and rotates: two turns that refresh
+  // concurrently would spend it twice, and the second exchange invalidates the
+  // credential the first one just wrote. The lock and the re-read inside it are
+  // what makes the second caller adopt the first's result — nothing tested
+  // that, so removing either left the whole suite green.
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'single-use-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  let refreshes = 0;
+  const refreshTokensSeen = [];
+  const backendTokens = [];
+  globalThis.fetch = async (url, init) => {
+    if (url === 'https://auth.openai.com/oauth/token') {
+      refreshes += 1;
+      refreshTokensSeen.push(JSON.parse(init.body).refresh_token);
+      // Long enough that a second caller reaches the refresh path while this
+      // one is still in flight — the race the guard exists for.
+      await new Promise((resolve) => { setTimeout(resolve, 50); });
+      return Response.json({
+        id_token: idTokenForAccount('account-1'),
+        access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600, jti: 'refreshed' }),
+        refresh_token: 'rotated-refresh-token',
+      });
+    }
+    backendTokens.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.output_text.delta', delta: 'OK' },
+      { type: 'response.completed', response: { id: 'resp_concurrent', model: 'gpt-5.5' } },
+    ]), { status: 200 });
+  };
+  const first = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const second = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const results = await Promise.all([
+    first.generate(textRequest()),
+    second.generate(textRequest()),
+  ]);
+  await first.close();
+  await second.close();
+
+  assert.deepEqual(results.map((result) => result.text), ['OK', 'OK']);
+  assert.equal(refreshes, 1, `expected one refresh, got ${refreshes} (${refreshTokensSeen.join(', ')})`);
+  assert.deepEqual(refreshTokensSeen, ['single-use-refresh-token']);
+  assert.equal(new Set(backendTokens).size, 1, 'both turns should carry the same refreshed token');
+  const persisted = JSON.parse(await readFile(join(codexHome, 'auth.json'), 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'rotated-refresh-token');
 });
 
 test('CodexBackendTransport refreshes after backend unauthorized and retries once', async () => {

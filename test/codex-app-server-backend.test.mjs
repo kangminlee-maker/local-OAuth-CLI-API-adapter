@@ -720,7 +720,15 @@ function providerEnvNames() {
   return [
     'ANTHROPIC_API_KEY',
     'ANTHROPIC_BASE_URL',
+    // Namespaces an exact-name blocklist missed, all read by the installed
+    // CLIs: a header set, the AWS and Google credential chains, and the switch
+    // that puts a child on Bedrock with them.
+    'ANTHROPIC_CUSTOM_HEADERS',
+    'AWS_ACCESS_KEY_ID',
+    'AWS_BEARER_TOKEN_BEDROCK',
+    'CLAUDE_CODE_USE_BEDROCK',
     'FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV',
+    'GOOGLE_APPLICATION_CREDENTIALS',
     'OPENAI_API_KEY',
     'OPENAI_BASE_URL',
   ];

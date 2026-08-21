@@ -54,6 +54,21 @@ Provider가 모델 세대별로 문서화한 호출 규약은 프롬프트 최�
 
 If a direct semantic reference fails, the benchmark records `referenceErrors` and fails that row as a reference-availability problem rather than treating it as proxy output quality. This distinction matters for provider `max_tokens` failures: `max_tokens` is the per-request output cap, not subscription or credit exhaustion.
 
+## 판정과 종료 코드
+
+exit 0은 "측정했고 문제가 없었다"만을 의미한다. 다음 중 하나라도 해당하면 exit 1이며, 이유는 summary의 `verdictFailures`와 stderr의 `BENCHMARK FAILED —` 줄에 남는다.
+
+- 실패한 row가 있다(`failed > 0`).
+- `--baseline`을 읽지 못했다. 측정 결과는 그대로 보존·기록하지만, 요청한 비교가 실행되지 않았으므로 통과로 보고하지 않는다.
+- baseline 대비 회귀가 있다(`regressionGate.regressions`).
+- 비교 대상 row가 있는데 그중 어느 것도 실제로 비교되지 않았다(`eligibleRows > 0`인데 `comparedRows === 0`). basis 불일치로 전 행이 void되거나, baseline에 같은 row가 없거나, 양쪽이 공유하는 유효 metric이 없을 때가 여기 해당한다. `--regression-targets`가 제외한 row는 운영자가 스스로 좁힌 범위이므로 대상에 넣지 않는다. 이유별 건수는 `regressionGate.skippedByReason`에 남는다.
+
+비교 기반(basis) 필드가 다르면 그 필드가 지배하는 row의 delta는 무효가 된다(`regressionGate.basisMismatch`). 기반 필드에는 모델·judge·격리 설정과 함께 `repeats`(표본 수가 달라지면 median과 min-of-N의 의미가 달라진다)와 `codexImageTransport`가 포함된다. `codexImageTransport`는 이미지 행이 실제로 실행된 run에서만 기록한다 — basis 범위가 OpenAI 계열 전체라, 텍스트 전용 run에 기록하면 그 transport가 지배하지 않는 행까지 무효화한다. baseline이 아예 기록하지 않은 필드는 불일치가 아니라 `basisUnknown`으로만 보고하고 비교는 진행한다.
+
+각 row의 `sample`은 그 row의 게이트가 실제로 읽은 최저 점수 표본이다: semantic row는 `relativeQuality`(없으면 절대 `score`), image row는 `imageQuality.score` 기준이며, 서로 다른 척도를 섞어 최저값을 고르지 않는다.
+
+`--quality-repeats`, `--semantic-quality-repeats`, `--image-quality-repeats`, `--min-semantic-quality`, `--min-image-quality`에 정수가 아닌 값을 주면 실행 전에 오류로 멈춘다. `0.9`가 0으로 잘려 게이트가 조용히 꺼지는 것을 막기 위해서다.
+
 ## Suite 계층
 
 | Suite | 목적 | 실행 빈도 | 반복 수 | 실패 시 의미 |
