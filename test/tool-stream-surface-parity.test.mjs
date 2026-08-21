@@ -531,6 +531,59 @@ test('messages stream opens each content block once and stops only what it opene
   });
 });
 
+/** Narrate, call a tool, then narrate again — the model resuming after a call. */
+function narrateCallNarrateEvents() {
+  return [
+    { type: 'response.output_text.delta', delta: 'Let me check. ' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.output_text.delta', delta: 'One moment.' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+test('text resuming after a tool call opens a new block, never a stopped one', async () => {
+  // A tool call stops the open text block, because two content blocks are never
+  // open at once on this wire. The narration that follows is therefore a NEW
+  // block — writing it to the stopped index left an SDK accumulator dropping
+  // the text or throwing, since it had already finalized that block.
+  await withProxy(narrateCallNarrateEvents(), async (url) => {
+    const res = await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        stream: true,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    });
+    const state = new Map();
+    const order = [];
+    let text = '';
+    for (const event of sseEvents(await res.text())) {
+      if (event.type === 'content_block_start') {
+        assert.equal(state.get(event.index), undefined, `content block ${event.index} started twice`);
+        state.set(event.index, 'open');
+        order.push(event.content_block?.type);
+      }
+      if (event.type === 'content_block_delta') {
+        assert.equal(state.get(event.index), 'open', `delta written to a ${state.get(event.index) ?? 'never opened'} content block ${event.index}`);
+        text += event.delta?.text ?? '';
+      }
+      if (event.type === 'content_block_stop') {
+        assert.equal(state.get(event.index), 'open', `stop for a ${state.get(event.index) ?? 'never opened'} content block ${event.index}`);
+        state.set(event.index, 'stopped');
+      }
+    }
+    assert.deepEqual(order, ['text', 'tool_use', 'text']);
+    assert.equal(text, 'Let me check. One moment.');
+    assert.deepEqual([...state.values()], ['stopped', 'stopped', 'stopped'], 'every block must be closed');
+  });
+});
+
 test('narration accompanying a tool call survives on every surface', async () => {
   await withProxy(narrateThenCallEvents(), async (url) => {
     const chat = await (await realFetch(`${url}/v1/chat/completions`, {

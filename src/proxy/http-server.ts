@@ -2723,8 +2723,14 @@ async function writeAnthropicMessagesStream(
     });
 
     const ensureTextStarted = async (): Promise<void> => {
-      if (textStarted) return;
+      if (textStarted && !textBlockClosed) return;
+      // Two content blocks are never open at once on this wire, so a tool call
+      // stops the text block — and text that resumes afterwards is a NEW block.
+      // Continuing to write at the stopped index left an SDK accumulator, which
+      // finalizes a block on `content_block_stop`, dropping the trailing
+      // narration or rejecting the stream outright.
       textStarted = true;
+      textBlockClosed = false;
       textBlockIndex = allocateBlockIndex();
       await writeSseEvent(res, 'content_block_start', {
         type: 'content_block_start',
