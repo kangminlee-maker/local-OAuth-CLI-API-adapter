@@ -181,8 +181,15 @@ export class LocalCliChatSessionManager {
       };
     } finally {
       if (deadline) clearTimeout(deadline);
-      if (session.currentAbort === abort) session.currentAbort = undefined;
-      if (session.status === 'running') session.status = 'ready';
+      // Only the turn that still owns the session may release it. An
+      // interrupted stream nobody is reading finalizes late — after its turn
+      // was stopped and the next one started — and the status is shared, so an
+      // ownerless reset here handed the running turn's slot to whoever asked
+      // next, and two turns then ran on one thread.
+      if (session.currentAbort === abort) {
+        session.currentAbort = undefined;
+        if (session.status === 'running') session.status = 'ready';
+      }
     }
   }
 

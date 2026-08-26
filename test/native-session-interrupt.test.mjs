@@ -202,6 +202,73 @@ test('an interrupted claude turn leaves a session that still answers', { timeout
   }
 });
 
+test('an abandoned turn does not release the turn that replaced it', { timeout: 20_000 }, async () => {
+  // A stream nobody is reading finalizes late — after its turn was interrupted
+  // and the next one started. The session's status is shared, so an ownerless
+  // reset there hands the running turn's slot to whoever asks next, and two
+  // turns then run on one thread.
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+
+  const abandoned = manager.streamTurn(session.id, { input: 'hello' })[Symbol.asyncIterator]();
+  await abandoned.next();
+  await manager.interrupt(session.id);
+
+  const replacement = manager.streamTurn(session.id, { input: 'hello again' })[Symbol.asyncIterator]();
+  await replacement.next();
+  assert.equal(manager.get(session.id).status, 'running');
+
+  // The abandoned stream is torn down now, the way the HTTP layer tears down
+  // the response it belonged to.
+  await abandoned.return();
+
+  assert.equal(
+    manager.get(session.id).status,
+    'running',
+    'the replacement still owns the session',
+  );
+  const third = manager.streamTurn(session.id, { input: 'third' })[Symbol.asyncIterator]();
+  await assert.rejects(
+    third.next(),
+    /already has a running turn/i,
+    'a third turn must still be refused while the replacement runs',
+  );
+  await replacement.return();
+});
+
+test('a claude turn whose caller left before it started writes nothing to the child', { timeout: 20_000 }, async () => {
+  // The prompt is assembled asynchronously — a path-based image is file I/O —
+  // and the child can be replaced while that runs. Writing afterwards sends the
+  // abandoned turn's prompt down a pipe that belongs to nobody: either a killed
+  // child's stdin, whose EPIPE has no listener, or the replacement's.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const imagePath = join(cwd, 'pixel.png');
+  await writeFile(imagePath, Buffer.from('89504e470d0a1a0a', 'hex'));
+  const session = await ClaudeNativeCliChatSession.create({
+    command: fakeClaude,
+    cwd,
+    model: 'claude-opus-4-8',
+    timeoutMs: 20_000,
+  });
+  openSessions.push(() => session.close());
+
+  const controller = new AbortController();
+  const turn = session.startTurn({
+    input: [
+      { type: 'image', source: { type: 'path', path: imagePath } },
+      { type: 'text', text: 'describe it' },
+    ],
+  }, controller.signal)[Symbol.asyncIterator]();
+  const first = turn.next();
+  // Synchronously, while the body is suspended reading the image.
+  controller.abort();
+  await assert.rejects(first, /abort|interrupt/i);
+
+  assert.equal(await turnText(session, 'Say OK'), 'OK', 'the session still answers');
+});
+
 async function turnText(session, input) {
   let text = '';
   for await (const event of session.startTurn({ input })) {

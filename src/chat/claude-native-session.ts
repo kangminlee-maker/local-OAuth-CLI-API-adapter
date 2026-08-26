@@ -94,18 +94,32 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     const abort = (): void => {
       void this.interrupt();
     };
-    this.activeTurn = { queue };
-    if (signal) {
-      if (signal.aborted) abort();
-      else signal.addEventListener('abort', abort, { once: true });
+    // A caller that has already left gets no turn at all: replacing the child
+    // for a turn that was never sent costs the session its child for nothing.
+    if (signal?.aborted) {
+      clearTimeout(timer);
+      throw new Error('request aborted');
     }
+    this.activeTurn = { queue };
+    signal?.addEventListener('abort', abort, { once: true });
     try {
       const request = chatNormalizedRequest(input, this.model);
-      this.child.stdin.write(`${JSON.stringify({
+      const content = await claudeMessageContentFor(request, chatPromptText(input));
+      // Assembling the prompt is asynchronous — a path-based image is file I/O
+      // — and the turn can be stopped while it runs, which replaces the child.
+      // The child read here is the one that exists NOW, and the prompt is only
+      // written while this turn still owns the session: writing afterwards sent
+      // an abandoned turn's prompt down a pipe belonging to nobody, either a
+      // killed child's stdin or the replacement's.
+      const child = this.child;
+      if (!child || this.activeTurn?.queue !== queue) {
+        throw new Error('request aborted');
+      }
+      child.stdin.write(`${JSON.stringify({
         type: 'user',
         message: {
           role: 'user',
-          content: await claudeMessageContentFor(request, chatPromptText(input)),
+          content,
         },
         parent_tool_use_id: null,
       })}\n`);
@@ -201,6 +215,12 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     // then cleared the LIVE child and failed a turn that had nothing to do
     // with it — the restart repaired the session and its own aftermath broke it.
     child.on('error', (err) => {
+      if (this.child === child) this.failActive(err);
+    });
+    // A pipe that dies under a write reports it here, and an `error` event with
+    // no listener is an uncaught exception: one racing write would take the
+    // whole proxy down rather than the turn.
+    child.stdin.on('error', (err) => {
       if (this.child === child) this.failActive(err);
     });
     child.on('close', (code, signal) => {
