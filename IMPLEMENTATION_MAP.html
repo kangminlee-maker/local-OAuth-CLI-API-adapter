@@ -719,10 +719,10 @@
       <tbody>
         <tr>
           <td>신규</td>
-          <td>semantic 품질 게이트 기준을 결정합니다. 2026-06-22 ×3 재측정에서 median은 대부분 ≥ 95이나 min-of-3은 판정자 stochastic dip을 잡아 <code>proxy-codex</code> 15/20·<code>proxy-claude</code> 5/10만 통과합니다. min 유지 시 반복 수를 올려 변동을 줄일지, median 기준으로 완화할지 정하고, <code>korean_incident_report</code>·<code>provider_error_policy</code>(median 94)는 일반 규칙으로 보강합니다.</td>
-          <td>낮음. 게이트 기준 변경은 측정 해석이며 런타임 속도와 무관합니다.</td>
-          <td class="ok">높음. min/median 선택이 품질 회귀 판정 민감도를 좌우합니다.</td>
-          <td>게이트 기준이 문서화되고, 경계 task 2개가 일반 규칙 보강 후 동일 n에서 기준을 충족</td>
+          <td><strong>경계 semantic task 2개의 품질 미달을 조사합니다.</strong> 게이트 기준 자체는 2026-08-27에 <strong>min-of-N 유지로 확정</strong>했습니다 — 저장된 후보를 고정한 채 판정을 5회 반복하면 폭이 ±3점(평균 2.7)이고 경계 6개 row에서 min과 median 판정이 한 건도 갈리지 않아, "min이 판정자 dip을 잡는다"는 전제가 실측으로 기각됐습니다(근거·해석 규칙은 <code>docs/api-benchmark-design.md</code>). 남은 것은 게이트가 아니라 <strong>내용</strong>입니다: <code>korean_incident_report</code>·<code>streaming_latency_decision</code>은 형식 위반이 아니라 같은 모델 direct 출력보다 <em>덜 자세해서</em> 90~93에 머뭅니다(영향·계측 항목의 세분화 부족). 특히 <code>streaming_latency_decision</code>은 기본 경로 <code>proxy-codex</code>는 통과하고 진단 경로(<code>app-server</code>·<code>backend</code>)만 미달이라, 경로별 지시문·effort 차이를 먼저 확인해야 합니다.</td>
+          <td>없음. 응답 깊이 문제이며 런타임 속도와 무관합니다.</td>
+          <td class="warn">중간. 두 task는 게이트 기준이 아니라 실제 품질 격차이고, 기본 경로와 진단 경로가 갈린다는 점이 단서입니다.</td>
+          <td>두 task가 같은 n에서 기준을 충족하거나, 미달이 프록시 경로의 지시문·effort 차이로 재현 가능하게 귀속됨. 그리고 <code>relativeQuality</code>가 실제로 기록된 release-gate run이 최소 1회 남을 것(현재 아티팩트 69개 판정 중 0건)</td>
         </tr>
         <tr>
           <td>1</td>
