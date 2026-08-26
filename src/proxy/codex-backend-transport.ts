@@ -172,6 +172,8 @@ interface ToolState {
    * later names the position owns it — see `toolOrdinal`.
    */
   anonymous: boolean;
+  /** Whether the client has been told this call's arguments are complete. */
+  argumentsDone: boolean;
 }
 
 class CodexBackendStreamState {
@@ -343,7 +345,14 @@ class CodexBackendStreamState {
       if (event.item.call_id !== undefined) state.identified = true;
       if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
       this.toolStates.set(index, state);
-      if (state.identified) out.push(...this.emitPending(index, state));
+      if (state.identified) {
+        out.push(...this.emitPending(index, state));
+        // The backend closing the item is the one point where the proxy can
+        // promise a client that this call is finished: the event carries the
+        // call's authoritative arguments. `response.completed` is too late —
+        // the surfaces have already had to guess where the call ended.
+        out.push(...this.emitArgumentsDone(index, state));
+      }
       return out;
     }
     if (event.type === 'response.completed') {
@@ -391,6 +400,7 @@ class CodexBackendStreamState {
       started: false,
       identified: false,
       anonymous: seed.anonymous ?? false,
+      argumentsDone: false,
     };
   }
 
@@ -435,6 +445,40 @@ class CodexBackendStreamState {
         argumentsDelta: pending,
       });
     }
+    return out;
+  }
+
+  /**
+   * Says the call is finished, after sending the value the completed result
+   * will report. `toolCalls()` normalizes arguments that are empty or do not
+   * parse, so a call announced as finished has to be normalized here too: a
+   * no-argument call would otherwise be closed on the wire having streamed
+   * nothing while the body said `{}`, and a closed call has no way left to
+   * carry the difference.
+   */
+  private emitArgumentsDone(index: number, state: ToolState): LocalStreamEvent[] {
+    if (state.argumentsDone) return [];
+    state.argumentsDone = true;
+    const out: LocalStreamEvent[] = [];
+    const complete = ensureJsonString(state.arguments);
+    if (complete.startsWith(state.streamed) && complete !== state.streamed) {
+      const pending = complete.slice(state.streamed.length);
+      state.streamed = complete;
+      out.push({
+        type: 'tool_call_delta',
+        index,
+        id: state.id,
+        name: state.name,
+        argumentsDelta: pending,
+      });
+    }
+    out.push({
+      type: 'tool_call_delta',
+      index,
+      id: state.id,
+      name: state.name,
+      argumentsDone: true,
+    });
     return out;
   }
 

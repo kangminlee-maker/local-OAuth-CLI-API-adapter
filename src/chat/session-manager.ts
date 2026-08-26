@@ -100,8 +100,13 @@ export class LocalCliChatSessionManager {
 
   async interrupt(id: string): Promise<LocalCliChatSessionSnapshot> {
     const session = this.requireSession(id);
-    session.currentAbort?.abort();
-    await session.nativeSession.interrupt?.();
+    // One trigger. The runtime's own interrupt stops the child AND ends the
+    // turn's stream, so also aborting the turn signal sent a second stop to a
+    // child that had already been told — two owners of one operation, and the
+    // runtime's is the one that knows what stopping means there. A runtime that
+    // implements no interrupt still has to stop, so it falls back to the signal.
+    if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
+    else session.currentAbort?.abort();
     session.status = 'ready';
     return snapshot(session);
   }

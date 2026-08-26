@@ -2843,6 +2843,8 @@ interface AnthropicToolUseState {
   arguments: string;
   /** The content block index this call occupies on the wire. */
   blockIndex: number;
+  /** Whether this call's block has already been stopped. */
+  closed: boolean;
 }
 
 class AnthropicToolUseStreamState {
@@ -2863,18 +2865,33 @@ class AnthropicToolUseStreamState {
       event.name ?? 'tool',
     );
     if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
+    // A backend that says where a call's arguments end closes the block there,
+    // so the narration that resumes after it — or the next call — opens while
+    // nothing else is open. Two blocks open at once is not this wire's shape,
+    // and a client that assembles by index has no way to nest them.
+    if (event.argumentsDone) await this.stop(state);
   }
 
   async finish(toolCalls: readonly LocalToolCall[]): Promise<void> {
     for (const [index, call] of toolCalls.entries()) {
       const state = await this.ensureStarted(index, call.id, call.name);
+      // A call the backend already finished carries the arguments the completed
+      // result reports — the backend sends them with the event that finishes it
+      // — so there is nothing left to reconcile and nothing left to stop.
+      if (state.closed) continue;
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);
-      await writeSseEvent(this.res, 'content_block_stop', {
-        type: 'content_block_stop',
-        index: state.blockIndex,
-      });
+      await this.stop(state);
     }
+  }
+
+  private async stop(state: AnthropicToolUseState): Promise<void> {
+    if (state.closed) return;
+    state.closed = true;
+    await writeSseEvent(this.res, 'content_block_stop', {
+      type: 'content_block_stop',
+      index: state.blockIndex,
+    });
   }
 
   private async ensureStarted(
@@ -2884,7 +2901,7 @@ class AnthropicToolUseStreamState {
   ): Promise<AnthropicToolUseState> {
     const existing = this.states.get(index);
     if (existing) return existing;
-    const state = { id, name, arguments: '', blockIndex: this.allocateBlockIndex() };
+    const state = { id, name, arguments: '', blockIndex: this.allocateBlockIndex(), closed: false };
     this.states.set(index, state);
     await writeSseEvent(this.res, 'content_block_start', {
       type: 'content_block_start',

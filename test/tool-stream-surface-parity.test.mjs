@@ -584,6 +584,146 @@ test('text resuming after a tool call opens a new block, never a stopped one', a
   });
 });
 
+/**
+ * A call before any narration, finished the way the backend really finishes an
+ * item. The sibling fixture above stops at the arguments, which is the OTHER
+ * case — a call the backend never closes — and it is covered on its own below.
+ */
+function callThenNarrateFinishedEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.output_text.delta', delta: 'Checking now.' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+/** Two calls in a row, each finished by the backend before the next opens. */
+function twoCallsEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_2', delta: '{"city":"Busan"}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'get_weather', arguments: '{"city":"Busan"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+/** A call the backend never finishes: no `output_item.done`, arguments cut off. */
+function callNeverFinishedEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'r',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+      },
+    },
+  ];
+}
+
+/** A call that takes no arguments, finished by the backend with an empty string. */
+function callWithoutArgumentsEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'now' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'now', arguments: '' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+/** Every content block event of one `/v1/messages` stream, in order. */
+async function messagesStreamBlocks(url, tools = [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }]) {
+  const res = await realFetch(`${url}/v1/messages`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'gpt-5.5',
+      stream: true,
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'w' }],
+      tools,
+    }),
+  });
+  const opened = [];
+  const arguments_ = new Map();
+  let open = 0;
+  let maxOpen = 0;
+  for (const event of sseEvents(await res.text())) {
+    if (event.type === 'content_block_start') {
+      opened.push(event.content_block?.type);
+      open += 1;
+      maxOpen = Math.max(maxOpen, open);
+    }
+    if (event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta') {
+      arguments_.set(event.index, `${arguments_.get(event.index) ?? ''}${event.delta.partial_json}`);
+    }
+    if (event.type === 'content_block_stop') open -= 1;
+  }
+  return { opened, maxOpen, open, toolArguments: [...arguments_.values()] };
+}
+
+const SEQUENTIAL_BLOCK_CASES = [
+  ['narration resuming after a call', narrateCallNarrateEvents(), ['text', 'tool_use', 'text']],
+  ['a call before any narration', callThenNarrateFinishedEvents(), ['tool_use', 'text']],
+  ['narration before a call', narrateThenCallEvents(), ['text', 'tool_use']],
+  ['two calls in a row', twoCallsEvents(), ['tool_use', 'tool_use']],
+];
+
+for (const [label, events, expected] of SEQUENTIAL_BLOCK_CASES) {
+  test(`messages blocks open and close one at a time with ${label}`, async () => {
+    // The tool_use block used to stay open until the end of the turn, so the
+    // narration that resumed after it — and the next call — opened INSIDE it.
+    // A client that assembles content by index has nowhere to put a nested
+    // block; this wire never has two open at once.
+    await withProxy(events, async (url) => {
+      const stream = await messagesStreamBlocks(url);
+      assert.deepEqual(stream.opened, expected);
+      assert.equal(stream.maxOpen, 1, 'two content blocks were open at the same time');
+      assert.equal(stream.open, 0, 'every block must be closed');
+    });
+  });
+}
+
+test('a call the backend never finishes still delivers its arguments', async () => {
+  // The other half of closing early: a backend that cannot say where a call's
+  // arguments end keeps its block open to the end of the turn, where the
+  // completed result supplies the tail the stream was cut off before sending.
+  await withProxy(callNeverFinishedEvents(), async (url) => {
+    const stream = await messagesStreamBlocks(url);
+    assert.deepEqual(stream.toolArguments, ['{"city":"Seoul"}']);
+    assert.equal(stream.open, 0, 'every block must be closed');
+  });
+});
+
+test('a call closed with no arguments carries the same input as the body', async () => {
+  // `{}` is what the completed body reports for a call that streamed nothing,
+  // and it used to be sent as the turn ended. Closing the block at the
+  // backend's own item boundary has to send it there instead, or a client
+  // accumulating deltas finishes with an empty string that is not JSON.
+  const tools = [{ name: 'now', description: 'n', input_schema: { type: 'object', properties: {}, additionalProperties: false } }];
+  await withProxy(callWithoutArgumentsEvents(), async (url) => {
+    const stream = await messagesStreamBlocks(url, tools);
+    assert.deepEqual(stream.toolArguments, ['{}']);
+    const body = await (await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools,
+      }),
+    })).json();
+    assert.deepEqual(body.content.find((block) => block.type === 'tool_use')?.input, {});
+  });
+});
+
 test('narration accompanying a tool call survives on every surface', async () => {
   await withProxy(narrateThenCallEvents(), async (url) => {
     const chat = await (await realFetch(`${url}/v1/chat/completions`, {

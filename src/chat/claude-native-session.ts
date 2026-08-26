@@ -39,6 +39,8 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   private lineReader: readline.Interface | null = null;
   private stderr = '';
   private activeTurn: ActiveTurn | null = null;
+  /** The in-flight child replacement, so a turn waits for it instead of racing it. */
+  private restarting: Promise<void> | null = null;
 
   private constructor(options: Required<ClaudeNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -72,6 +74,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     input: LocalCliChatTurnInput,
     signal?: AbortSignal,
   ): AsyncIterable<LocalCliChatRuntimeEvent> {
+    if (this.restarting) await this.restarting;
     if (!this.child) throw new Error('claude native chat session is not running');
     if (this.activeTurn) throw new Error('claude native chat session already has a running turn');
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
@@ -84,10 +87,12 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       // was delivered to the NEXT turn as its own. Retire the child instead.
       void this.restartChild();
     }, this.timeoutMs);
+    // Abandoning a turn and interrupting one are the same operation on this
+    // runtime, so they take the same path: stopping the child without the
+    // restart left the session reporting `ready` over a child that had been
+    // signalled away, and every later turn answered "session is not running".
     const abort = (): void => {
-      queue.fail(new Error('request aborted'));
-      this.child?.kill('SIGINT');
-      this.activeTurn = null;
+      void this.interrupt();
     };
     this.activeTurn = { queue };
     if (signal) {
@@ -116,25 +121,38 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     const hadTurn = this.activeTurn !== null;
     this.activeTurn?.queue.fail(new Error('request interrupted'));
     this.activeTurn = null;
-    // SIGINT ends this CLI, so interrupting is a restart, not a signal it
-    // survives: without one the session reported `ready` while every later
-    // turn answered "session is not running". An idle session has nothing to
-    // interrupt, so it is left alone.
+    // This CLI has no in-band stop, so interrupting it is a restart: the child
+    // is mid-prompt, and every line it writes goes to whatever turn is active
+    // when it arrives. Without the restart the session reported `ready` while
+    // every later turn answered "session is not running". An idle session has
+    // nothing to interrupt, so it is left alone.
     if (hadTurn) await this.restartChild();
   }
 
   /** Replaces the child so the session stays usable after an abandoned turn. */
   private async restartChild(): Promise<void> {
-    const previous = this.child;
-    this.child = null;
-    this.lineReader?.close();
-    this.lineReader = null;
-    previous?.kill('SIGTERM');
+    const restart = (async () => {
+      const previous = this.child;
+      this.child = null;
+      this.lineReader?.close();
+      this.lineReader = null;
+      previous?.kill('SIGTERM');
+      try {
+        await this.start();
+      } catch {
+        // Left not-running: the next turn reports that plainly rather than
+        // hanging against a child that no longer exists.
+      }
+    })();
+    // A restart nobody awaited — the idle deadline's, and an interrupt whose
+    // caller has already been answered — otherwise races the next turn, which
+    // found `child` null for as long as the spawn took and refused a session
+    // that was about to be fine.
+    this.restarting = restart;
     try {
-      await this.start();
-    } catch {
-      // Left not-running: the next turn reports that plainly rather than
-      // hanging against a child that no longer exists.
+      await restart;
+    } finally {
+      if (this.restarting === restart) this.restarting = null;
     }
   }
 
@@ -148,7 +166,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   }
 
   private async start(): Promise<void> {
-    this.child = spawn(this.command, [
+    const child = spawn(this.command, [
       '-p',
       '--input-format',
       'stream-json',
@@ -173,17 +191,25 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       env: proxyChildProcessEnv(),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    this.child.stderr.setEncoding('utf8');
-    this.child.stderr.on('data', (chunk) => {
+    this.child = child;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
       this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
     });
-    this.child.on('error', (err) => this.failActive(err));
-    this.child.on('close', (code, signal) => {
+    // Only while this child is still the session's. A replaced child reports
+    // its own exit after the replacement is already running, and answering it
+    // then cleared the LIVE child and failed a turn that had nothing to do
+    // with it — the restart repaired the session and its own aftermath broke it.
+    child.on('error', (err) => {
+      if (this.child === child) this.failActive(err);
+    });
+    child.on('close', (code, signal) => {
+      if (this.child !== child) return;
       this.failActive(new Error(`claude code exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`));
       this.child = null;
       this.lineReader = null;
     });
-    this.lineReader = readline.createInterface({ input: this.child.stdout });
+    this.lineReader = readline.createInterface({ input: child.stdout });
     this.lineReader.on('line', (line) => this.handleLine(line));
   }
 

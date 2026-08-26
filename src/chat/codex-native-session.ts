@@ -128,8 +128,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // answering left an aborted turn iterating forever — the abort reached
       // the child and nothing reached the caller.
       queue.fail(new Error('local CLI chat turn aborted'));
-      if (!turnId) return;
-      await this.send('turn/interrupt', { threadId: this.threadId, turnId }).catch(() => undefined);
+      // The local `turnId`, not `this.activeTurn`: the turn is interruptible
+      // from the moment the child names it, which is before it is installed as
+      // the active one.
+      await this.sendTurnInterrupt(turnId);
     };
     const onAbort = (): void => {
       void abort();
@@ -161,7 +163,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // there was no turn id to interrupt with. Now there is one, and the turn
       // is running on the child: interrupt it rather than walking away from it.
       if (signal?.aborted) {
-        await this.send('turn/interrupt', { threadId: this.threadId, turnId }).catch(() => undefined);
+        await this.sendTurnInterrupt(turnId);
         throw new Error('local CLI chat turn aborted');
       }
       this.activeTurn = { turnId, queue };
@@ -180,8 +182,21 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     }
   }
 
+  /**
+   * Stops the running turn for both parties. The caller's iteration ends here
+   * too, the way the turn signal ends it: the child answers an interrupt with
+   * whatever it chooses, and a turn whose reader is still waiting on
+   * `turn/completed` is not stopped.
+   */
   async interrupt(): Promise<void> {
-    const turnId = this.activeTurn?.turnId;
+    const turn = this.activeTurn;
+    if (!turn) return;
+    turn.queue.fail(new Error('local CLI chat turn aborted'));
+    await this.sendTurnInterrupt(turn.turnId);
+  }
+
+  /** The one place a turn is interrupted on the child. */
+  private async sendTurnInterrupt(turnId: string): Promise<void> {
     if (!turnId) return;
     await this.send('turn/interrupt', { threadId: this.threadId, turnId }).catch(() => undefined);
   }

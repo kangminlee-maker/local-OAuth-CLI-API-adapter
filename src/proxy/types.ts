@@ -225,6 +225,16 @@ export type LocalStreamEvent =
       readonly id?: string;
       readonly name?: string;
       readonly argumentsDelta?: string;
+      /**
+       * The backend has delivered this call's arguments in full: nothing more
+       * will be sent for it, and what was streamed already equals what the
+       * completed result will report. Surfaces that address a tool call as an
+       * open region — the Anthropic `content_block` — close it here, so two
+       * blocks are never open at once. A backend that cannot say when a call's
+       * arguments end omits it, and its calls close at the end of the turn,
+       * where the completed result still supplies whatever was not streamed.
+       */
+      readonly argumentsDone?: true;
     }
   | { readonly type: 'completed'; readonly result: LocalCompletionResult };
 

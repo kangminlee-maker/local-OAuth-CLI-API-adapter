@@ -91,6 +91,12 @@ export interface LocalCliChatRuntimeSession {
     input: LocalCliChatTurnInput,
     signal?: AbortSignal,
   ): AsyncIterable<LocalCliChatRuntimeEvent>;
+  /**
+   * Stops the running turn: the child stops working AND the turn's iteration
+   * ends. It is the session's only stop — the manager triggers nothing beside
+   * it — so a runtime that implements this owns interrupting there. Only a
+   * runtime that implements none is stopped through the turn's abort signal.
+   */
   interrupt?(): Promise<void>;
   close(): Promise<void>;
 }

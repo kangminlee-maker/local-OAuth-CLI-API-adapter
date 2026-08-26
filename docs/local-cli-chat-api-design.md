@@ -180,12 +180,22 @@ Output:
 }
 ```
 
+Stopping a turn is one operation with one owner: the runtime session. The
+endpoint calls it and triggers nothing else, and the turn's abort signal — the
+idle deadline's path — routes to the same stop, so the child is told once
+however the stop was asked for. Both parts belong to it: the child stops
+working AND the turn's iteration ends.
+
 Runtime mapping:
 
 - Codex: `turn/interrupt`, and the turn's event queue is failed so the caller's
   iteration ends — the queue otherwise closes only on `turn/completed`, which a
   child that stopped answering never sends.
-- Claude: process signal or CLI-supported interruption when available.
+- Claude: the CLI has no in-band stop, so the child is replaced. The turn's
+  queue is failed and a fresh child takes over, because a signalled-away child
+  leaves a session that reports `ready` and answers every later turn with
+  "session is not running". The next turn waits for that replacement rather
+  than racing it.
 
 A turn is also bounded by the server's `--timeout-ms`, applied as an IDLE
 deadline: every event restarts it, so a long turn that keeps streaming is never
