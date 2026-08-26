@@ -538,6 +538,70 @@ test('an interrupted turn does not report its tail as the next turn', { timeout:
   );
 });
 
+test('an abandoned turn\'s abort cannot stop the turn that replaced it', { timeout: 20_000 }, async () => {
+  // A turn's abort listener is removed in its generator's `finally`, which an
+  // abandoned reader never reaches — so the listener outlives the turn. The
+  // manager's own idle deadline for that abandoned turn fires exactly this
+  // signal, and without an identity check it stopped whoever was running then.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const session = await ClaudeNativeCliChatSession.create({
+    command: fakeClaude,
+    cwd,
+    model: 'claude-opus-4-8',
+    timeoutMs: 20_000,
+  });
+  openSessions.push(() => session.close());
+
+  const controller = new AbortController();
+  const abandoned = session.startTurn({ input: 'PARTIAL' }, controller.signal)[Symbol.asyncIterator]();
+  await abandoned.next();
+  await session.interrupt();
+
+  const replacement = session.startTurn({ input: 'HANG' })[Symbol.asyncIterator]();
+  let replacementEnded = null;
+  replacement.next().then(
+    () => { replacementEnded = 'resolved'; },
+    (err) => { replacementEnded = err; },
+  );
+  await delay(100);
+
+  controller.abort();
+  await delay(200);
+
+  assert.equal(replacementEnded, null, `a stale abort stopped the running turn: ${replacementEnded}`);
+  await assert.rejects(
+    (async () => {
+      for await (const _event of session.startTurn({ input: 'Say OK' })) break;
+    })(),
+    /already has a running turn/i,
+    'the replacement must still hold the session',
+  );
+});
+
+test('closing a session tells a streaming caller its turn ended, not that it finished', { timeout: 20_000 }, async () => {
+  // A closed queue reads as a turn that completed: the caller was handed an
+  // answer that was never produced, indistinguishable from a real one.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const session = await ClaudeNativeCliChatSession.create({
+    command: fakeClaude,
+    cwd,
+    model: 'claude-opus-4-8',
+    timeoutMs: 20_000,
+  });
+  const streaming = session.startTurn({ input: 'HANG' })[Symbol.asyncIterator]();
+  const pending = streaming.next();
+  // Past the prompt write, so the turn is parked on its queue — otherwise the
+  // close races the write and the cancellation guard there answers first,
+  // which says nothing about how a closed queue reads.
+  await delay(100);
+
+  await session.close();
+
+  await assert.rejects(pending, /session closed/i);
+});
+
 async function turnText(session, input) {
   let text = '';
   for await (const event of session.startTurn({ input })) {

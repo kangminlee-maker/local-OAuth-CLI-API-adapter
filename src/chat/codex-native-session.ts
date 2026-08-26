@@ -55,6 +55,12 @@ interface Turn {
   /** Resolves when the turn stops being the session's, however it ends. */
   readonly retired: Promise<void>;
   markRetired: () => void;
+  /**
+   * Removes what preparing this turn's input wrote — a temp file per image.
+   * Owned by the turn because a turn can end while its reader is parked at a
+   * `yield`, and the generator's `finally` never runs for that caller.
+   */
+  cleanup: (() => Promise<void>) | null;
 }
 
 type JsonRpcMessage = Record<string, unknown>;
@@ -154,6 +160,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       interrupted: false,
       retired,
       markRetired,
+      cleanup: null,
     };
     this.turn = turn;
     const onAbort = (): void => {
@@ -163,6 +170,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     let preparedInput: Awaited<ReturnType<typeof prepareCodexInput>> | null = null;
     try {
       preparedInput = await prepareCodexInput(request, chatPromptText(input));
+      turn.cleanup = preparedInput.cleanup;
       if (turn.stopped) throw new Error('local CLI chat turn aborted');
       const response = await this.send('turn/start', {
         threadId: this.threadId,
@@ -196,7 +204,6 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     } finally {
       signal?.removeEventListener('abort', onAbort);
       this.retire(turn);
-      await preparedInput?.cleanup();
     }
   }
 
@@ -244,6 +251,9 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private retire(turn: Turn): void {
     if (this.turn === turn) this.turn = null;
     turn.markRetired();
+    const cleanup = turn.cleanup;
+    turn.cleanup = null;
+    void cleanup?.().catch(() => undefined);
   }
 
   /**
@@ -267,7 +277,9 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
 
   async close(): Promise<void> {
     if (this.turn) {
-      this.turn.queue.close();
+      // Failed, not closed: a closed queue reads as a turn that FINISHED, and
+      // the caller was streaming an answer that will now never come.
+      this.turn.queue.fail(new Error('local CLI chat session closed'));
       this.retire(this.turn);
     }
     if (this.threadId) {

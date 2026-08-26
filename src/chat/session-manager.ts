@@ -81,8 +81,12 @@ export class LocalCliChatSessionManager {
 
   async close(id: string): Promise<LocalCliChatSessionSnapshot> {
     const session = this.requireSession(id);
-    session.currentAbort?.abort();
+    // Closed first, then aborted. A runtime whose stop is a child REPLACEMENT
+    // spawned one on the way out — a whole CLI launch, killed microseconds
+    // later by the close that followed. Closing ends the turn; the abort is
+    // what is left for a runtime that needs the signal.
     await session.nativeSession.close();
+    session.currentAbort?.abort();
     session.status = 'closed';
     this.sessions.delete(id);
     return snapshot(session);
@@ -92,9 +96,9 @@ export class LocalCliChatSessionManager {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map(async (session) => {
-      session.currentAbort?.abort();
       session.status = 'closed';
       await session.nativeSession.close().catch(() => undefined);
+      session.currentAbort?.abort();
     }));
   }
 

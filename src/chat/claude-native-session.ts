@@ -98,7 +98,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     // restart left the session reporting `ready` over a child that had been
     // signalled away, and every later turn answered "session is not running".
     const abort = (): void => {
-      void this.interrupt();
+      void this.stopTurn(turn);
     };
     // A caller that has already left gets no turn at all: replacing the child
     // for a turn that was never sent costs the session its child for nothing.
@@ -106,7 +106,8 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       clearTimeout(timer);
       throw new Error('request aborted');
     }
-    this.turn = { queue, timer };
+    const turn: Turn = { queue, timer };
+    this.turn = turn;
     signal?.addEventListener('abort', abort, { once: true });
     try {
       const request = chatNormalizedRequest(input, this.model);
@@ -138,18 +139,28 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   }
 
   async interrupt(): Promise<void> {
-    const hadTurn = this.turn !== null;
-    this.turn?.queue.fail(new Error('request interrupted'));
+    if (this.turn) await this.stopTurn(this.turn);
+  }
+
+  /**
+   * Stops one turn — and only if it is still the session's. An abandoned turn's
+   * abort listener is never removed, because its generator never finalizes, so
+   * it can fire long after that turn ended: without the identity check it
+   * stopped whoever was running by then and replaced that turn's child.
+   */
+  private async stopTurn(turn: Turn): Promise<void> {
+    if (this.turn !== turn) return;
+    turn.queue.fail(new Error('request interrupted'));
     this.retire();
     // This CLI has no in-band stop, so interrupting it is a restart: the child
     // is mid-prompt, and every line it writes goes to whatever turn is active
     // when it arrives. Without the restart the session reported `ready` while
-    // every later turn answered "session is not running". An idle session has
-    // nothing to interrupt, so it is left alone.
+    // every later turn answered "session is not running".
+    //
     // Not awaited: the replacement is a process launch, and the next turn
     // already waits for it. Making the interrupt endpoint wait for a spawn
     // spends that latency on every caller who asked only to stop.
-    if (hadTurn) void this.restartChild();
+    void this.restartChild();
   }
 
   /** Replaces the child so the session stays usable after an abandoned turn. */
@@ -164,6 +175,11 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       this.lineReader?.close();
       this.lineReader = null;
       previous?.kill('SIGTERM');
+      // The replacement starts with a clean slate: a SIGTERMed child usually
+      // writes its own shutdown to stderr, and carrying that into the next
+      // child's buffer reported the previous child's death as the diagnosis for
+      // an unrelated turn's failure.
+      this.stderr = '';
       try {
         await this.start();
       } catch {
@@ -184,7 +200,10 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   }
 
   async close(): Promise<void> {
-    this.turn?.queue.close();
+    // Failed, not closed: a closed queue reads as a turn that finished, and the
+    // caller was streaming an answer that will now never come. And no
+    // replacement child — the session is going away, not carrying on.
+    this.turn?.queue.fail(new Error('local CLI chat session closed'));
     this.retire();
     this.lineReader?.close();
     this.child?.kill('SIGTERM');

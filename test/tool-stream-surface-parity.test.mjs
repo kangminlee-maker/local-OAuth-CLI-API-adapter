@@ -852,6 +852,48 @@ test('a call announced as finished is not rewritten by the completed output', as
   });
 });
 
+/** A backend that keeps sending arguments after it said the call was finished. */
+function argumentsAfterDoneEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: ' ' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+test('nothing is written to a call the backend already finished', async () => {
+  // The signal is what the Anthropic surface closes the block on, so anything
+  // sent for that call afterwards lands in a block that has been stopped —
+  // the one wire shape this whole change exists to prevent.
+  await withProxy(argumentsAfterDoneEvents(), async (url) => {
+    const res = await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        stream: true,
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    });
+    const stopped = new Set();
+    const arguments_ = new Map();
+    for (const event of sseEvents(await res.text())) {
+      if (event.type === 'content_block_stop') stopped.add(event.index);
+      if (event.type === 'content_block_delta') {
+        assert.equal(stopped.has(event.index), false, `delta written to stopped block ${event.index}`);
+        if (event.delta?.type === 'input_json_delta') {
+          arguments_.set(event.index, `${arguments_.get(event.index) ?? ''}${event.delta.partial_json}`);
+        }
+      }
+    }
+    assert.deepEqual([...arguments_.values()], ['{"city":"Seoul"}']);
+  });
+});
+
 /** A reasoning item the backend opens AFTER it has already produced text. */
 function lateReasoningEvents() {
   return [

@@ -458,8 +458,10 @@ class CodexBackendStreamState {
   }
 
   /**
-   * Sends the part of `value` the client has not been told yet, and reports
-   * whether the stream now carries `value` in full.
+   * Sends the part of `value` the client has not been told yet, if any.
+   * Whether the stream ended up carrying `value` in full is read from
+   * `state.streamed` by the caller that needs to know — `emitArgumentsDone`,
+   * which may only promise a value the stream actually holds.
    *
    * Only an extension of what was sent may be sent. A value that CONTRADICTS
    * the streamed prefix is not a continuation of it, and appending the
@@ -467,6 +469,11 @@ class CodexBackendStreamState {
    * result carries the authoritative arguments.
    */
   private emitArgumentExtension(index: number, state: ToolState, value: string): LocalStreamEvent[] {
+    // A call announced as finished is finished. The surfaces that close on that
+    // signal cannot carry anything more for it — a later delta would be written
+    // into a stopped block — so a backend that keeps sending is not forwarded,
+    // and the completed result keeps the value the client was promised.
+    if (state.argumentsDone) return [];
     if (!value.startsWith(state.streamed)) return [];
     if (value === state.streamed) return [];
     const pending = value.slice(state.streamed.length);
