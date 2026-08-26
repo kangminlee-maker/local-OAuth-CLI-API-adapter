@@ -225,13 +225,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // A turn the child has been asked for but has not named yet cannot be
     // interrupted, and nothing may start ahead of it: releasing the session
     // here let the next turn's `turn/start` reach the child before this turn's
-    // interrupt, putting two turns on the thread. The acknowledgement — or the
-    // failure of the request — is where this turn ends, and the wait is bounded
-    // by that request's own timeout.
-    if (!turn.turnId) {
-      await turn.retired;
-      return;
-    }
+    // interrupt, putting two turns on the thread. So the turn keeps the session
+    // until its acknowledgement arrives — or its request fails — which is where
+    // the interrupt gets written. The caller is not made to wait for that: it
+    // has already been told the turn is over, and `isBusy` reports the session
+    // as occupied until the turn really ends.
+    if (!turn.turnId) return;
     // Retired here, not only in the generator's `finally`: a caller that has
     // walked away never resumes the generator, so that `finally` never runs,
     // and the session then refused every later turn as concurrent while
@@ -265,6 +264,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     const turn = this.turn;
     if (!turn) return;
     await this.stopTurn(turn);
+  }
+
+  isBusy(): boolean {
+    return this.turn !== null;
   }
 
   /** The one place a turn is interrupted on the child. */

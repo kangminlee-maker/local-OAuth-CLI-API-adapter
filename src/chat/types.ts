@@ -96,8 +96,20 @@ export interface LocalCliChatRuntimeSession {
    * ends. It is the session's only stop — the manager triggers nothing beside
    * it — so a runtime that implements this owns interrupting there. Only a
    * runtime that implements none is stopped through the turn's abort signal.
+   *
+   * It does not wait for the session to become free again. A turn the child has
+   * been asked for but has not named yet cannot be interrupted until it is, and
+   * a caller who asked to stop should not hold a socket for that: the session
+   * stays busy until then, which `isBusy` reports.
    */
   interrupt?(): Promise<void>;
+  /**
+   * Whether a turn still occupies the session. The manager reports its status
+   * from this rather than tracking a second lifetime of its own — the two used
+   * to disagree, so a session could answer `ready` while its runtime refused
+   * every turn, or the reverse.
+   */
+  isBusy?(): boolean;
   close(): Promise<void>;
 }
 

@@ -193,7 +193,26 @@ test('a stop between the request and its acknowledgement still precedes the next
   // Long enough for `turn/start` to be written, short of its acknowledgement.
   await delay(200);
 
+  const interruptedAt = Date.now();
   await manager.interrupt(session.id);
+  assert.ok(
+    Date.now() - interruptedAt < 200,
+    'asking to stop must not wait for the child to name the turn',
+  );
+
+  // The turn cannot be interrupted until the child names it, so the session is
+  // still occupied — and says so. A turn asked for now is refused rather than
+  // dispatched ahead of the interrupt.
+  assert.equal(manager.get(session.id).status, 'running');
+  await assert.rejects(
+    (async () => {
+      for await (const _event of manager.streamTurn(session.id, { input: 'too soon' })) break;
+    })(),
+    /already has a running turn/i,
+  );
+
+  await delay(700);
+  assert.equal(manager.get(session.id).status, 'ready', 'the acknowledgement frees the session');
 
   const next = [];
   for await (const event of manager.streamTurn(session.id, { input: 'DEBUG_PAYLOAD' })) next.push(event);
@@ -535,6 +554,37 @@ test('an interrupted turn does not report its tail as the next turn', { timeout:
     next.some((event) => event.usage?.totalTokens === 999),
     false,
     `the interrupted turn's tail was reported as this turn's: ${JSON.stringify(next.map((e) => e.usage))}`,
+  );
+});
+
+test('an abandoned turn\'s deadline cannot reach the turn after it', { timeout: 20_000 }, async () => {
+  // The manager's idle deadline lived only in the stream's `finally`, which an
+  // abandoned reader never reaches: it stayed armed for the whole budget and
+  // then aborted a signal whose turn was long over, stopping whoever was
+  // running by then.
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const abandoned = manager.streamTurn(session.id, { input: 'hello' }, { timeoutMs: 400 })[Symbol.asyncIterator]();
+  await abandoned.next();
+  await manager.interrupt(session.id);
+
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  const replacement = manager.streamTurn(session.id, { input: 'DEBUG_PAYLOAD' })[Symbol.asyncIterator]();
+  await replacement.next();
+  // Past the abandoned turn's deadline.
+  await delay(600);
+
+  const events = [];
+  let event = await replacement.next();
+  while (!event.done) {
+    events.push(event.value);
+    event = await replacement.next();
+  }
+  assert.equal(
+    events.at(-1)?.event,
+    'cli.completed',
+    `the replacement was stopped by an abandoned turn's deadline: ${JSON.stringify(events.at(-1))}`,
   );
 });
 

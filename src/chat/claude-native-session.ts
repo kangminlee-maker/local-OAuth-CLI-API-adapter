@@ -142,6 +142,10 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     if (this.turn) await this.stopTurn(this.turn);
   }
 
+  isBusy(): boolean {
+    return this.turn !== null;
+  }
+
   /**
    * Stops one turn — and only if it is still the session's. An abandoned turn's
    * abort listener is never removed, because its generator never finalizes, so
