@@ -179,6 +179,33 @@ test('the child is told to stop before it is asked for the next turn', { timeout
   );
 });
 
+test('a stop between the request and its acknowledgement still precedes the next turn', { timeout: 20_000 }, async () => {
+  // The third window a stop can land in. The invariant was pinned for a stop
+  // AFTER the child names the turn, and asserted for one before the request is
+  // even written — but in between, the turn has been asked for and has no id,
+  // so there is nothing to interrupt yet. Releasing the session there let the
+  // next turn reach the child first: start, start, interrupt.
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '600';
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const stopped = manager.streamTurn(session.id, { input: 'hello' })[Symbol.asyncIterator]();
+  void stopped.next().catch(() => undefined);
+  // Long enough for `turn/start` to be written, short of its acknowledgement.
+  await delay(200);
+
+  await manager.interrupt(session.id);
+
+  const next = [];
+  for await (const event of manager.streamTurn(session.id, { input: 'DEBUG_PAYLOAD' })) next.push(event);
+  assert.equal(next.at(-1).event, 'cli.completed', 'the next turn runs');
+
+  assert.deepEqual(
+    (await receivedMethods(methodLog)).filter((m) => m === 'turn/start' || m === 'turn/interrupt'),
+    ['turn/start', 'turn/interrupt', 'turn/start'],
+    'the child must hear the interrupt before it is asked for the next turn',
+  );
+});
+
 test('a claude turn abandoned mid-flight leaves a session that still answers', { timeout: 20_000 }, async () => {
   // The abort signal killed the child without replacing it, so the session
   // reported `ready` over a child that was gone and every later turn answered

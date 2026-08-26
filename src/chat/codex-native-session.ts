@@ -52,6 +52,9 @@ interface Turn {
   stopped: boolean;
   /** Whether the child has been told. A turn is interrupted once, at most. */
   interrupted: boolean;
+  /** Resolves when the turn stops being the session's, however it ends. */
+  readonly retired: Promise<void>;
+  markRetired: () => void;
 }
 
 type JsonRpcMessage = Record<string, unknown>;
@@ -142,11 +145,15 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // and — with no turn id yet — nothing could interrupt.
     if (signal?.aborted) throw new Error('local CLI chat turn aborted');
     const request = chatNormalizedRequest(input, this.model);
+    let markRetired = (): void => {};
+    const retired = new Promise<void>((resolve) => { markRetired = resolve; });
     const turn: Turn = {
       queue: new AsyncQueue<LocalCliChatRuntimeEvent>(),
       turnId: '',
       stopped: false,
       interrupted: false,
+      retired,
+      markRetired,
     };
     this.turn = turn;
     const onAbort = (): void => {
@@ -208,18 +215,27 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // answering left an aborted turn iterating forever — the abort reached the
     // child and nothing reached the caller.
     turn.queue.fail(new Error('local CLI chat turn aborted'));
+    // A turn the child has been asked for but has not named yet cannot be
+    // interrupted, and nothing may start ahead of it: releasing the session
+    // here let the next turn's `turn/start` reach the child before this turn's
+    // interrupt, putting two turns on the thread. The acknowledgement — or the
+    // failure of the request — is where this turn ends, and the wait is bounded
+    // by that request's own timeout.
+    if (!turn.turnId) {
+      await turn.retired;
+      return;
+    }
     // Retired here, not only in the generator's `finally`: a caller that has
     // walked away never resumes the generator, so that `finally` never runs,
     // and the session then refused every later turn as concurrent while
     // reporting itself ready.
     //
-    // Retiring before the child acknowledges is deliberate: holding the session
-    // until the interrupt RPC settles would let an unresponsive child — the
-    // case interrupts exist for — refuse every later turn for a whole request
-    // budget. What has to hold instead is ORDER, and it does because nothing
-    // awaits between the retirement above and the write below: the child is
-    // told to stop before it can be asked for anything else. Do not put an
-    // `await` in between.
+    // Retiring before the child acknowledges the INTERRUPT is deliberate:
+    // waiting for that would let an unresponsive child — the case interrupts
+    // exist for — refuse every later turn for a whole request budget. What has
+    // to hold instead is ORDER, and it does because nothing awaits between the
+    // retirement above and the write below: the child is told to stop before it
+    // can be asked for anything else. Do not put an `await` in between.
     this.retire(turn);
     await this.sendTurnInterrupt(turn);
   }
@@ -227,6 +243,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   /** The one place a turn stops being the session's. */
   private retire(turn: Turn): void {
     if (this.turn === turn) this.turn = null;
+    turn.markRetired();
   }
 
   /**
