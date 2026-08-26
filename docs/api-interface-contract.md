@@ -166,7 +166,7 @@ Non-streaming response uses Responses object shape:
 }
 ```
 
-Text output is represented as a reasoning item plus an assistant message item with `content[].type: "output_text"`. Tool output is represented as `function_call` items with `call_id`, `name`, and `arguments`. The array is ordered the way the turn was produced: a call made before any narration precedes the message item.
+Text output is represented as an assistant message item with `content[].type: "output_text"`. Tool output is represented as `function_call` items with `call_id`, `name`, and `arguments`. A `reasoning` item leads the array when — and only when — the backend reported one, carrying the id the backend gave it; a turn the runtime answered without reasoning has no such item. The rest of the array is ordered the way the turn was produced: a call made before any narration precedes the message item.
 
 ### Streaming output spec
 
@@ -186,6 +186,8 @@ Responses streaming uses named SSE events:
 - `error`
 
 Each event payload includes a monotonically increasing `sequence_number`. The stream ends with `data: [DONE]`.
+
+A `reasoning` item, when the backend reports one, is announced first — `response.output_item.added`/`.done` at `output_index: 0` — ahead of the message item and of every `function_call`, and it is the first output item a client sees. A turn whose runtime reported no reasoning item announces none.
 
 ## OpenAI Images
 

@@ -17,6 +17,7 @@ import { postprocessFlatGraphicImageIfNeeded } from './flat-image-postprocess.js
 import type {
   LocalCliBackend,
   LocalCompletionResult,
+  LocalReasoningItem,
   LocalStreamEvent,
   LocalToolCall,
   LocalUsage,
@@ -193,6 +194,7 @@ class CodexBackendStreamState {
   private settled = false;
   private stopReason?: string;
   private toolCallsBeforeText?: boolean;
+  private reasoning?: LocalReasoningItem;
 
   constructor(
     private readonly request: NormalizedRequest,
@@ -287,6 +289,24 @@ class CodexBackendStreamState {
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
       this.text += event.delta;
       out.push({ type: 'text_delta', delta: event.delta });
+      return out;
+    }
+    if (event.type === 'response.output_item.added' && event.item?.type === 'reasoning') {
+      // Announced, not reconstructed from the completed output: the two paths
+      // through this state machine — streaming and not — both see this event,
+      // so reporting it here keeps the stream and the body saying the same
+      // thing. A backend that lists a reasoning item ONLY in its completed
+      // output is not reported, because the stream could no longer place it.
+      // One turn carries one such item, first, on both the ChatGPT Codex
+      // backend and the direct API (measured 2026-08-26, gpt-5.5), so a later
+      // one would be a second copy of what the client already has.
+      if (!this.reasoning) {
+        this.reasoning = typeof event.item.id === 'string' ? { id: event.item.id } : {};
+        out.push({
+          type: 'reasoning_item',
+          ...(typeof event.item.id === 'string' ? { id: event.item.id } : {}),
+        });
+      }
       return out;
     }
     if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
@@ -507,6 +527,7 @@ class CodexBackendStreamState {
       // is the one ordering a non-streaming client cannot reconstruct — and
       // both ordered surfaces need it to agree with the stream.
       ...(this.toolCallsBeforeText && toolCalls.length > 0 ? { toolCallsBeforeText: true } : {}),
+      ...(this.reasoning ? { reasoning: this.reasoning } : {}),
       toolCalls,
       usage: this.usage ?? usageFor(this.request, this.text, toolCalls),
       latencyMs: Date.now() - this.startedAt,

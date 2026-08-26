@@ -361,8 +361,10 @@ test('OpenAI responses usage exposes provider token details', async () => {
 
   assert.equal(res.status, 200);
   assert.equal('output_text' in body, false);
-  assert.equal(body.output[0].type, 'reasoning');
-  assert.equal(body.output[1].type, 'message');
+  // This backend reports no reasoning item (and 0 reasoning tokens), so the
+  // response carries none: the surface reports what the runtime produced.
+  assert.equal(body.output[0].type, 'message');
+  assert.equal(body.output.some((item) => item.type === 'reasoning'), false);
   assert.equal(body.usage.input_tokens, 7);
   assert.equal(body.usage.output_tokens, 1);
   assert.equal(body.usage.total_tokens, 8);

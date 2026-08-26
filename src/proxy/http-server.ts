@@ -1827,16 +1827,22 @@ function openAiResponsesResponse(
   result: LocalCompletionResult,
   request: NormalizedRequest,
 ): unknown {
+  // A reasoning item only when the backend reported one, and always first —
+  // where the backend puts it and where the direct API puts it, ahead of both
+  // the message and the tool calls.
+  const reasoning = result.reasoning
+    ? [openAiResponseReasoningItem(result.reasoning.id)]
+    : [];
   const output = result.toolCalls.length > 0
-    ? orderedByEmission(result, {
-        // The reasoning item introduces the message, so it travels with it.
-        text: result.text
-          ? [openAiResponseReasoningItem(), openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)]
-          : [],
-        toolCalls: result.toolCalls.map(openAiResponseToolCall),
-      })
+    ? [
+        ...reasoning,
+        ...orderedByEmission(result, {
+          text: result.text ? [openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)] : [],
+          toolCalls: result.toolCalls.map(openAiResponseToolCall),
+        }),
+      ]
     : [
-        openAiResponseReasoningItem(),
+        ...reasoning,
         openAiResponseMessageItem(`msg_${randomUUID()}`, result.text),
       ];
   return openAiResponseObject({
@@ -2024,9 +2030,12 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
   };
 }
 
-function openAiResponseReasoningItem(): unknown {
+function openAiResponseReasoningItem(id?: string): unknown {
   return {
-    id: `rs_${randomUUID()}`,
+    // The backend's own id when it gave one: a client that feeds `output` back
+    // as input is echoing an item the runtime really produced, and a minted id
+    // names one that never existed.
+    id: id ?? `rs_${randomUUID()}`,
     type: 'reasoning',
     summary: [],
   };
@@ -2161,6 +2170,9 @@ async function writeOpenAiChatStream(
         await toolState.write(base, event);
         continue;
       }
+      // The chat surface has no reasoning item: its shape reports reasoning
+      // only as a token count in `usage`.
+      if (event.type === 'reasoning_item') continue;
       const result = event.result;
       base = { ...base, model: result.model };
       if (result.toolCalls.length > 0) {
@@ -2333,10 +2345,8 @@ async function writeOpenAiResponsesStream(
 ): Promise<void> {
   writeSseHeaders(res);
   const responseId = `resp_stream_${randomUUID()}`;
-  const reasoningItem = openAiResponseReasoningItem();
   const itemId = `msg_${randomUUID()}`;
   let textStarted = false;
-  let reasoningEmitted = false;
   let streamedText = '';
   // Keyed by the position each item was announced at, so the completed array
   // reads the same way the stream did. Assembling it in a fixed order made
@@ -2382,23 +2392,29 @@ async function writeOpenAiResponsesStream(
       response: createdResponse,
     });
 
+    // Announced when the backend announces its own, at the position the backend
+    // gave it — first. It used to be synthesized at the first text delta
+    // instead, which put an item the turn never produced ahead of the message,
+    // dropped the real one on a turn that only called a tool, and on a
+    // tool-first turn placed it after the call the backend had put it before.
+    const emitReasoningItem = async (id?: string): Promise<void> => {
+      const item = openAiResponseReasoningItem(id);
+      const reasoningOutputIndex = allocateOutputIndex();
+      finalItems.set(reasoningOutputIndex, item);
+      await writeResponseEvent('response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: reasoningOutputIndex,
+        item,
+      });
+      await writeResponseEvent('response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: reasoningOutputIndex,
+        item,
+      });
+    };
+
     const ensureTextStarted = async (): Promise<void> => {
       if (textStarted) return;
-      if (!reasoningEmitted) {
-        reasoningEmitted = true;
-        const reasoningOutputIndex = allocateOutputIndex();
-        finalItems.set(reasoningOutputIndex, reasoningItem);
-        await writeResponseEvent('response.output_item.added', {
-          type: 'response.output_item.added',
-          output_index: reasoningOutputIndex,
-          item: reasoningItem,
-        });
-        await writeResponseEvent('response.output_item.done', {
-          type: 'response.output_item.done',
-          output_index: reasoningOutputIndex,
-          item: reasoningItem,
-        });
-      }
       textStarted = true;
       messageOutputIndex = allocateOutputIndex();
       await writeResponseEvent('response.output_item.added', {
@@ -2439,6 +2455,10 @@ async function writeOpenAiResponsesStream(
       }
       if (event.type === 'tool_call_delta') {
         await toolState.write(event);
+        continue;
+      }
+      if (event.type === 'reasoning_item') {
+        await emitReasoningItem(event.id);
         continue;
       }
 
@@ -2765,6 +2785,9 @@ async function writeAnthropicMessagesStream(
         await toolState.write(event);
         continue;
       }
+      // No content block corresponds to it on this wire — a `thinking` block
+      // would need the reasoning TEXT, which the backends do not hand over.
+      if (event.type === 'reasoning_item') continue;
 
       const result = event.result;
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);

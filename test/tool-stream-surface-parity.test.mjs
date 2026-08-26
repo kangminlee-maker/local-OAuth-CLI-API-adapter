@@ -455,6 +455,8 @@ test('messages blocks come in the same order streamed and not', async () => {
 // same index make an SDK accumulator overwrite one with the other.
 function narrateThenCallEvents() {
   return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
     { type: 'response.output_text.delta', delta: 'Let me check the weather. ' },
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
     { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
@@ -465,6 +467,8 @@ function narrateThenCallEvents() {
 
 function callThenNarrateEvents() {
   return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
     { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
     { type: 'response.output_text.delta', delta: 'Checking now.' },
@@ -495,6 +499,80 @@ test('responses stream gives every output item its own index', async () => {
       itemsByIndex.set(event.output_index, event.item?.type);
     }
     assert.deepEqual([...itemsByIndex.values()].sort(), ['function_call', 'message', 'reasoning']);
+    assert.equal(itemsByIndex.get(0), 'reasoning', 'the reasoning item is announced first');
+  });
+});
+
+/** A turn the model answered without reasoning: the backend opens no such item. */
+function noReasoningEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+async function responsesSurfaces(url) {
+  const stream = await realFetch(`${url}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+    body: JSON.stringify({
+      model: 'gpt-5.5',
+      stream: true,
+      input: 'w',
+      tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+    }),
+  });
+  const announced = [];
+  let streamCompleted = null;
+  for (const event of sseEvents(await stream.text())) {
+    if (event.type === 'response.output_item.added') announced.push({ index: event.output_index, type: event.item?.type, id: event.item?.id });
+    if (event.type === 'response.completed') streamCompleted = event.response?.output ?? [];
+  }
+  const body = await (await realFetch(`${url}/v1/responses`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+    body: JSON.stringify({
+      model: 'gpt-5.5',
+      input: 'w',
+      tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+    }),
+  })).json();
+  return { announced, streamCompleted, body };
+}
+
+test('the reasoning item leads the output, even when the tool call came first', async () => {
+  // The proxy used to synthesize this item at the first TEXT delta, which put
+  // it after a call the backend had put it before — and the direct API places
+  // it first on every turn that reasons (measured 2026-08-26, gpt-5.5).
+  await withProxy(callThenNarrateEvents(), async (url) => {
+    const { announced, streamCompleted, body } = await responsesSurfaces(url);
+    assert.deepEqual(announced.map((item) => item.type), ['reasoning', 'function_call', 'message']);
+    assert.deepEqual(streamCompleted.map((item) => item.type), ['reasoning', 'function_call', 'message']);
+    assert.deepEqual(body.output.map((item) => item.type), ['reasoning', 'function_call', 'message']);
+  });
+});
+
+test('the reasoning item carries the id the backend gave it', async () => {
+  // A minted `rs_...` names an item the runtime never produced, and a client
+  // feeding `output` back as input echoes it.
+  await withProxy(callThenNarrateEvents(), async (url) => {
+    const { announced, body } = await responsesSurfaces(url);
+    assert.equal(announced[0].id, 'rs_1');
+    assert.equal(body.output[0].id, 'rs_1');
+  });
+});
+
+test('a turn the backend never reasoned on reports no reasoning item', async () => {
+  // The direct API omits the item entirely when `reasoning_tokens` is 0; it
+  // does not send an empty one, and neither may a proxy that reports what its
+  // runtime produced.
+  await withProxy(noReasoningEvents(), async (url) => {
+    const { announced, streamCompleted, body } = await responsesSurfaces(url);
+    assert.deepEqual(announced.map((item) => item.type), ['function_call']);
+    assert.deepEqual(streamCompleted.map((item) => item.type), ['function_call']);
+    assert.deepEqual(body.output.map((item) => item.type), ['function_call']);
   });
 });
 
