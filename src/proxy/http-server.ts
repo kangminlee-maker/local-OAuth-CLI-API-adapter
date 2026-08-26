@@ -1827,16 +1827,22 @@ function openAiResponsesResponse(
   result: LocalCompletionResult,
   request: NormalizedRequest,
 ): unknown {
+  // A reasoning item only when the backend reported one, and always first —
+  // where the backend puts it and where the direct API puts it, ahead of both
+  // the message and the tool calls.
+  const reasoning = result.reasoning
+    ? [openAiResponseReasoningItem(result.reasoning.id)]
+    : [];
   const output = result.toolCalls.length > 0
-    ? orderedByEmission(result, {
-        // The reasoning item introduces the message, so it travels with it.
-        text: result.text
-          ? [openAiResponseReasoningItem(), openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)]
-          : [],
-        toolCalls: result.toolCalls.map(openAiResponseToolCall),
-      })
+    ? [
+        ...reasoning,
+        ...orderedByEmission(result, {
+          text: result.text ? [openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)] : [],
+          toolCalls: result.toolCalls.map(openAiResponseToolCall),
+        }),
+      ]
     : [
-        openAiResponseReasoningItem(),
+        ...reasoning,
         openAiResponseMessageItem(`msg_${randomUUID()}`, result.text),
       ];
   return openAiResponseObject({
@@ -2024,9 +2030,12 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
   };
 }
 
-function openAiResponseReasoningItem(): unknown {
+function openAiResponseReasoningItem(id?: string): unknown {
   return {
-    id: `rs_${randomUUID()}`,
+    // The backend's own id when it gave one: a client that feeds `output` back
+    // as input is echoing an item the runtime really produced, and a minted id
+    // names one that never existed.
+    id: id ?? `rs_${randomUUID()}`,
     type: 'reasoning',
     summary: [],
   };
@@ -2161,6 +2170,9 @@ async function writeOpenAiChatStream(
         await toolState.write(base, event);
         continue;
       }
+      // The chat surface has no reasoning item: its shape reports reasoning
+      // only as a token count in `usage`.
+      if (event.type === 'reasoning_item') continue;
       const result = event.result;
       base = { ...base, model: result.model };
       if (result.toolCalls.length > 0) {
@@ -2333,10 +2345,8 @@ async function writeOpenAiResponsesStream(
 ): Promise<void> {
   writeSseHeaders(res);
   const responseId = `resp_stream_${randomUUID()}`;
-  const reasoningItem = openAiResponseReasoningItem();
   const itemId = `msg_${randomUUID()}`;
   let textStarted = false;
-  let reasoningEmitted = false;
   let streamedText = '';
   // Keyed by the position each item was announced at, so the completed array
   // reads the same way the stream did. Assembling it in a fixed order made
@@ -2382,23 +2392,29 @@ async function writeOpenAiResponsesStream(
       response: createdResponse,
     });
 
+    // Announced when the backend announces its own, at the position the backend
+    // gave it — first. It used to be synthesized at the first text delta
+    // instead, which put an item the turn never produced ahead of the message,
+    // dropped the real one on a turn that only called a tool, and on a
+    // tool-first turn placed it after the call the backend had put it before.
+    const emitReasoningItem = async (id?: string): Promise<void> => {
+      const item = openAiResponseReasoningItem(id);
+      const reasoningOutputIndex = allocateOutputIndex();
+      finalItems.set(reasoningOutputIndex, item);
+      await writeResponseEvent('response.output_item.added', {
+        type: 'response.output_item.added',
+        output_index: reasoningOutputIndex,
+        item,
+      });
+      await writeResponseEvent('response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: reasoningOutputIndex,
+        item,
+      });
+    };
+
     const ensureTextStarted = async (): Promise<void> => {
       if (textStarted) return;
-      if (!reasoningEmitted) {
-        reasoningEmitted = true;
-        const reasoningOutputIndex = allocateOutputIndex();
-        finalItems.set(reasoningOutputIndex, reasoningItem);
-        await writeResponseEvent('response.output_item.added', {
-          type: 'response.output_item.added',
-          output_index: reasoningOutputIndex,
-          item: reasoningItem,
-        });
-        await writeResponseEvent('response.output_item.done', {
-          type: 'response.output_item.done',
-          output_index: reasoningOutputIndex,
-          item: reasoningItem,
-        });
-      }
       textStarted = true;
       messageOutputIndex = allocateOutputIndex();
       await writeResponseEvent('response.output_item.added', {
@@ -2439,6 +2455,10 @@ async function writeOpenAiResponsesStream(
       }
       if (event.type === 'tool_call_delta') {
         await toolState.write(event);
+        continue;
+      }
+      if (event.type === 'reasoning_item') {
+        await emitReasoningItem(event.id);
         continue;
       }
 
@@ -2765,6 +2785,9 @@ async function writeAnthropicMessagesStream(
         await toolState.write(event);
         continue;
       }
+      // No content block corresponds to it on this wire — a `thinking` block
+      // would need the reasoning TEXT, which the backends do not hand over.
+      if (event.type === 'reasoning_item') continue;
 
       const result = event.result;
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
@@ -2787,13 +2810,7 @@ async function writeAnthropicMessagesStream(
             });
           }
         }
-        if (textStarted && !textBlockClosed) {
-          textBlockClosed = true;
-          await writeSseEvent(res, 'content_block_stop', {
-            type: 'content_block_stop',
-            index: textBlockIndex,
-          });
-        }
+        await closeOpenTextBlock();
       }
 
       await writeSseEvent(res, 'message_delta', {
@@ -2843,6 +2860,8 @@ interface AnthropicToolUseState {
   arguments: string;
   /** The content block index this call occupies on the wire. */
   blockIndex: number;
+  /** Whether this call's block has already been stopped. */
+  closed: boolean;
 }
 
 class AnthropicToolUseStreamState {
@@ -2863,18 +2882,37 @@ class AnthropicToolUseStreamState {
       event.name ?? 'tool',
     );
     if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
+    // A backend that says where a call's arguments end closes the block there,
+    // so the narration that resumes after it — or the next call — opens while
+    // nothing else is open. Two blocks open at once is not this wire's shape,
+    // and a client that assembles by index has no way to nest them.
+    if (event.argumentsDone) await this.stop(state);
   }
 
   async finish(toolCalls: readonly LocalToolCall[]): Promise<void> {
     for (const [index, call] of toolCalls.entries()) {
       const state = await this.ensureStarted(index, call.id, call.name);
+      // A call the backend announced as finished carries the arguments the
+      // completed result reports: the transport only sends that signal once the
+      // stream holds the value in full, and refuses to let the completed output
+      // rewrite it afterwards. So there is nothing left to reconcile and
+      // nothing left to stop — and nothing could be sent into a stopped block
+      // anyway, which is why the signal is withheld whenever that invariant
+      // cannot be met.
+      if (state.closed) continue;
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);
-      await writeSseEvent(this.res, 'content_block_stop', {
-        type: 'content_block_stop',
-        index: state.blockIndex,
-      });
+      await this.stop(state);
     }
+  }
+
+  private async stop(state: AnthropicToolUseState): Promise<void> {
+    if (state.closed) return;
+    state.closed = true;
+    await writeSseEvent(this.res, 'content_block_stop', {
+      type: 'content_block_stop',
+      index: state.blockIndex,
+    });
   }
 
   private async ensureStarted(
@@ -2884,7 +2922,7 @@ class AnthropicToolUseStreamState {
   ): Promise<AnthropicToolUseState> {
     const existing = this.states.get(index);
     if (existing) return existing;
-    const state = { id, name, arguments: '', blockIndex: this.allocateBlockIndex() };
+    const state = { id, name, arguments: '', blockIndex: this.allocateBlockIndex(), closed: false };
     this.states.set(index, state);
     await writeSseEvent(this.res, 'content_block_start', {
       type: 'content_block_start',

@@ -17,6 +17,7 @@ import { postprocessFlatGraphicImageIfNeeded } from './flat-image-postprocess.js
 import type {
   LocalCliBackend,
   LocalCompletionResult,
+  LocalReasoningItem,
   LocalStreamEvent,
   LocalToolCall,
   LocalUsage,
@@ -172,6 +173,8 @@ interface ToolState {
    * later names the position owns it — see `toolOrdinal`.
    */
   anonymous: boolean;
+  /** Whether the client has been told this call's arguments are complete. */
+  argumentsDone: boolean;
 }
 
 class CodexBackendStreamState {
@@ -191,6 +194,7 @@ class CodexBackendStreamState {
   private settled = false;
   private stopReason?: string;
   private toolCallsBeforeText?: boolean;
+  private reasoning?: LocalReasoningItem;
 
   constructor(
     private readonly request: NormalizedRequest,
@@ -287,6 +291,27 @@ class CodexBackendStreamState {
       out.push({ type: 'text_delta', delta: event.delta });
       return out;
     }
+    if (event.type === 'response.output_item.added' && event.item?.type === 'reasoning') {
+      // Announced, not reconstructed from the completed output: the two paths
+      // through this state machine — streaming and not — both see this event,
+      // so reporting it here keeps the stream and the body saying the same
+      // thing. A backend that lists a reasoning item ONLY in its completed
+      // output is not reported, because the stream could no longer place it.
+      // One turn carries one such item, and it LEADS the turn, on both the
+      // ChatGPT Codex backend and the direct API (measured 2026-08-26,
+      // gpt-5.5). Only that leading item is reported: the completed body
+      // places the item by rule and the stream by arrival, so an item opened
+      // after the turn has already produced output would have the two surfaces
+      // describe the same turn in two different orders.
+      if (!this.reasoning && this.text === '' && this.toolStates.size === 0) {
+        this.reasoning = typeof event.item.id === 'string' ? { id: event.item.id } : {};
+        out.push({
+          type: 'reasoning_item',
+          ...(typeof event.item.id === 'string' ? { id: event.item.id } : {}),
+        });
+      }
+      return out;
+    }
     if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
       const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
       const id = event.item.call_id ?? event.item.id ?? `call_${index + 1}`;
@@ -343,7 +368,14 @@ class CodexBackendStreamState {
       if (event.item.call_id !== undefined) state.identified = true;
       if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
       this.toolStates.set(index, state);
-      if (state.identified) out.push(...this.emitPending(index, state));
+      if (state.identified) {
+        out.push(...this.emitPending(index, state));
+        // The backend closing the item is the one point where the proxy can
+        // promise a client that this call is finished: the event carries the
+        // call's authoritative arguments. `response.completed` is too late —
+        // the surfaces have already had to guess where the call ended.
+        out.push(...this.emitArgumentsDone(index, state));
+      }
       return out;
     }
     if (event.type === 'response.completed') {
@@ -391,6 +423,7 @@ class CodexBackendStreamState {
       started: false,
       identified: false,
       anonymous: seed.anonymous ?? false,
+      argumentsDone: false,
     };
   }
 
@@ -420,21 +453,73 @@ class CodexBackendStreamState {
         argumentsDelta: '',
       });
     }
-    // Only an extension of what was sent may be sent. A final value that
-    // CONTRADICTS the streamed prefix is not a continuation of it, and
-    // appending the difference would leave the client with two spliced
-    // fragments; the completed result carries the authoritative arguments.
-    if (state.arguments.startsWith(state.streamed) && state.arguments !== state.streamed) {
-      const pending = state.arguments.slice(state.streamed.length);
-      state.streamed = state.arguments;
-      out.push({
-        type: 'tool_call_delta',
-        index,
-        id: state.id,
-        name: state.name,
-        argumentsDelta: pending,
-      });
-    }
+    out.push(...this.emitArgumentExtension(index, state, state.arguments));
+    return out;
+  }
+
+  /**
+   * Sends the part of `value` the client has not been told yet, if any.
+   * Whether the stream ended up carrying `value` in full is read from
+   * `state.streamed` by the caller that needs to know — `emitArgumentsDone`,
+   * which may only promise a value the stream actually holds.
+   *
+   * Only an extension of what was sent may be sent. A value that CONTRADICTS
+   * the streamed prefix is not a continuation of it, and appending the
+   * difference would leave the client with two spliced fragments; the completed
+   * result carries the authoritative arguments.
+   */
+  private emitArgumentExtension(index: number, state: ToolState, value: string): LocalStreamEvent[] {
+    // A call announced as finished is finished. The surfaces that close on that
+    // signal cannot carry anything more for it — a later delta would be written
+    // into a stopped block — so a backend that keeps sending is not forwarded,
+    // and the completed result keeps the value the client was promised.
+    if (state.argumentsDone) return [];
+    if (!value.startsWith(state.streamed)) return [];
+    if (value === state.streamed) return [];
+    const pending = value.slice(state.streamed.length);
+    state.streamed = value;
+    return [{
+      type: 'tool_call_delta',
+      index,
+      id: state.id,
+      name: state.name,
+      argumentsDelta: pending,
+    }];
+  }
+
+  /**
+   * Says the call is finished, after sending the value the completed result
+   * will report. `toolCalls()` normalizes arguments that are empty or do not
+   * parse, so a call announced as finished has to be normalized here too: a
+   * no-argument call would otherwise be closed on the wire having streamed
+   * nothing while the body said `{}`, and a closed call has no way left to
+   * carry the difference.
+   */
+  private emitArgumentsDone(index: number, state: ToolState): LocalStreamEvent[] {
+    if (state.argumentsDone) return [];
+    const complete = ensureJsonString(state.arguments);
+    const out = this.emitArgumentExtension(index, state, complete);
+    // The signal says "what you have is what the body will report", and a
+    // surface that closes on it can send nothing afterwards. When the finishing
+    // event names no arguments and what was streamed does not normalize to the
+    // streamed value, that promise cannot be made: stay silent and let the end
+    // of the turn reconcile, which is the path for a backend that never says
+    // where arguments end.
+    if (state.streamed !== complete) return out;
+    // Keep both baselines in one coordinate system: `emitPending` compares
+    // later values against `arguments`, and leaving it unnormalized here made a
+    // no-argument call's `arguments` ('') disagree with its `streamed` ('{}'),
+    // so any later delta for that call was silently dropped from the stream
+    // while the completed result still folded it in.
+    state.arguments = complete;
+    state.argumentsDone = true;
+    out.push({
+      type: 'tool_call_delta',
+      index,
+      id: state.id,
+      name: state.name,
+      argumentsDone: true,
+    });
     return out;
   }
 
@@ -463,6 +548,7 @@ class CodexBackendStreamState {
       // is the one ordering a non-streaming client cannot reconstruct — and
       // both ordered surfaces need it to agree with the stream.
       ...(this.toolCallsBeforeText && toolCalls.length > 0 ? { toolCallsBeforeText: true } : {}),
+      ...(this.reasoning ? { reasoning: this.reasoning } : {}),
       toolCalls,
       usage: this.usage ?? usageFor(this.request, this.text, toolCalls),
       latencyMs: Date.now() - this.startedAt,
@@ -527,7 +613,16 @@ class CodexBackendStreamState {
         // arguments the streamed text is a prefix of are that same call's
         // finished value, not another call's payload. Anything that
         // contradicts the prefix is refused, as before.
-        if (typeof obj.arguments === 'string' && (mayReplace || obj.arguments.startsWith(state.arguments))) {
+        // ...and never for a call already announced as finished. The stream
+        // closed on the value it sent and cannot take it back, so a completed
+        // output that names a different one would have the client's
+        // accumulation and the body's report describe the same call
+        // differently.
+        if (
+          typeof obj.arguments === 'string'
+          && !state.argumentsDone
+          && (mayReplace || obj.arguments.startsWith(state.arguments))
+        ) {
           state.arguments = obj.arguments;
         }
         this.toolStates.set(index, state);

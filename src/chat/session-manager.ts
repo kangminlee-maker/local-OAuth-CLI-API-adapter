@@ -27,6 +27,13 @@ export interface LocalCliChatTurnOptions {
   readonly timeoutMs?: number;
 }
 
+/** What the manager owns for one turn: the caller's deadline and its signal. */
+interface ManagedTurn {
+  readonly abort: AbortController;
+  /** Cancels this turn's idle deadline, wherever the turn ends. */
+  readonly stopDeadline: () => void;
+}
+
 interface ManagedSession {
   readonly id: string;
   readonly runtime: LocalCliChatRuntime;
@@ -35,9 +42,26 @@ interface ManagedSession {
   readonly model?: string;
   readonly title?: string;
   readonly nativeSession: LocalCliChatRuntimeSession;
-  status: LocalCliChatSessionStatus;
+  closed: boolean;
+  /**
+   * Whether a turn is running, for a runtime that cannot say. A runtime that
+   * can is asked instead — see `sessionStatus`.
+   */
+  running: boolean;
   lastTurnId?: string;
-  currentAbort?: AbortController;
+  currentTurn?: ManagedTurn;
+}
+
+/**
+ * One answer about occupancy, from whoever knows. A runtime that reports it
+ * IS the authority: the manager's own bookkeeping used to be a second, parallel
+ * lifetime, and the two disagreed — a session answered `ready` while its
+ * runtime refused every turn as concurrent, and the reverse.
+ */
+function sessionStatus(session: ManagedSession): LocalCliChatSessionStatus {
+  if (session.closed) return 'closed';
+  const busy = session.nativeSession.isBusy?.() ?? session.running;
+  return busy ? 'running' : 'ready';
 }
 
 export class LocalCliChatSessionManager {
@@ -69,7 +93,8 @@ export class LocalCliChatSessionManager {
       model: input.model,
       title: input.title,
       nativeSession,
-      status: 'ready',
+      closed: false,
+      running: false,
     };
     this.sessions.set(session.id, session);
     return snapshot(session);
@@ -81,9 +106,13 @@ export class LocalCliChatSessionManager {
 
   async close(id: string): Promise<LocalCliChatSessionSnapshot> {
     const session = this.requireSession(id);
-    session.currentAbort?.abort();
+    // Closed first, then aborted. A runtime whose stop is a child REPLACEMENT
+    // spawned one on the way out — a whole CLI launch, killed microseconds
+    // later by the close that followed. Closing ends the turn; the abort is
+    // what is left for a runtime that needs the signal.
     await session.nativeSession.close();
-    session.status = 'closed';
+    this.endTurn(session);
+    session.closed = true;
     this.sessions.delete(id);
     return snapshot(session);
   }
@@ -92,18 +121,44 @@ export class LocalCliChatSessionManager {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map(async (session) => {
-      session.currentAbort?.abort();
-      session.status = 'closed';
       await session.nativeSession.close().catch(() => undefined);
+      this.endTurn(session);
+      session.closed = true;
     }));
   }
 
   async interrupt(id: string): Promise<LocalCliChatSessionSnapshot> {
     const session = this.requireSession(id);
-    session.currentAbort?.abort();
-    await session.nativeSession.interrupt?.();
-    session.status = 'ready';
+    // The runtime session owns stopping its turn: it tells the child AND ends
+    // the caller's iteration, and it is the only thing that knows what
+    // stopping means for that CLI. Every route ends there — this endpoint asks
+    // it directly, the idle deadline asks through the turn's abort signal, and
+    // the session's own handler for that signal runs the same stop. Asking
+    // both ways at once is what told the child twice. A runtime that
+    // implements no interrupt is stopped through the signal alone.
+    // The turn's deadline goes with the turn. An abandoned stream's `finally` —
+    // the only other place it was cleared — never runs, so the deadline
+    // outlived the turn it belonged to and later aborted a signal whose turn
+    // was long over, stopping whoever was running by then.
+    const turn = this.endTurn(session);
+    try {
+      if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
+      else turn?.abort.abort();
+    } finally {
+      // Even when the runtime's stop threw. Whether the session is free again
+      // is the runtime's answer, not this bookkeeping — a turn the child has
+      // not named yet keeps it busy until it can be told to stop.
+      session.running = false;
+    }
     return snapshot(session);
+  }
+
+  /** Ends the manager's side of the current turn: its deadline and its record. */
+  private endTurn(session: ManagedSession): ManagedTurn | undefined {
+    const turn = session.currentTurn;
+    turn?.stopDeadline();
+    session.currentTurn = undefined;
+    return turn;
   }
 
   async *streamTurn(
@@ -112,17 +167,17 @@ export class LocalCliChatSessionManager {
     options: LocalCliChatTurnOptions = {},
   ): AsyncIterable<LocalCliChatEvent> {
     const session = this.requireSession(sessionId);
-    if (session.status === 'closed') {
+    const status = sessionStatus(session);
+    if (status === 'closed') {
       throw new LocalCliChatError('Session is closed.', 410, 'session_closed');
     }
-    if (session.status === 'running') {
+    if (status === 'running') {
       throw new LocalCliChatError('Session already has a running turn.', 409, 'turn_already_running');
     }
     const turnId = `turn_${randomUUID()}`;
     session.lastTurnId = turnId;
-    session.status = 'running';
+    session.running = true;
     const abort = new AbortController();
-    session.currentAbort = abort;
     // The caller's deadline reaches the runtime through the turn's own signal —
     // the same mechanism `interrupt` uses. Without it a child that stopped
     // answering held the HTTP request open with no end, and left the session
@@ -136,9 +191,15 @@ export class LocalCliChatSessionManager {
       ? options.timeoutMs
       : undefined;
     let deadline: NodeJS.Timeout | undefined;
+    const stopDeadline = (): void => {
+      if (deadline) clearTimeout(deadline);
+      deadline = undefined;
+    };
+    const turn: ManagedTurn = { abort, stopDeadline };
+    session.currentTurn = turn;
     const armDeadline = (): void => {
       if (idleTimeoutMs === undefined) return;
-      if (deadline) clearTimeout(deadline);
+      stopDeadline();
       deadline = setTimeout(() => abort.abort(), idleTimeoutMs);
     };
     armDeadline();
@@ -173,9 +234,15 @@ export class LocalCliChatSessionManager {
         },
       };
     } finally {
-      if (deadline) clearTimeout(deadline);
-      if (session.currentAbort === abort) session.currentAbort = undefined;
-      if (session.status === 'running') session.status = 'ready';
+      stopDeadline();
+      // Only the turn that still owns the session may release it. An
+      // interrupted stream nobody is reading finalizes late — after its turn
+      // was stopped and the next one started — and releasing there handed the
+      // running turn's slot to whoever asked next.
+      if (session.currentTurn === turn) {
+        session.currentTurn = undefined;
+        session.running = false;
+      }
     }
   }
 
@@ -234,7 +301,7 @@ function snapshot(session: ManagedSession): LocalCliChatSessionSnapshot {
     id: session.id,
     runtime: session.runtime,
     created_at: session.createdAt,
-    status: session.status,
+    status: sessionStatus(session),
     cwd: session.cwd,
     ...(session.model ? { model: session.model } : {}),
     ...(session.title ? { title: session.title } : {}),

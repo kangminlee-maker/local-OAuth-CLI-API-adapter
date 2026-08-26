@@ -397,10 +397,14 @@ test('CodexBackendTransport streams native function-call argument deltas', async
   for await (const event of backend.stream(toolRequest())) events.push(event);
 
   const toolEvents = events.filter((event) => event.type === 'tool_call_delta');
-  assert.equal(toolEvents.length, 3);
+  assert.equal(toolEvents.length, 4);
   assert.equal(toolEvents[0].name, 'get_weather');
   assert.equal(toolEvents[1].argumentsDelta, '{"city"');
   assert.equal(toolEvents[2].argumentsDelta, ':"Seoul"}');
+  // The item the backend finished is announced as finished, once and last, so
+  // a surface that holds the call open knows where it ends.
+  assert.equal(toolEvents[3].argumentsDone, true);
+  assert.equal(toolEvents[3].argumentsDelta, undefined);
   assert.equal(events.at(-1).type, 'completed');
   assert.equal(events.at(-1).result.toolCalls[0].arguments, '{"city":"Seoul"}');
   assert.equal(events.at(-1).result.usage.source, 'provider');
@@ -550,6 +554,56 @@ test('calls with ids stay separate when the stream omits output_index', async ()
     perIndex.set(event.index, `${perIndex.get(event.index) ?? ''}${event.argumentsDelta ?? ''}`);
   }
   assert.deepEqual([...perIndex.entries()], [[0, '{"city":"Seoul"}'], [1, '{"tz":"KST"}']]);
+});
+
+test('a call is announced finished only when the backend finished it', async () => {
+  // The signal is a promise to the surfaces that hold a call open: nothing more
+  // is coming for it. A turn cut off mid-argument has no such point, so it must
+  // not be claimed — the completed result is what carries the rest there.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'resp_unfinished',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+      },
+    },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  assert.equal(events.filter((event) => event.argumentsDone).length, 0);
+  assert.equal(events.at(-1).result.toolCalls[0].arguments, '{"city":"Seoul"}');
+});
+
+test('a finished call with no arguments streams the value its result reports', async () => {
+  // `{}` is what the completed result carries for a call that streamed nothing.
+  // Announcing the call finished without it left a surface that closes on the
+  // signal holding an empty string, which is not the JSON the body promises.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'now' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'now', arguments: '' } },
+    { type: 'response.completed', response: { id: 'resp_noargs', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const streamed = events
+    .filter((event) => event.type === 'tool_call_delta')
+    .map((event) => event.argumentsDelta ?? '')
+    .join('');
+  assert.equal(streamed, events.at(-1).result.toolCalls[0].arguments);
+  assert.equal(streamed, '{}');
+  assert.equal(events.filter((event) => event.argumentsDone).length, 1);
 });
 
 test('arguments that arrive before the call is named belong to that call', async () => {

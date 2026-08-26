@@ -324,6 +324,14 @@ rl.on('line', (line) => {
   }
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {
     result(payload.id);
+    // A real child keeps talking for a moment after being told to stop, and
+    // some of what it says carries no turn id at all — which is why where
+    // those notifications land matters.
+    if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_TRAILING_NOTIFICATION === '1') {
+      setTimeout(() => {
+        write({ method: 'thread/tokenUsage/updated', params: { totalTokens: 999 } });
+      }, 10);
+    }
     return;
   }
 

@@ -103,6 +103,11 @@ export interface LocalToolCall {
   readonly arguments: string;
 }
 
+/** A reasoning item as the backend reported it; the summary is not carried. */
+export interface LocalReasoningItem {
+  readonly id?: string;
+}
+
 export interface LocalCompletionResult {
   readonly id: string;
   readonly model: string;
@@ -117,6 +122,16 @@ export interface LocalCompletionResult {
    * is what a backend that cannot interleave the two always produces.
    */
   readonly toolCallsBeforeText?: boolean;
+  /**
+   * The reasoning item the backend reported for this turn, when it reported
+   * one. Its presence is the fact — a turn that did not reason has no such
+   * item, which is what the direct API returns (measured on gpt-5.5: an item
+   * whenever `reasoning_tokens > 0`, none at all when zero, and always ahead
+   * of the message and the tool calls). A backend that cannot report one omits
+   * this, and the surfaces then report no reasoning item rather than inventing
+   * one.
+   */
+  readonly reasoning?: LocalReasoningItem;
   readonly usage: LocalUsage;
   readonly latencyMs: number;
   // CLI-reported stop reason (e.g. end_turn, max_tokens, refusal) when available;
@@ -225,6 +240,26 @@ export type LocalStreamEvent =
       readonly id?: string;
       readonly name?: string;
       readonly argumentsDelta?: string;
+      /**
+       * The backend has delivered this call's arguments in full: nothing more
+       * will be sent for it, and what was streamed already equals what the
+       * completed result will report. Surfaces that address a tool call as an
+       * open region — the Anthropic `content_block` — close it here, so two
+       * blocks are never open at once. A backend that cannot say when a call's
+       * arguments end omits it, and its calls close at the end of the turn,
+       * where the completed result still supplies whatever was not streamed.
+       */
+      readonly argumentsDone?: true;
+    }
+  | {
+      /**
+       * The backend opened a reasoning item. Forwarded so the Responses
+       * surface can announce it where the backend put it — first — instead of
+       * guessing at the end of the turn. Surfaces with no reasoning item of
+       * their own ignore it.
+       */
+      readonly type: 'reasoning_item';
+      readonly id?: string;
     }
   | { readonly type: 'completed'; readonly result: LocalCompletionResult };
 
