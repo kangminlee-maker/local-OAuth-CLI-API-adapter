@@ -166,7 +166,7 @@ Non-streaming response uses Responses object shape:
 }
 ```
 
-Text output is represented as an assistant message item with `content[].type: "output_text"`. Tool output is represented as `function_call` items with `call_id`, `name`, and `arguments`. A `reasoning` item leads the array when — and only when — the backend reported one, carrying the id the backend gave it; a turn the runtime answered without reasoning has no such item. The rest of the array is ordered the way the turn was produced: a call made before any narration precedes the message item.
+Text output is represented as an assistant message item with `content[].type: "output_text"`. Tool output is represented as `function_call` items with `call_id`, `name`, and `arguments`. A `reasoning` item leads the array when — and only when — the backend opened one at the head of the turn, carrying the id the backend gave it; a turn the runtime answered without reasoning has no such item, and neither does one whose backend opened it after the turn had already produced output (the completed body places the item by rule and the stream by arrival, so only the leading item can be reported the same way on both). Reporting it at all is per-runtime: the `codex-backend` transport reads it from the backend's own stream, while the `claude` runtime and the `app-server` transport do not surface reasoning items, so their responses carry none even where `usage.output_tokens_details.reasoning_tokens` is non-zero. The rest of the array is ordered the way the turn was produced: a call made before any narration precedes the message item.
 
 ### Streaming output spec
 

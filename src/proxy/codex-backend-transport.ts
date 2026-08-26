@@ -297,10 +297,13 @@ class CodexBackendStreamState {
       // so reporting it here keeps the stream and the body saying the same
       // thing. A backend that lists a reasoning item ONLY in its completed
       // output is not reported, because the stream could no longer place it.
-      // One turn carries one such item, first, on both the ChatGPT Codex
-      // backend and the direct API (measured 2026-08-26, gpt-5.5), so a later
-      // one would be a second copy of what the client already has.
-      if (!this.reasoning) {
+      // One turn carries one such item, and it LEADS the turn, on both the
+      // ChatGPT Codex backend and the direct API (measured 2026-08-26,
+      // gpt-5.5). Only that leading item is reported: the completed body
+      // places the item by rule and the stream by arrival, so an item opened
+      // after the turn has already produced output would have the two surfaces
+      // describe the same turn in two different orders.
+      if (!this.reasoning && this.text === '' && this.toolStates.size === 0) {
         this.reasoning = typeof event.item.id === 'string' ? { id: event.item.id } : {};
         out.push({
           type: 'reasoning_item',
@@ -450,22 +453,31 @@ class CodexBackendStreamState {
         argumentsDelta: '',
       });
     }
-    // Only an extension of what was sent may be sent. A final value that
-    // CONTRADICTS the streamed prefix is not a continuation of it, and
-    // appending the difference would leave the client with two spliced
-    // fragments; the completed result carries the authoritative arguments.
-    if (state.arguments.startsWith(state.streamed) && state.arguments !== state.streamed) {
-      const pending = state.arguments.slice(state.streamed.length);
-      state.streamed = state.arguments;
-      out.push({
-        type: 'tool_call_delta',
-        index,
-        id: state.id,
-        name: state.name,
-        argumentsDelta: pending,
-      });
-    }
+    out.push(...this.emitArgumentExtension(index, state, state.arguments));
     return out;
+  }
+
+  /**
+   * Sends the part of `value` the client has not been told yet, and reports
+   * whether the stream now carries `value` in full.
+   *
+   * Only an extension of what was sent may be sent. A value that CONTRADICTS
+   * the streamed prefix is not a continuation of it, and appending the
+   * difference would leave the client with two spliced fragments; the completed
+   * result carries the authoritative arguments.
+   */
+  private emitArgumentExtension(index: number, state: ToolState, value: string): LocalStreamEvent[] {
+    if (!value.startsWith(state.streamed)) return [];
+    if (value === state.streamed) return [];
+    const pending = value.slice(state.streamed.length);
+    state.streamed = value;
+    return [{
+      type: 'tool_call_delta',
+      index,
+      id: state.id,
+      name: state.name,
+      argumentsDelta: pending,
+    }];
   }
 
   /**
@@ -478,20 +490,22 @@ class CodexBackendStreamState {
    */
   private emitArgumentsDone(index: number, state: ToolState): LocalStreamEvent[] {
     if (state.argumentsDone) return [];
-    state.argumentsDone = true;
-    const out: LocalStreamEvent[] = [];
     const complete = ensureJsonString(state.arguments);
-    if (complete.startsWith(state.streamed) && complete !== state.streamed) {
-      const pending = complete.slice(state.streamed.length);
-      state.streamed = complete;
-      out.push({
-        type: 'tool_call_delta',
-        index,
-        id: state.id,
-        name: state.name,
-        argumentsDelta: pending,
-      });
-    }
+    const out = this.emitArgumentExtension(index, state, complete);
+    // The signal says "what you have is what the body will report", and a
+    // surface that closes on it can send nothing afterwards. When the finishing
+    // event names no arguments and what was streamed does not normalize to the
+    // streamed value, that promise cannot be made: stay silent and let the end
+    // of the turn reconcile, which is the path for a backend that never says
+    // where arguments end.
+    if (state.streamed !== complete) return out;
+    // Keep both baselines in one coordinate system: `emitPending` compares
+    // later values against `arguments`, and leaving it unnormalized here made a
+    // no-argument call's `arguments` ('') disagree with its `streamed` ('{}'),
+    // so any later delta for that call was silently dropped from the stream
+    // while the completed result still folded it in.
+    state.arguments = complete;
+    state.argumentsDone = true;
     out.push({
       type: 'tool_call_delta',
       index,
@@ -592,7 +606,16 @@ class CodexBackendStreamState {
         // arguments the streamed text is a prefix of are that same call's
         // finished value, not another call's payload. Anything that
         // contradicts the prefix is refused, as before.
-        if (typeof obj.arguments === 'string' && (mayReplace || obj.arguments.startsWith(state.arguments))) {
+        // ...and never for a call already announced as finished. The stream
+        // closed on the value it sent and cannot take it back, so a completed
+        // output that names a different one would have the client's
+        // accumulation and the body's report describe the same call
+        // differently.
+        if (
+          typeof obj.arguments === 'string'
+          && !state.argumentsDone
+          && (mayReplace || obj.arguments.startsWith(state.arguments))
+        ) {
           state.arguments = obj.arguments;
         }
         this.toolStates.set(index, state);

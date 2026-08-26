@@ -24,6 +24,7 @@ const openSessions = [];
 const originalCodexHome = process.env.CODEX_HOME;
 const originalNoCompletion = process.env.FAKE_CODEX_NO_TURN_COMPLETION;
 const originalMethodLog = process.env.FAKE_CODEX_METHOD_LOG;
+const originalStartDelay = process.env.FAKE_CODEX_TURN_START_DELAY_MS;
 
 before(async () => {
   await chmod(fakeCodex, 0o755);
@@ -38,6 +39,8 @@ afterEach(async () => {
   else process.env.FAKE_CODEX_NO_TURN_COMPLETION = originalNoCompletion;
   if (originalMethodLog === undefined) delete process.env.FAKE_CODEX_METHOD_LOG;
   else process.env.FAKE_CODEX_METHOD_LOG = originalMethodLog;
+  if (originalStartDelay === undefined) delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  else process.env.FAKE_CODEX_TURN_START_DELAY_MS = originalStartDelay;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -92,7 +95,58 @@ test('an interrupted codex turn is stopped once, not once per path', { timeout: 
   assert.equal(events.at(-1).event, 'cli.error', 'the caller stops iterating too');
 });
 
-test('a claude turn abandoned mid-flight leaves a session that still answers', async () => {
+test('an interrupt during the turn/start round-trip still reaches the child', { timeout: 20_000 }, async () => {
+  // The window between asking the child to start a turn and being told its id
+  // is the slowest part of starting one — input preparation plus the RPC — and
+  // an interrupt that lands there used to reach the child through the turn's
+  // abort signal. Reading only `activeTurn`, which is installed after the
+  // acknowledgement, made the endpoint a no-op for that whole window: the child
+  // kept working and the caller kept waiting, while the session reported ready.
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '1500';
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const events = [];
+  const drain = (async () => {
+    for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event);
+  })();
+  await delay(400);
+
+  await manager.interrupt(session.id);
+  await drain;
+
+  assert.equal(
+    (await receivedMethods(methodLog)).filter((method) => method === 'turn/interrupt').length,
+    1,
+    'the turn must be interrupted on the child, whenever the interrupt lands',
+  );
+  assert.equal(events.at(-1).event, 'cli.error', 'the caller stops iterating too');
+});
+
+test('a session whose caller walked away accepts the next turn after an interrupt', { timeout: 20_000 }, async () => {
+  // The documented cancellation for an abandoned turn is this endpoint. Failing
+  // the queue without clearing the active turn left the session refusing every
+  // later turn with "already has a running turn" — the abandoned generator's
+  // `finally`, which clears it, only runs if someone resumes the generator.
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const stream = manager.streamTurn(session.id, { input: 'hello' })[Symbol.asyncIterator]();
+  await stream.next();
+  await delay(200);
+
+  await manager.interrupt(session.id);
+
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  const events = [];
+  for await (const event of manager.streamTurn(session.id, { input: 'DEBUG_PAYLOAD' })) events.push(event);
+  assert.equal(
+    events.at(-1).event,
+    'cli.completed',
+    `the next turn must run: ${JSON.stringify(events.at(-1))}`,
+  );
+});
+
+test('a claude turn abandoned mid-flight leaves a session that still answers', { timeout: 20_000 }, async () => {
   // The abort signal killed the child without replacing it, so the session
   // reported `ready` over a child that was gone and every later turn answered
   // "session is not running". Abandoning and interrupting are one operation.
@@ -122,7 +176,7 @@ test('a claude turn abandoned mid-flight leaves a session that still answers', a
   }
 });
 
-test('an interrupted claude turn leaves a session that still answers', async () => {
+test('an interrupted claude turn leaves a session that still answers', { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
   tempDirs.push(cwd);
   const session = await ClaudeNativeCliChatSession.create({

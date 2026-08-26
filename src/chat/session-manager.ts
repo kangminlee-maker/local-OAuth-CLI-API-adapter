@@ -100,11 +100,13 @@ export class LocalCliChatSessionManager {
 
   async interrupt(id: string): Promise<LocalCliChatSessionSnapshot> {
     const session = this.requireSession(id);
-    // One trigger. The runtime's own interrupt stops the child AND ends the
-    // turn's stream, so also aborting the turn signal sent a second stop to a
-    // child that had already been told — two owners of one operation, and the
-    // runtime's is the one that knows what stopping means there. A runtime that
-    // implements no interrupt still has to stop, so it falls back to the signal.
+    // The runtime session owns stopping its turn: it tells the child AND ends
+    // the caller's iteration, and it is the only thing that knows what
+    // stopping means for that CLI. Every route ends there — this endpoint asks
+    // it directly, the idle deadline asks through the turn's abort signal, and
+    // the session's own handler for that signal runs the same stop. Asking
+    // both ways at once is what told the child twice. A runtime that
+    // implements no interrupt is stopped through the signal alone.
     if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
     else session.currentAbort?.abort();
     session.status = 'ready';

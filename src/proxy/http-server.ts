@@ -2898,9 +2898,13 @@ class AnthropicToolUseStreamState {
   async finish(toolCalls: readonly LocalToolCall[]): Promise<void> {
     for (const [index, call] of toolCalls.entries()) {
       const state = await this.ensureStarted(index, call.id, call.name);
-      // A call the backend already finished carries the arguments the completed
-      // result reports — the backend sends them with the event that finishes it
-      // — so there is nothing left to reconcile and nothing left to stop.
+      // A call the backend announced as finished carries the arguments the
+      // completed result reports: the transport only sends that signal once the
+      // stream holds the value in full, and refuses to let the completed output
+      // rewrite it afterwards. So there is nothing left to reconcile and
+      // nothing left to stop — and nothing could be sent into a stopped block
+      // anyway, which is why the signal is withheld whenever that invariant
+      // cannot be met.
       if (state.closed) continue;
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);

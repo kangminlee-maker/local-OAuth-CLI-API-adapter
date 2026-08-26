@@ -467,10 +467,13 @@ function narrateThenCallEvents() {
 
 function callThenNarrateEvents() {
   return [
+    // The reasoning item holds output_index 0, so the call takes 1 — a
+    // preceding item shifts the backend's positions, and a fixture that gives
+    // two items the same one exercises a wire the backend never produces.
     { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
     { type: 'response.output_item.done', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
-    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
-    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
     { type: 'response.output_text.delta', delta: 'Checking now.' },
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
   ];
@@ -767,6 +770,107 @@ for (const [label, events, expected] of SEQUENTIAL_BLOCK_CASES) {
     });
   });
 }
+
+/**
+ * The backend closes the item but names no arguments there, and only the
+ * completed output carries the finished value — the partial the stream sent is
+ * not a prefix of what `toolCalls()` will normalize it to.
+ */
+function callFinishedWithoutArgumentsEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'r',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+      },
+    },
+  ];
+}
+
+/** The backend finishes the item, then contradicts itself in the final output. */
+function argumentsExtendedAfterDoneEvents() {
+  return [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    {
+      type: 'response.completed',
+      response: {
+        id: 'r',
+        model: 'gpt-5.5',
+        output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul","unit":"c"}' }],
+      },
+    },
+  ];
+}
+
+test('a call finished without its arguments keeps the block open for them', async () => {
+  // Closing on the signal is a promise that what was streamed is what the body
+  // will report. When the finishing event names no arguments, that promise
+  // cannot be made: the block has to stay open so the end of the turn can
+  // still send the rest, which is where the completed output supplies it.
+  await withProxy(callFinishedWithoutArgumentsEvents(), async (url) => {
+    const stream = await messagesStreamBlocks(url);
+    assert.deepEqual(stream.toolArguments, ['{"city":"Seoul"}']);
+    assert.equal(stream.open, 0, 'every block must be closed by the end of the turn');
+    const body = await (await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    })).json();
+    assert.deepEqual(body.content.find((block) => block.type === 'tool_use')?.input, { city: 'Seoul' });
+  });
+});
+
+test('a call announced as finished is not rewritten by the completed output', async () => {
+  // The stream cannot take back a value it has already closed on, so the body
+  // must not report a different one: what the client accumulated and what the
+  // response says have to be the same call.
+  await withProxy(argumentsExtendedAfterDoneEvents(), async (url) => {
+    const stream = await messagesStreamBlocks(url);
+    assert.deepEqual(stream.toolArguments, ['{"city":"Seoul"}']);
+    const body = await (await realFetch(`${url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        max_tokens: 128,
+        messages: [{ role: 'user', content: 'w' }],
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+      }),
+    })).json();
+    assert.deepEqual(body.content.find((block) => block.type === 'tool_use')?.input, { city: 'Seoul' });
+  });
+});
+
+/** A reasoning item the backend opens AFTER it has already produced text. */
+function lateReasoningEvents() {
+  return [
+    { type: 'response.output_text.delta', delta: 'Thinking about it. ' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'reasoning', id: 'rs_late' } },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'reasoning', id: 'rs_late' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+}
+
+test('stream and body agree about the reasoning item when it does not come first', async () => {
+  // The body places the item by rule and the stream by arrival, so a backend
+  // that opens one late made the two surfaces describe different turns.
+  await withProxy(lateReasoningEvents(), async (url) => {
+    const { announced, streamCompleted, body } = await responsesSurfaces(url);
+    assert.deepEqual(streamCompleted.map((item) => item.type), body.output.map((item) => item.type));
+    assert.deepEqual(announced.map((item) => item.type), body.output.map((item) => item.type));
+  });
+});
 
 test('a call the backend never finishes still delivers its arguments', async () => {
   // The other half of closing early: a backend that cannot say where a call's

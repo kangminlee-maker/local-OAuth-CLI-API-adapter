@@ -72,6 +72,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private stderr = '';
   private readonly pending = new Map<number, PendingRequest>();
   private activeTurn: ActiveTurn | null = null;
+  /**
+   * Stops whatever turn is in flight, from the moment one is asked for. The
+   * active turn is only installed once the child has named it, and the wait for
+   * that acknowledgement — input preparation plus the RPC — is the slowest part
+   * of starting a turn, so an owner that reads `activeTurn` cannot stop a turn
+   * during exactly the window where stopping matters most.
+   */
+  private stopTurn: (() => Promise<void>) | null = null;
   private bufferedNotifications: LocalCliChatRuntimeEvent[] = [];
   private isolation: Awaited<ReturnType<typeof createCodexIsolation>> | null = null;
   private threadId = '';
@@ -122,19 +130,32 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     const preparedInput = await prepareCodexInput(request, chatPromptText(input));
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
     let turnId = '';
-    const abort = async (): Promise<void> => {
+    // A stop asked for before the child named the turn cannot interrupt it yet.
+    // Remembering that it was asked lets the acknowledgement, when it arrives,
+    // interrupt the turn the child has just started rather than leaving it
+    // running with nobody reading it.
+    let stopped = false;
+    const stop = async (): Promise<void> => {
+      stopped = true;
       // Ending the caller's iteration is the part that must not depend on the
       // child: the queue closes on `turn/completed`, so a child that stopped
       // answering left an aborted turn iterating forever — the abort reached
       // the child and nothing reached the caller.
       queue.fail(new Error('local CLI chat turn aborted'));
+      // Retire the turn here, not only in the generator's `finally`: a caller
+      // that has walked away never resumes the generator, so that `finally`
+      // never runs, and the session then refused every later turn as
+      // concurrent while reporting itself ready.
+      if (this.activeTurn?.queue === queue) this.activeTurn = null;
+      if (this.stopTurn === stop) this.stopTurn = null;
       // The local `turnId`, not `this.activeTurn`: the turn is interruptible
       // from the moment the child names it, which is before it is installed as
       // the active one.
       await this.sendTurnInterrupt(turnId);
     };
+    this.stopTurn = stop;
     const onAbort = (): void => {
-      void abort();
+      void stop();
     };
     // A caller that has already left gets no turn at all. Failing the queue and
     // then starting one anyway spent a turn on the child that nobody would read
@@ -159,11 +180,11 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       });
       turnId = readPath<string>(response, ['result', 'turn', 'id']) ?? '';
       if (!turnId) throw new Error('codex app-server did not return a turn id');
-      // The abort may have fired while this acknowledgement was in flight, when
+      // The stop may have come while this acknowledgement was in flight, when
       // there was no turn id to interrupt with. Now there is one, and the turn
       // is running on the child: interrupt it rather than walking away from it.
-      if (signal?.aborted) {
-        await this.sendTurnInterrupt(turnId);
+      if (stopped || signal?.aborted) {
+        await stop();
         throw new Error('local CLI chat turn aborted');
       }
       this.activeTurn = { turnId, queue };
@@ -178,21 +199,18 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     } finally {
       if (signal) signal.removeEventListener('abort', onAbort);
       if (this.activeTurn?.turnId === turnId) this.activeTurn = null;
+      if (this.stopTurn === stop) this.stopTurn = null;
       await preparedInput.cleanup();
     }
   }
 
   /**
-   * Stops the running turn for both parties. The caller's iteration ends here
-   * too, the way the turn signal ends it: the child answers an interrupt with
-   * whatever it chooses, and a turn whose reader is still waiting on
-   * `turn/completed` is not stopped.
+   * Stops the running turn for both parties: the child is told, and the
+   * caller's iteration ends. A turn whose reader is still waiting on
+   * `turn/completed` is not stopped by telling the child alone.
    */
   async interrupt(): Promise<void> {
-    const turn = this.activeTurn;
-    if (!turn) return;
-    turn.queue.fail(new Error('local CLI chat turn aborted'));
-    await this.sendTurnInterrupt(turn.turnId);
+    await this.stopTurn?.();
   }
 
   /** The one place a turn is interrupted on the child. */
