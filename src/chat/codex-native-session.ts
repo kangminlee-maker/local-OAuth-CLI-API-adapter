@@ -148,6 +148,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // concurrent while reporting itself ready.
       if (this.activeTurn?.queue === queue) this.activeTurn = null;
       if (this.stopTurn === stop) this.stopTurn = null;
+      // Released before the child acknowledges, and that is deliberate: holding
+      // the session until the interrupt RPC settles would let an unresponsive
+      // child — the case interrupts exist for — refuse every later turn for a
+      // whole request budget. What has to hold instead is ORDER, and it does
+      // because nothing awaits between the release above and the write below:
+      // the child is told to stop before it can be asked for anything else.
+      // Do not put an `await` in between.
+      //
       // The local `turnId`, not `this.activeTurn`: the turn is interruptible
       // from the moment the child names it, which is before it is installed as
       // the active one.

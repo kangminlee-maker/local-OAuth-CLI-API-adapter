@@ -146,6 +146,36 @@ test('a session whose caller walked away accepts the next turn after an interrup
   );
 });
 
+test('the child is told to stop before it is asked for the next turn', { timeout: 20_000 }, async () => {
+  // Stopping releases the session as soon as the turn is retired, without
+  // waiting for the child to acknowledge the interrupt — holding the session
+  // until then would let an unresponsive child, the case interrupts exist for,
+  // block every later turn for a whole request budget. What has to hold instead
+  // is ORDER: the child is told to stop before it is asked to start anything
+  // else, and requests reach it in the order they are written.
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+
+  const events = [];
+  for await (const event of manager.streamTurn(session.id, { input: 'hello' }, { timeoutMs: 300 })) {
+    events.push(event);
+  }
+  assert.equal(events.at(-1).event, 'cli.error', 'the idle deadline ends the turn');
+
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  const next = [];
+  for await (const event of manager.streamTurn(session.id, { input: 'DEBUG_PAYLOAD' })) next.push(event);
+  assert.equal(next.at(-1).event, 'cli.completed', 'the next turn runs');
+
+  const methods = (await receivedMethods(methodLog)).filter((m) => m === 'turn/start' || m === 'turn/interrupt');
+  assert.deepEqual(
+    methods,
+    ['turn/start', 'turn/interrupt', 'turn/start'],
+    'the interrupt must reach the child before the next turn does',
+  );
+});
+
 test('a claude turn abandoned mid-flight leaves a session that still answers', { timeout: 20_000 }, async () => {
   // The abort signal killed the child without replacing it, so the session
   // reported `ready` over a child that was gone and every later turn answered
