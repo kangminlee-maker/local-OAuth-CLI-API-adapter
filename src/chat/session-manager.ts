@@ -107,9 +107,15 @@ export class LocalCliChatSessionManager {
     // the session's own handler for that signal runs the same stop. Asking
     // both ways at once is what told the child twice. A runtime that
     // implements no interrupt is stopped through the signal alone.
-    if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
-    else session.currentAbort?.abort();
-    session.status = 'ready';
+    try {
+      if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
+      else session.currentAbort?.abort();
+    } finally {
+      // Even when the runtime's stop threw. The status is the session's
+      // concurrency gate, and leaving it `running` because an interrupt failed
+      // answers every later turn with 409 for the life of the process.
+      session.status = 'ready';
+    }
     return snapshot(session);
   }
 

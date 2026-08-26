@@ -37,9 +37,21 @@ interface PendingRequest {
   readonly timer: NodeJS.Timeout;
 }
 
-interface ActiveTurn {
-  readonly turnId: string;
+/**
+ * Everything one turn owns, installed the moment a turn is asked for and
+ * retired in exactly one place. The pieces used to live in separate fields
+ * updated at separate sites, and every site that forgot one produced the same
+ * defect in a new shape: a turn nobody could stop, a session nobody could use
+ * again, a stop aimed at a turn that was already over.
+ */
+interface Turn {
   readonly queue: AsyncQueue<LocalCliChatRuntimeEvent>;
+  /** Empty until the child names the turn; it cannot be interrupted before. */
+  turnId: string;
+  /** Whether a stop has been asked for, whether or not it could be delivered. */
+  stopped: boolean;
+  /** Whether the child has been told. A turn is interrupted once, at most. */
+  interrupted: boolean;
 }
 
 type JsonRpcMessage = Record<string, unknown>;
@@ -71,15 +83,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private nextId = 1;
   private stderr = '';
   private readonly pending = new Map<number, PendingRequest>();
-  private activeTurn: ActiveTurn | null = null;
   /**
-   * Stops whatever turn is in flight, from the moment one is asked for. The
-   * active turn is only installed once the child has named it, and the wait for
-   * that acknowledgement — input preparation plus the RPC — is the slowest part
-   * of starting a turn, so an owner that reads `activeTurn` cannot stop a turn
-   * during exactly the window where stopping matters most.
+   * The turn in flight, from the moment one is asked for until it is retired.
+   * Installed before the first `await` so that preparing the input — file I/O
+   * for every base64 image — is inside the turn's life rather than before it:
+   * that window is the slowest part of starting a turn, and a turn that cannot
+   * be seen there cannot be stopped there either.
    */
-  private stopTurn: (() => Promise<void>) | null = null;
+  private turn: Turn | null = null;
   private bufferedNotifications: LocalCliChatRuntimeEvent[] = [];
   private isolation: Awaited<ReturnType<typeof createCodexIsolation>> | null = null;
   private threadId = '';
@@ -125,55 +136,27 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     signal?: AbortSignal,
   ): AsyncIterable<LocalCliChatRuntimeEvent> {
     if (!this.child) throw new Error('codex native chat session is not running');
-    if (this.activeTurn) throw new Error('codex native chat session already has a running turn');
-    const request = chatNormalizedRequest(input, this.model);
-    const preparedInput = await prepareCodexInput(request, chatPromptText(input));
-    const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
-    let turnId = '';
-    // A stop asked for before the child named the turn cannot interrupt it yet.
-    // Remembering that it was asked lets the acknowledgement, when it arrives,
-    // interrupt the turn the child has just started rather than leaving it
-    // running with nobody reading it.
-    let stopped = false;
-    const stop = async (): Promise<void> => {
-      stopped = true;
-      // Ending the caller's iteration is the part that must not depend on the
-      // child: the queue closes on `turn/completed`, so a child that stopped
-      // answering left an aborted turn iterating forever — the abort reached
-      // the child and nothing reached the caller.
-      queue.fail(new Error('local CLI chat turn aborted'));
-      // Retire the turn here, not only in the generator's `finally`: a caller
-      // that has walked away never resumes the generator, so that `finally`
-      // never runs, and the session then refused every later turn as
-      // concurrent while reporting itself ready.
-      if (this.activeTurn?.queue === queue) this.activeTurn = null;
-      if (this.stopTurn === stop) this.stopTurn = null;
-      // Released before the child acknowledges, and that is deliberate: holding
-      // the session until the interrupt RPC settles would let an unresponsive
-      // child — the case interrupts exist for — refuse every later turn for a
-      // whole request budget. What has to hold instead is ORDER, and it does
-      // because nothing awaits between the release above and the write below:
-      // the child is told to stop before it can be asked for anything else.
-      // Do not put an `await` in between.
-      //
-      // The local `turnId`, not `this.activeTurn`: the turn is interruptible
-      // from the moment the child names it, which is before it is installed as
-      // the active one.
-      await this.sendTurnInterrupt(turnId);
-    };
-    this.stopTurn = stop;
-    const onAbort = (): void => {
-      void stop();
-    };
+    if (this.turn) throw new Error('codex native chat session already has a running turn');
     // A caller that has already left gets no turn at all. Failing the queue and
     // then starting one anyway spent a turn on the child that nobody would read
     // and — with no turn id yet — nothing could interrupt.
-    if (signal?.aborted) {
-      await preparedInput.cleanup();
-      throw new Error('local CLI chat turn aborted');
-    }
+    if (signal?.aborted) throw new Error('local CLI chat turn aborted');
+    const request = chatNormalizedRequest(input, this.model);
+    const turn: Turn = {
+      queue: new AsyncQueue<LocalCliChatRuntimeEvent>(),
+      turnId: '',
+      stopped: false,
+      interrupted: false,
+    };
+    this.turn = turn;
+    const onAbort = (): void => {
+      void this.stopTurn(turn);
+    };
     signal?.addEventListener('abort', onAbort, { once: true });
+    let preparedInput: Awaited<ReturnType<typeof prepareCodexInput>> | null = null;
     try {
+      preparedInput = await prepareCodexInput(request, chatPromptText(input));
+      if (turn.stopped) throw new Error('local CLI chat turn aborted');
       const response = await this.send('turn/start', {
         threadId: this.threadId,
         cwd: this.cwd,
@@ -186,30 +169,64 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
         outputSchema: null,
         personality: 'none',
       });
-      turnId = readPath<string>(response, ['result', 'turn', 'id']) ?? '';
-      if (!turnId) throw new Error('codex app-server did not return a turn id');
+      turn.turnId = readPath<string>(response, ['result', 'turn', 'id']) ?? '';
+      if (!turn.turnId) throw new Error('codex app-server did not return a turn id');
       // The stop may have come while this acknowledgement was in flight, when
       // there was no turn id to interrupt with. Now there is one, and the turn
       // is running on the child: interrupt it rather than walking away from it.
-      if (stopped || signal?.aborted) {
-        await stop();
+      if (turn.stopped) {
+        await this.stopTurn(turn);
         throw new Error('local CLI chat turn aborted');
       }
-      this.activeTurn = { turnId, queue };
-      queue.push({
+      turn.queue.push({
         raw: {
           method: 'turn/start',
           response,
         },
       });
-      this.flushBufferedNotifications(turnId, queue);
-      for await (const event of queue) yield event;
+      this.flushBufferedNotifications(turn);
+      for await (const event of turn.queue) yield event;
     } finally {
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (this.activeTurn?.turnId === turnId) this.activeTurn = null;
-      if (this.stopTurn === stop) this.stopTurn = null;
-      await preparedInput.cleanup();
+      signal?.removeEventListener('abort', onAbort);
+      this.retire(turn);
+      await preparedInput?.cleanup();
     }
+  }
+
+  /**
+   * Stops one turn for both parties: the caller's iteration ends and the child
+   * is told. Safe to call for a turn that is already over — the child hears
+   * about a turn once.
+   */
+  private async stopTurn(turn: Turn): Promise<void> {
+    // Not short-circuited on `stopped`: a stop asked for before the child named
+    // the turn has nothing to send, and the acknowledgement calls back here to
+    // deliver it once there is an id. What is sent once is the interrupt.
+    turn.stopped = true;
+    // Ending the caller's iteration is the part that must not depend on the
+    // child: the queue closes on `turn/completed`, so a child that stopped
+    // answering left an aborted turn iterating forever — the abort reached the
+    // child and nothing reached the caller.
+    turn.queue.fail(new Error('local CLI chat turn aborted'));
+    // Retired here, not only in the generator's `finally`: a caller that has
+    // walked away never resumes the generator, so that `finally` never runs,
+    // and the session then refused every later turn as concurrent while
+    // reporting itself ready.
+    //
+    // Retiring before the child acknowledges is deliberate: holding the session
+    // until the interrupt RPC settles would let an unresponsive child — the
+    // case interrupts exist for — refuse every later turn for a whole request
+    // budget. What has to hold instead is ORDER, and it does because nothing
+    // awaits between the retirement above and the write below: the child is
+    // told to stop before it can be asked for anything else. Do not put an
+    // `await` in between.
+    this.retire(turn);
+    await this.sendTurnInterrupt(turn);
+  }
+
+  /** The one place a turn stops being the session's. */
+  private retire(turn: Turn): void {
+    if (this.turn === turn) this.turn = null;
   }
 
   /**
@@ -218,18 +235,24 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
    * `turn/completed` is not stopped by telling the child alone.
    */
   async interrupt(): Promise<void> {
-    await this.stopTurn?.();
+    const turn = this.turn;
+    if (!turn) return;
+    await this.stopTurn(turn);
   }
 
   /** The one place a turn is interrupted on the child. */
-  private async sendTurnInterrupt(turnId: string): Promise<void> {
-    if (!turnId) return;
-    await this.send('turn/interrupt', { threadId: this.threadId, turnId }).catch(() => undefined);
+  private async sendTurnInterrupt(turn: Turn): Promise<void> {
+    if (!turn.turnId || turn.interrupted) return;
+    turn.interrupted = true;
+    await this.send('turn/interrupt', { threadId: this.threadId, turnId: turn.turnId })
+      .catch(() => undefined);
   }
 
   async close(): Promise<void> {
-    this.activeTurn?.queue.close();
-    this.activeTurn = null;
+    if (this.turn) {
+      this.turn.queue.close();
+      this.retire(this.turn);
+    }
     if (this.threadId) {
       // A courtesy call gets a courtesy budget. Archiving an ephemeral thread is
       // best-effort cleanup, but it was awaited under the TURN timeout, so a
@@ -288,6 +311,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
     });
     this.child.on('error', (err) => this.failActive(err));
+    // An `error` event with no listener is an uncaught exception: one racing
+    // write to a child that has just died would take the whole proxy down
+    // rather than the turn. The sibling claude session guards the same pipe.
+    this.child.stdin.on('error', (err) => this.failActive(err));
     this.child.on('close', (code, signal) => {
       this.failActive(new Error(`codex app-server exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`));
       this.child = null;
@@ -336,7 +363,15 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     if (!this.child) return Promise.reject(new Error('codex app-server is not running'));
     const id = this.nextId;
     this.nextId += 1;
-    this.child.stdin.write(`${JSON.stringify({ method, id, params })}\n`);
+    try {
+      this.child.stdin.write(`${JSON.stringify({ method, id, params })}\n`);
+    } catch (err) {
+      // A pipe that died under the write throws from here, and this function
+      // returns a promise: a synchronous throw escapes the caller's `.catch`
+      // and — on the interrupt path, where the child is likeliest to be dying —
+      // took the whole endpoint with it.
+      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
@@ -387,37 +422,41 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       ...(method === 'thread/tokenUsage/updated' ? { usage: params } : {}),
     };
     const turnId = typeof data?.turnId === 'string' ? data.turnId : undefined;
-    if (this.activeTurn && (!turnId || turnId === this.activeTurn.turnId)) {
-      this.activeTurn.queue.push(event);
-      if (method === 'turn/completed') this.activeTurn.queue.close();
+    const turn = this.turn;
+    // Nothing is running, so this belongs to a turn that is over. Holding it
+    // would deliver an interrupted turn's tail — its usage above all — to
+    // whoever asked next, as that turn's own.
+    if (!turn) return;
+    // Still being named: what arrives now belongs to the turn being started,
+    // and nothing else can be running, so hold it until there is an id to
+    // route by.
+    if (!turn.turnId) {
+      this.bufferedNotifications.push(event);
+      this.bufferedNotifications = this.bufferedNotifications.slice(-100);
       return;
     }
-    this.bufferedNotifications.push(event);
-    this.bufferedNotifications = this.bufferedNotifications.slice(-100);
+    if (turnId && turnId !== turn.turnId) return;
+    turn.queue.push(event);
+    if (method === 'turn/completed') turn.queue.close();
   }
 
-  private flushBufferedNotifications(
-    turnId: string,
-    queue: AsyncQueue<LocalCliChatRuntimeEvent>,
-  ): void {
-    const remaining: LocalCliChatRuntimeEvent[] = [];
-    for (const event of this.bufferedNotifications) {
+  private flushBufferedNotifications(turn: Turn): void {
+    const buffered = this.bufferedNotifications;
+    this.bufferedNotifications = [];
+    for (const event of buffered) {
       const params = asRecord(asRecord(event.raw)?.params);
       const eventTurnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
-      if (!eventTurnId || eventTurnId === turnId) {
-        queue.push(event);
-        if (asRecord(event.raw)?.method === 'turn/completed') queue.close();
-      } else {
-        remaining.push(event);
-      }
+      if (eventTurnId && eventTurnId !== turn.turnId) continue;
+      turn.queue.push(event);
+      if (asRecord(event.raw)?.method === 'turn/completed') turn.queue.close();
     }
-    this.bufferedNotifications = remaining;
   }
 
   private failActive(err: Error): void {
     const detail = this.stderr ? `\n${this.stderr.slice(-2000)}` : '';
-    this.activeTurn?.queue.fail(new Error(`${err.message}${detail}`));
-    this.activeTurn = null;
+    if (!this.turn) return;
+    this.turn.queue.fail(new Error(`${err.message}${detail}`));
+    this.retire(this.turn);
   }
 }
 

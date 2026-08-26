@@ -2810,13 +2810,7 @@ async function writeAnthropicMessagesStream(
             });
           }
         }
-        if (textStarted && !textBlockClosed) {
-          textBlockClosed = true;
-          await writeSseEvent(res, 'content_block_stop', {
-            type: 'content_block_stop',
-            index: textBlockIndex,
-          });
-        }
+        await closeOpenTextBlock();
       }
 
       await writeSseEvent(res, 'message_delta', {

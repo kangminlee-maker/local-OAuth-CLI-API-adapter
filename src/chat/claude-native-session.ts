@@ -12,7 +12,7 @@ import type {
 
 type JsonObject = Record<string, unknown>;
 
-interface ActiveTurn {
+interface Turn {
   readonly queue: AsyncQueue<LocalCliChatRuntimeEvent>;
   /**
    * The turn's own deadline. It is retired with the turn: an abandoned
@@ -44,7 +44,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   private child: ChildProcessWithoutNullStreams | null = null;
   private lineReader: readline.Interface | null = null;
   private stderr = '';
-  private activeTurn: ActiveTurn | null = null;
+  private turn: Turn | null = null;
   /** The in-flight child replacement, so a turn waits for it instead of racing it. */
   private restarting: Promise<void> | null = null;
 
@@ -82,11 +82,11 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   ): AsyncIterable<LocalCliChatRuntimeEvent> {
     if (this.restarting) await this.restarting;
     if (!this.child) throw new Error('claude native chat session is not running');
-    if (this.activeTurn) throw new Error('claude native chat session already has a running turn');
+    if (this.turn) throw new Error('claude native chat session already has a running turn');
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
     const timer = setTimeout(() => {
       queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms`));
-      this.retireActiveTurn();
+      this.retire();
       // The child is still working on the abandoned prompt, and every line it
       // writes goes to whatever turn is active when it arrives — including the
       // `result` that closes a queue as a success. A timed-out turn's answer
@@ -106,7 +106,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       clearTimeout(timer);
       throw new Error('request aborted');
     }
-    this.activeTurn = { queue, timer };
+    this.turn = { queue, timer };
     signal?.addEventListener('abort', abort, { once: true });
     try {
       const request = chatNormalizedRequest(input, this.model);
@@ -118,7 +118,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       // an abandoned turn's prompt down a pipe belonging to nobody, either a
       // killed child's stdin or the replacement's.
       const child = this.child;
-      if (!child || this.activeTurn?.queue !== queue) {
+      if (!child || this.turn?.queue !== queue) {
         throw new Error('request aborted');
       }
       child.stdin.write(`${JSON.stringify({
@@ -133,24 +133,31 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     } finally {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', abort);
-      if (this.activeTurn?.queue === queue) this.retireActiveTurn();
+      if (this.turn?.queue === queue) this.retire();
     }
   }
 
   async interrupt(): Promise<void> {
-    const hadTurn = this.activeTurn !== null;
-    this.activeTurn?.queue.fail(new Error('request interrupted'));
-    this.retireActiveTurn();
+    const hadTurn = this.turn !== null;
+    this.turn?.queue.fail(new Error('request interrupted'));
+    this.retire();
     // This CLI has no in-band stop, so interrupting it is a restart: the child
     // is mid-prompt, and every line it writes goes to whatever turn is active
     // when it arrives. Without the restart the session reported `ready` while
     // every later turn answered "session is not running". An idle session has
     // nothing to interrupt, so it is left alone.
-    if (hadTurn) await this.restartChild();
+    // Not awaited: the replacement is a process launch, and the next turn
+    // already waits for it. Making the interrupt endpoint wait for a spawn
+    // spends that latency on every caller who asked only to stop.
+    if (hadTurn) void this.restartChild();
   }
 
   /** Replaces the child so the session stays usable after an abandoned turn. */
   private async restartChild(): Promise<void> {
+    // One replacement at a time. Two overlapping restarts killed the child the
+    // first had just spawned and left the second owning a field the first
+    // would not clear.
+    if (this.restarting) return this.restarting;
     const restart = (async () => {
       const previous = this.child;
       this.child = null;
@@ -177,8 +184,8 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   }
 
   async close(): Promise<void> {
-    this.activeTurn?.queue.close();
-    this.retireActiveTurn();
+    this.turn?.queue.close();
+    this.retire();
     this.lineReader?.close();
     this.child?.kill('SIGTERM');
     this.child = null;
@@ -241,27 +248,34 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
 
   private handleLine(line: string): void {
     const message = parseJsonObject(line);
-    if (!message || !this.activeTurn) return;
+    if (!message || !this.turn) return;
     const event = eventFromClaudeMessage(message);
-    this.activeTurn.queue.push(event);
+    this.turn.queue.push(event);
     if (message.type === 'result') {
-      if (message.subtype === 'success') this.activeTurn.queue.close();
-      else this.activeTurn.queue.fail(new Error(readErrorMessage(message)));
-      this.activeTurn = null;
+      if (message.subtype === 'success') this.turn.queue.close();
+      else this.turn.queue.fail(new Error(readErrorMessage(message)));
+      this.retire();
     }
   }
 
   private failActive(err: Error): void {
     const detail = this.stderr ? `\n${this.stderr.slice(-2000)}` : '';
-    this.activeTurn?.queue.fail(new Error(`${err.message}${detail}`));
-    this.retireActiveTurn();
+    this.turn?.queue.fail(new Error(`${err.message}${detail}`));
+    this.retire();
   }
 
-  /** Retires the running turn, its deadline included. */
-  private retireActiveTurn(): void {
-    if (!this.activeTurn) return;
-    clearTimeout(this.activeTurn.timer);
-    this.activeTurn = null;
+  /**
+   * Retires the running turn, its deadline included — and the ONLY place the
+   * turn stops being the session's. A deadline that outlives its turn fires
+   * against whoever is running by then: it retires that turn and replaces its
+   * child, and because the turn was already cleared, the child's exit fails
+   * nothing, so the replacement never answers and never errors either. Every
+   * path that ends a turn comes through here for that reason.
+   */
+  private retire(): void {
+    if (!this.turn) return;
+    clearTimeout(this.turn.timer);
+    this.turn = null;
   }
 }
 

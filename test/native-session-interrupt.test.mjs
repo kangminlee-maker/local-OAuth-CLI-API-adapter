@@ -25,6 +25,7 @@ const originalCodexHome = process.env.CODEX_HOME;
 const originalNoCompletion = process.env.FAKE_CODEX_NO_TURN_COMPLETION;
 const originalMethodLog = process.env.FAKE_CODEX_METHOD_LOG;
 const originalStartDelay = process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+const originalTrailing = process.env.FAKE_CODEX_TRAILING_NOTIFICATION;
 
 before(async () => {
   await chmod(fakeCodex, 0o755);
@@ -41,6 +42,8 @@ afterEach(async () => {
   else process.env.FAKE_CODEX_METHOD_LOG = originalMethodLog;
   if (originalStartDelay === undefined) delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
   else process.env.FAKE_CODEX_TURN_START_DELAY_MS = originalStartDelay;
+  if (originalTrailing === undefined) delete process.env.FAKE_CODEX_TRAILING_NOTIFICATION;
+  else process.env.FAKE_CODEX_TRAILING_NOTIFICATION = originalTrailing;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -351,6 +354,160 @@ test('an interrupted claude turn cannot time out the turn that replaced it', { t
     })(),
     /already has a running turn/i,
     'the replacement must still hold the session after the stale deadline',
+  );
+});
+
+test('a completed turn nobody read cannot time out the turn after it', { timeout: 20_000 }, async () => {
+  // The other way a turn ends without its generator finishing: the child
+  // answered, `handleLine` closed the queue and retired the turn, but the
+  // reader had stopped advancing — so `startTurn`'s `finally`, the other place
+  // the deadline is cleared, never ran. Retiring a turn has to take its
+  // deadline with it wherever the turn ends.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const session = await ClaudeNativeCliChatSession.create({
+    command: fakeClaude,
+    cwd,
+    model: 'claude-opus-4-8',
+    timeoutMs: 1_000,
+  });
+  openSessions.push(() => session.close());
+
+  const finished = session.startTurn({ input: 'Say OK' })[Symbol.asyncIterator]();
+  await finished.next();
+  await delay(800);
+
+  const replacement = session.startTurn({ input: 'HANG' })[Symbol.asyncIterator]();
+  let replacementEnded = null;
+  replacement.next().then(
+    () => { replacementEnded = 'resolved'; },
+    (err) => { replacementEnded = err; },
+  );
+  // Past the finished turn's deadline, far short of the replacement's own.
+  await delay(400);
+
+  assert.equal(replacementEnded, null, `the replacement was failed by a finished turn's deadline: ${replacementEnded}`);
+  await assert.rejects(
+    (async () => {
+      for await (const _event of session.startTurn({ input: 'Say OK' })) break;
+    })(),
+    /already has a running turn/i,
+    'the replacement must still hold the session',
+  );
+});
+
+const PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+test('an interrupt while the input is being prepared keeps the turn off the child', { timeout: 20_000 }, async () => {
+  // Preparing the input is file I/O — a temp file per image — and it happens
+  // before the child is asked for anything. A turn that cannot be seen during
+  // that window cannot be stopped there either: the interrupt answered `200`
+  // while the turn went on to start on the child and run to completion.
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const stream = manager.streamTurn(session.id, {
+    input: [
+      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PIXEL_PNG } },
+      { type: 'text', text: 'describe it' },
+    ],
+  })[Symbol.asyncIterator]();
+  // The generator body runs to its first await — preparing the input — so the
+  // interrupt lands inside that window.
+  const first = stream.next();
+
+  await manager.interrupt(session.id);
+  const event = await first;
+
+  assert.equal(event.value?.event, 'cli.error', `the turn ends for its caller: ${JSON.stringify(event)}`);
+  assert.deepEqual(
+    (await receivedMethods(methodLog)).filter((method) => method === 'turn/start'),
+    [],
+    'a turn stopped before it was sent must never reach the child',
+  );
+});
+
+test('a session survives an interrupt whose runtime stop throws', { timeout: 20_000 }, async () => {
+  // One route to stopping means one route to failing. Leaving the status at
+  // `running` because the runtime threw answers every later turn with 409 for
+  // the life of the process.
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: {},
+        async *startTurn() {
+          yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'hi' };
+          // Still running: the turn has to be live when the interrupt fails, or
+          // the status this is about was already restored by its own stream.
+          await new Promise(() => {});
+        },
+        async interrupt() {
+          throw new Error('the pipe died under the interrupt');
+        },
+        async close() {},
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'codex' });
+  const running = manager.streamTurn(session.id, { input: 'one' })[Symbol.asyncIterator]();
+  await running.next();
+  assert.equal(manager.get(session.id).status, 'running');
+
+  await assert.rejects(manager.interrupt(session.id), /pipe died/);
+
+  assert.equal(manager.get(session.id).status, 'ready', 'the session is not wedged');
+  const next = manager.streamTurn(session.id, { input: 'two' })[Symbol.asyncIterator]();
+  const first = await next.next();
+  assert.equal(first.value?.event, 'cli.event', 'a later turn is admitted');
+});
+
+test('a turn that is still starting already occupies the session', { timeout: 20_000 }, async () => {
+  // Occupancy used to begin at the child's acknowledgement, so a second turn
+  // could be dispatched into the same window and overwrite the first turn's
+  // stop — leaving the first stoppable and the second not.
+  const { manager } = await startCodexManager();
+  const created = await manager.create({ runtime: 'codex' });
+  const cwd = process.cwd();
+  const session = await CodexNativeCliChatSession.create({ command: fakeCodex, cwd, timeoutMs: 20_000 });
+  openSessions.push(() => session.close());
+  void created;
+
+  const first = session.startTurn({ input: 'hello' })[Symbol.asyncIterator]();
+  void first.next().catch(() => undefined);
+
+  await assert.rejects(
+    (async () => {
+      for await (const _event of session.startTurn({ input: 'again' })) break;
+    })(),
+    /already has a running turn/i,
+  );
+  await session.interrupt();
+});
+
+test('an interrupted turn does not report its tail as the next turn', { timeout: 20_000 }, async () => {
+  // A child keeps talking for a moment after being told to stop, and what it
+  // says without a turn id used to be held and replayed into whatever turn came
+  // next — reported as that turn's events, and its usage.
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION = '1';
+  const { manager } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const abandoned = manager.streamTurn(session.id, { input: 'hello' })[Symbol.asyncIterator]();
+  await abandoned.next();
+  await manager.interrupt(session.id);
+  await delay(100);
+
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  const next = [];
+  for await (const event of manager.streamTurn(session.id, { input: 'DEBUG_PAYLOAD' })) next.push(event);
+
+  assert.equal(next.at(-1).event, 'cli.completed');
+  assert.equal(
+    next.some((event) => event.usage?.totalTokens === 999),
+    false,
+    `the interrupted turn's tail was reported as this turn's: ${JSON.stringify(next.map((e) => e.usage))}`,
   );
 });
 
