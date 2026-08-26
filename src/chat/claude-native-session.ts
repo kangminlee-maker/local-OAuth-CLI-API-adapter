@@ -14,6 +14,12 @@ type JsonObject = Record<string, unknown>;
 
 interface ActiveTurn {
   readonly queue: AsyncQueue<LocalCliChatRuntimeEvent>;
+  /**
+   * The turn's own deadline. It is retired with the turn: an abandoned
+   * generator never reaches its `finally`, so a turn stopped any other way
+   * left its timer armed to fire on whatever turn was running by then.
+   */
+  readonly timer: NodeJS.Timeout;
 }
 
 export interface ClaudeNativeCliChatSessionOptions {
@@ -80,7 +86,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
     const timer = setTimeout(() => {
       queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms`));
-      this.activeTurn = null;
+      this.retireActiveTurn();
       // The child is still working on the abandoned prompt, and every line it
       // writes goes to whatever turn is active when it arrives — including the
       // `result` that closes a queue as a success. A timed-out turn's answer
@@ -100,7 +106,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       clearTimeout(timer);
       throw new Error('request aborted');
     }
-    this.activeTurn = { queue };
+    this.activeTurn = { queue, timer };
     signal?.addEventListener('abort', abort, { once: true });
     try {
       const request = chatNormalizedRequest(input, this.model);
@@ -127,14 +133,14 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     } finally {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', abort);
-      if (this.activeTurn?.queue === queue) this.activeTurn = null;
+      if (this.activeTurn?.queue === queue) this.retireActiveTurn();
     }
   }
 
   async interrupt(): Promise<void> {
     const hadTurn = this.activeTurn !== null;
     this.activeTurn?.queue.fail(new Error('request interrupted'));
-    this.activeTurn = null;
+    this.retireActiveTurn();
     // This CLI has no in-band stop, so interrupting it is a restart: the child
     // is mid-prompt, and every line it writes goes to whatever turn is active
     // when it arrives. Without the restart the session reported `ready` while
@@ -172,7 +178,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
 
   async close(): Promise<void> {
     this.activeTurn?.queue.close();
-    this.activeTurn = null;
+    this.retireActiveTurn();
     this.lineReader?.close();
     this.child?.kill('SIGTERM');
     this.child = null;
@@ -248,6 +254,13 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   private failActive(err: Error): void {
     const detail = this.stderr ? `\n${this.stderr.slice(-2000)}` : '';
     this.activeTurn?.queue.fail(new Error(`${err.message}${detail}`));
+    this.retireActiveTurn();
+  }
+
+  /** Retires the running turn, its deadline included. */
+  private retireActiveTurn(): void {
+    if (!this.activeTurn) return;
+    clearTimeout(this.activeTurn.timer);
     this.activeTurn = null;
   }
 }

@@ -32,6 +32,17 @@ rl.on('line', (line) => {
   // A child that took the prompt and never answered — the failure an interrupt
   // exists for, and the only way to hold a turn open here.
   if (text.includes('HANG')) return;
+  // One event and then silence: the turn produces, so its reader can stop
+  // advancing at a yield, and the turn stays open behind it.
+  if (text.includes('PARTIAL')) {
+    write({ type: 'system', subtype: 'init', session_id: 'fake_native_session' });
+    write({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'thinking' } },
+      session_id: 'fake_native_session',
+    });
+    return;
+  }
   write({ type: 'system', subtype: 'init', session_id: 'fake_native_session' });
   write({
     type: 'stream_event',

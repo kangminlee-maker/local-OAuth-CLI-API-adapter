@@ -299,6 +299,61 @@ test('a claude turn whose caller left before it started writes nothing to the ch
   assert.equal(await turnText(session, 'Say OK'), 'OK', 'the session still answers');
 });
 
+test('an interrupted claude turn cannot time out the turn that replaced it', { timeout: 20_000 }, async () => {
+  // A turn's deadline belongs to that turn. An abandoned generator never
+  // reaches its `finally`, so the interrupt that retires it leaves the timer
+  // armed — and the callback retired whatever turn was active when it fired,
+  // child and all.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const session = await ClaudeNativeCliChatSession.create({
+    command: fakeClaude,
+    cwd,
+    model: 'claude-opus-4-8',
+    timeoutMs: 1_000,
+  });
+  openSessions.push(() => session.close());
+
+  // Pulled once and then left alone: the generator is suspended at a yield, so
+  // failing its queue does not resume it and its `finally` never runs. A reader
+  // that is merely awaiting the next event WOULD resume and clear the timer, so
+  // this state is the one the finding is about.
+  const abandoned = session.startTurn({ input: 'PARTIAL' })[Symbol.asyncIterator]();
+  await abandoned.next();
+  // Late in the abandoned turn's budget, so its stale deadline fires well
+  // before the replacement's own — otherwise the replacement timing out on
+  // schedule would look exactly like the defect.
+  await delay(800);
+  await session.interrupt();
+
+  const replacement = session.startTurn({ input: 'HANG' })[Symbol.asyncIterator]();
+  let replacementEnded = null;
+  replacement.next().then(
+    () => { replacementEnded = 'resolved'; },
+    (err) => { replacementEnded = err; },
+  );
+
+  // Past the abandoned turn's deadline (1000ms from its start), and 600ms short
+  // of the replacement's own.
+  await delay(400);
+  assert.equal(
+    replacementEnded,
+    null,
+    `the replacement turn was failed by an abandoned turn's deadline: ${replacementEnded}`,
+  );
+  // The signature of the defect is not an error — it is silence. The stale
+  // callback clears whatever turn is active and replaces the child, and the
+  // exit of a child nobody is tracking fails nothing, so the replacement just
+  // never answers. What proves it survived is that it still owns the session.
+  await assert.rejects(
+    (async () => {
+      for await (const _event of session.startTurn({ input: 'Say OK' })) break;
+    })(),
+    /already has a running turn/i,
+    'the replacement must still hold the session after the stale deadline',
+  );
+});
+
 async function turnText(session, input) {
   let text = '';
   for await (const event of session.startTurn({ input })) {
