@@ -16,8 +16,7 @@ const includeLiveModel = args.includes('--include-live-model');
 const failOnLiveFailure = args.includes('--fail-on-live-failure');
 const timeoutMs = Number(readValueArg('--timeout-ms') ?? 180_000);
 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-// Number of live model probes `runLiveModelSmokes` issues; keep in step with it.
-const LIVE_PROBE_COUNT = 7;
+const CATALOG_COLLECT_TIMEOUT_MS = 240_000;
 
 const tempRoot = await mkdtemp(join(tmpdir(), 'runtime-capability-smoke-'));
 const rows = [];
@@ -33,9 +32,9 @@ try {
 
   // There used to be a 1M-token warning here fed by a hardcoded 7 x 2,000
   // estimate, so the branch could never fire and documented a safeguard that did
-  // not exist. What is actually known before the run is how many live probes it
-  // will make; report that instead of a number nobody measured.
-  const plannedLiveProbes = includeLiveModel ? LIVE_PROBE_COUNT : 0;
+  // not exist. Its replacement counts the live rows the run actually produced
+  // rather than a constant someone has to remember to update — which is how the
+  // estimate it replaced went wrong.
 
   if (includeLiveModel) {
     liveRows.push(...await runLiveModelSmokes({ timeoutMs }));
@@ -43,7 +42,7 @@ try {
   }
 
   const summary = summarizeRows(rows, {
-    plannedLiveProbes,
+    liveProbes: liveRows.length,
   });
   const report = {
     generatedAt: new Date().toISOString(),
@@ -114,7 +113,7 @@ async function collectCatalog(root) {
     // parse probe it makes, and each probe carries its own multi-second timeout.
     // It measured 55s here the day a negative-control probe was added to the
     // codex path, which is what a 60s budget turns into an empty crash.
-    timeoutMs: 240_000,
+    timeoutMs: CATALOG_COLLECT_TIMEOUT_MS,
     maxBuffer: 20_000_000,
   });
   if (!result.ok) {
@@ -122,7 +121,7 @@ async function collectCatalog(root) {
     // empty strings and reported that catalog collection failed for no stated
     // reason. Say which way it failed.
     const how = result.signal
-      ? `killed by ${result.signal} (likely the ${240_000}ms budget)`
+      ? `killed by ${result.signal} (likely the ${CATALOG_COLLECT_TIMEOUT_MS}ms budget)`
       : `exit code ${result.code}`;
     throw new Error(`catalog collection failed: ${how}${result.stderr ? `\n${result.stderr}` : ''}`);
   }
@@ -171,16 +170,21 @@ function smokeCatalogBasics(catalog) {
   // green over a stale catalog, because nothing else in this report looks at
   // whether the documented surface still matches the installed one.
   const validity = catalog.catalogValidity ?? {};
-  const validityOk = validity.exists === true
-    && validity.staleCount === 0
-    && validity.inconclusive === false;
+  // Two different things, and only one of them is the adapter's problem. A
+  // stale entry means the catalog is WRONG and must fail. `inconclusive` means
+  // this machine could not check — one CLI missing, a probe killed — which is a
+  // true statement about the run, not a defect in the tree, and failing on it
+  // would make the smoke unrunnable anywhere but the author's laptop. The
+  // collector's own `--fail-on-stale` gate still fails on inconclusive, which is
+  // the right place for that rule.
+  const stale = validity.exists !== true || (validity.staleCount ?? 0) > 0;
   result.push({
     id: 'catalog.validity',
     runtime: 'both',
     kind: 'catalog_validation',
     risk: 'safe_metadata',
     execution: 'metadata',
-    status: validityOk ? 'pass' : 'fail',
+    status: stale ? 'fail' : (validity.inconclusive ? 'inventory' : 'pass'),
     inputContract: 'update-runtime-capability-catalog.mjs --skip-binary-scan (run by this smoke)',
     outputSchema: 'catalogValidity: exists, staleCount 0, inconclusive false',
     evidence: [
@@ -735,7 +739,7 @@ Generated at: ${report.generatedAt}
 
 Live model probes: ${report.includeLiveModel ? 'enabled' : 'disabled'}
 
-Planned live model probes: ${report.summary.plannedLiveProbes}
+Live model probes run: ${report.summary.liveProbes}
 
 ## Summary
 
@@ -744,7 +748,7 @@ Planned live model probes: ${report.summary.plannedLiveProbes}
 | Total rows | ${report.summary.total} |
 | Pass | ${report.summary.byStatus.pass ?? 0} |
 | Fail | ${report.summary.byStatus.fail ?? 0} |
-| Skipped | ${report.summary.byStatus.skip ?? 0} |
+| Inventory (asserts nothing) | ${report.summary.byStatus.inventory ?? 0} |
 
 ## Risk Classification
 

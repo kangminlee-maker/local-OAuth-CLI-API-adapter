@@ -176,9 +176,24 @@ export async function validateCatalog(data) {
   // computed the set and nothing read it, so the assertion in that comment was
   // never true. A missing string is not staleness on its own — the scan is noisy
   // and L0 is candidates only — but it is authority the run did not get.
-  for (const runtime of ['codex', 'claude']) {
-    const scan = data[runtime]?.binaryScan;
-    if (scan?.available && scan.ok && (scan.hiddenFlagsMissing ?? []).length > 0) {
+  //
+  // This covers claude only, and by design rather than by omission: `collectClaude`
+  // is the caller that passes a declared candidate list to `collectBinaryScan`,
+  // because those flags are hidden from every help surface AND cannot be probed
+  // positively — the CLI tolerates unknown options there. Codex's hidden options
+  // are probeable, so `codexOptionUses` is their authority and it is a stronger
+  // one; a candidate list for codex would add a noisier check over the same
+  // ground. Reading `hiddenFlagsMissing` for a runtime that declared no
+  // candidates would be a check over an empty set, which is the shape this whole
+  // pass exists to remove.
+  for (const [runtime, scan] of [['claude', data.claude?.binaryScan]]) {
+    if (!scan?.available || !scan.ok) continue;
+    const declared = (scan.hiddenFlagsPresent ?? []).length + (scan.hiddenFlagsMissing ?? []).length;
+    if (declared === 0) {
+      inconclusiveReasons.push(`${runtime} binary scan ran with no declared hidden-flag candidates to check`);
+      continue;
+    }
+    if (scan.hiddenFlagsMissing.length > 0) {
       inconclusiveReasons.push(`${runtime} binary scan no longer finds declared hidden-flag candidates: ${scan.hiddenFlagsMissing.join(', ')}`);
     }
   }

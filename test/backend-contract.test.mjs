@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
   buildPrompt,
@@ -167,44 +168,52 @@ test('buildPrompt keeps instruction messages by default for non-Codex backends',
 
 // The old version of this test asserted each of 46 instruction phrases was
 // present, which pinned the overfitting in place: every phrase tuned to one
-// quality-suite question had a test defending it. What the runtime owes a caller
-// is general request fidelity, so that is what is asserted here — plus the
-// negative half, which is the part that can actually fail when someone answers a
-// benchmark shortfall by teaching the runtime that benchmark's questions again.
-test('developer instructions state general request fidelity and nothing question-shaped', () => {
-  const instructions = developerInstructions();
+// quality-suite question had a test defending it. A denylist replaced it and was
+// no better — 12 patterns caught only a handful of the 38 deleted lines, so most
+// of them could come back green. The set of lines the runtime injects is small
+// and deliberate, so assert it exactly: anything added, removed or reworded
+// fails here and has to be an explicit edit to this list, which is the decision
+// the injected surface deserves.
+const DEVELOPER_INSTRUCTION_LINES = [
+  'Follow API request instruction messages and tagged conversation messages only.',
+  'Return requested content exactly.',
+  'No preface or caveat unless requested.',
+  'Preserve counts, formats, and word limits.',
+  'Preserve numbers, thresholds, labels, and technical identifiers exactly.',
+  'Preserve every explicit fact, comparison, decision criterion, exception, and threshold from the request.',
+  'When concise output is requested, omit filler rather than omitting required facts or criteria.',
+  'JSON mode: JSON only.',
+];
 
-  for (const rule of [
-    /Follow API request instruction messages/,
-    /Return requested content exactly/,
-    /No preface or caveat unless requested/,
-    /Preserve counts, formats, and word limits/,
-    /Preserve numbers, thresholds, labels, and technical identifiers exactly/,
-    /Preserve every explicit fact, comparison, decision criterion, exception, and threshold/,
-    /omit filler rather than omitting required facts/,
-    /JSON mode: JSON only/,
-  ]) {
-    assert.match(instructions, rule, `general request-fidelity rule missing: ${rule}`);
-  }
+test('developer instructions are exactly the general request-fidelity rules', () => {
+  assert.equal(developerInstructions(), DEVELOPER_INSTRUCTION_LINES.join(' '));
+});
 
-  // Subject matter belonging to one quality-suite question. A runtime that names
-  // these is answering that question from the prompt rather than from the model,
-  // and the suite stops measuring the adapter.
-  for (const questionShaped of [
-    /incident report/i,
-    /four-bullet|fixed-bullet/i,
-    /benchmark plan|test plan/i,
-    /vision judge|judge rubric/i,
-    /baseline row/i,
-    /error\.param|error\.code/i,
-    /wrapper context/i,
-    /turn wait|turnWaitMs/i,
-    /first_tool_argument|firstToolArgument/i,
-    /release gate/i,
-    /egress/i,
-    /one-to-one area mapping/i,
-  ]) {
-    assert.doesNotMatch(instructions, questionShaped, `question-shaped instruction returned: ${questionShaped}`);
+// Every surface that injects prose into a request, not just the one that grew.
+// A line shaped to a quality-suite question is as harmful in the image builder
+// as in the developer block, and the block that grew to 46 lines was the one
+// nobody was watching.
+test('no injected instruction surface names a quality-suite question', async () => {
+  const { claudeSystemPrompt } = await import('../dist/proxy/backend-contract.js');
+  const appServer = await readFile(new URL('../src/proxy/codex-app-server-backend.ts', import.meta.url), 'utf8');
+  const imageBlocks = [...appServer.matchAll(/function image\w*Instructions\(\)[^}]*}/g)].map((m) => m[0]);
+  assert.ok(imageBlocks.length >= 2, 'expected the image base and developer instruction builders');
+
+  const surfaces = [
+    ['developerInstructions', developerInstructions()],
+    ['claudeSystemPrompt', claudeSystemPrompt()],
+    ...imageBlocks.map((block, index) => [`image instruction block ${index + 1}`, block]),
+  ];
+  const questionShaped = [
+    /incident report/i, /four-bullet|fixed-bullet/i, /benchmark plan|test plan/i,
+    /vision judge|judge rubric/i, /baseline row/i, /error\.param|error\.code/i,
+    /wrapper context/i, /turn wait|turnWaitMs/i, /first_tool_argument|firstToolArgument/i,
+    /release gate/i, /zero-score/i, /one-to-one area mapping/i,
+  ];
+  for (const [name, text] of surfaces) {
+    for (const pattern of questionShaped) {
+      assert.doesNotMatch(text, pattern, `${name} returned question-shaped instruction: ${pattern}`);
+    }
   }
 });
 

@@ -39,7 +39,7 @@ pnpm catalog:runtime -- --skip-binary-scan
 
 | 플래그 | 끄는 것 | 게이트에 미치는 영향 |
 | --- | --- | --- |
-| `--skip-binary-scan` | L0 문자열 스캔 | 노이즈 감소. 게이트 판정에는 원래 반영되지 않는다(아래 「알려진 결함」 참조) |
+| `--skip-binary-scan` | L0 문자열 스캔 | 노이즈 감소. **claude의 L0 후보가 사라지면 inconclusive가 되므로, 이 플래그는 그 신호를 끈다.** `pnpm smoke:runtime-capabilities`는 이 플래그를 항상 붙이므로 smoke의 `catalog.validity` 행은 L0 드리프트를 보지 못한다 — L0 확인이 목적이면 수집기를 직접 돌린다 |
 | `--skip-flag-probe` | flag parse probe | `hiddenFlagAuthority`가 `declared_fallback`이 된다 — **규칙 4-1이 경고하는 그 상태를 만드는 것이 이 플래그다** |
 | `--skip-command-tree` | command 수집 | `validateDocumentedCommands`가 `not_collected`가 되어 command staleness가 0으로 보고된다 |
 | `--catalog <path>` | — | 검증 대상 문서를 바꾼다. 다른 파일을 검증하고 이 카탈로그가 통과했다고 읽지 않도록 주의 |
@@ -75,8 +75,10 @@ live smoke는 `--fail-on-live-failure`를 주지 않으면 **live 행이 전부 
 pnpm smoke:runtime-capabilities -- --include-live-model --fail-on-live-failure
 ```
 
-**1m token 경고는 현재 동작하지 않는다.** 추정치가 프롬프트를 읽지 않고 고정값을 쓰며 임계값보다
-두 자리 작아, 그 분기는 발화하지 않는다. 비용 통제를 이 경고에 의존하지 않는다.
+live smoke 비용을 미리 제한하는 장치는 없다. report는 실제로 실행한 live probe 수를
+`Live model probes run`으로 보고하며, 그것이 이 스위트가 비용에 대해 아는 전부다. 예전에 있던 1m token
+경고는 프롬프트를 읽지 않는 고정 추정치를 임계값보다 두 자리 작은 값과 비교해 결코 발화할 수 없었고,
+있지도 않은 안전장치를 문서가 보증하고 있었으므로 제거했다.
 
 ## 갱신 원칙
 

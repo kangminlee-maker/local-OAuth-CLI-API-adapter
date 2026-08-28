@@ -160,7 +160,10 @@ export async function commandUsage(binary, commandPath) {
   // A help that never ran carries no usage line, and an absent usage line is
   // how a command gets called removed. Say the run failed instead.
   if (!result.ok) return null;
-  return parseHelpText(`${result.stdout ?? ''}\n${result.stderr ?? ''}`).usage ?? null;
+  // `parseHelpText` initialises usage to '' and never returns null, so an empty
+  // string here means "help ran and printed no usage line" — not a usage of
+  // zero length. It is not a value the caller can compare against.
+  return parseHelpText(`${result.stdout ?? ''}\n${result.stderr ?? ''}`).usage || null;
 }
 
 // A hidden command prints usage for itself; an unknown name falls back to the
@@ -182,7 +185,11 @@ export async function commandAnswersForItself(binary, binaryName, commandPath, p
   // first. Three outcomes, so "could not tell" stays visible.
   if (!result.ok) return 'indeterminate';
   const usage = parseHelpText(text).usage;
-  if (!usage) return 'indeterminate';
-  if (parentUsage === null || parentUsage === undefined) return 'indeterminate';
+  // Both sides must be a real usage line. `parseHelpText` returns '' rather than
+  // null when it finds none, so a `=== null` guard here lets '' through and the
+  // `usage !== parentUsage` comparison below then reports a REMOVED command as
+  // confirmed — the inverted verdict this function exists to avoid. Compare
+  // truthiness, not nullness.
+  if (!usage || !parentUsage) return 'indeterminate';
   return usage !== parentUsage ? 'yes' : 'no';
 }
