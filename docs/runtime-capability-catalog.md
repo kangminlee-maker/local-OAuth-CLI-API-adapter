@@ -11,7 +11,7 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 | Runtime | Local version | Command on PATH | Scan target | Primary hot path |
 | --- | --- | --- | --- | --- |
 | Codex CLI | `codex-cli 0.149.1` | `/opt/homebrew/bin/codex` | 동일 | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.250` | `/Users/kangmin/.superset/bin/claude` (wrapper) | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Claude Code | `2.1.251` | `/Users/kangmin/.superset/bin/claude` (wrapper) | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
 PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper가 실제로 실행되는 명령이므로 version·help·schema·parse probe 같은 동작 권위는 wrapper 기준으로 수집한다. 다만 wrapper script에는 바이너리 문자열이 없으므로 string scan만 native 바이너리를 대상으로 하며, 그 후보는 wrapper와 `--version`이 일치할 때만 채택한다. 일치하는 후보가 없으면 scan은 대상 없음으로 보고한다. report의 `Command on PATH`와 `Scan target` 열이 이 둘을 구분한다.
 
@@ -36,7 +36,7 @@ L0과 L4의 관계에 주의한다. binary에 문자열이 남아 있다는 사�
 
 예외 하나. Codex app-server 요청 파라미터는 L2로 충분하다. 생성 schema와 문서화된 파라미터 표를 수집기가 직접 대조하므로 미선언 파라미터가 stale로 드러난다. CLI flag와 환경변수에는 이 대조가 없다.
 
-이 문서에서 L5로 표시된 관찰의 출처는 모두 동일하다. **2026-08-28, `codex-cli 0.149.1` / Claude Code `2.1.250`**, 요청 본문을 기록하고 400을 반환하는 로컬 HTTP sink로 수집했다. sink는 CLI 실행 전에 `curl`로 자가 검사해 "본문 0건"이 계측 실패와 구분되도록 했다.
+이 문서에서 L5로 표시된 관찰의 출처는 모두 동일하다. **2026-08-28, `codex-cli 0.149.1` / Claude Code `2.1.251`**, 요청 본문을 기록하고 400을 반환하는 로컬 HTTP sink로 수집했다. sink는 CLI 실행 전에 `curl`로 자가 검사해 "본문 0건"이 계측 실패와 구분되도록 했다.
 
 ## 갱신 방식
 
@@ -451,7 +451,7 @@ binary string scan은 위 목록보다 많은 option 등록 문자열을 뱉지�
 
 ### 환경 격리와 wire 기본값
 
-adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 관찰 조건은 위 신뢰 레벨 절과 같다(2026-08-28, Claude Code `2.1.250`, 로컬 sink). 기준선이 둘이라는 점에 주의한다. host-default는 설정 파일과 CLAUDE.md가 살아 있는 상태이고 isolated는 `--bare`에 빈 `--setting-sources`를 준 상태인데, 아무 flag도 주지 않은 adapter가 물려받는 쪽은 host-default다.
+adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 관찰 조건은 위 신뢰 레벨 절과 같다(2026-08-28, Claude Code `2.1.251`, 로컬 sink). 기준선이 둘이라는 점에 주의한다. host-default는 설정 파일과 CLAUDE.md가 살아 있는 상태이고 isolated는 `--bare`에 빈 `--setting-sources`를 준 상태인데, 아무 flag도 주지 않은 adapter가 물려받는 쪽은 host-default다.
 
 | Knob | 미설정 기본값 | 효과 | 권위 |
 | --- | --- | --- | --- |

@@ -92,11 +92,18 @@ try {
   // field check passes over an empty set, and the report is green about a
   // surface it never enumerated. The floors are this machine's populations;
   // they exist to catch a parser that stopped, not to pin an exact count.
+  // Conditioned on the runtime having been found. A population is empty for two
+  // very different reasons — the parser broke, or the CLI is not installed on
+  // this machine — and only the first is a defect. Failing on the second makes
+  // the smoke unrunnable anywhere but the author's laptop, which is the same
+  // mistake the `catalog.validity` row above avoids.
+  const haveClaude = Boolean(catalog.claude?.binary);
+  const haveCodex = Boolean(catalog.codex?.binary);
   const emptyPopulations = [
-    ['claude commands from --help', rows.filter((row) => row.id.startsWith('claude.command.')).length],
-    ['codex app-server schema methods', rows.filter((row) => row.id.startsWith('codex.schema.')).length],
-    ['claude flag inventory', rows.filter((row) => row.id.startsWith('claude.flag.')).length],
-  ].filter(([, count]) => count === 0);
+    ['claude commands from --help', haveClaude, rows.filter((row) => row.id.startsWith('claude.command.')).length],
+    ['codex app-server schema methods', haveCodex, rows.filter((row) => row.id.startsWith('codex.schema.')).length],
+    ['claude flag inventory', haveClaude, rows.filter((row) => row.id.startsWith('claude.flag.')).length],
+  ].filter(([, present, count]) => present && count === 0);
   if (emptyPopulations.length > 0) {
     process.stderr.write(`capability populations came back empty: ${emptyPopulations.map(([label]) => label).join(', ')}\n`);
   }
