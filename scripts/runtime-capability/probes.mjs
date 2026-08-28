@@ -132,6 +132,24 @@ export async function probeFlagInCommand(binary, command, flag) {
   return classifyFlagProbe(`${result.stdout ?? ''}\n${result.stderr ?? ''}`, flag, result);
 }
 
+// The same negative control the hidden-flag probe insists on, for the other
+// runtime. `classifyFlagProbe` decides "unregistered" by matching the CLI's
+// rejection wording, so a release that rewords it makes every probe fall
+// through to `registered_parsed` — every documented option would read as
+// confirmed and nothing would look wrong. Probing a flag the CLI cannot have
+// is what distinguishes "the parser rejected it" from "the matcher stopped
+// working". Controls are probed per command because subcommands can differ.
+export async function probeFlagControls(binary, command) {
+  const verdicts = {};
+  for (const control of FLAG_PROBE_CONTROLS) {
+    verdicts[control] = await probeFlagInCommand(binary, command, control);
+  }
+  return {
+    verdicts,
+    ok: FLAG_PROBE_CONTROLS.every((control) => verdicts[control] === 'unregistered'),
+  };
+}
+
 export async function commandUsage(binary, commandPath) {
   const argv = commandPath ? [...commandPath.split(' '), '--help'] : ['--help'];
   const result = await run(binary, argv, {
@@ -139,7 +157,13 @@ export async function commandUsage(binary, commandPath) {
     maxBuffer: 8_000_000,
     cwd: await probeScratchDir(),
   });
-  return parseHelpText(`${result.stdout ?? ''}\n${result.stderr ?? ''}`).usage;
+  // A help that never ran carries no usage line, and an absent usage line is
+  // how a command gets called removed. Say the run failed instead.
+  if (!result.ok) return null;
+  // `parseHelpText` initialises usage to '' and never returns null, so an empty
+  // string here means "help ran and printed no usage line" — not a usage of
+  // zero length. It is not a value the caller can compare against.
+  return parseHelpText(`${result.stdout ?? ''}\n${result.stderr ?? ''}`).usage || null;
 }
 
 // A hidden command prints usage for itself; an unknown name falls back to the
@@ -151,10 +175,22 @@ export async function commandAnswersForItself(binary, binaryName, commandPath, p
     maxBuffer: 8_000_000,
     cwd: await probeScratchDir(),
   });
+  // Nothing this run printed is evidence unless the run itself completed. A
+  // killed or non-zero invocation can still have emitted partial output that
+  // mentions the command — an error line naming it is enough — and reading that
+  // as "the command answered for itself" confirms an entry the CLI may have
+  // removed. The failure check has to come before any inspection of the text.
+  if (!result.ok) return 'indeterminate';
   const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
   if (new RegExp(`(^|\\s)${escapeRegExp(binaryName)}\\s+${escapeRegExp(commandPath)}(\\s|$)`, 'im').test(text)) {
-    return true;
+    return 'yes';
   }
   const usage = parseHelpText(text).usage;
-  return Boolean(usage) && Boolean(parentUsage) && usage !== parentUsage;
+  // Both sides must be a real usage line. `parseHelpText` returns '' rather than
+  // null when it finds none, so a `=== null` guard here lets '' through and the
+  // `usage !== parentUsage` comparison below then reports a REMOVED command as
+  // confirmed — the inverted verdict this function exists to avoid. Compare
+  // truthiness, not nullness.
+  if (!usage || !parentUsage) return 'indeterminate';
+  return usage !== parentUsage ? 'yes' : 'no';
 }

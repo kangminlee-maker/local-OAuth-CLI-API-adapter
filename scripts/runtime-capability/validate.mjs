@@ -12,7 +12,8 @@ import {
   normalizeDomainValue,
 } from './catalog-doc.mjs';
 import { rootOptionsOf } from './help-parser.mjs';
-import { commandAnswersForItself, commandUsage, probeFlagInCommand } from './probes.mjs';
+import { commandAnswersForItself, commandUsage, probeFlagControls, probeFlagInCommand } from './probes.mjs';
+import { probeTelemetry } from './exec.mjs';
 import {
   difference,
   extractVersionCell,
@@ -123,6 +124,83 @@ export async function validateCatalog(data) {
   // makes every declared hidden flag "supported", drives stale to zero, and lets
   // the verdict claim validity the run never established.
   const inconclusiveReasons = [];
+
+  // A run that stopped probing partway inspected only part of the surface, so it
+  // cannot support "nothing changed" for the part it never reached. Same rule as
+  // the truncated command walk below.
+  const probes = probeTelemetry();
+  if (probes.exhausted) {
+    inconclusiveReasons.push(`probe budget of ${probes.budgetMs}ms exhausted after ${probes.count} spawns: the rest of the surface went unprobed`);
+  }
+
+  // The same rule, one level earlier. Every check below compares a documented
+  // set against a collected one, so an empty documented set makes each
+  // difference() empty, each count zero, and the verdict clean — which is
+  // indistinguishable from a run that checked everything and found nothing. The
+  // ordinary way it happens is a renamed heading or a reformatted version row,
+  // and this catalog's own update rules actively invite both: they tell the
+  // operator to restructure the document. Assert the parse before trusting what
+  // it produced.
+  if (!codexSection) {
+    inconclusiveReasons.push('catalog heading "## Codex capability list" not found: codex expectations parsed empty');
+  } else if (documentedCodexMethods.length === 0) {
+    inconclusiveReasons.push('codex capability section parsed to zero documented methods');
+  }
+  if (!claudeSection) {
+    inconclusiveReasons.push('catalog heading "## Claude Code capability list" not found: claude expectations parsed empty');
+  } else if (documentedClaudeFlags.length === 0) {
+    inconclusiveReasons.push('claude capability section parsed to zero documented flags');
+  }
+  // Section-wide non-emptiness is not enough: each of these parsers reads its own
+  // table with its own heading, and any one of them can return an empty list
+  // while the surrounding section is full. Its validator then iterates zero
+  // times, its stale set is empty, and the verdict is clean over claims nobody
+  // checked. Populations on this machine are 66/33 commands, 14 codex flag uses,
+  // 2 request contracts and 10 option domains, so zero means the parse broke.
+  // The mirror of the parsed-population check. A diff needs both sides: if the
+  // COLLECTED authority came back empty — schema not generated, help not read,
+  // probes stopped — then every documented entry looks missing and staleCount
+  // reports the whole catalog as rotten. That is the same vacuity pointing the
+  // other way, and it is worse, because the update rules tell the operator to
+  // delete what reads as stale.
+  const collectedPopulations = [
+    ['codex app-server schema methods', schemaMethods.length],
+    ['claude help flags', (data.claude?.helpFlags ?? []).length],
+  ];
+  const emptyCollected = collectedPopulations.filter(([, count]) => !count);
+  for (const [label] of emptyCollected) {
+    inconclusiveReasons.push(`${label} collected zero entries: documented items cannot be called stale against nothing`);
+  }
+
+  const parsedPopulations = [
+    ['codex commands', codexCommands.documentedCount],
+    ['claude commands', claudeCommands.documentedCount],
+    ['codex flag uses', codexFlags.count],
+    ['codex request contracts', requestContracts.documentedCount],
+    ['documented option domains', (codexDomains.documentedCount ?? 0) + (claudeDomains.documentedCount ?? 0)],
+  ];
+  for (const [label, count] of parsedPopulations) {
+    if (!count) {
+      inconclusiveReasons.push(`${label} parsed to zero entries: that table's claims went unchecked`);
+    }
+  }
+  // #3: an authority the operator switched off is not an authority that passed.
+  // `--skip-flag-probe` already reports itself this way; the binary scan did not.
+  for (const runtime of ['claude']) {
+    const scan = data[runtime]?.binaryScan;
+    const declaredL0 = (data[runtime]?.hiddenL0CandidateFlags ?? []).length;
+    if (declaredL0 > 0 && (!scan || scan.skipped || !scan.available || !scan.ok)) {
+      inconclusiveReasons.push(`${runtime} binary scan did not run, so its ${declaredL0} L0-only candidates went unchecked`);
+    }
+  }
+  for (const runtime of ['codex', 'claude']) {
+    if (!documentedVersions[runtime]) {
+      inconclusiveReasons.push(`${runtime} version cell not found in the catalog table: version drift unchecked`);
+    }
+    if (!observedVersions[runtime]) {
+      inconclusiveReasons.push(`${runtime} version not observed from the binary: version drift unchecked`);
+    }
+  }
   if (!probeIsAuthoritative) {
     inconclusiveReasons.push(probe?.skipped
       ? 'hidden flag parse probe skipped'
@@ -136,6 +214,46 @@ export async function validateCatalog(data) {
   }
   if (codexFlags.indeterminate.length > 0) {
     inconclusiveReasons.push(`indeterminate codex option probes: ${codexFlags.indeterminate.join(', ')}`);
+  }
+  if ((codexFlags.controlsFailed ?? []).length > 0) {
+    inconclusiveReasons.push(`codex option probe controls did not come back unregistered for: ${codexFlags.controlsFailed.join(', ')}`);
+  }
+  for (const [runtime, check] of [['codex', codexCommands], ['claude', claudeCommands]]) {
+    if ((check.indeterminate ?? []).length > 0) {
+      inconclusiveReasons.push(`${runtime} command probes could not tell: ${check.indeterminate.join(', ')}`);
+    }
+  }
+  // The collector states that a dropped L0 candidate should surface here. It
+  // computed the set and nothing read it, so the assertion in that comment was
+  // never true. A missing string is not staleness on its own — the scan is noisy
+  // and L0 is candidates only — but it is authority the run did not get.
+  //
+  // This covers claude only, and by design rather than by omission: `collectClaude`
+  // is the caller that passes a declared candidate list to `collectBinaryScan`,
+  // because those flags are hidden from every help surface AND cannot be probed
+  // positively — the CLI tolerates unknown options there. Codex's hidden options
+  // are probeable, so `codexOptionUses` is their authority and it is a stronger
+  // one; a candidate list for codex would add a noisier check over the same
+  // ground. Reading `hiddenFlagsMissing` for a runtime that declared no
+  // candidates would be a check over an empty set, which is the shape this whole
+  // pass exists to remove.
+  for (const [runtime, scan] of [['claude', data.claude?.binaryScan]]) {
+    if (!scan?.available || !scan.ok) continue;
+    const declared = (scan.hiddenFlagsPresent ?? []).length + (scan.hiddenFlagsMissing ?? []).length;
+    if (declared === 0) {
+      inconclusiveReasons.push(`${runtime} binary scan ran with no declared hidden-flag candidates to check`);
+      continue;
+    }
+    // The scan is handed every probed flag, not only the L0 candidates, so the
+    // report can answer "is this string in the binary" for all of them. Only the
+    // L0-only ones carry authority here: a parser-confirmed or docs-listed flag
+    // missing from a deliberately noisy string scan says nothing, and treating
+    // it as lost authority would block healthy runs.
+    const l0Candidates = new Set(data[runtime]?.hiddenL0CandidateFlags ?? []);
+    const lostL0 = scan.hiddenFlagsMissing.filter((flag) => l0Candidates.has(flag));
+    if (lostL0.length > 0) {
+      inconclusiveReasons.push(`${runtime} binary scan no longer finds declared L0-only hidden-flag candidates: ${lostL0.join(', ')}`);
+    }
   }
   if (requestContracts.unverified.length > 0) {
     inconclusiveReasons.push(`request contracts not verified: ${requestContracts.unverified.map((entry) => `${entry.method} (${entry.reason})`).join(', ')}`);
@@ -160,9 +278,16 @@ export async function validateCatalog(data) {
 
   return {
     exists: true,
-    verdict: staleCount > 0
-      ? 'needs_update'
-      : (inconclusive ? 'inconclusive_reduced_authority' : 'valid_against_collected_authorities'),
+    // Staleness is a claim about a comparison that happened. When the run lost an
+    // authority it needed — the probe budget ran out, or a collected set came
+    // back empty — the difference it computed is against nothing, so it must not be
+    // published as "needs update"; that is the reading that gets real entries
+    // deleted. Report what is true: the run could not conclude.
+    verdict: (probes.exhausted || emptyCollected.length > 0)
+      ? 'inconclusive_reduced_authority'
+      : (staleCount > 0
+        ? 'needs_update'
+        : (inconclusive ? 'inconclusive_reduced_authority' : 'valid_against_collected_authorities')),
     inconclusive,
     inconclusiveReasons,
     staleCount,
@@ -230,22 +355,22 @@ export async function validateDocumentedCommands(runtime, section, binaryName) {
   const visible = documented.filter((command) => known.has(command));
   const hiddenConfirmed = [];
   const absent = [];
+  const indeterminateCommands = [];
   for (const command of documented.filter((entry) => !known.has(entry))) {
     const parent = command.split(' ').slice(0, -1).join(' ');
     // The parent of a hidden command is often hidden too, so it is absent from
     // the tree. Falling back to the root usage there would accept a removed
     // child whose invocation lands on its still-present parent's help, since
     // that help differs from the root's. Probe the real parent instead.
-    let parentUsage = usageOf.get(parent || '(root)');
-    if (parentUsage === undefined) {
-      parentUsage = await commandUsage(runtime.binary, parent);
-      usageOf.set(parent || '(root)', parentUsage);
+    const parentKey = parent || '(root)';
+    if (!usageOf.has(parentKey)) {
+      usageOf.set(parentKey, await commandUsage(runtime.binary, parent));
     }
-    if (await commandAnswersForItself(runtime.binary, binaryName, command, parentUsage)) {
-      hiddenConfirmed.push(command);
-    } else {
-      absent.push(command);
-    }
+    const parentUsage = usageOf.get(parentKey);
+    const answer = await commandAnswersForItself(runtime.binary, binaryName, command, parentUsage);
+    if (answer === 'yes') hiddenConfirmed.push(command);
+    else if (answer === 'indeterminate') indeterminateCommands.push(command);
+    else absent.push(command);
   }
   // Commands the installed CLI has but the catalog never mentions are additive
   // candidates: not stale, but the only signal that the surface grew.
@@ -255,6 +380,7 @@ export async function validateDocumentedCommands(runtime, section, binaryName) {
     .filter((command) => command !== '(root)' && !documentedSet.has(command));
   return {
     authority: 'command_tree_plus_probe',
+    indeterminate: indeterminateCommands,
     documentedCount: documented.length,
     visible,
     hiddenConfirmed,
@@ -271,7 +397,9 @@ export function validateDocumentedRequestContracts(codex, section) {
   const contracts = codex.schema?.requestContracts ?? {};
   const mismatches = [];
   const unverified = [];
+  let documentedCount = 0;
   for (const [method, documented] of documentedRequestContracts(section)) {
+    documentedCount += 1;
     const observed = contracts[method];
     if (!observed) {
       unverified.push({ method, reason: 'no schema contract collected' });
@@ -288,7 +416,7 @@ export function validateDocumentedRequestContracts(codex, section) {
       mismatches.push({ method, required, optional });
     }
   }
-  return { mismatches, unverified };
+  return { mismatches, unverified, documentedCount };
 }
 
 // Documented options need a presence authority too. The claude flags have one
@@ -310,6 +438,8 @@ export async function validateDocumentedFlagUses(runtime, section, binaryName) {
   const absent = [];
   const indeterminate = [];
   const unprobed = [];
+  const controlsByCommand = new Map();
+  const controlsFailed = new Set();
   for (const use of uses) {
     const key = use.command || '(root)';
     const label = `${use.command} ${use.flag}`.trim();
@@ -323,6 +453,16 @@ export async function validateDocumentedFlagUses(runtime, section, binaryName) {
       unprobed.push(label);
       continue;
     }
+    // Controls first, once per command: without them a reworded rejection makes
+    // every probe below read as confirmed.
+    if (!controlsByCommand.has(key)) {
+      controlsByCommand.set(key, await probeFlagControls(runtime.binary, use.command));
+    }
+    if (!controlsByCommand.get(key).ok) {
+      controlsFailed.add(key);
+      indeterminate.push(label);
+      continue;
+    }
     const verdict = await probeFlagInCommand(runtime.binary, use.command, use.flag);
     if (verdict === 'unregistered') absent.push(label);
     else if (verdict === 'indeterminate') indeterminate.push(label);
@@ -330,6 +470,7 @@ export async function validateDocumentedFlagUses(runtime, section, binaryName) {
   }
   return {
     authority: skipFlagProbe ? 'command_tree_only' : 'command_tree_plus_probe',
+    controlsFailed: [...controlsFailed],
     count: uses.length,
     visible,
     hiddenConfirmed,
@@ -350,7 +491,9 @@ export function validateDocumentedOptionDomains(runtime, section) {
   const unresolved = new Set(probe.unresolved ?? []);
   const mismatches = [];
   const unverified = [];
+  let documentedCount = 0;
   for (const [flag, documented] of documentedOptionDomains(section)) {
+    documentedCount += 1;
     const collected = observed.get(flag);
     if (!collected || collected.size === 0) {
       // A documented domain with no evidence went unchecked, whatever the
@@ -379,7 +522,7 @@ export function validateDocumentedOptionDomains(runtime, section) {
       });
     }
   }
-  return { mismatches, unverified };
+  return { mismatches, unverified, documentedCount };
 }
 
 export function collectedOptionDomains(runtime) {

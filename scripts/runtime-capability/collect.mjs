@@ -108,8 +108,9 @@ export async function collectClaude() {
   // L0-only candidates named in the catalog's hidden-surface section: registered
   // option-spec strings found in the binary but absent from every collected help,
   // and not positively probeable because the CLI tolerates unknown options. Presence
-  // is re-checked against the binary scan so a future version that drops one
-  // surfaces as a stale catalog entry.
+  // is re-checked against the binary scan, and a version that drops one makes the
+  // run inconclusive — the scan is noisy and L0 is candidates only, so it is not
+  // staleness by itself, but it is authority the run did not get.
   const hiddenL0CandidateFlags = [
     '--append-system-prompt-file',
     '--judge-model',

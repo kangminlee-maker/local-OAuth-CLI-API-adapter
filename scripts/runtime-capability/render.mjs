@@ -28,6 +28,9 @@ Verdict: \`${data.catalogValidity?.verdict ?? 'not_checked'}\`
 | --- | ---: |
 | Stale or changed entries | ${data.catalogValidity?.staleCount ?? 0} |
 | Additive update candidates | ${data.catalogValidity?.updateCandidateCount ?? 0} |
+| CLI spawns this run | ${data.probes?.count ?? 'n/a'} in ${data.probes?.totalMs ?? 'n/a'}ms (budget ${data.probes?.budgetMs ?? 'n/a'}ms${data.probes?.exhausted ? ', EXHAUSTED' : ''}) |
+| Reasons the run could not conclude | ${(data.catalogValidity?.inconclusiveReasons ?? []).length > 0 ? data.catalogValidity.inconclusiveReasons.map((value) => inline(value)).join('; ') : 'none'} |
+| Codex option probes whose controls failed | ${(data.catalogValidity?.codexOptionUses?.controlsFailed ?? []).length > 0 ? data.catalogValidity.codexOptionUses.controlsFailed.map((value) => inline(value)).join(', ') : 'none'} |
 | Codex documented methods missing from schema | ${data.catalogValidity?.codex?.documentedMethodsMissingFromSchema?.length ?? 0} |
 | Codex schema methods undocumented in catalog | ${data.catalogValidity?.codex?.schemaMethodsUndocumentedInCatalog?.length ?? 0} |
 | Claude documented flags missing from help/docs-only list | ${data.catalogValidity?.claude?.documentedFlagsMissingFromHelpOrDocs?.length ?? 0} |
@@ -41,12 +44,12 @@ Verdict: \`${data.catalogValidity?.verdict ?? 'not_checked'}\`
 
 ### Documented Commands
 
-| Runtime | Authority | Documented | In command tree | Hidden, probe-confirmed | Absent |
-| --- | --- | ---: | ---: | ---: | --- |
+| Runtime | Authority | Documented | In command tree | Hidden, probe-confirmed | Could not tell | Absent |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
 ${['codex', 'claude'].map((runtime) => {
   const check = data.catalogValidity?.commands?.[runtime];
   const absent = check?.absent ?? [];
-  return `| ${runtime} | \`${check?.authority ?? 'not_checked'}\` | ${check?.documentedCount ?? 0} | ${check?.visible?.length ?? 0} | ${check?.hiddenConfirmed?.length ?? 0} | ${absent.length > 0 ? absent.map((value) => inline(value)).join(', ') : 'none'} |`;
+  return `| ${runtime} | \`${check?.authority ?? 'not_checked'}\` | ${check?.documentedCount ?? 0} | ${check?.visible?.length ?? 0} | ${check?.hiddenConfirmed?.length ?? 0} | ${check?.indeterminate?.length ?? 0} | ${absent.length > 0 ? absent.map((value) => inline(value)).join(', ') : 'none'} |`;
 }).join('\n')}
 
 ### Version Drift

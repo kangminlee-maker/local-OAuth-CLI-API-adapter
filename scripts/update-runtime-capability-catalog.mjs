@@ -4,7 +4,7 @@ import { arch, platform, release } from 'node:os';
 import { join } from 'node:path';
 import { catalogPath, failOnStale, outDir, repoRoot } from './runtime-capability/options.mjs';
 import { collectClaude, collectCodex } from './runtime-capability/collect.mjs';
-import { cleanupProbeScratch } from './runtime-capability/exec.mjs';
+import { cleanupProbeScratch, probeTelemetry } from './runtime-capability/exec.mjs';
 import { renderMarkdown } from './runtime-capability/render.mjs';
 import { validateCatalog } from './runtime-capability/validate.mjs';
 
@@ -35,6 +35,7 @@ async function collectReport() {
       generatedAt: new Date().toISOString(),
       repoRoot,
       catalogPath,
+      probes: probeTelemetry(),
       platform: {
         os: platform(),
         arch: arch(),

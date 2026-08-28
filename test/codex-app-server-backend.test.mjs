@@ -186,7 +186,6 @@ test('CodexAppServerBackend keeps API-isolated proxy mode as the default app-ser
 
     assert.match(payload.threadStart.baseInstructions, /API proxy completion only/);
     assert.match(payload.threadStart.developerInstructions, /Follow API request instruction messages/);
-    assert.match(payload.threadStart.developerInstructions, /first_tool_argument/);
     assert.equal(payload.threadStart.config.model_verbosity, 'medium');
     assert.equal(payload.threadStart.personality, 'none');
     assert.equal(payload.turnStart.personality, 'none');

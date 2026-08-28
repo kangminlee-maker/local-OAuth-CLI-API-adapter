@@ -16,7 +16,7 @@ const includeLiveModel = args.includes('--include-live-model');
 const failOnLiveFailure = args.includes('--fail-on-live-failure');
 const timeoutMs = Number(readValueArg('--timeout-ms') ?? 180_000);
 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-const tokenWarningThreshold = 1_000_000;
+const CATALOG_COLLECT_TIMEOUT_MS = 240_000;
 
 const tempRoot = await mkdtemp(join(tmpdir(), 'runtime-capability-smoke-'));
 const rows = [];
@@ -30,10 +30,11 @@ try {
   rows.push(...await smokeClaudeHelpCommands(catalog.claude?.binary));
   rows.push(...smokeClaudeFlags(catalog));
 
-  const plannedLiveTokens = includeLiveModel ? estimateLiveTokens() : 0;
-  if (plannedLiveTokens > tokenWarningThreshold) {
-    process.stderr.write(`WARNING: planned live model smoke may exceed ${tokenWarningThreshold} tokens. estimate=${plannedLiveTokens}\n`);
-  }
+  // There used to be a 1M-token warning here fed by a hardcoded 7 x 2,000
+  // estimate, so the branch could never fire and documented a safeguard that did
+  // not exist. Its replacement counts the live rows the run actually produced
+  // rather than a constant someone has to remember to update — which is how the
+  // estimate it replaced went wrong.
 
   if (includeLiveModel) {
     liveRows.push(...await runLiveModelSmokes({ timeoutMs }));
@@ -41,8 +42,7 @@ try {
   }
 
   const summary = summarizeRows(rows, {
-    plannedLiveTokens,
-    liveTokenWarningThreshold: tokenWarningThreshold,
+    liveProbes: liveRows.length,
   });
   const report = {
     generatedAt: new Date().toISOString(),
@@ -77,8 +77,38 @@ try {
   process.stdout.write(`runtime capability smoke report: ${jsonPath}\n`);
   process.stdout.write(`runtime capability smoke summary: ${markdownPath}\n`);
 
+  // The runbook's completion criterion asks that every capability carry a risk
+  // and an execution mode. The summary counts them, and countBy files a missing
+  // field under the literal key "undefined" and prints it as an ordinary total —
+  // so the criterion was satisfied by reading a table carefully, or not at all.
+  const unclassified = rows.filter((row) => !row.risk || !row.execution);
+  if (unclassified.length > 0) {
+    process.stderr.write(`rows missing risk or execution: ${unclassified.map((row) => row.id).join(', ')}\n`);
+  }
+  // Checking the rows that exist says nothing about the rows that should. A
+  // changed `Commands:` header makes the claude command extractor return [], and
+  // a schema layout change makes the codex method parser return [] while the
+  // expected files are still present — either way no rows are emitted, every
+  // field check passes over an empty set, and the report is green about a
+  // surface it never enumerated. The floors are this machine's populations;
+  // they exist to catch a parser that stopped, not to pin an exact count.
+  // Conditioned on the runtime having been found. A population is empty for two
+  // very different reasons — the parser broke, or the CLI is not installed on
+  // this machine — and only the first is a defect. Failing on the second makes
+  // the smoke unrunnable anywhere but the author's laptop, which is the same
+  // mistake the `catalog.validity` row above avoids.
+  const haveClaude = Boolean(catalog.claude?.binary);
+  const haveCodex = Boolean(catalog.codex?.binary);
+  const emptyPopulations = [
+    ['claude commands from --help', haveClaude, rows.filter((row) => row.id.startsWith('claude.command.')).length],
+    ['codex app-server schema methods', haveCodex, rows.filter((row) => row.id.startsWith('codex.schema.')).length],
+    ['claude flag inventory', haveClaude, rows.filter((row) => row.id.startsWith('claude.flag.')).length],
+  ].filter(([, present, count]) => present && count === 0);
+  if (emptyPopulations.length > 0) {
+    process.stderr.write(`capability populations came back empty: ${emptyPopulations.map(([label]) => label).join(', ')}\n`);
+  }
   const hardFailures = rows.filter((row) => row.status === 'fail' && (row.execution !== 'live_model' || failOnLiveFailure));
-  if (hardFailures.length > 0) process.exitCode = 1;
+  if (hardFailures.length > 0 || unclassified.length > 0 || emptyPopulations.length > 0) process.exitCode = 1;
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
 }
@@ -101,11 +131,21 @@ async function collectCatalog(root) {
     catalogOut,
     '--skip-binary-scan',
   ], {
-    timeoutMs: 60_000,
+    // The collector spawns both CLIs for every version, help, command-tree and
+    // parse probe it makes, and each probe carries its own multi-second timeout.
+    // It measured 55s here the day a negative-control probe was added to the
+    // codex path, which is what a 60s budget turns into an empty crash.
+    timeoutMs: CATALOG_COLLECT_TIMEOUT_MS,
     maxBuffer: 20_000_000,
   });
   if (!result.ok) {
-    throw new Error(`catalog collection failed: ${result.stderr || result.stdout}`);
+    // A killed subprocess writes nothing, so the old message interpolated two
+    // empty strings and reported that catalog collection failed for no stated
+    // reason. Say which way it failed.
+    const how = result.signal
+      ? `killed by ${result.signal} (likely the ${CATALOG_COLLECT_TIMEOUT_MS}ms budget)`
+      : `exit code ${result.code}`;
+    throw new Error(`catalog collection failed: ${how}${result.stderr ? `\n${result.stderr}` : ''}`);
   }
   return JSON.parse(await readFile(join(catalogOut, 'latest.json'), 'utf8'));
 }
@@ -147,6 +187,37 @@ async function collectCodexSchema(root, codexBinary) {
 
 function smokeCatalogBasics(catalog) {
   const result = [];
+  // The collector already ran, spawned both CLIs and reached a verdict; reading
+  // it here is free. Discarding it meant an operator who ran only this smoke saw
+  // green over a stale catalog, because nothing else in this report looks at
+  // whether the documented surface still matches the installed one.
+  const validity = catalog.catalogValidity ?? {};
+  // Two different things, and only one of them is the adapter's problem. A
+  // stale entry means the catalog is WRONG and must fail. `inconclusive` means
+  // this machine could not check — one CLI missing, a probe killed — which is a
+  // true statement about the run, not a defect in the tree, and failing on it
+  // would make the smoke unrunnable anywhere but the author's laptop. The
+  // collector's own `--fail-on-stale` gate still fails on inconclusive, which is
+  // the right place for that rule.
+  const stale = validity.exists !== true || (validity.staleCount ?? 0) > 0;
+  result.push({
+    id: 'catalog.validity',
+    runtime: 'both',
+    kind: 'catalog_validation',
+    risk: 'safe_metadata',
+    execution: 'metadata',
+    status: stale ? 'fail' : (validity.inconclusive ? 'inventory' : 'pass'),
+    inputContract: 'update-runtime-capability-catalog.mjs --skip-binary-scan (run by this smoke)',
+    outputSchema: 'catalogValidity: exists, staleCount 0, inconclusive false',
+    evidence: [
+      `verdict=${validity.verdict ?? 'missing'}`,
+      `stale=${validity.staleCount ?? 'n/a'}`,
+      `versionDrift=${(validity.versionDrift ?? []).length}`,
+      (validity.inconclusiveReasons ?? []).length > 0
+        ? `inconclusive: ${validity.inconclusiveReasons.join('; ')}`
+        : 'inconclusive: none',
+    ].join(' | '),
+  });
   result.push({
     id: 'catalog.codex.version',
     runtime: 'codex',
@@ -279,6 +350,14 @@ async function smokeClaudeHelpCommands(claudeBinary) {
   return rows;
 }
 
+// These rows are an inventory with a risk classification, not a check. They are
+// built from the flags `--help` reported, so "exists in help" is true by
+// construction — and they were the largest block of passes in the report, which
+// made the whole smoke read as more verified than it was. A flag the CLI drops
+// does not fail here either; the row simply stops being emitted. Flag drift is
+// gated by `catalog.validity`, which compares the documented set against the
+// collected one. Marking these `inventory` keeps the classification and stops
+// them from counting as evidence.
 function smokeClaudeFlags(catalog) {
   return (catalog.claude?.helpFlags ?? []).map((flag) => {
     const classification = classifyClaudeFlag(flag);
@@ -288,9 +367,9 @@ function smokeClaudeFlags(catalog) {
       kind: 'cli_flag',
       risk: classification.risk,
       execution: 'help_definition',
-      status: 'pass',
+      status: 'inventory',
       inputContract: flag,
-      outputSchema: 'flag definition exists in local claude --help output',
+      outputSchema: 'flag observed in an aggregated claude --help surface; asserts nothing on its own',
       evidence: classification.reason,
     };
   });
@@ -650,10 +729,6 @@ function exactStatusSchema(runtime) {
   };
 }
 
-function estimateLiveTokens() {
-  return 7 * 2_000;
-}
-
 function summarizeRows(allRows, extra) {
   const byStatus = countBy(allRows, 'status');
   const byRisk = countBy(allRows, 'risk');
@@ -686,9 +761,7 @@ Generated at: ${report.generatedAt}
 
 Live model probes: ${report.includeLiveModel ? 'enabled' : 'disabled'}
 
-Planned live token estimate: ${report.summary.plannedLiveTokens}
-
-1m token warning threshold: ${report.summary.liveTokenWarningThreshold}
+Live model probes run: ${report.summary.liveProbes}
 
 ## Summary
 
@@ -697,7 +770,7 @@ Planned live token estimate: ${report.summary.plannedLiveTokens}
 | Total rows | ${report.summary.total} |
 | Pass | ${report.summary.byStatus.pass ?? 0} |
 | Fail | ${report.summary.byStatus.fail ?? 0} |
-| Skipped | ${report.summary.byStatus.skip ?? 0} |
+| Inventory (asserts nothing) | ${report.summary.byStatus.inventory ?? 0} |
 
 ## Risk Classification
 
