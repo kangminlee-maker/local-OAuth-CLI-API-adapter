@@ -1026,3 +1026,75 @@ test('a codex tool result that carries an image still answers its call', async (
     globalThis.fetch = realFetch;
   }
 });
+
+/** The shapes a real client sends once tools work across turns. */
+const TOOL_HISTORY_SHAPES = [
+  ['narration alongside the call', [
+    { role: 'user', content: 'call echo' },
+    { role: 'assistant', content: [{ type: 'text', text: '확인해 보겠습니다.' }, { type: 'tool_use', id: 'call_a1', name: 'echo', input: { s: 'hi' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_a1', content: 'hi' }] },
+  ]],
+  ['the call alone', [
+    { role: 'user', content: 'call echo' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'call_b1', name: 'echo', input: { s: 'hi' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_b1', content: 'hi' }] },
+  ]],
+  ['two results answered in one turn', [
+    { role: 'user', content: 'call echo twice' },
+    { role: 'assistant', content: [
+      { type: 'tool_use', id: 'call_c1', name: 'echo', input: { s: 'a' } },
+      { type: 'tool_use', id: 'call_c2', name: 'echo', input: { s: 'b' } },
+    ] },
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'call_c1', content: 'a' },
+      { type: 'tool_result', tool_use_id: 'call_c2', content: 'b' },
+    ] },
+  ]],
+  ['two results answered in separate turns', [
+    { role: 'user', content: 'call echo twice' },
+    { role: 'assistant', content: [
+      { type: 'tool_use', id: 'call_d1', name: 'echo', input: { s: 'a' } },
+      { type: 'tool_use', id: 'call_d2', name: 'echo', input: { s: 'b' } },
+    ] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_d1', content: 'a' }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_d2', content: 'b' }] },
+  ]],
+];
+
+for (const [label, messages] of TOOL_HISTORY_SHAPES) {
+  test(`every tool call is answered when the history carries ${label}`, async () => {
+    // This API rejects a `function_call` with no output and an output with no
+    // call, both as 400. The narration a model writes beside its call used to
+    // turn the whole message into prose — the call disappeared — and results
+    // answered together in one turn produced a single output for however many
+    // calls there were.
+    const codexHome = await createCodexHome();
+    let sent = null;
+    globalThis.fetch = async (_url, init) => {
+      sent = JSON.parse(init.body);
+      return new Response(sse([{ type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } }]), { status: 200 });
+    };
+    const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+    const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+    try {
+      await realFetch(`${server.url}/v1/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: 'gpt-5.5',
+          max_tokens: 128,
+          tools: [{ name: 'echo', description: 'e', input_schema: { type: 'object', properties: { s: { type: 'string' } }, required: ['s'], additionalProperties: false } }],
+          messages,
+        }),
+      });
+      const items = sent?.input ?? [];
+      const calls = items.filter((item) => item.type === 'function_call').map((item) => item.call_id);
+      const outputs = items.filter((item) => item.type === 'function_call_output').map((item) => item.call_id);
+      assert.deepEqual(outputs, calls, `calls and outputs must pair: ${JSON.stringify(items.map((i) => i.type))}`);
+    } finally {
+      await server.close();
+      await backend.close();
+      globalThis.fetch = realFetch;
+    }
+  });
+}

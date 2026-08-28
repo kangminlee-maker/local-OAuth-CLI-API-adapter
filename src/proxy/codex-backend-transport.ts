@@ -34,6 +34,12 @@ import type {
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
+import {
+  ASSISTANT_TOOL_CALL_MARKER,
+  TOOL_RESULT_MARKER,
+  markerIndex,
+  splitAtMarkers,
+} from './tool-history-markers.js';
 
 const CHATGPT_CODEX_BACKEND_URL = 'https://chatgpt.com/backend-api/codex';
 const CODEX_REFRESH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
@@ -1684,28 +1690,54 @@ async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
  */
 function responseToolHistoryItems(message: NormalizedMessage): unknown[] | null {
   const text = message.content.trim();
-  if (text.startsWith('[assistant tool_call]')) {
-    return parseAssistantToolCalls(text).map((call) => ({
+  const callAt = markerIndex(text, ASSISTANT_TOOL_CALL_MARKER);
+  if (callAt !== -1) {
+    // The narration the model wrote alongside its call is part of the turn, and
+    // the call must survive it. Reading tool history only from position 0 made
+    // a "let me check…" before the call turn the whole message into prose, so
+    // the call vanished and the result that answered it had nothing to pair
+    // with — a 400 from this API.
+    const narration = text.slice(0, callAt).trim();
+    const items: unknown[] = parseAssistantToolCalls(text.slice(callAt)).map((call) => ({
       type: 'function_call',
       call_id: call.id,
       name: call.name,
       arguments: call.arguments,
     }));
+    if (narration) {
+      items.unshift({
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: narration }],
+      });
+    }
+    return items;
   }
-  if (text.startsWith('[tool result]')) {
-    const result = parseToolResult(text);
-    return [{
-      type: 'function_call_output',
-      call_id: result.callId,
-      output: result.output,
-    }];
+  const resultAt = markerIndex(text, TOOL_RESULT_MARKER);
+  if (resultAt !== -1) {
+    // One output per result. Parallel calls answer in a single user turn, and
+    // reading one `tool_call_id:` for the whole message answered the first call
+    // and left the rest unanswered — the other half of the same 400.
+    const items: unknown[] = splitAtMarkers(text.slice(resultAt), TOOL_RESULT_MARKER).map((block) => {
+      const result = parseToolResult(block);
+      return { type: 'function_call_output', call_id: result.callId, output: result.output };
+    });
+    const preamble = text.slice(0, resultAt).trim();
+    if (preamble) {
+      items.push({
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: preamble }],
+      });
+    }
+    return items.length > 0 ? items : null;
   }
   return null;
 }
 
 function parseAssistantToolCalls(text: string): LocalToolCall[] {
   return text
-    .split('[assistant tool_call]')
+    .split(ASSISTANT_TOOL_CALL_MARKER)
     .map((block) => block.trim())
     .filter(Boolean)
     .map((block, index) => ({

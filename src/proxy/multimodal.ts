@@ -1,3 +1,4 @@
+import { TOOL_RESULT_MARKER, toolResultCallId } from './tool-history-markers.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
@@ -57,8 +58,24 @@ export async function claudeMessageContentFor(
   prompt: string,
 ): Promise<readonly unknown[]> {
   const content: unknown[] = [];
-  for (const image of requestImages(request)) {
-    content.push(await claudeImageBlock(image));
+  for (const message of request.messages) {
+    // `images` is optional on the shape callers build by hand.
+    const images = message.images ?? [];
+    if (images.length === 0) continue;
+    // An image that answers a tool call says so. Every image used to be hoisted
+    // ahead of one flattened prompt with nothing naming its origin, so a turn
+    // whose two tool results each returned a picture left the model to match
+    // them by position — and "what colour was the second one" was answered by
+    // ordering luck. Now that tools stay available for a whole conversation,
+    // that shape is ordinary rather than exotic.
+    const callId = toolResultCallId(message.content);
+    for (const [index, image] of images.entries()) {
+      if (callId) {
+        const which = images.length > 1 ? ` (${index + 1} of ${images.length})` : '';
+        content.push({ type: 'text', text: `${TOOL_RESULT_MARKER} image for tool_call_id: ${callId}${which}` });
+      }
+      content.push(await claudeImageBlock(image));
+    }
   }
   content.push({ type: 'text', text: prompt });
   return content;
