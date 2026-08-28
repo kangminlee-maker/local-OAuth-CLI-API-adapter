@@ -54,28 +54,45 @@ test('auto tool decisions keep the full decision wrapper schema', () => {
   assert.deepEqual(Object.keys(outputSchemaFor(request).properties).sort(), ['status', 'text', 'toolCalls']);
 });
 
-test('auto tool result continuation uses final answer mode', () => {
+test('a turn after a tool result can still call a tool', () => {
+  // The model that wants a second lookup has to have somewhere to put it. With
+  // the tools taken off this turn it wrote the call as prose and the turn came
+  // back as an answer, so every question needing two lookups broke.
   const request = requestWithTools({
     messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"temperature":"21C"}', images: [] }],
   });
 
-  assert.equal(hasToolDecisionSchema(request), false);
-  assert.equal(outputSchemaFor(request), null);
-  assert.doesNotMatch(buildPrompt(request), /Schema JSON only/);
-  assert.match(buildPrompt(request), /Return only the assistant response text/);
+  assert.equal(hasToolDecisionSchema(request), true);
+  assert.deepEqual(Object.keys(outputSchemaFor(request).properties).sort(), ['status', 'text', 'toolCalls']);
 });
 
-test('auto tool result continuation preserves requested JSON schema', () => {
+test('answering is still expressible on a turn after a tool result', () => {
+  // Keeping the tools on must not force a call: the same schema carries the
+  // answer case, which is what makes the continuation lose nothing.
+  const request = requestWithTools({
+    messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"temperature":"21C"}', images: [] }],
+  });
+
+  assert.deepEqual(
+    parseBackendOutput(request, JSON.stringify({ status: 'message', text: '서울은 21도입니다.', toolCalls: [] })),
+    { text: '서울은 21도입니다.', toolCalls: [] },
+  );
+});
+
+test('a continuation keeps the requested JSON schema when the tools are off', () => {
   const schema = {
     type: 'object',
     additionalProperties: false,
     properties: { answer: { type: 'string' } },
     required: ['answer'],
   };
+  // Tools are available for every turn now, so a client that wants its own
+  // schema honoured says so the way the API already allows.
   const request = requestWithTools({
     messages: [{ role: 'user', content: '[tool result]\ntool_call_id: call_1\n{"answer":"OK"}', images: [] }],
     jsonMode: true,
     jsonSchema: schema,
+    toolChoice: { type: 'none' },
   });
 
   assert.equal(hasToolDecisionSchema(request), false);

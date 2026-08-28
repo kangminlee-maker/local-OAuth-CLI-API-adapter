@@ -2087,16 +2087,26 @@ function numberOrDefault(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/**
+ * Anthropic counts cache reads OUTSIDE `input_tokens`; the OpenAI-shaped
+ * runtimes count them inside `prompt_tokens` and report the hit separately as
+ * `cached_tokens`. Reading only the Anthropic-named fields left a real cache
+ * hit invisible on this surface — a codex-backed turn whose prefix was served
+ * from cache reported no cache fields at all, so a client computing cost or
+ * cache efficiency from `usage` saw a full-price prompt every turn.
+ */
 function anthropicUsage(usage: LocalUsage): Record<string, number> {
+  const cacheRead = usage.cacheReadInputTokens ?? usage.cachedInputTokens;
+  const inputTokens = usage.cacheReadInputTokens === undefined && usage.cachedInputTokens !== undefined
+    ? Math.max(usage.inputTokens - usage.cachedInputTokens, 0)
+    : usage.inputTokens;
   return {
-    input_tokens: usage.inputTokens,
+    input_tokens: inputTokens,
     output_tokens: usage.outputTokens,
     ...(usage.cacheCreationInputTokens !== undefined
       ? { cache_creation_input_tokens: usage.cacheCreationInputTokens }
       : {}),
-    ...(usage.cacheReadInputTokens !== undefined
-      ? { cache_read_input_tokens: usage.cacheReadInputTokens }
-      : {}),
+    ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
   };
 }
 
