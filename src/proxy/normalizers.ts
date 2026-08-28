@@ -108,7 +108,12 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const maxTokens = readRequiredMaxTokens(input.max_tokens);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
-  if (outputFormat !== undefined && tools.length > 0) {
+  const toolChoice = readAnthropicToolChoice(input.tool_choice);
+  // ...unless the turn has taken the tools off. There is one structured-output
+  // channel, so a tool schema and a format schema would collide — but with
+  // `tool_choice: "none"` no tool schema is built, and refusing anyway left a
+  // client that asked for its own format on such a turn with nowhere to go.
+  if (outputFormat !== undefined && tools.length > 0 && toolChoice.type !== 'none') {
     // The proxy has a single structured-output channel (claude --json-schema); a
     // forced/decision tool schema and output_config.format would collide, so the
     // user's format schema would be silently dropped. Reject instead.
@@ -132,7 +137,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     jsonMode: outputFormat !== undefined,
     jsonSchema: outputFormat,
     tools,
-    toolChoice: readAnthropicToolChoice(input.tool_choice),
+    toolChoice,
     raw: body,
   };
 }

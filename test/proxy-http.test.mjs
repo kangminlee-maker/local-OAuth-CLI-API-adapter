@@ -372,6 +372,68 @@ test('OpenAI responses usage exposes provider token details', async () => {
   assert.equal(body.usage.output_tokens_details.reasoning_tokens, 0);
 });
 
+test('a runtime cache hit is reported in the shape the client asked in', async () => {
+  // Anthropic counts cache reads outside `input_tokens`; the OpenAI-shaped
+  // runtimes count them inside the prompt total and name the hit
+  // `cached_tokens`. Reading only the Anthropic-named fields made a real hit
+  // invisible here — a codex-backed turn whose prefix came from cache reported
+  // no cache fields at all, and a client costing the turn from `usage` paid
+  // full price on paper every time.
+  const cached = await startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 10_000,
+    backend: {
+      name: 'cache-backend',
+      model: 'fake-local-model',
+      async generate(request) {
+        return {
+          id: 'cache_test',
+          model: request.model,
+          text: 'OK',
+          toolCalls: [],
+          usage: {
+            inputTokens: 8_360,
+            outputTokens: 20,
+            totalTokens: 8_380,
+            cachedInputTokens: 7_936,
+            source: 'provider',
+          },
+          latencyMs: 1,
+        };
+      },
+      async close() {},
+    },
+  });
+  try {
+    const res = await fetch(`${cached.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'fake-local-model',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+    const body = await res.json();
+    assert.equal(body.usage.cache_read_input_tokens, 7_936);
+    // Anthropic's own `input_tokens` excludes what was read from cache, so the
+    // three numbers add up the way a client's cost arithmetic expects.
+    assert.equal(body.usage.input_tokens, 424);
+
+    const chat = await (await fetch(`${cached.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({ model: 'fake-local-model', messages: [{ role: 'user', content: 'hi' }] }),
+    })).json();
+    // The OpenAI shape keeps counting them inside the prompt total.
+    assert.equal(chat.usage.prompt_tokens, 8_360);
+    assert.equal(chat.usage.prompt_tokens_details.cached_tokens, 7_936);
+  } finally {
+    await cached.close();
+  }
+});
+
 test('POST /v1/chat/completions preserves OpenAI image_url input parts', async () => {
   const res = await postJson('/v1/chat/completions', {
     model: 'fake-local-model',

@@ -975,3 +975,54 @@ test('narration accompanying a tool call survives on every surface', async () =>
     assert.deepEqual(messages.content.map((block) => block.type), ['text', 'tool_use']);
   });
 });
+
+test('a codex tool result that carries an image still answers its call', async () => {
+  // The tool history is what answers a `function_call`; an unanswered one is a
+  // 400 from this API. An image used to disqualify the whole message from
+  // being read as tool history, so the answer vanished and the `[tool result]`
+  // marker went to the model as prose — the shape a consumer reported as a
+  // broken image, on the runtime that was never checked.
+  const px = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+  const codexHome = await createCodexHome();
+  let sent = null;
+  globalThis.fetch = async (_url, init) => {
+    sent = JSON.parse(init.body);
+    return new Response(sse([{ type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } }]), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    await realFetch(`${server.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({
+        model: 'gpt-5.5',
+        max_tokens: 128,
+        tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }],
+        messages: [
+          { role: 'user', content: 'w' },
+          { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'get_weather', input: { city: 'Seoul' } }] },
+          {
+            role: 'user',
+            content: [{
+              type: 'tool_result',
+              tool_use_id: 't1',
+              content: [
+                { type: 'text', text: '{"temp":3}' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: px } },
+              ],
+            }],
+          },
+        ],
+      }),
+    });
+    const types = (sent?.input ?? []).map((item) => item.type);
+    assert.ok(types.includes('function_call_output'), `the call was left unanswered: ${JSON.stringify(types)}`);
+    const images = JSON.stringify(sent?.input ?? []).includes(px);
+    assert.ok(images, 'the image the tool returned must still reach the model');
+  } finally {
+    await server.close();
+    await backend.close();
+    globalThis.fetch = realFetch;
+  }
+});

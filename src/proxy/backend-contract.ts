@@ -60,10 +60,24 @@ export function outputSchemaFor(request: NormalizedRequest): unknown {
   return request.jsonSchema ?? null;
 }
 
+/**
+ * Tools are available for the whole conversation, not just its first turn.
+ *
+ * A turn that follows a tool result used to be given the plain-text mode, on
+ * the reading that a continuation is where the model finally answers. But a
+ * model that wants to call another tool there has no structured way to say so:
+ * it wrote the call as prose — `{"name":"get_weather","arguments":{…}}` — and
+ * the turn came back as `stop_reason: end_turn` with the call stranded in a
+ * text block, so every question needing two lookups broke. The decision schema
+ * already carries `status: 'message'` for the answer case, so keeping it on
+ * costs the continuation nothing and gives the call somewhere to go.
+ *
+ * A client that wants its own JSON schema honoured on such a turn says so the
+ * way the API already allows: `tool_choice: "none"` takes the tools off the
+ * table for that turn.
+ */
 export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
-  return request.tools.length > 0
-    && request.toolChoice.type !== 'none'
-    && !isAutoToolResultContinuation(request);
+  return request.tools.length > 0 && request.toolChoice.type !== 'none';
 }
 
 export function parseBackendOutput(
@@ -92,12 +106,20 @@ export function parseBackendOutput(
       const calls = Array.isArray(obj.toolCalls)
         ? obj.toolCalls.map((call, index) => normalizeToolCall(call, index))
         : [];
-      return { text: '', toolCalls: calls };
+      // The narration that came with the call is part of the turn — every
+      // surface reports text alongside tool calls, and dropping it here made
+      // this runtime the one that silently did not. The wrapper has a `text`
+      // field for exactly this.
+      return { text: typeof obj.text === 'string' ? obj.text : '', toolCalls: calls };
     }
-    return {
-      text: typeof obj.text === 'string' ? obj.text : '',
-      toolCalls: [],
-    };
+    // Only a wrapper this backend produced may be unwrapped. A json-mode client
+    // gets its OWN object back from the runtime, and reading that as a wrapper
+    // with no `text` field returned an empty answer — the whole reply dropped
+    // on the floor. Anything that is not the wrapper is the answer itself.
+    if (typeof obj.text === 'string' && obj.status === 'message') {
+      return { text: obj.text, toolCalls: [] };
+    }
+    return { text, toolCalls: [] };
   } catch {
     return { text, toolCalls: [] };
   }
@@ -199,20 +221,6 @@ function modeInstructions(request: NormalizedRequest): string {
 function maxTokenInstruction(request: NormalizedRequest): string {
   if (!request.maxTokens || request.maxTokens > 128) return '';
   return `Output token limit: ${request.maxTokens}.`;
-}
-
-function isAutoToolResultContinuation(request: NormalizedRequest): boolean {
-  if (request.toolChoice.type !== 'auto') return false;
-  const lastMessage = request.messages.at(-1);
-  if (!lastMessage) return false;
-  if (lastMessage.role === 'tool') return true;
-  return containsNormalizedToolResult(lastMessage.content);
-}
-
-function containsNormalizedToolResult(content: string): boolean {
-  const trimmed = content.trimStart();
-  return trimmed.startsWith('[tool result]')
-    || trimmed.includes('\n[tool result]');
 }
 
 function toolModeInstructions(request: NormalizedRequest): string {

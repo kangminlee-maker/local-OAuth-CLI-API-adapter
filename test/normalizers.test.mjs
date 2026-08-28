@@ -5,6 +5,10 @@ import {
   normalizeOpenAiChatRequest,
   normalizeOpenAiResponsesRequest,
 } from '../dist/proxy/normalizers.js';
+import { claudeMessageContentFor } from '../dist/proxy/multimodal.js';
+import { buildPrompt } from '../dist/proxy/backend-contract.js';
+
+const RED_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 
 test('OpenAI chat normalizer preserves request reasoning_effort', () => {
   const request = normalizeOpenAiChatRequest({
@@ -228,4 +232,69 @@ test('Anthropic normalizer rejects output_config.format combined with tools', ()
     })),
     /not supported together with tools/,
   );
+});
+
+test('an image inside a tool_result reaches the runtime as an image, not as prose', async () => {
+  // A consumer reported this as broken and worked around it. It was not: the
+  // symptom belonged to the tool channel being closed on the turn AFTER a tool
+  // result, so the call that would have fetched the image never went out. This
+  // pins the part that was suspected, so the next such report is answered in
+  // seconds rather than by reading the pipeline again.
+  const request = normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-5',
+    max_tokens: 100,
+    tools: [{ name: 'get_image', description: 'd', input_schema: { type: 'object', properties: {}, additionalProperties: false } }],
+    messages: [
+      { role: 'user', content: '이미지를 가져와서 색을 말해줘.' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'get_image', input: {} }] },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 't1',
+          content: [
+            { type: 'text', text: '이미지입니다.' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: RED_PIXEL_PNG } },
+          ],
+        }],
+      },
+    ],
+  });
+
+  assert.equal(request.messages.at(-1).images.length, 1, 'the tool result carries its image');
+  const prompt = buildPrompt(request);
+  const content = await claudeMessageContentFor(request, prompt);
+  const image = content.find((block) => block.type === 'image');
+  assert.ok(image, `no image block reached the runtime: ${JSON.stringify(content).slice(0, 200)}`);
+  assert.equal(image.source.data, RED_PIXEL_PNG);
+  // The text half names the call the image answers — the marker alone proves
+  // nothing, since `buildPrompt` writes it whether or not the image survived.
+  assert.match(prompt, /tool_call_id: t1/);
+});
+
+test('taking the tools off a turn lets an Anthropic client keep its own format', () => {
+  // The contract tells a client to use `tool_choice: "none"` when it wants its
+  // own schema on a turn that carries tools. That was a 400 here — the check
+  // fired before the choice was read — so the documented way out did not exist
+  // on this surface.
+  const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false };
+  const request = normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-5',
+    max_tokens: 100,
+    tools: [{ name: 'get_weather', description: 'd', input_schema: { type: 'object', properties: {}, additionalProperties: false } }],
+    tool_choice: { type: 'none' },
+    output_config: { format: { type: 'json_schema', schema } },
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.deepEqual(request.jsonSchema, schema);
+  assert.equal(request.toolChoice.type, 'none');
+
+  // With the tools live, the collision is still refused.
+  assert.throws(() => normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-5',
+    max_tokens: 100,
+    tools: [{ name: 'get_weather', description: 'd', input_schema: { type: 'object', properties: {}, additionalProperties: false } }],
+    output_config: { format: { type: 'json_schema', schema } },
+    messages: [{ role: 'user', content: 'hi' }],
+  }), /not supported together with tools/);
 });

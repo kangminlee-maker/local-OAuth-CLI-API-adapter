@@ -17,11 +17,12 @@ test('tool decision schema remains enabled before an auto tool call', () => {
   })), true);
 });
 
-test('tool decision schema remains enabled for required tool choice', () => {
-  assert.equal(hasToolDecisionSchema(requestWithTools({
-    messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"ok":true}', images: [] }],
-    toolChoice: { type: 'required' },
-  })), true);
+test('the tool choice is what turns the decision schema off, and only `none` does', () => {
+  const messages = [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"ok":true}', images: [] }];
+  for (const toolChoice of [{ type: 'auto' }, { type: 'required' }, { type: 'tool', name: 'get_weather' }]) {
+    assert.equal(hasToolDecisionSchema(requestWithTools({ messages, toolChoice })), true, JSON.stringify(toolChoice));
+  }
+  assert.equal(hasToolDecisionSchema(requestWithTools({ messages, toolChoice: { type: 'none' } })), false);
 });
 
 test('forced single tool calls use arguments-only schema and parser', () => {
@@ -54,28 +55,60 @@ test('auto tool decisions keep the full decision wrapper schema', () => {
   assert.deepEqual(Object.keys(outputSchemaFor(request).properties).sort(), ['status', 'text', 'toolCalls']);
 });
 
-test('auto tool result continuation uses final answer mode', () => {
+test('a turn after a tool result can still call a tool', () => {
+  // The model that wants a second lookup has to have somewhere to put it. With
+  // the tools taken off this turn it wrote the call as prose and the turn came
+  // back as an answer, so every question needing two lookups broke.
   const request = requestWithTools({
     messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"temperature":"21C"}', images: [] }],
   });
 
-  assert.equal(hasToolDecisionSchema(request), false);
-  assert.equal(outputSchemaFor(request), null);
-  assert.doesNotMatch(buildPrompt(request), /Schema JSON only/);
-  assert.match(buildPrompt(request), /Return only the assistant response text/);
+  assert.equal(hasToolDecisionSchema(request), true);
+  assert.deepEqual(Object.keys(outputSchemaFor(request).properties).sort(), ['status', 'text', 'toolCalls']);
 });
 
-test('auto tool result continuation preserves requested JSON schema', () => {
+test('answering is still expressible on a turn after a tool result', () => {
+  // Keeping the tools on must not force a call: the same schema carries the
+  // answer case, which is what makes the continuation lose nothing.
+  const request = requestWithTools({
+    messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"temperature":"21C"}', images: [] }],
+  });
+
+  assert.deepEqual(
+    parseBackendOutput(request, JSON.stringify({ status: 'message', text: '서울은 21도입니다.', toolCalls: [] })),
+    { text: '서울은 21도입니다.', toolCalls: [] },
+  );
+});
+
+test('a json-mode answer is not mistaken for an empty wrapper', () => {
+  // With tools on every turn, a json-mode client's own object reaches this
+  // parser. Read as a wrapper it has no `text`, and the answer came back empty
+  // — the reply dropped on the floor rather than delivered.
+  const request = requestWithTools({
+    messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"ok":true}', images: [] }],
+    jsonMode: true,
+  });
+
+  assert.deepEqual(
+    parseBackendOutput(request, '{"answer":"OK"}'),
+    { text: '{"answer":"OK"}', toolCalls: [] },
+  );
+});
+
+test('a continuation keeps the requested JSON schema when the tools are off', () => {
   const schema = {
     type: 'object',
     additionalProperties: false,
     properties: { answer: { type: 'string' } },
     required: ['answer'],
   };
+  // Tools are available for every turn now, so a client that wants its own
+  // schema honoured says so the way the API already allows.
   const request = requestWithTools({
     messages: [{ role: 'user', content: '[tool result]\ntool_call_id: call_1\n{"answer":"OK"}', images: [] }],
     jsonMode: true,
     jsonSchema: schema,
+    toolChoice: { type: 'none' },
   });
 
   assert.equal(hasToolDecisionSchema(request), false);
@@ -223,3 +256,23 @@ function requestWithTools(overrides = {}) {
     ...overrides,
   };
 }
+
+test('narration that comes with a tool call survives the wrapper', () => {
+  // Every surface reports text alongside tool calls; this parser used to make
+  // the schema-driven runtimes the exception by discarding it.
+  const request = requestWithTools({
+    messages: [{ role: 'user', content: 'Use weather tool', images: [] }],
+  });
+
+  assert.deepEqual(
+    parseBackendOutput(request, JSON.stringify({
+      status: 'tool_calls',
+      text: '날씨를 확인하겠습니다.',
+      toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"서울"}' }],
+    })),
+    {
+      text: '날씨를 확인하겠습니다.',
+      toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"서울"}' }],
+    },
+  );
+});
