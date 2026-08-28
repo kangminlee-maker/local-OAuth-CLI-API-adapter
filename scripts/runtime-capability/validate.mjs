@@ -123,6 +123,33 @@ export async function validateCatalog(data) {
   // makes every declared hidden flag "supported", drives stale to zero, and lets
   // the verdict claim validity the run never established.
   const inconclusiveReasons = [];
+
+  // The same rule, one level earlier. Every check below compares a documented
+  // set against a collected one, so an empty documented set makes each
+  // difference() empty, each count zero, and the verdict clean — which is
+  // indistinguishable from a run that checked everything and found nothing. The
+  // ordinary way it happens is a renamed heading or a reformatted version row,
+  // and this catalog's own update rules actively invite both: they tell the
+  // operator to restructure the document. Assert the parse before trusting what
+  // it produced.
+  if (!codexSection) {
+    inconclusiveReasons.push('catalog heading "## Codex capability list" not found: codex expectations parsed empty');
+  } else if (documentedCodexMethods.length === 0) {
+    inconclusiveReasons.push('codex capability section parsed to zero documented methods');
+  }
+  if (!claudeSection) {
+    inconclusiveReasons.push('catalog heading "## Claude Code capability list" not found: claude expectations parsed empty');
+  } else if (documentedClaudeFlags.length === 0) {
+    inconclusiveReasons.push('claude capability section parsed to zero documented flags');
+  }
+  for (const runtime of ['codex', 'claude']) {
+    if (!documentedVersions[runtime]) {
+      inconclusiveReasons.push(`${runtime} version cell not found in the catalog table: version drift unchecked`);
+    }
+    if (!observedVersions[runtime]) {
+      inconclusiveReasons.push(`${runtime} version not observed from the binary: version drift unchecked`);
+    }
+  }
   if (!probeIsAuthoritative) {
     inconclusiveReasons.push(probe?.skipped
       ? 'hidden flag parse probe skipped'

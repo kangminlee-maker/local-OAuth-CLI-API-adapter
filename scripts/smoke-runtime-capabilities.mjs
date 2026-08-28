@@ -147,6 +147,32 @@ async function collectCodexSchema(root, codexBinary) {
 
 function smokeCatalogBasics(catalog) {
   const result = [];
+  // The collector already ran, spawned both CLIs and reached a verdict; reading
+  // it here is free. Discarding it meant an operator who ran only this smoke saw
+  // green over a stale catalog, because nothing else in this report looks at
+  // whether the documented surface still matches the installed one.
+  const validity = catalog.catalogValidity ?? {};
+  const validityOk = validity.exists === true
+    && validity.staleCount === 0
+    && validity.inconclusive === false;
+  result.push({
+    id: 'catalog.validity',
+    runtime: 'both',
+    kind: 'catalog_validation',
+    risk: 'safe_metadata',
+    execution: 'metadata',
+    status: validityOk ? 'pass' : 'fail',
+    inputContract: 'update-runtime-capability-catalog.mjs --skip-binary-scan (run by this smoke)',
+    outputSchema: 'catalogValidity: exists, staleCount 0, inconclusive false',
+    evidence: [
+      `verdict=${validity.verdict ?? 'missing'}`,
+      `stale=${validity.staleCount ?? 'n/a'}`,
+      `versionDrift=${(validity.versionDrift ?? []).length}`,
+      (validity.inconclusiveReasons ?? []).length > 0
+        ? `inconclusive: ${validity.inconclusiveReasons.join('; ')}`
+        : 'inconclusive: none',
+    ].join(' | '),
+  });
   result.push({
     id: 'catalog.codex.version',
     runtime: 'codex',
