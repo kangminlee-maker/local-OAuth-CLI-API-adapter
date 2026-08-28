@@ -12,7 +12,7 @@ import {
   normalizeDomainValue,
 } from './catalog-doc.mjs';
 import { rootOptionsOf } from './help-parser.mjs';
-import { commandAnswersForItself, commandUsage, probeFlagInCommand } from './probes.mjs';
+import { commandAnswersForItself, commandUsage, probeFlagControls, probeFlagInCommand } from './probes.mjs';
 import {
   difference,
   extractVersionCell,
@@ -164,6 +164,24 @@ export async function validateCatalog(data) {
   if (codexFlags.indeterminate.length > 0) {
     inconclusiveReasons.push(`indeterminate codex option probes: ${codexFlags.indeterminate.join(', ')}`);
   }
+  if ((codexFlags.controlsFailed ?? []).length > 0) {
+    inconclusiveReasons.push(`codex option probe controls did not come back unregistered for: ${codexFlags.controlsFailed.join(', ')}`);
+  }
+  for (const [runtime, check] of [['codex', codexCommands], ['claude', claudeCommands]]) {
+    if ((check.indeterminate ?? []).length > 0) {
+      inconclusiveReasons.push(`${runtime} command probes could not tell: ${check.indeterminate.join(', ')}`);
+    }
+  }
+  // The collector states that a dropped L0 candidate should surface here. It
+  // computed the set and nothing read it, so the assertion in that comment was
+  // never true. A missing string is not staleness on its own — the scan is noisy
+  // and L0 is candidates only — but it is authority the run did not get.
+  for (const runtime of ['codex', 'claude']) {
+    const scan = data[runtime]?.binaryScan;
+    if (scan?.available && scan.ok && (scan.hiddenFlagsMissing ?? []).length > 0) {
+      inconclusiveReasons.push(`${runtime} binary scan no longer finds declared hidden-flag candidates: ${scan.hiddenFlagsMissing.join(', ')}`);
+    }
+  }
   if (requestContracts.unverified.length > 0) {
     inconclusiveReasons.push(`request contracts not verified: ${requestContracts.unverified.map((entry) => `${entry.method} (${entry.reason})`).join(', ')}`);
   }
@@ -257,22 +275,22 @@ export async function validateDocumentedCommands(runtime, section, binaryName) {
   const visible = documented.filter((command) => known.has(command));
   const hiddenConfirmed = [];
   const absent = [];
+  const indeterminateCommands = [];
   for (const command of documented.filter((entry) => !known.has(entry))) {
     const parent = command.split(' ').slice(0, -1).join(' ');
     // The parent of a hidden command is often hidden too, so it is absent from
     // the tree. Falling back to the root usage there would accept a removed
     // child whose invocation lands on its still-present parent's help, since
     // that help differs from the root's. Probe the real parent instead.
-    let parentUsage = usageOf.get(parent || '(root)');
-    if (parentUsage === undefined) {
-      parentUsage = await commandUsage(runtime.binary, parent);
-      usageOf.set(parent || '(root)', parentUsage);
+    const parentKey = parent || '(root)';
+    if (!usageOf.has(parentKey)) {
+      usageOf.set(parentKey, await commandUsage(runtime.binary, parent));
     }
-    if (await commandAnswersForItself(runtime.binary, binaryName, command, parentUsage)) {
-      hiddenConfirmed.push(command);
-    } else {
-      absent.push(command);
-    }
+    const parentUsage = usageOf.get(parentKey);
+    const answer = await commandAnswersForItself(runtime.binary, binaryName, command, parentUsage);
+    if (answer === 'yes') hiddenConfirmed.push(command);
+    else if (answer === 'indeterminate') indeterminateCommands.push(command);
+    else absent.push(command);
   }
   // Commands the installed CLI has but the catalog never mentions are additive
   // candidates: not stale, but the only signal that the surface grew.
@@ -282,6 +300,7 @@ export async function validateDocumentedCommands(runtime, section, binaryName) {
     .filter((command) => command !== '(root)' && !documentedSet.has(command));
   return {
     authority: 'command_tree_plus_probe',
+    indeterminate: indeterminateCommands,
     documentedCount: documented.length,
     visible,
     hiddenConfirmed,
@@ -337,6 +356,8 @@ export async function validateDocumentedFlagUses(runtime, section, binaryName) {
   const absent = [];
   const indeterminate = [];
   const unprobed = [];
+  const controlsByCommand = new Map();
+  const controlsFailed = new Set();
   for (const use of uses) {
     const key = use.command || '(root)';
     const label = `${use.command} ${use.flag}`.trim();
@@ -350,6 +371,16 @@ export async function validateDocumentedFlagUses(runtime, section, binaryName) {
       unprobed.push(label);
       continue;
     }
+    // Controls first, once per command: without them a reworded rejection makes
+    // every probe below read as confirmed.
+    if (!controlsByCommand.has(key)) {
+      controlsByCommand.set(key, await probeFlagControls(runtime.binary, use.command));
+    }
+    if (!controlsByCommand.get(key).ok) {
+      controlsFailed.add(key);
+      indeterminate.push(label);
+      continue;
+    }
     const verdict = await probeFlagInCommand(runtime.binary, use.command, use.flag);
     if (verdict === 'unregistered') absent.push(label);
     else if (verdict === 'indeterminate') indeterminate.push(label);
@@ -357,6 +388,7 @@ export async function validateDocumentedFlagUses(runtime, section, binaryName) {
   }
   return {
     authority: skipFlagProbe ? 'command_tree_only' : 'command_tree_plus_probe',
+    controlsFailed: [...controlsFailed],
     count: uses.length,
     visible,
     hiddenConfirmed,

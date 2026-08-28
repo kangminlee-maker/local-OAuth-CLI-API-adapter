@@ -145,9 +145,9 @@ LLM에게 catalog 갱신을 맡길 때는 아래 입력을 함께 제공한다.
 
 - **[기계]** `pnpm catalog:runtime -- --fail-on-stale`이 exit 0이다. 플래그 없이 돌린 실행은 이 기준을
   만족시키지 못한다.
-- **[운영자]** `artifacts/runtime-capability-smoke/latest.md`에서 각 capability가 risk와 execution mode를
-  갖고 있다. 집계는 값이 없는 행을 `undefined`라는 이름의 정상 항목으로 세므로, 개수만 보지 말고
-  `undefined` 버킷이 있는지 직접 확인한다.
+- **[기계]** `pnpm smoke:runtime-capabilities`가 exit 0이다. 여기에는 `catalog.validity` 행(수집기의
+  판정)과 모든 행이 risk·execution을 갖는지에 대한 단언이 포함된다. `status: inventory` 행은 검사가
+  아니라 목록이므로 통과 건수에 들어가지 않는다.
 - **[운영자]** 원본 catalog가 현재 runtime/version/source-level 사실만 담고 있다. 버전을 본문 산문에도
   적었다면 표와 함께 고친다 — 게이트는 `| Codex CLI |` / `| Claude Code |` 행만 읽으므로 산문에 남은
   옛 버전은 보이지 않는다.
@@ -157,25 +157,10 @@ LLM에게 catalog 갱신을 맡길 때는 아래 입력을 함께 제공한다.
 - 런북 본문이 지시하는 "markdown link 검증"에 해당하는 도구는 **현재 이 레포에 없다.** 링크를 바꿨다면
   수동 확인이며, 그렇게 보고한다.
 
-## 알려진 결함 — 초록을 읽을 때 감안할 것
+## 도구가 강제하는 것과 하지 않는 것
 
-이 절은 도구가 고쳐지면 지운다. 그때까지 아래 초록은 그 자체로 증거가 아니다.
+수집기와 smoke는 버전·명령·flag·요청 계약의 **드리프트**를 강제한다. 강제하지 않는 것이 둘 남아 있고,
+둘 다 운영자 몫이다. 첫째, 카탈로그가 현재 사실만 담고 있는지 — 과거 버전 서술이 산문에 남아도 게이트는
+표 행만 읽으므로 보이지 않는다. 둘째, markdown 링크 유효성 — 해당 도구가 이 레포에 없다.
 
-2026-08-29에 둘을 고쳤다. smoke가 이미 계산해 두고 버리던 `catalogValidity`를 이제 `catalog.validity`
-행으로 보고하고 실패시키며, 기대 목록이나 버전 셀이 비어 있으면 검증이 조용히 통과하는 대신
-`inconclusive`가 된다. 둘 다 변이로 확인했다 — 섹션 제목을 바꾼 사본은 exit 1과 함께 이유를 내고,
-버전 셀을 틀리게 바꾼 카탈로그에서는 smoke가 `verdict=needs_update`로 빨간불이 된다.
-
-1. **smoke의 claude flag 행은 아무것도 단언하지 않는다.** 그 행들은 `--help` 출력에서 만들어졌고 "help에
-   존재한다"를 확인하므로 구조상 항상 통과한다. smoke 통과 건수의 최대 블록이며, CLI에서 플래그가
-   사라지면 실패가 아니라 **행이 사라진다.**
-2. **codex option probe에는 네거티브 컨트롤이 없다.** claude 경로는 bogus control 두 개가
-   `unregistered`로 돌아와야 결과를 신뢰하지만 codex 경로는 그 대조가 없다. codex의 거부 문구가 바뀌면
-   문서화된 옵션 전부가 조용히 "확인됨"이 된다.
-3. **binary scan 결과는 게이트에 들어가지 않는다.** 코드 주석은 L0 후보가 사라지면 stale로 드러난다고
-   적고 있으나 실제로는 렌더링에만 쓰인다.
-4. **`--help`가 실패하면 "확인 불가"가 아니라 "없음"이 된다.** 타임아웃이나 강제 종료도 명령이 사라진
-   것으로 기록되므로, 원칙 1(stale 우선 처리)을 따르다 멀쩡한 명령을 지울 수 있다. stale로 뜬 command는
-   지우기 전에 손으로 한 번 실행해 본다.
-5. **카탈로그 본문의 probe 예시에 쓰인 control flag 이름이 코드와 다르다.** 그 줄을 그대로 복사하면
-   대조 없는 probe를 돌리게 된다. probe는 두 네거티브 컨트롤이 모두 `unregistered`로 와야 증거다.
+`pnpm pack:adapter`는 카탈로그가 tarball에 **존재하는지**만 확인하며 내용은 검사하지 않는다.

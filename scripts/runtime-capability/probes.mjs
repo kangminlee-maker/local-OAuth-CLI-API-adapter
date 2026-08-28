@@ -132,6 +132,24 @@ export async function probeFlagInCommand(binary, command, flag) {
   return classifyFlagProbe(`${result.stdout ?? ''}\n${result.stderr ?? ''}`, flag, result);
 }
 
+// The same negative control the hidden-flag probe insists on, for the other
+// runtime. `classifyFlagProbe` decides "unregistered" by matching the CLI's
+// rejection wording, so a release that rewords it makes every probe fall
+// through to `registered_parsed` — every documented option would read as
+// confirmed and nothing would look wrong. Probing a flag the CLI cannot have
+// is what distinguishes "the parser rejected it" from "the matcher stopped
+// working". Controls are probed per command because subcommands can differ.
+export async function probeFlagControls(binary, command) {
+  const verdicts = {};
+  for (const control of FLAG_PROBE_CONTROLS) {
+    verdicts[control] = await probeFlagInCommand(binary, command, control);
+  }
+  return {
+    verdicts,
+    ok: FLAG_PROBE_CONTROLS.every((control) => verdicts[control] === 'unregistered'),
+  };
+}
+
 export async function commandUsage(binary, commandPath) {
   const argv = commandPath ? [...commandPath.split(' '), '--help'] : ['--help'];
   const result = await run(binary, argv, {
@@ -139,7 +157,10 @@ export async function commandUsage(binary, commandPath) {
     maxBuffer: 8_000_000,
     cwd: await probeScratchDir(),
   });
-  return parseHelpText(`${result.stdout ?? ''}\n${result.stderr ?? ''}`).usage;
+  // A help that never ran carries no usage line, and an absent usage line is
+  // how a command gets called removed. Say the run failed instead.
+  if (!result.ok) return null;
+  return parseHelpText(`${result.stdout ?? ''}\n${result.stderr ?? ''}`).usage ?? null;
 }
 
 // A hidden command prints usage for itself; an unknown name falls back to the
@@ -153,8 +174,15 @@ export async function commandAnswersForItself(binary, binaryName, commandPath, p
   });
   const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
   if (new RegExp(`(^|\\s)${escapeRegExp(binaryName)}\\s+${escapeRegExp(commandPath)}(\\s|$)`, 'im').test(text)) {
-    return true;
+    return 'yes';
   }
+  // A killed or timed-out probe produces no usage line, which is the same shape
+  // as a removed command. Reporting "no" there sends the operator to delete a
+  // command that may still exist, because the update rules put stale entries
+  // first. Three outcomes, so "could not tell" stays visible.
+  if (!result.ok) return 'indeterminate';
   const usage = parseHelpText(text).usage;
-  return Boolean(usage) && Boolean(parentUsage) && usage !== parentUsage;
+  if (!usage) return 'indeterminate';
+  if (parentUsage === null || parentUsage === undefined) return 'indeterminate';
+  return usage !== parentUsage ? 'yes' : 'no';
 }

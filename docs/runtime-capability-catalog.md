@@ -130,10 +130,11 @@ Hidden-surface probe (claude는 bun-compiled commander CLI다. `hideHelp()` flag
 # L0: binary에서 commander option 등록 문자열을 추출한다. 후보 발견용이며 수용 근거가 아니다.
 strings -n 6 "$(readlink -f ~/.local/bin/claude)" | grep -oE -- '--[a-z0-9-]+ (<[^>]{1,40}>|\[[^]]{1,40}\])' | sort -u
 # L4: flag에 bogus control flag를 붙여 parser 응답을 읽는다. 값이 아니라 flag를 주는 것이 핵심이다.
-claude --thinking --zzz-control          # "argument '--zzz-control' is invalid. Allowed choices ..." → 값 flag로 등록됨
-claude --maintenance --zzz-control       # "unknown option '--zzz-control'"                          → boolean으로 등록됨
-claude --judge-model --zzz-control       # "unknown option '--judge-model'"                          → 미등록
-claude --zzz-absent --zzz-control        # negative control: 반드시 미등록으로 나와야 probe가 유효
+claude --thinking --zzz-catalog-probe-control          # "argument '--zzz-catalog-probe-control' is invalid. Allowed choices ..." → 값 flag로 등록됨
+claude --maintenance --zzz-catalog-probe-control       # "unknown option '--zzz-catalog-probe-control'"                          → boolean으로 등록됨
+claude --judge-model --zzz-catalog-probe-control       # "unknown option '--judge-model'"                          → 미등록
+claude --zzz-not-a-real-flag --zzz-catalog-probe-control      # negative control 1 — 반드시 unregistered
+claude --zzz-catalog-probe-absent --zzz-catalog-probe-control # negative control 2 — 둘 다 unregistered여야 probe가 유효
 # Hidden subcommand probe: 실제 명령은 자기 usage를, 없는 이름은 main help를 출력한다.
 claude <name> --help | head -1           # "Usage: claude <name>" vs "Usage: claude [options] [command]"
 ```

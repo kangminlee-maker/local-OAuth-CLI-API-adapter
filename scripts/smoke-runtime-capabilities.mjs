@@ -16,7 +16,8 @@ const includeLiveModel = args.includes('--include-live-model');
 const failOnLiveFailure = args.includes('--fail-on-live-failure');
 const timeoutMs = Number(readValueArg('--timeout-ms') ?? 180_000);
 const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-const tokenWarningThreshold = 1_000_000;
+// Number of live model probes `runLiveModelSmokes` issues; keep in step with it.
+const LIVE_PROBE_COUNT = 7;
 
 const tempRoot = await mkdtemp(join(tmpdir(), 'runtime-capability-smoke-'));
 const rows = [];
@@ -30,10 +31,11 @@ try {
   rows.push(...await smokeClaudeHelpCommands(catalog.claude?.binary));
   rows.push(...smokeClaudeFlags(catalog));
 
-  const plannedLiveTokens = includeLiveModel ? estimateLiveTokens() : 0;
-  if (plannedLiveTokens > tokenWarningThreshold) {
-    process.stderr.write(`WARNING: planned live model smoke may exceed ${tokenWarningThreshold} tokens. estimate=${plannedLiveTokens}\n`);
-  }
+  // There used to be a 1M-token warning here fed by a hardcoded 7 x 2,000
+  // estimate, so the branch could never fire and documented a safeguard that did
+  // not exist. What is actually known before the run is how many live probes it
+  // will make; report that instead of a number nobody measured.
+  const plannedLiveProbes = includeLiveModel ? LIVE_PROBE_COUNT : 0;
 
   if (includeLiveModel) {
     liveRows.push(...await runLiveModelSmokes({ timeoutMs }));
@@ -41,8 +43,7 @@ try {
   }
 
   const summary = summarizeRows(rows, {
-    plannedLiveTokens,
-    liveTokenWarningThreshold: tokenWarningThreshold,
+    plannedLiveProbes,
   });
   const report = {
     generatedAt: new Date().toISOString(),
@@ -77,8 +78,16 @@ try {
   process.stdout.write(`runtime capability smoke report: ${jsonPath}\n`);
   process.stdout.write(`runtime capability smoke summary: ${markdownPath}\n`);
 
+  // The runbook's completion criterion asks that every capability carry a risk
+  // and an execution mode. The summary counts them, and countBy files a missing
+  // field under the literal key "undefined" and prints it as an ordinary total —
+  // so the criterion was satisfied by reading a table carefully, or not at all.
+  const unclassified = rows.filter((row) => !row.risk || !row.execution);
+  if (unclassified.length > 0) {
+    process.stderr.write(`rows missing risk or execution: ${unclassified.map((row) => row.id).join(', ')}\n`);
+  }
   const hardFailures = rows.filter((row) => row.status === 'fail' && (row.execution !== 'live_model' || failOnLiveFailure));
-  if (hardFailures.length > 0) process.exitCode = 1;
+  if (hardFailures.length > 0 || unclassified.length > 0) process.exitCode = 1;
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
 }
@@ -101,11 +110,21 @@ async function collectCatalog(root) {
     catalogOut,
     '--skip-binary-scan',
   ], {
-    timeoutMs: 60_000,
+    // The collector spawns both CLIs for every version, help, command-tree and
+    // parse probe it makes, and each probe carries its own multi-second timeout.
+    // It measured 55s here the day a negative-control probe was added to the
+    // codex path, which is what a 60s budget turns into an empty crash.
+    timeoutMs: 240_000,
     maxBuffer: 20_000_000,
   });
   if (!result.ok) {
-    throw new Error(`catalog collection failed: ${result.stderr || result.stdout}`);
+    // A killed subprocess writes nothing, so the old message interpolated two
+    // empty strings and reported that catalog collection failed for no stated
+    // reason. Say which way it failed.
+    const how = result.signal
+      ? `killed by ${result.signal} (likely the ${240_000}ms budget)`
+      : `exit code ${result.code}`;
+    throw new Error(`catalog collection failed: ${how}${result.stderr ? `\n${result.stderr}` : ''}`);
   }
   return JSON.parse(await readFile(join(catalogOut, 'latest.json'), 'utf8'));
 }
@@ -305,6 +324,14 @@ async function smokeClaudeHelpCommands(claudeBinary) {
   return rows;
 }
 
+// These rows are an inventory with a risk classification, not a check. They are
+// built from the flags `--help` reported, so "exists in help" is true by
+// construction — and they were the largest block of passes in the report, which
+// made the whole smoke read as more verified than it was. A flag the CLI drops
+// does not fail here either; the row simply stops being emitted. Flag drift is
+// gated by `catalog.validity`, which compares the documented set against the
+// collected one. Marking these `inventory` keeps the classification and stops
+// them from counting as evidence.
 function smokeClaudeFlags(catalog) {
   return (catalog.claude?.helpFlags ?? []).map((flag) => {
     const classification = classifyClaudeFlag(flag);
@@ -314,9 +341,9 @@ function smokeClaudeFlags(catalog) {
       kind: 'cli_flag',
       risk: classification.risk,
       execution: 'help_definition',
-      status: 'pass',
+      status: 'inventory',
       inputContract: flag,
-      outputSchema: 'flag definition exists in local claude --help output',
+      outputSchema: 'flag observed in an aggregated claude --help surface; asserts nothing on its own',
       evidence: classification.reason,
     };
   });
@@ -676,10 +703,6 @@ function exactStatusSchema(runtime) {
   };
 }
 
-function estimateLiveTokens() {
-  return 7 * 2_000;
-}
-
 function summarizeRows(allRows, extra) {
   const byStatus = countBy(allRows, 'status');
   const byRisk = countBy(allRows, 'risk');
@@ -712,9 +735,7 @@ Generated at: ${report.generatedAt}
 
 Live model probes: ${report.includeLiveModel ? 'enabled' : 'disabled'}
 
-Planned live token estimate: ${report.summary.plannedLiveTokens}
-
-1m token warning threshold: ${report.summary.liveTokenWarningThreshold}
+Planned live model probes: ${report.summary.plannedLiveProbes}
 
 ## Summary
 
