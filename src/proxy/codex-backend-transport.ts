@@ -1522,6 +1522,16 @@ function responseOutputTypes(output: readonly unknown[] | undefined): string[] {
     .filter((type): type is string => typeof type === 'string');
 }
 
+/** Sums a token field only when at least one side reported it. */
+function optionalSum(
+  field: 'cacheCreationInputTokens' | 'cacheReadInputTokens',
+  left: LocalUsage,
+  right: LocalUsage,
+): Partial<LocalUsage> {
+  if (left[field] === undefined && right[field] === undefined) return {};
+  return { [field]: (left[field] ?? 0) + (right[field] ?? 0) };
+}
+
 function mergeUsage(
   left: LocalUsage | undefined,
   right: LocalUsage | undefined,
@@ -1533,8 +1543,11 @@ function mergeUsage(
     outputTokens: left.outputTokens + right.outputTokens,
     totalTokens: (left.totalTokens ?? 0) + (right.totalTokens ?? 0),
     cachedInputTokens: (left.cachedInputTokens ?? 0) + (right.cachedInputTokens ?? 0),
-    cacheCreationInputTokens: (left.cacheCreationInputTokens ?? 0) + (right.cacheCreationInputTokens ?? 0),
-    cacheReadInputTokens: (left.cacheReadInputTokens ?? 0) + (right.cacheReadInputTokens ?? 0),
+    // Summed only where one side reported them: `?? 0` turned two silent
+    // halves into a reported zero, which downstream reads as "this runtime
+    // reports caching and got none" — a different claim from "it does not say".
+    ...optionalSum('cacheCreationInputTokens', left, right),
+    ...optionalSum('cacheReadInputTokens', left, right),
     reasoningOutputTokens: (left.reasoningOutputTokens ?? 0) + (right.reasoningOutputTokens ?? 0),
     source: left.source === 'provider' || right.source === 'provider' ? 'provider' : left.source ?? right.source,
     raw: [left.raw, right.raw].filter((value) => value !== undefined),
@@ -1628,7 +1641,22 @@ async function responseInputItems(request: NormalizedRequest): Promise<unknown[]
 
 async function responseInputItemsForMessage(message: NormalizedMessage): Promise<unknown[]> {
   const toolHistory = responseToolHistoryItems(message);
-  if (toolHistory) return toolHistory;
+  if (toolHistory) {
+    if (message.images.length === 0) return toolHistory;
+    // The call still has to be answered — an unanswered `function_call` is a
+    // 400 from this API — and the picture the tool returned still has to
+    // arrive. `function_call_output` carries a string, so the image travels
+    // beside it as its own user message rather than being dropped with the
+    // answer.
+    return [
+      ...toolHistory,
+      {
+        type: 'message',
+        role: 'user',
+        content: await Promise.all(message.images.map((image) => responseImagePart(image))),
+      },
+    ];
+  }
   return [{
     type: 'message',
     role: responseRole(message.role),
@@ -1646,8 +1674,15 @@ async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
   return content.length > 0 ? content : [{ type: textType, text: '' }];
 }
 
+/**
+ * The tool turns of the conversation, as this API's own items.
+ *
+ * Images used to disqualify a message from being read as tool history at all,
+ * which left the `function_call` before it unanswered — a 400 here, and prose
+ * saying `[tool result]` in the prompt if it got through. The images come back
+ * beside these items instead; see `responseInputItemsForMessage`.
+ */
 function responseToolHistoryItems(message: NormalizedMessage): unknown[] | null {
-  if (message.images.length > 0) return null;
   const text = message.content.trim();
   if (text.startsWith('[assistant tool_call]')) {
     return parseAssistantToolCalls(text).map((call) => ({

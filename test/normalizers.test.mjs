@@ -267,6 +267,34 @@ test('an image inside a tool_result reaches the runtime as an image, not as pros
   const image = content.find((block) => block.type === 'image');
   assert.ok(image, `no image block reached the runtime: ${JSON.stringify(content).slice(0, 200)}`);
   assert.equal(image.source.data, RED_PIXEL_PNG);
-  // And the text half still describes the result the image came with.
-  assert.match(prompt, /tool result/);
+  // The text half names the call the image answers — the marker alone proves
+  // nothing, since `buildPrompt` writes it whether or not the image survived.
+  assert.match(prompt, /tool_call_id: t1/);
+});
+
+test('taking the tools off a turn lets an Anthropic client keep its own format', () => {
+  // The contract tells a client to use `tool_choice: "none"` when it wants its
+  // own schema on a turn that carries tools. That was a 400 here — the check
+  // fired before the choice was read — so the documented way out did not exist
+  // on this surface.
+  const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false };
+  const request = normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-5',
+    max_tokens: 100,
+    tools: [{ name: 'get_weather', description: 'd', input_schema: { type: 'object', properties: {}, additionalProperties: false } }],
+    tool_choice: { type: 'none' },
+    output_config: { format: { type: 'json_schema', schema } },
+    messages: [{ role: 'user', content: 'hi' }],
+  });
+  assert.deepEqual(request.jsonSchema, schema);
+  assert.equal(request.toolChoice.type, 'none');
+
+  // With the tools live, the collision is still refused.
+  assert.throws(() => normalizeAnthropicMessagesRequest({
+    model: 'claude-opus-5',
+    max_tokens: 100,
+    tools: [{ name: 'get_weather', description: 'd', input_schema: { type: 'object', properties: {}, additionalProperties: false } }],
+    output_config: { format: { type: 'json_schema', schema } },
+    messages: [{ role: 'user', content: 'hi' }],
+  }), /not supported together with tools/);
 });

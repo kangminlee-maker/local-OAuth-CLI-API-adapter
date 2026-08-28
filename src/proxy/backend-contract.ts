@@ -108,10 +108,14 @@ export function parseBackendOutput(
         : [];
       return { text: '', toolCalls: calls };
     }
-    return {
-      text: typeof obj.text === 'string' ? obj.text : '',
-      toolCalls: [],
-    };
+    // Only a wrapper this backend produced may be unwrapped. A json-mode client
+    // gets its OWN object back from the runtime, and reading that as a wrapper
+    // with no `text` field returned an empty answer — the whole reply dropped
+    // on the floor. Anything that is not the wrapper is the answer itself.
+    if (typeof obj.text === 'string' && obj.status === 'message') {
+      return { text: obj.text, toolCalls: [] };
+    }
+    return { text, toolCalls: [] };
   } catch {
     return { text, toolCalls: [] };
   }

@@ -1400,6 +1400,16 @@ function imageGenerationFromThreadItem(
   };
 }
 
+/** Sums a token field only when at least one side reported it. */
+function optionalSum(
+  field: 'cacheCreationInputTokens' | 'cacheReadInputTokens',
+  left: LocalUsage,
+  right: LocalUsage,
+): Partial<LocalUsage> {
+  if (left[field] === undefined && right[field] === undefined) return {};
+  return { [field]: (left[field] ?? 0) + (right[field] ?? 0) };
+}
+
 function mergeUsage(
   current: LocalUsage | undefined,
   next: LocalUsage | undefined,
@@ -1411,8 +1421,11 @@ function mergeUsage(
     outputTokens: current.outputTokens + next.outputTokens,
     totalTokens: (current.totalTokens ?? 0) + (next.totalTokens ?? 0),
     cachedInputTokens: (current.cachedInputTokens ?? 0) + (next.cachedInputTokens ?? 0),
-    cacheCreationInputTokens: (current.cacheCreationInputTokens ?? 0) + (next.cacheCreationInputTokens ?? 0),
-    cacheReadInputTokens: (current.cacheReadInputTokens ?? 0) + (next.cacheReadInputTokens ?? 0),
+    // Summed only where one side reported them: `?? 0` turned two silent
+    // halves into a reported zero, which downstream reads as "this runtime
+    // reports caching and got none" — a different claim from "it does not say".
+    ...optionalSum('cacheCreationInputTokens', current, next),
+    ...optionalSum('cacheReadInputTokens', current, next),
     reasoningOutputTokens: (current.reasoningOutputTokens ?? 0) + (next.reasoningOutputTokens ?? 0),
     source: current.source === 'provider' && next.source === 'provider' ? 'provider' : 'estimated',
     raw: [current.raw, next.raw].filter(Boolean),

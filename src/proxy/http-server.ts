@@ -2095,10 +2095,27 @@ function numberOrDefault(value: unknown, fallback: number): number {
  * from cache reported no cache fields at all, so a client computing cost or
  * cache efficiency from `usage` saw a full-price prompt every turn.
  */
+/**
+ * The part of the final text a stream has not delivered. Live deltas can stop
+ * short of the finished answer — a wrapper's text is read from a growing
+ * snapshot — and a surface that only handles "nothing was streamed" then
+ * truncates the reply at whatever arrived first.
+ */
+function missingTextTail(streamed: string, final: string): string {
+  if (!final || final === streamed) return '';
+  if (!streamed) return final;
+  return final.startsWith(streamed) ? final.slice(streamed.length) : '';
+}
+
 function anthropicUsage(usage: LocalUsage): Record<string, number> {
-  const cacheRead = usage.cacheReadInputTokens ?? usage.cachedInputTokens;
-  const inputTokens = usage.cacheReadInputTokens === undefined && usage.cachedInputTokens !== undefined
-    ? Math.max(usage.inputTokens - usage.cachedInputTokens, 0)
+  // A zero is not a report: the OpenAI-shaped producers read `cached_tokens`
+  // with a numeric default, and merged usages sum absent halves into 0, so
+  // treating 0 as "this runtime reports caching" put `cache_read_input_tokens:
+  // 0` on every cache-miss turn and re-hid a real hit behind a merged zero.
+  const openAiCacheRead = usage.cachedInputTokens || undefined;
+  const cacheRead = usage.cacheReadInputTokens ?? openAiCacheRead;
+  const inputTokens = usage.cacheReadInputTokens === undefined && openAiCacheRead !== undefined
+    ? Math.max(usage.inputTokens - openAiCacheRead, 0)
     : usage.inputTokens;
   return {
     input_tokens: inputTokens,
@@ -2194,14 +2211,12 @@ async function writeOpenAiChatStream(
         ));
       } else {
         await ensureTextStarted();
-        if (!streamedText && result.text) {
-          for (const chunk of chunkText(result.text)) {
-            await writeSseData(res, openAiChatStreamChunk(
-              base,
-              [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-              request.streamOptions,
-            ));
-          }
+        for (const chunk of chunkText(missingTextTail(streamedText, result.text))) {
+          await writeSseData(res, openAiChatStreamChunk(
+            base,
+            [{ index: 0, delta: { content: chunk }, finish_reason: null }],
+            request.streamOptions,
+          ));
         }
         await writeSseData(res, openAiChatStreamChunk(
           base,
@@ -2505,8 +2520,8 @@ async function writeOpenAiResponsesStream(
         }
       } else {
         await ensureTextStarted();
-        if (!streamedText && result.text) {
-          for (const chunk of chunkText(result.text)) {
+        {
+          for (const chunk of chunkText(missingTextTail(streamedText, result.text))) {
             streamedText += chunk;
             await writeResponseEvent('response.output_text.delta', {
               type: 'response.output_text.delta',
@@ -2809,9 +2824,10 @@ async function writeAnthropicMessagesStream(
         // where no live text_delta was emitted), then close the block. A truly empty
         // result opens no content block, matching the non-streaming content:[] mapping
         // — so streaming and non-streaming refusals carry the same content.
-        if (!streamedText && result.text) {
+        const tail = missingTextTail(streamedText, result.text);
+        if (tail) {
           await ensureTextStarted();
-          for (const chunk of chunkText(result.text)) {
+          for (const chunk of chunkText(tail)) {
             streamedText += chunk;
             await writeSseEvent(res, 'content_block_delta', {
               type: 'content_block_delta',

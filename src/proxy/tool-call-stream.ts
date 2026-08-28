@@ -17,11 +17,18 @@ interface ToolCallState {
 export class ToolCallDeltaExtractor {
   private raw = '';
   private readonly states = new Map<number, ToolCallState>();
+  /** How much of the wrapper's answer text has already been streamed. */
+  private streamedText = '';
 
   push(delta: string): LocalStreamEvent[] {
     if (!delta) return [];
     this.raw += delta;
     const out: LocalStreamEvent[] = [];
+    // The wrapper carries the ANSWER too, and a turn that answers is the common
+    // one once tools stay available for the whole conversation. Reading only
+    // its tool calls meant such a turn streamed nothing at all and arrived in
+    // one piece when it finished — the client sat silent through the wait.
+    out.push(...this.textDeltas());
     for (const snapshot of readToolCallSnapshots(this.raw)) {
       const state = this.states.get(snapshot.index) ?? {
         arguments: '',
@@ -60,6 +67,21 @@ export class ToolCallDeltaExtractor {
       this.states.set(snapshot.index, state);
     }
     return out;
+  }
+
+  /**
+   * The part of the wrapper's `text` the client has not seen. Read from the
+   * growing snapshot the same way arguments are: what a partial value decodes
+   * to can only grow, and anything that contradicts what was already sent is
+   * not sent again.
+   */
+  private textDeltas(): LocalStreamEvent[] {
+    const text = readStringProperty(this.raw, 'text');
+    if (text === undefined || text === this.streamedText) return [];
+    if (!text.startsWith(this.streamedText)) return [];
+    const delta = text.slice(this.streamedText.length);
+    this.streamedText = text;
+    return delta ? [{ type: 'text_delta', delta }] : [];
   }
 }
 

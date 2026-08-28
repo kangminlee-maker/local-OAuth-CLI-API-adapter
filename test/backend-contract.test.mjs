@@ -17,11 +17,12 @@ test('tool decision schema remains enabled before an auto tool call', () => {
   })), true);
 });
 
-test('tool decision schema remains enabled for required tool choice', () => {
-  assert.equal(hasToolDecisionSchema(requestWithTools({
-    messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"ok":true}', images: [] }],
-    toolChoice: { type: 'required' },
-  })), true);
+test('the tool choice is what turns the decision schema off, and only `none` does', () => {
+  const messages = [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"ok":true}', images: [] }];
+  for (const toolChoice of [{ type: 'auto' }, { type: 'required' }, { type: 'tool', name: 'get_weather' }]) {
+    assert.equal(hasToolDecisionSchema(requestWithTools({ messages, toolChoice })), true, JSON.stringify(toolChoice));
+  }
+  assert.equal(hasToolDecisionSchema(requestWithTools({ messages, toolChoice: { type: 'none' } })), false);
 });
 
 test('forced single tool calls use arguments-only schema and parser', () => {
@@ -76,6 +77,21 @@ test('answering is still expressible on a turn after a tool result', () => {
   assert.deepEqual(
     parseBackendOutput(request, JSON.stringify({ status: 'message', text: '서울은 21도입니다.', toolCalls: [] })),
     { text: '서울은 21도입니다.', toolCalls: [] },
+  );
+});
+
+test('a json-mode answer is not mistaken for an empty wrapper', () => {
+  // With tools on every turn, a json-mode client's own object reaches this
+  // parser. Read as a wrapper it has no `text`, and the answer came back empty
+  // — the reply dropped on the floor rather than delivered.
+  const request = requestWithTools({
+    messages: [{ role: 'tool', content: '[tool result]\ntool_call_id: call_1\n{"ok":true}', images: [] }],
+    jsonMode: true,
+  });
+
+  assert.deepEqual(
+    parseBackendOutput(request, '{"answer":"OK"}'),
+    { text: '{"answer":"OK"}', toolCalls: [] },
   );
 });
 
