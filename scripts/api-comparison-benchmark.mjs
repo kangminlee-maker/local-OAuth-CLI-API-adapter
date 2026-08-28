@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import { captureSummary, recordExchange, startCaptureRun } from './lib/capture-recorder.mjs';
 import fs from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 import {
@@ -238,6 +241,23 @@ const claudeIsolateUserSettings = strictBooleanOption(
   '--claude-isolate-user-settings',
 );
 const outputPath = options.output;
+// Migration step 1: from here on every run keeps the exchanges it made. Nothing
+// reads them yet — the conformance suite that will is not built — but a run
+// whose evidence was discarded cannot be re-asked later, and this suite has
+// been discarding it since it was written.
+const benchmarkRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const captureDir = options.captureDir ?? (options.noCapture === 'true' ? null : resolve(benchmarkRepoRoot, 'artifacts/api-captures'));
+const captureRun = startCaptureRun({
+  dir: captureDir,
+  meta: {
+    suites: options.suites ?? options.suite ?? null,
+    targets: options.targets ?? options.target ?? null,
+    openAiModel,
+    codexModel: options.codexBackendModel ?? options.codexModel ?? null,
+    claudeCliModel: options.claudeCliModel ?? 'opus',
+  },
+});
+if (captureRun) process.stdout.write(`api capture run: ${captureRun.runDir}\n`);
 const baselinePath = options.baseline;
 const regressionTargets = options.regressionTargets ?? 'proxy';
 const latencyRegressionPct = numberOption(options.latencyRegressionPct, 30);
@@ -508,6 +528,7 @@ const verdictFailures = benchmarkFailureReasons({
 });
 const summary = {
   ...summaryBase,
+  captures: captureSummary(),
   ...(baselineLoadError ? { baselineError: baselineLoadError } : {}),
   ...(imageAttemptDiagnostics.length > 0 ? { imageAttemptDiagnostics } : {}),
   ...(regressionGate ? { regressionGate } : {}),
@@ -2240,13 +2261,28 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
 
 async function postJson(url, body, headers) {
   const startedAt = performance.now();
+  const requestBody = JSON.stringify(stripUndefined(body));
   const res = await guardedProxyFetch(url, () => fetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify(stripUndefined(body)),
+    body: requestBody,
     signal: AbortSignal.timeout(timeoutMs),
   }));
   const text = await res.text();
+  // Recorded before the status check, so the body of a 4xx survives — that body
+  // is the whole evidence for an error-parity row.
+  recordExchange({
+    kind: 'json',
+    label: captureLabelFor(url),
+    url,
+    requestHeaders: headers,
+    requestBody,
+    status: res.status,
+    statusText: res.statusText,
+    responseHeaders: res.headers,
+    responseBody: text,
+    durationMs: elapsed(startedAt),
+  });
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -2255,6 +2291,17 @@ async function postJson(url, body, headers) {
   }
   if (!res.ok) throw new Error(`${url} ${res.status}: ${truncate(text)}`);
   return { body: parsed, totalMs: elapsed(startedAt) };
+}
+
+// A stable, filesystem-safe name for the exchange: the path says which surface
+// answered, which is what a reader looks for months later.
+function captureLabelFor(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.hostname}${parsed.pathname}`;
+  } catch {
+    return String(url);
+  }
 }
 
 async function postMultipart(url, fields, files, headers) {
@@ -2267,6 +2314,20 @@ async function postMultipart(url, fields, files, headers) {
     signal: AbortSignal.timeout(timeoutMs),
   }));
   const text = await res.text();
+  recordExchange({
+    kind: 'multipart',
+    label: captureLabelFor(url),
+    url,
+    requestHeaders: headers,
+    // The parts, not the encoded body: a multipart payload carries binary
+    // fixtures whose bytes are already on disk under test/fixtures.
+    requestBody: JSON.stringify({ fields, files: files.map((file) => ({ name: file.name, filename: file.filename, bytes: file.data?.length ?? null })) }),
+    status: res.status,
+    statusText: res.statusText,
+    responseHeaders: res.headers,
+    responseBody: text,
+    durationMs: elapsed(startedAt),
+  });
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -2390,6 +2451,11 @@ async function postSseRequest(url, request, collectText, collectToolArgument = (
     if (!res.body) throw new Error(`${url} did not return a readable stream`);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
+    // The wire as it arrived, before any event parsing. The terminator and the
+    // chunk boundaries exist only here — the parsed event list cannot say
+    // whether `[DONE]` was sent, which is the single highest-risk unverified
+    // cell in the conformance matrix.
+    let rawStream = '';
     let buffer = '';
     let firstDataMs = null;
     let firstTextMs = null;
@@ -2434,7 +2500,9 @@ async function postSseRequest(url, request, collectText, collectToolArgument = (
     while (true) {
       const read = await reader.read();
       if (read.done) break;
-      buffer += decoder.decode(read.value, { stream: true });
+      const decoded = decoder.decode(read.value, { stream: true });
+      rawStream += decoded;
+      buffer += decoded;
       let index;
       while ((index = buffer.indexOf('\n\n')) !== -1) {
         const frame = buffer.slice(0, index);
@@ -2445,6 +2513,18 @@ async function postSseRequest(url, request, collectText, collectToolArgument = (
     buffer += decoder.decode();
     const finalFrame = buffer.trim();
     if (finalFrame) processFrame(finalFrame);
+    recordExchange({
+      kind: 'sse',
+      label: captureLabelFor(url),
+      url,
+      requestHeaders: request.headers,
+      requestBody: request.body,
+      status: res.status,
+      statusText: res.statusText,
+      responseHeaders: res.headers,
+      streamBytes: rawStream,
+      durationMs: elapsed(startedAt),
+    });
     return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, firstToolArgumentMs, chunks, text, toolArguments, done, events };
   });
 }

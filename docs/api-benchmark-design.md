@@ -190,6 +190,20 @@ Gate:
 - paired diagnostics keep `sampleFailures` with provider error details such as `insufficient_quota`, so a quota/rate-limit failure can be separated from proxy latency regression
 - image generation/edit은 provider 자체 변동성이 크므로 p50/p95와 outlier reason을 함께 본다
 
+## 교환 기록 (적합성 스위트 이행 1단계)
+
+모든 실행이 자신이 만든 HTTP 교환을 `artifacts/api-captures/<runId>/`에 남긴다. 교환마다 보낸 요청
+본문 원본, 상태줄, 응답 헤더, 응답 바이트, 스트림이면 **파싱 이전의 와이어 텍스트**를 저장하며, 인증
+헤더는 값 대신 `present and redacted`로 기록한다. 본문은 64KB를 넘으면 gzip한다 — 압축은 무손실이고
+잘라내기는 아니기 때문이다. 실패한 시도는 재시도가 덮어쓰지 않는다(일련번호가 정체성이다).
+
+단언은 이 기록을 읽지 않는다. 이 단계의 목적은 판정을 바꾸는 것이 아니라 **증거를 잃지 않는 것**이다:
+`bench-results/*.json`은 판정과 텍스트 표본만 남기므로, 이 프로젝트는 vendor 요청 필드 기본값을 한 번도
+관찰하지 못했다. 첫 실행에서 바로 값을 했다 — `/v1/chat/completions` 스트림의 종결자가
+`data: [DONE]\n\n`으로 와이어에 기록됐고, 이는 적합성 매트릭스에서 가장 위험한 미검증 셀이었다.
+
+끄려면 `--no-capture true`. 위치를 바꾸려면 `--capture-dir <path>`.
+
 ## 실행 명령
 
 빠른 contract:
