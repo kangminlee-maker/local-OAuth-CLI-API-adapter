@@ -1,6 +1,6 @@
 {
   "name": "local-oauth-cli-api-adapter",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local OpenAI/Anthropic-compatible API proxy backed by logged-in Codex CLI or Claude Code OAuth sessions — chat completions, responses, messages, and images without provider API keys.",
   "keywords": [
     "openai",

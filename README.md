@@ -29,15 +29,15 @@ pnpm pack:adapter
 The command writes and verifies a standalone package:
 
 ```text
-artifacts/local-oauth-cli-api-adapter-0.2.0.tgz
+artifacts/local-oauth-cli-api-adapter-0.2.1.tgz
 ```
 
 Install that tarball from any other repository:
 
 ```bash
-pnpm add -D /path/to/local-oauth-cli-api-adapter-0.2.0.tgz
+pnpm add -D /path/to/local-oauth-cli-api-adapter-0.2.1.tgz
 # or
-pnpm add -g /path/to/local-oauth-cli-api-adapter-0.2.0.tgz
+pnpm add -g /path/to/local-oauth-cli-api-adapter-0.2.1.tgz
 ```
 
 Start the proxy from the consumer repository:
