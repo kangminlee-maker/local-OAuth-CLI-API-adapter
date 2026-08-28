@@ -404,6 +404,35 @@ POST /v1/messages   (headers: anthropic-version: 2023-06-01)
 
 ---
 
+## 5.5 Tier A 실측 (2026-08-29) — DOC → VERIFIED
+
+12회 호출, 실패 0. 모델 `gpt-5.6-terra` / `claude-sonnet-5`. 원본 캡처는
+`artifacts/direct-api-captures/a5eee9af-fcf4-450c-a0b0-4b16cdfcefbf/`에 요청 본문·상태·응답 헤더·응답 바이트(스트림은 파싱 이전
+와이어)로 남아 있고, 아래 값은 전부 그 바이트에서 읽은 것이다. 검출기는 실행 전에 **답이 반대인 입력**으로
+6/6 자가 검사를 통과했다 — 기대와 일치하는 관찰일수록 계기를 먼저 의심해야 하기 때문이다.
+
+| 프로브 | 관찰된 사실 | 증거 등급 |
+| --- | --- | --- |
+| P-1 | `/v1/responses` 최소 요청의 응답 키 집합에 `background`·`billing`·`moderation`·`prompt_cache_key`·`prompt_cache_retention`·`max_tool_calls`·`frequency_penalty`·`presence_penalty`가 포함된다 | VERIFIED |
+| **P-2** | **`/v1/responses` 스트림은 `[DONE]`으로 끝나지 않는다.** 이벤트 9종(`response.created` → `response.completed`), `sequence_number`는 **0**에서 시작, `obfuscation` 필드가 기본으로 존재 | VERIFIED |
+| P-3 | `/v1/chat/completions` 최소 응답의 키는 `choices,created,id,model,object,service_tier,system_fingerprint,usage`. `service_tier: "default"`, `system_fingerprint: null`. choice 키는 `finish_reason,index,message` — `logprobs`·`annotations`·`refusal`은 없다 | VERIFIED |
+| **P-4** | **`/v1/messages` 스트림도 `[DONE]`이 없다.** `message_start`→`content_block_start`→`ping`→`content_block_delta`→`content_block_stop`→`message_delta`→`message_stop`, `ping` 이벤트가 실제로 온다. `message_start.usage.input_tokens`가 존재 | VERIFIED |
+| P-5 | 미지의 최상위 필드: OpenAI 두 표면 모두 400 + `{type: invalid_request_error, param, code: unknown_parameter}`. **Anthropic은 400이지만 `param`도 `code`도 없다** — `{type, message}`뿐 | VERIFIED |
+| P-6 | `anthropic-version` 헤더 누락 → 400 `invalid_request_error`, 메시지 `anthropic-version: header is required` | VERIFIED |
+| P-7 | Chat `n: 2` 수용, `choices` 길이 2 | VERIFIED |
+| P-8 | Anthropic `stop_sequences` 적중 시 `stop_reason: "stop_sequence"`, `stop_sequence: "ZZ"`로 에코 | VERIFIED |
+| **P-9** | **Chat `stop`은 `gpt-5.6-terra`에서 미지원** — 400 `{code: unsupported_parameter, param: stop}`. 모델군별 호출 규약이며 벤치 row 정의에 반영해야 한다 | VERIFIED |
+| P-10 | `/v1/responses`의 `stream_options.include_usage`는 400 `unknown_parameter` — Responses에는 없는 파라미터다 | VERIFIED |
+
+### 이 실측이 즉시 드러낸 프록시 발산
+
+**프록시의 `/v1/responses`가 `data: [DONE]`을 보낸다. direct는 보내지 않는다.** 이벤트 9종은 이름과
+순서까지 일치하므로 차이는 종결자 하나뿐이다. 기존 스트림 단언이 종결자를 **양쪽 다** 보지 않았기 때문에
+지금까지 드러나지 않았다. 근거는 두 캡처의 원본 바이트다 — direct는 위 run, 프록시는
+`artifacts/api-captures/`의 같은 표면 교환.
+
+Chat 표면에서는 `[DONE]`이 맞다(direct도 보낸다). Responses에서만 다르다.
+
 ## 6. Probe plan — converting DOC into VERIFIED
 
 **Ranking.** risk = P(our proxy diverges) × client visibility. Tier A = a divergence a normal SDK client would hit on an ordinary request. Tier B = a divergence a client hits when it uses the feature. Tier C = completeness.
