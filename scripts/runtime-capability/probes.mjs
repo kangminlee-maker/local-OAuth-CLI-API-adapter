@@ -175,15 +175,16 @@ export async function commandAnswersForItself(binary, binaryName, commandPath, p
     maxBuffer: 8_000_000,
     cwd: await probeScratchDir(),
   });
+  // Nothing this run printed is evidence unless the run itself completed. A
+  // killed or non-zero invocation can still have emitted partial output that
+  // mentions the command — an error line naming it is enough — and reading that
+  // as "the command answered for itself" confirms an entry the CLI may have
+  // removed. The failure check has to come before any inspection of the text.
+  if (!result.ok) return 'indeterminate';
   const text = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
   if (new RegExp(`(^|\\s)${escapeRegExp(binaryName)}\\s+${escapeRegExp(commandPath)}(\\s|$)`, 'im').test(text)) {
     return 'yes';
   }
-  // A killed or timed-out probe produces no usage line, which is the same shape
-  // as a removed command. Reporting "no" there sends the operator to delete a
-  // command that may still exist, because the update rules put stale entries
-  // first. Three outcomes, so "could not tell" stays visible.
-  if (!result.ok) return 'indeterminate';
   const usage = parseHelpText(text).usage;
   // Both sides must be a real usage line. `parseHelpText` returns '' rather than
   // null when it finds none, so a `=== null` guard here lets '' through and the

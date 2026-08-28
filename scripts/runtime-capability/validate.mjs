@@ -142,6 +142,33 @@ export async function validateCatalog(data) {
   } else if (documentedClaudeFlags.length === 0) {
     inconclusiveReasons.push('claude capability section parsed to zero documented flags');
   }
+  // Section-wide non-emptiness is not enough: each of these parsers reads its own
+  // table with its own heading, and any one of them can return an empty list
+  // while the surrounding section is full. Its validator then iterates zero
+  // times, its stale set is empty, and the verdict is clean over claims nobody
+  // checked. Populations on this machine are 66/33 commands, 14 codex flag uses,
+  // 2 request contracts and 10 option domains, so zero means the parse broke.
+  const parsedPopulations = [
+    ['codex commands', codexCommands.documentedCount],
+    ['claude commands', claudeCommands.documentedCount],
+    ['codex flag uses', codexFlags.count],
+    ['codex request contracts', requestContracts.documentedCount],
+    ['documented option domains', (codexDomains.documentedCount ?? 0) + (claudeDomains.documentedCount ?? 0)],
+  ];
+  for (const [label, count] of parsedPopulations) {
+    if (!count) {
+      inconclusiveReasons.push(`${label} parsed to zero entries: that table's claims went unchecked`);
+    }
+  }
+  // #3: an authority the operator switched off is not an authority that passed.
+  // `--skip-flag-probe` already reports itself this way; the binary scan did not.
+  for (const runtime of ['claude']) {
+    const scan = data[runtime]?.binaryScan;
+    const declaredL0 = (data[runtime]?.hiddenL0CandidateFlags ?? []).length;
+    if (declaredL0 > 0 && (!scan || scan.skipped || !scan.available || !scan.ok)) {
+      inconclusiveReasons.push(`${runtime} binary scan did not run, so its ${declaredL0} L0-only candidates went unchecked`);
+    }
+  }
   for (const runtime of ['codex', 'claude']) {
     if (!documentedVersions[runtime]) {
       inconclusiveReasons.push(`${runtime} version cell not found in the catalog table: version drift unchecked`);
@@ -193,8 +220,15 @@ export async function validateCatalog(data) {
       inconclusiveReasons.push(`${runtime} binary scan ran with no declared hidden-flag candidates to check`);
       continue;
     }
-    if (scan.hiddenFlagsMissing.length > 0) {
-      inconclusiveReasons.push(`${runtime} binary scan no longer finds declared hidden-flag candidates: ${scan.hiddenFlagsMissing.join(', ')}`);
+    // The scan is handed every probed flag, not only the L0 candidates, so the
+    // report can answer "is this string in the binary" for all of them. Only the
+    // L0-only ones carry authority here: a parser-confirmed or docs-listed flag
+    // missing from a deliberately noisy string scan says nothing, and treating
+    // it as lost authority would block healthy runs.
+    const l0Candidates = new Set(data[runtime]?.hiddenL0CandidateFlags ?? []);
+    const lostL0 = scan.hiddenFlagsMissing.filter((flag) => l0Candidates.has(flag));
+    if (lostL0.length > 0) {
+      inconclusiveReasons.push(`${runtime} binary scan no longer finds declared L0-only hidden-flag candidates: ${lostL0.join(', ')}`);
     }
   }
   if (requestContracts.unverified.length > 0) {
@@ -332,7 +366,9 @@ export function validateDocumentedRequestContracts(codex, section) {
   const contracts = codex.schema?.requestContracts ?? {};
   const mismatches = [];
   const unverified = [];
+  let documentedCount = 0;
   for (const [method, documented] of documentedRequestContracts(section)) {
+    documentedCount += 1;
     const observed = contracts[method];
     if (!observed) {
       unverified.push({ method, reason: 'no schema contract collected' });
@@ -349,7 +385,7 @@ export function validateDocumentedRequestContracts(codex, section) {
       mismatches.push({ method, required, optional });
     }
   }
-  return { mismatches, unverified };
+  return { mismatches, unverified, documentedCount };
 }
 
 // Documented options need a presence authority too. The claude flags have one
@@ -424,7 +460,9 @@ export function validateDocumentedOptionDomains(runtime, section) {
   const unresolved = new Set(probe.unresolved ?? []);
   const mismatches = [];
   const unverified = [];
+  let documentedCount = 0;
   for (const [flag, documented] of documentedOptionDomains(section)) {
+    documentedCount += 1;
     const collected = observed.get(flag);
     if (!collected || collected.size === 0) {
       // A documented domain with no evidence went unchecked, whatever the
@@ -453,7 +491,7 @@ export function validateDocumentedOptionDomains(runtime, section) {
       });
     }
   }
-  return { mismatches, unverified };
+  return { mismatches, unverified, documentedCount };
 }
 
 export function collectedOptionDomains(runtime) {

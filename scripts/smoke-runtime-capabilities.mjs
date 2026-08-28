@@ -85,8 +85,23 @@ try {
   if (unclassified.length > 0) {
     process.stderr.write(`rows missing risk or execution: ${unclassified.map((row) => row.id).join(', ')}\n`);
   }
+  // Checking the rows that exist says nothing about the rows that should. A
+  // changed `Commands:` header makes the claude command extractor return [], and
+  // a schema layout change makes the codex method parser return [] while the
+  // expected files are still present — either way no rows are emitted, every
+  // field check passes over an empty set, and the report is green about a
+  // surface it never enumerated. The floors are this machine's populations;
+  // they exist to catch a parser that stopped, not to pin an exact count.
+  const emptyPopulations = [
+    ['claude commands from --help', rows.filter((row) => row.id.startsWith('claude.command.')).length],
+    ['codex app-server schema methods', rows.filter((row) => row.id.startsWith('codex.schema.')).length],
+    ['claude flag inventory', rows.filter((row) => row.id.startsWith('claude.flag.')).length],
+  ].filter(([, count]) => count === 0);
+  if (emptyPopulations.length > 0) {
+    process.stderr.write(`capability populations came back empty: ${emptyPopulations.map(([label]) => label).join(', ')}\n`);
+  }
   const hardFailures = rows.filter((row) => row.status === 'fail' && (row.execution !== 'live_model' || failOnLiveFailure));
-  if (hardFailures.length > 0 || unclassified.length > 0) process.exitCode = 1;
+  if (hardFailures.length > 0 || unclassified.length > 0 || emptyPopulations.length > 0) process.exitCode = 1;
 } finally {
   await rm(tempRoot, { recursive: true, force: true });
 }

@@ -531,7 +531,7 @@ Rule: projections are convenience views. The raw event is always retained for au
 | Probe | Done when |
 | --- | --- |
 | `runtime_capability_smoke` | `pnpm smoke:runtime-capabilities` classifies every collected capability by risk and validates input/output schema presence |
-| `runtime_capability_live_smoke` | `pnpm smoke:runtime-capabilities -- --include-live-model` passes safe live model probes without crossing the 1m token warning threshold |
+| `runtime_capability_live_smoke` | `pnpm smoke:runtime-capabilities -- --include-live-model --fail-on-live-failure` passes the safe live model probes. 비용을 사전에 제한하는 장치는 없다 — report의 `Live model probes run`이 실제 실행 수를 사후 보고할 뿐이다 |
 | `codex_app_server_schema_probe` | `generate-json-schema --experimental` succeeds and required methods are present |
 | `codex_native_text_turn_probe` | `thread/start`, `turn/start`, first `item/agentMessage/delta`, `turn/completed`, `thread/tokenUsage/updated` observed |
 | `codex_dynamic_tool_probe` | `item/tool/call` request is received and client response reaches the model |
