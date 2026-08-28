@@ -165,61 +165,47 @@ test('buildPrompt keeps instruction messages by default for non-Codex backends',
   assert.match(prompt, /<user>\nWrite the report\.\n<\/user>/);
 });
 
-test('developer instructions preserve request facts without compactness bias', () => {
+// The old version of this test asserted each of 46 instruction phrases was
+// present, which pinned the overfitting in place: every phrase tuned to one
+// quality-suite question had a test defending it. What the runtime owes a caller
+// is general request fidelity, so that is what is asserted here — plus the
+// negative half, which is the part that can actually fail when someone answers a
+// benchmark shortfall by teaching the runtime that benchmark's questions again.
+test('developer instructions state general request fidelity and nothing question-shaped', () => {
   const instructions = developerInstructions();
 
-  assert.match(instructions, /explicit fact/);
-  assert.match(instructions, /negative constraints/);
-  assert.match(instructions, /condition-to-consequence links/);
-  assert.match(instructions, /Preserve requiredness and conditionality exactly/);
-  assert.match(instructions, /error\.param/);
-  assert.match(instructions, /relevant error\.param values/);
-  assert.match(instructions, /provider-compatible error\.code values/);
-  assert.match(instructions, /Mention null for error\.param or error\.code only for concrete cases/);
-  assert.match(instructions, /OpenAI-compatible error body/);
-  assert.match(instructions, /include error\.param as a stable field/);
-  assert.match(instructions, /relevant request parameter or null/);
-  assert.match(instructions, /include error\.code as a stable field/);
-  assert.match(instructions, /provider-compatible value or null/);
-  assert.match(instructions, /Do not summarize error\.param and error\.code as vague stable param\/code fields/);
-  assert.match(instructions, /attach the stated HTTP status to both invalid and unsupported options/);
-  assert.match(instructions, /silently falling back/);
-  assert.match(instructions, /URL accessibility\/expiry\/MIME parity/);
-  assert.match(instructions, /cross-cutting authority/);
-  assert.match(instructions, /one-to-one area mapping/);
-  assert.match(instructions, /zero-score enforcement/);
-  assert.match(instructions, /vision judge rubric/);
-  assert.match(instructions, /direct Images API positive and negative baseline rows plus proxy generation rows/);
-  assert.match(instructions, /no-direct-provider rule on that route itself/);
-  assert.match(instructions, /keep each bullet compact/);
-  assert.match(instructions, /state global rules once/);
-  assert.match(instructions, /generation routes in generation coverage/);
-  assert.match(instructions, /supported combinations/);
-  assert.match(instructions, /decision criterion/);
-  assert.match(instructions, /event timeline/);
-  assert.match(instructions, /complete valid arguments/);
-  assert.match(instructions, /do not invent them when schema, usage, or data integrity are stated as normal/);
-  assert.match(instructions, /first_tool_argument/);
-  assert.match(instructions, /direct provider behavior/);
-  assert.match(instructions, /payload delivery/);
-  assert.match(instructions, /percentage and absolute thresholds are alternatives or combined criteria/);
-  assert.match(instructions, /fixed number of bullets/);
-  assert.match(instructions, /compact clauses/);
-  assert.match(instructions, /affected scope/);
-  assert.match(instructions, /connect each named cause candidate/);
-  assert.match(instructions, /wrapper context growth/);
-  assert.match(instructions, /separate usage collection from streaming delivery/);
-  assert.match(instructions, /compare proxy latency against direct provider latency/);
-  assert.match(instructions, /Avoid vague remediation verbs/);
-  assert.match(instructions, /answering in Korean/);
-  assert.match(instructions, /do not introduce non-Korean operational terms/);
-  assert.match(instructions, /observed elapsed times from derived additional delay/);
-  assert.match(instructions, /one compact sentence per bullet/);
-  assert.match(instructions, /affected paths or data flows/);
-  assert.match(instructions, /omit filler/);
-  assert.match(instructions, /candidates remain candidates/);
-  assert.doesNotMatch(instructions, /compact concrete factors/);
-  assert.doesNotMatch(instructions, /generic direction-only wording/);
+  for (const rule of [
+    /Follow API request instruction messages/,
+    /Return requested content exactly/,
+    /No preface or caveat unless requested/,
+    /Preserve counts, formats, and word limits/,
+    /Preserve numbers, thresholds, labels, and technical identifiers exactly/,
+    /Preserve every explicit fact, comparison, decision criterion, exception, and threshold/,
+    /omit filler rather than omitting required facts/,
+    /JSON mode: JSON only/,
+  ]) {
+    assert.match(instructions, rule, `general request-fidelity rule missing: ${rule}`);
+  }
+
+  // Subject matter belonging to one quality-suite question. A runtime that names
+  // these is answering that question from the prompt rather than from the model,
+  // and the suite stops measuring the adapter.
+  for (const questionShaped of [
+    /incident report/i,
+    /four-bullet|fixed-bullet/i,
+    /benchmark plan|test plan/i,
+    /vision judge|judge rubric/i,
+    /baseline row/i,
+    /error\.param|error\.code/i,
+    /wrapper context/i,
+    /turn wait|turnWaitMs/i,
+    /first_tool_argument|firstToolArgument/i,
+    /release gate/i,
+    /egress/i,
+    /one-to-one area mapping/i,
+  ]) {
+    assert.doesNotMatch(instructions, questionShaped, `question-shaped instruction returned: ${questionShaped}`);
+  }
 });
 
 test('Claude system prompt shares the API backend semantic contract', () => {
