@@ -106,7 +106,11 @@ export function parseBackendOutput(
       const calls = Array.isArray(obj.toolCalls)
         ? obj.toolCalls.map((call, index) => normalizeToolCall(call, index))
         : [];
-      return { text: '', toolCalls: calls };
+      // The narration that came with the call is part of the turn — every
+      // surface reports text alongside tool calls, and dropping it here made
+      // this runtime the one that silently did not. The wrapper has a `text`
+      // field for exactly this.
+      return { text: typeof obj.text === 'string' ? obj.text : '', toolCalls: calls };
     }
     // Only a wrapper this backend produced may be unwrapped. A json-mode client
     // gets its OWN object back from the runtime, and reading that as a wrapper

@@ -256,3 +256,23 @@ function requestWithTools(overrides = {}) {
     ...overrides,
   };
 }
+
+test('narration that comes with a tool call survives the wrapper', () => {
+  // Every surface reports text alongside tool calls; this parser used to make
+  // the schema-driven runtimes the exception by discarding it.
+  const request = requestWithTools({
+    messages: [{ role: 'user', content: 'Use weather tool', images: [] }],
+  });
+
+  assert.deepEqual(
+    parseBackendOutput(request, JSON.stringify({
+      status: 'tool_calls',
+      text: '날씨를 확인하겠습니다.',
+      toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"서울"}' }],
+    })),
+    {
+      text: '날씨를 확인하겠습니다.',
+      toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"서울"}' }],
+    },
+  );
+});
