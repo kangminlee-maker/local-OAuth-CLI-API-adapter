@@ -470,8 +470,8 @@
         </tr>
         <tr>
           <td>의미 품질</td>
-          <td class="warn">quality-realistic ×3(min-of-3 게이트) 재측정에서 <code>proxy-codex</code> 20 task-표면 중 15, <code>proxy-claude</code> 10 중 5가 min ≥ 95입니다. 미달 대부분은 median ≥ 95인 판정자 stochastic dip이고, <code>korean_incident_report</code>·<code>provider_error_policy</code>만 median 94로 진짜 경계입니다.</td>
-          <td>남은 작업은 korean_incident/provider_error 계열의 일반 규칙 보강과, 판정자 변동을 줄이기 위한 semantic 반복 수 상향 검토입니다. median은 대부분 통과하므로 게이트를 min에서 median 기준으로 볼지도 결정이 필요합니다.</td>
+          <td class="warn">quality-realistic ×3(min-of-3 게이트) 재측정에서 <code>proxy-codex</code> 20 task-표면 중 15, <code>proxy-claude</code> 10 중 5가 min ≥ 95입니다. <strong>2026-08-27 정정:</strong> 미달을 "판정자 stochastic dip"으로 읽던 해석은 실측으로 기각됐습니다 — 후보를 고정한 채 5회 재판정하면 폭이 ±3점(평균 2.7)이고, 경계 6개 row에서 min과 median 판정이 한 건도 갈리지 않습니다. 미달은 후보 자체의 미달입니다.</td>
+          <td>게이트 통계는 <strong>min-of-N으로 확정</strong>했습니다(2026-08-27): median으로 바꿔도 경계 판정이 달라지지 않고, 소수 턴에만 나타나는 간헐 결함을 가립니다. 남은 작업은 경계 task의 <em>내용</em> 격차이고, 지금 경계에 있는 것은 <code>korean_incident_report</code>와 <code>streaming_latency_decision</code>입니다(<code>provider_error_policy</code>는 재측정에서 96~98로 통과). 근거와 해석 규칙은 <code>docs/api-benchmark-design.md</code>에 있습니다.</td>
         </tr>
         <tr>
           <td>이미지 품질</td>

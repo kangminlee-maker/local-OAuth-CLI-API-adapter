@@ -122,7 +122,8 @@ Gate:
 - direct reference 자체가 실패하면 그 row는 proxy 품질 실패가 아니라 reference 무효(`referenceErrors`)로 기록된다. reference 예산(max tokens)은 완주 가능하도록 잡되, 종료 조건은 "direct가 유효한 reference"이지 "proxy 통과"가 아니다.
 - hard fail: required term 누락, 숫자/식별자 왜곡, schema contract 위반
 - **표본 통계는 최저값(min-of-N)이다. median으로 완화하지 않는다.** 근거는 실측이다(2026-08-27, judge `gpt-5.5`): 저장된 후보 텍스트·reference·루브릭을 고정한 채 같은 판정을 5회 반복하면 점수 폭이 **최대 ±3점**(평균 2.7)이고, 경계 6개 row에서 min과 median의 판정이 **한 건도 갈리지 않았다**. 즉 min이 잡는 실패는 판정자 변동이 아니라 후보 자체의 미달이며, median으로 바꾸면 얻는 것은 없고 간헐 결함(2026-08-19 이미지 배경 반전처럼 턴당 8~20%로 나타나는 종류)을 가리게 된다.
-- 그 ±3은 **임계값을 읽는 방법**이다: min이 92~98 구간이면 판정자 잡음과 구분되지 않으므로 그 row는 반복 수를 올려 다시 재기 전에는 회귀로 부르지 않는다. 92 미만은 실측 잡음 밖이므로 실패로 읽는다.
+- 게이트 자체에는 회색지대가 없다. 러너는 `relativeQuality` 최저값이 임계값 미만이면 그대로 실패시킨다(`api-comparison-benchmark.mjs`의 semantic 게이트). ±3은 **사람이 임계값 근처의 실패를 읽는 방법**이지 러너의 판정 규칙이 아니다.
+- 임계값 근처(예: 92~97) 실패가 판정자 변동인지 후보 미달인지 가리려면 `node scripts/rejudge-semantic-sample.mjs --artifact <run.json> [--case <id>] [--repeats 5]`로 **저장된 후보를 고정한 채 재판정**한다. `--semantic-quality-repeats`를 올리는 것으로는 그 구분이 불가능하다 — 반복마다 후보와 reference를 새로 뽑으므로 판정자·후보·기준이 함께 움직인다.
 - 상대 지표는 판정을 관대하게 만들지 않는다: 같은 실측에서 절대→상대로 바꿔도 경계 6개 row의 판정은 **전부 동일**했고(통과 row는 96→100으로 올라가고 미달 row는 92→90으로 유지), 상대 기준이 존재하는 이유는 관대함이 아니라 reference가 같은 제약을 받는 과제에서 비교 기반을 맞추는 것이다.
 
 ### Image quality
