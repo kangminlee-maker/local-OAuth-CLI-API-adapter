@@ -1,3 +1,4 @@
+import { ASSISTANT_TOOL_CALL_MARKER, TOOL_RESULT_MARKER } from './tool-history-markers.js';
 import { fileURLToPath } from 'node:url';
 import type {
   NormalizedAnthropicEffort,
@@ -503,7 +504,7 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
         const call = asRecord(toolCall);
         const fn = asRecord(call?.function);
         return [
-          '[assistant tool_call]',
+          ASSISTANT_TOOL_CALL_MARKER,
           `id: ${readString(call?.id, 'tool_call')}`,
           `name: ${readString(fn?.name, 'tool')}`,
           `arguments: ${typeof fn?.arguments === 'string' ? fn.arguments : JSON.stringify(fn?.arguments ?? {})}`,
@@ -528,7 +529,7 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
     const output = flattenOpenAiContent(msg.output);
     return {
       text: [
-        '[tool result]',
+        TOOL_RESULT_MARKER,
         `tool_call_id: ${readString(msg.call_id, 'tool_call')}`,
         output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? '')),
       ].join('\n'),
@@ -538,7 +539,7 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
   if (msg.type === 'function_call') {
     return {
       text: [
-        '[assistant tool_call]',
+        ASSISTANT_TOOL_CALL_MARKER,
         `id: ${readString(msg.call_id, 'tool_call')}`,
         `name: ${readString(msg.name, 'tool')}`,
         `arguments: ${typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {})}`,
@@ -564,7 +565,7 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
     }
     if (block.type === 'tool_use') {
       return [
-        '[assistant tool_call]',
+        ASSISTANT_TOOL_CALL_MARKER,
         `id: ${readString(block.id, 'tool_call')}`,
         `name: ${readString(block.name, 'tool')}`,
         `arguments: ${JSON.stringify(block.input ?? {})}`,
@@ -574,7 +575,7 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
       const resultContent = flattenAnthropicContent(block.content);
       images.push(...resultContent.images);
       return [
-        '[tool result]',
+        TOOL_RESULT_MARKER,
         `tool_call_id: ${readString(block.tool_use_id, 'tool_call')}`,
         resultContent.text,
       ].join('\n');
