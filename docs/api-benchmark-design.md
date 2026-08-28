@@ -1,5 +1,11 @@
 # API 대비 벤치마크 설계
 
+> **이 문서의 semantic quality 게이트는 `docs/conformance-suite-design.md`가 대체한다(2026-08-28).**
+> 손으로 쓴 10개 질문을 판정자로 재는 방식이 런타임을 그 질문들에 맞춰 조정되게 만들었고,
+> 그 경위와 대체 설계는 그 문서에 있다. 이행이 끝날 때까지 이 문서는 **비교 authority, latency
+> metrics, image quality, suite 계층, 실행 명령**의 권위로 남는다. 아래 「품질 벤치 설계」의
+> Text semantic quality 절은 이행 중 현재 러너가 무엇을 하는지에 대한 기록으로만 읽는다.
+
 이 문서는 로컬 OAuth CLI API 어댑터가 실제 provider API와 얼마나 같은 표면과 품질을 보이는지 검증하기 위한 벤치마크 설계이다. 목표는 단순 smoke 통과가 아니라, 실제 사용 환경에서 API contract, streaming latency, semantic quality, image quality, error parity가 함께 유지되는지 확인하는 것이다.
 
 ## 기준 소스
