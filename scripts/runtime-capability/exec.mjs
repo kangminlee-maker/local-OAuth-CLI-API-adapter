@@ -6,7 +6,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { repoRoot } from './options.mjs';
+import { probeBudgetMs, repoRoot } from './options.mjs';
 import { firstLine, trimEnd } from './text.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -15,7 +15,19 @@ const execFileAsync = promisify(execFile);
 // so probing from the repo root would litter the working tree.
 let probeScratchPromise = null;
 
+// Telemetry for every CLI spawn the collector makes, so growth is visible in the
+// artifact rather than discovered as a timeout months later.
+const telemetry = { count: 0, totalMs: 0, exhausted: false };
+
+export function probeTelemetry() {
+  return { ...telemetry, budgetMs: probeBudgetMs };
+}
+
 export async function run(command, commandArgs, options = {}) {
+  if (telemetry.exhausted) {
+    return { ok: false, code: null, signal: null, budgetExhausted: true, stdout: '', stderr: 'probe budget exhausted' };
+  }
+  const startedAt = Date.now();
   try {
     const result = await execFileAsync(command, commandArgs, {
       cwd: options.cwd ?? repoRoot,
@@ -38,6 +50,10 @@ export async function run(command, commandArgs, options = {}) {
       stdout: error.stdout ?? '',
       stderr: error.stderr ?? error.message ?? '',
     };
+  } finally {
+    telemetry.count += 1;
+    telemetry.totalMs += Date.now() - startedAt;
+    if (telemetry.totalMs > probeBudgetMs) telemetry.exhausted = true;
   }
 }
 

@@ -44,6 +44,10 @@ pnpm catalog:runtime -- --skip-binary-scan
 | `--skip-command-tree` | command 수집 | `validateDocumentedCommands`가 `not_collected`가 되어 command staleness가 0으로 보고된다 |
 | `--catalog <path>` | — | 검증 대상 문서를 바꾼다. 다른 파일을 검증하고 이 카탈로그가 통과했다고 읽지 않도록 주의 |
 | `--out <dir>` | — | 산출물 위치 |
+| `--probe-budget-ms <n>` | — | CLI spawn 총 소요의 상한(기본 150,000). 넘으면 남은 probe를 멈추고 **inconclusive**로 보고한다 — 밖에서 죽으면 리포트 자체가 남지 않기 때문이다 |
+
+report의 `CLI spawns this run`이 이번 실행의 spawn 수와 총 소요를 예산과 함께 보고한다. 문서화된
+표면이 늘면 이 값이 먼저 움직이므로, 타임아웃으로 발견하기 전에 여기서 보인다.
 
 `pnpm catalog:runtime`은 매 실행마다 `latest.*` 외에 타임스탬프가 붙은 report 쌍을 추가로 쓴다.
 `artifacts/runtime-capability-catalog/`는 정리하지 않으면 계속 쌓인다.

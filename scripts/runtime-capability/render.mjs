@@ -28,6 +28,7 @@ Verdict: \`${data.catalogValidity?.verdict ?? 'not_checked'}\`
 | --- | ---: |
 | Stale or changed entries | ${data.catalogValidity?.staleCount ?? 0} |
 | Additive update candidates | ${data.catalogValidity?.updateCandidateCount ?? 0} |
+| CLI spawns this run | ${data.probes?.count ?? 'n/a'} in ${data.probes?.totalMs ?? 'n/a'}ms (budget ${data.probes?.budgetMs ?? 'n/a'}ms${data.probes?.exhausted ? ', EXHAUSTED' : ''}) |
 | Reasons the run could not conclude | ${(data.catalogValidity?.inconclusiveReasons ?? []).length > 0 ? data.catalogValidity.inconclusiveReasons.map((value) => inline(value)).join('; ') : 'none'} |
 | Codex option probes whose controls failed | ${(data.catalogValidity?.codexOptionUses?.controlsFailed ?? []).length > 0 ? data.catalogValidity.codexOptionUses.controlsFailed.map((value) => inline(value)).join(', ') : 'none'} |
 | Codex documented methods missing from schema | ${data.catalogValidity?.codex?.documentedMethodsMissingFromSchema?.length ?? 0} |

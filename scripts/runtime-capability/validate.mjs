@@ -13,6 +13,7 @@ import {
 } from './catalog-doc.mjs';
 import { rootOptionsOf } from './help-parser.mjs';
 import { commandAnswersForItself, commandUsage, probeFlagControls, probeFlagInCommand } from './probes.mjs';
+import { probeTelemetry } from './exec.mjs';
 import {
   difference,
   extractVersionCell,
@@ -124,6 +125,14 @@ export async function validateCatalog(data) {
   // the verdict claim validity the run never established.
   const inconclusiveReasons = [];
 
+  // A run that stopped probing partway inspected only part of the surface, so it
+  // cannot support "nothing changed" for the part it never reached. Same rule as
+  // the truncated command walk below.
+  const probes = probeTelemetry();
+  if (probes.exhausted) {
+    inconclusiveReasons.push(`probe budget of ${probes.budgetMs}ms exhausted after ${probes.count} spawns: the rest of the surface went unprobed`);
+  }
+
   // The same rule, one level earlier. Every check below compares a documented
   // set against a collected one, so an empty documented set makes each
   // difference() empty, each count zero, and the verdict clean — which is
@@ -148,6 +157,21 @@ export async function validateCatalog(data) {
   // times, its stale set is empty, and the verdict is clean over claims nobody
   // checked. Populations on this machine are 66/33 commands, 14 codex flag uses,
   // 2 request contracts and 10 option domains, so zero means the parse broke.
+  // The mirror of the parsed-population check. A diff needs both sides: if the
+  // COLLECTED authority came back empty — schema not generated, help not read,
+  // probes stopped — then every documented entry looks missing and staleCount
+  // reports the whole catalog as rotten. That is the same vacuity pointing the
+  // other way, and it is worse, because the update rules tell the operator to
+  // delete what reads as stale.
+  const collectedPopulations = [
+    ['codex app-server schema methods', schemaMethods.length],
+    ['claude help flags', (data.claude?.helpFlags ?? []).length],
+  ];
+  const emptyCollected = collectedPopulations.filter(([, count]) => !count);
+  for (const [label] of emptyCollected) {
+    inconclusiveReasons.push(`${label} collected zero entries: documented items cannot be called stale against nothing`);
+  }
+
   const parsedPopulations = [
     ['codex commands', codexCommands.documentedCount],
     ['claude commands', claudeCommands.documentedCount],
@@ -254,9 +278,16 @@ export async function validateCatalog(data) {
 
   return {
     exists: true,
-    verdict: staleCount > 0
-      ? 'needs_update'
-      : (inconclusive ? 'inconclusive_reduced_authority' : 'valid_against_collected_authorities'),
+    // Staleness is a claim about a comparison that happened. When the run lost an
+    // authority it needed — the probe budget ran out, or a collected set came
+    // back empty — the difference it computed is against nothing, so it must not be
+    // published as "needs update"; that is the reading that gets real entries
+    // deleted. Report what is true: the run could not conclude.
+    verdict: (probes.exhausted || emptyCollected.length > 0)
+      ? 'inconclusive_reduced_authority'
+      : (staleCount > 0
+        ? 'needs_update'
+        : (inconclusive ? 'inconclusive_reduced_authority' : 'valid_against_collected_authorities')),
     inconclusive,
     inconclusiveReasons,
     staleCount,

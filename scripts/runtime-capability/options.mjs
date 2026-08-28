@@ -13,6 +13,13 @@ export const skipBinaryScan = args.includes('--skip-binary-scan');
 export const skipFlagProbe = args.includes('--skip-flag-probe');
 export const skipCommandTree = args.includes('--skip-command-tree');
 export const failOnStale = args.includes('--fail-on-stale');
+// Every probe spawns a CLI, and the probe set grows with the documented surface.
+// Growth that outruns the caller's timeout gets the collector killed from
+// outside, which loses the partial result and says nothing about why. A budget
+// the collector owns lets it stop probing and report the run as inconclusive
+// instead — "could not check" survives, where a kill leaves no report at all.
+// Set below the smoke's 240s subprocess timeout so this fires first.
+export const probeBudgetMs = Number(readValueArg('--probe-budget-ms') ?? 150_000);
 
 export const COMMAND_TREE_MAX_DEPTH = 4;
 export const COMMAND_TREE_MAX_COMMANDS = 300;
