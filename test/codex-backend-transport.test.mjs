@@ -973,7 +973,7 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
   assert.deepEqual(body.tool_choice, { type: 'image_generation' });
   assert.equal(body.reasoning.effort, 'medium');
   assert.match(body.instructions, /Use the image_generation tool/);
-  assert.match(body.input[0].content[0].text, /Original Images API prompt:/);
+  assert.doesNotMatch(body.input[0].content[0].text, /translation constraints/, 'no route hint, no translation block');
   assert.match(body.input[0].content[0].text, /green leaf icon/);
   assert.equal(result.images.length, 1);
   assert.equal(result.images[0].b64Json, image);
@@ -1024,7 +1024,7 @@ test('CodexBackendTransport includes reference images for backend image edits', 
   assert.equal(body.tools[0].action, 'edit');
   assert.equal(body.input[0].content[1].type, 'input_image');
   assert.match(body.input[0].content[1].image_url, /^data:image\/png;base64,/);
-  assert.match(body.input[0].content[0].text, /This is an edit request/);
+  assert.match(body.input[0].content[0].text, /Make the leaf blue while keeping the composition\./, 'the caller prompt goes through verbatim');
   assert.match(body.input[0].content[0].text, /Attached images 1-1/);
 });
 

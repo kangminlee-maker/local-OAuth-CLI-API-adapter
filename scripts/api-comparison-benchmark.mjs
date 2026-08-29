@@ -1529,14 +1529,7 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     if (isApi) {
       return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/responses`, {
         model: openAiModel,
-        input: image2ViaGpt55Prompt({
-          action: 'generate',
-          prompt,
-          size: '1024x1024',
-          quality: 'medium',
-          outputFormat: 'png',
-          background: 'transparent',
-        }),
+        input: image2ViaGpt55Prompt({ prompt }),
         reasoning: { effort: openAiImageQualityReasoningEffort('medium') },
         tools: [{
           type: 'image_generation',
@@ -1718,18 +1711,10 @@ async function imagesApiMultiSampleSummary(response, responseApi, judgeSpec) {
 
 async function directResponsesImageSample(baseUrl, prompt, options) {
   const imageOptions = options.imageOptions ?? {};
-  const translatedPrompt = image2ViaGpt55Prompt({
-    action: options.action,
-    prompt,
-    size: imageOptions.size ?? '1024x1024',
-    quality: imageOptions.quality ?? 'low',
-    outputFormat: imageOptions.output_format ?? 'png',
-    outputCompression: imageOptions.output_compression,
-    background: imageOptions.background,
-    moderation: imageOptions.moderation,
-    inputFidelity: imageOptions.input_fidelity,
-    imageCount: options.images?.length ?? 0,
-  });
+  // The proxy's translation is now identity without a route hint, and the
+  // direct arm never sends one; calling it keeps the two arms on the same
+  // prompt by construction rather than by assertion.
+  const translatedPrompt = image2ViaGpt55Prompt({ prompt });
   const response = await postJson(`${baseUrl}/v1/responses`, {
     model: openAiModel,
     input: responsesImageInput(translatedPrompt, options.images ?? []),
@@ -1883,13 +1868,7 @@ async function openAiImageGenerationStreamSample(baseUrl, isApi) {
   const response = isApi
     ? await postSse(`${baseUrl}/v1/responses`, {
         model: openAiModel,
-        input: image2ViaGpt55Prompt({
-          action: 'generate',
-          prompt,
-          size: '1024x1024',
-          quality: 'low',
-          outputFormat: 'png',
-        }),
+        input: image2ViaGpt55Prompt({ prompt }),
         reasoning: { effort: openAiImageQualityReasoningEffort('low') },
         stream: true,
         tools: [{
