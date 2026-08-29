@@ -502,6 +502,9 @@ function normalizeOpenAiImageRequest(
     );
   }
   const n = imageInteger(input.n, 'n', 1, 10, isMultipart) ?? 1;
+  // `quality` is checked before `output_compression`, `size` after it
+  // (measured with two faults per form).
+  const quality = imageEnum(input.quality, 'quality', ['low', 'medium', 'high', 'auto'], isMultipart);
   const proxyRoute = optionalImageProxyRoute(input.x_proxy_image_route);
   const outputFormat = imageEnum(input.output_format, 'output_format', ['png', 'webp', 'jpeg'], isMultipart)
     ?? proxyRoute?.outputFormat;
@@ -517,7 +520,7 @@ function normalizeOpenAiImageRequest(
     // multipart generation it is simply not read.
     mask: operation === 'edit' ? requiredValidImageInput(input.mask, 'mask') : undefined,
     size: optionalImageSize(input.size),
-    quality: imageEnum(input.quality, 'quality', ['low', 'medium', 'high', 'auto'], isMultipart),
+    quality,
     background: imageEnum(input.background, 'background', ['transparent', 'opaque', 'auto'], isMultipart),
     outputFormat,
     outputCompression,
@@ -606,7 +609,7 @@ const OPENAI_IMAGE_EDIT_KEYS: ReadonlySet<string> = new Set([
   ...OPENAI_IMAGE_GENERATION_KEYS, 'images', 'mask', 'input_fidelity',
 ]);
 const OPENAI_IMAGE_EDIT_MULTIPART_KEYS: ReadonlySet<string> = new Set([
-  ...OPENAI_IMAGE_EDIT_KEYS, 'image', 'image[]',
+  ...[...OPENAI_IMAGE_EDIT_KEYS].filter((key) => key !== 'images'), 'image', 'image[]',
 ]);
 
 function rejectUnknownOpenAiImageParameters(
@@ -619,15 +622,17 @@ function rejectUnknownOpenAiImageParameters(
     : OPENAI_IMAGE_GENERATION_KEYS;
   for (const name of Object.keys(input)) {
     if (known.has(name)) continue;
-    if (operation === 'edit' && !isMultipart && (name === 'image' || name === 'image[]')) {
-      throw new ProxyRequestError(
-        `Unknown parameter: '${name}'. For application/json on /v1/images/edits, use 'images' (array).`,
-        400,
-        'openai',
-        'invalid_request_error',
-        name,
-        'invalid_value',
-      );
+    // The two encodings spell the image field differently, and the direct API
+    // points a body at the other spelling (both measured).
+    const pointer = operation !== 'edit'
+      ? null
+      : !isMultipart && (name === 'image' || name === 'image[]')
+        ? "For application/json on /v1/images/edits, use 'images' (array)."
+        : isMultipart && name === 'images'
+          ? "For multipart/form-data use 'image' or 'image[]'."
+          : null;
+    if (pointer) {
+      throw new ProxyRequestError(`Unknown parameter: '${name}'. ${pointer}`, 400, 'openai', 'invalid_request_error', name, 'invalid_value');
     }
     throw unknownImageParameter(name);
   }
@@ -644,12 +649,13 @@ function unknownImageParameter(name: string): ProxyRequestError {
   );
 }
 
-// The direct API's wording for a wrong JSON type: "got null instead", "got an
-// integer instead" (both measured); the other names follow the same pattern.
+// The direct API's wording for a wrong JSON type — "got null / an integer / a
+// decimal number / a boolean / an object / an array instead" — each measured
+// on `model` (2026-08-30).
 function jsonTypeName(value: unknown): string {
   if (value === null) return 'null';
   if (Array.isArray(value)) return 'an array';
-  if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a number';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a decimal number';
   if (typeof value === 'boolean') return 'a boolean';
   if (typeof value === 'object') return 'an object';
   return `a ${typeof value}`;
@@ -889,7 +895,11 @@ function imageInteger(
   if (typeof value === 'number') {
     if (!Number.isInteger(value)) throw invalidImageType(field, 'an integer', 'a decimal number');
     parsed = value;
-  } else if (isMultipart && typeof value === 'string' && /^-?\d+$/.test(value.trim())) {
+  } else if (isMultipart && typeof value === 'string') {
+    if (!/^-?\d+$/.test(value.trim())) {
+      // The one type sentence the direct API ends without "instead" (measured).
+      throw new ProxyRequestError(`Invalid type for '${field}': expected an integer, but got a string value that could not be converted into an integer.`, 400, 'openai', 'invalid_request_error', field, 'invalid_type');
+    }
     parsed = Number(value.trim());
   } else {
     throw invalidImageType(field, 'an integer', jsonTypeName(value));
@@ -1063,7 +1073,8 @@ function imageProxyRoutePayload(value: unknown): Record<string, unknown> {
 // sentence. `auto` passes; null is omission.
 function optionalImageSize(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
-  const size = typeof value === 'string' ? value : String(value);
+  if (typeof value !== 'string') throw invalidImageType('size', 'a string', jsonTypeName(value));
+  const size = value;
   if (size === 'auto') return size;
   const invalid = (detail: string): ProxyRequestError => new ProxyRequestError(
     `Invalid size '${size}'. ${detail}`, 400, 'openai', 'image_generation_user_error', 'size', 'invalid_value',

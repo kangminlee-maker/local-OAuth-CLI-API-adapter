@@ -496,7 +496,9 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 | null: `n`·`output_compression`·`partial_images`·`quality`·`size`·`stream` | 전부 생략으로 취급(다음 필드의 오류가 보고됨) |
 | 순서 (두 결함을 한 본문에) | model → 미지 키 → prompt → images → n → 나머지(`output_compression`·`quality` 등, 상호 순서 미측정) |
 
-미측정: `model`/`quality`가 boolean·object·array일 때의 정확한 문구(같은 패턴으로 구현), multipart 본문의 미지 키(JSON과 같게 거절하기로 함), `output_compression < 100` + PNG의 최종 판정(검증 단계는 통과).
+추가 실측 (2026-08-30 오후): `model`이 `1.5`/`true`/`{}`/`[]` → `invalid_type` "got a decimal number / a boolean / an object / an array instead"; `quality`가 `true`/`{}`/`[]` → 같은 패턴("expected one of … or 'auto', but got …"); `size: 123` → `invalid_type` "expected a string, but got an integer instead"; JSON `n: "abc"` → "got a string instead".
+**multipart edits** (실제 폼, `n=0` 또는 `output_compression=101` tripwire): `style`·`bogus_field`·`response_format` → `unknown_parameter`; 파트 이름 `images` → `invalid_value` "Unknown parameter: 'images'. For multipart/form-data use 'image' or 'image[]'."; `n=abc`·`n=2.5`·`output_compression=abc` → `invalid_type` "expected an integer, but got a string value that could not be converted into an integer."; `quality=ultra`·`quality=`(빈 값) → JSON과 같은 `invalid_value`; 순서: `quality`가 `output_compression`보다 먼저, `size`는 `output_compression` 뒤, `mask` 파일은 `size` 검사를 막지 않음.
+미측정: multipart `stream=yes`(검증 단계에서 `output_compression`보다 뒤라 tripwire로는 판정 불가 — 프록시는 `invalid_type`으로 거절), `output_compression < 100` + PNG의 최종 판정(검증 단계는 통과).
 
 ## 6. Probe plan — converting DOC into VERIFIED
 

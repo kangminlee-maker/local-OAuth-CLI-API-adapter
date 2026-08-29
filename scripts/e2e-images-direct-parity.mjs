@@ -95,6 +95,9 @@ const cases = [
   ["model 'image-2'", G, { model: 'image-2' }],
   ["model 'dall-e-2'", G, { model: 'dall-e-2' }],
   ["model ''", G, { model: '' }],
+  ['model 1.5', G, { model: 1.5 }], ['model true', G, { model: true }], ['model {}', G, { model: {} }], ['model []', G, { model: [] }],
+  ['quality true', G, { quality: true }], ['quality {}', G, { quality: {} }], ['quality []', G, { quality: [] }],
+  ['size 123', G, { size: 123 }], ['n "abc"', G, { n: 'abc' }],
   // parameters no live model knows
   ['response_format url', G, { response_format: 'url' }],
   ['response_format null', G, { response_format: null }],
@@ -140,6 +143,44 @@ try {
     const body = { model: 'gpt-image-2', prompt: 'a dot', ...extra };
     for (const key of Object.keys(body)) if (body[key] === undefined) delete body[key];
     await parity(name, path, body);
+  }
+  // Multipart edits: the same form to both sides. `output_compression=101` is
+  // the tripwire for fields the direct API validates after it.
+  const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=', 'base64');
+  const forms = [
+    ['style', { style: 'vivid', n: '0' }],
+    ['bogus_field', { bogus_field: '1', n: '0' }],
+    ['response_format', { response_format: 'b64_json', n: '0' }],
+    ['n abc', { n: 'abc' }],
+    ['n 2.5', { n: '2.5' }],
+    ['output_compression abc', { output_compression: 'abc' }],
+    ['quality ultra', { quality: 'ultra', output_compression: '101' }],
+    ['quality empty', { quality: '', output_compression: '101' }],
+    ['size 9x9 with a mask', { size: '9x9' }, true],
+    ['images file', {}, false, 'images'],
+    ['n 0', { n: '0' }],
+  ];
+  for (const [name, fields, withMask = false, fileField = 'image'] of forms) {
+    const build = () => {
+      const form = new FormData();
+      form.set('model', 'gpt-image-2');
+      form.set('prompt', 'x');
+      form.set(fileField, new Blob([PNG], { type: 'image/png' }), 'x.png');
+      if (withMask) form.set('mask', new Blob([PNG], { type: 'image/png' }), 'm.png');
+      for (const [k, v] of Object.entries(fields)) form.set(k, v);
+      return form;
+    };
+    const send = async (base, headers) => {
+      const res = await realFetch(`${base}${E}`, { method: 'POST', headers, body: build() });
+      const text = await res.text();
+      let json = null; try { json = JSON.parse(text); } catch { /* not JSON */ }
+      return { status: res.status, json };
+    };
+    const [p, d] = await Promise.all([send(started.url, {}), send(DIRECT, { authorization: `Bearer ${KEY}` })]);
+    const pe = envelope(p); const de = envelope(d);
+    const same = JSON.stringify(pe) === JSON.stringify(de);
+    record(`parity multipart ${name}`, same, same ? `→ ${de.status} ${de.code ?? ''} ${de.param ?? ''}` : `\n   proxy : ${JSON.stringify(pe)}\n   direct: ${JSON.stringify(de)}`);
+    if (d.status === 200) process.stdout.write(`   !! the direct API generated for multipart "${name}"\n`);
   }
   {
     // Status parity; the bodies differ by design on neither side: both are
@@ -198,7 +239,7 @@ try {
   await started.close();
 }
 
-process.stdout.write(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAIL`} — ${cases.length} parity cases${generate ? ' + 3 generations' : ''}\n`);
+process.stdout.write(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAIL`} — ${cases.length} JSON + 11 multipart parity cases${generate ? ' + 3 generations' : ''}\n`);
 process.exit(failures ? 1 : 0);
 
 function png(width, height, rgba) {

@@ -173,6 +173,67 @@ for (const [label, prompt, code, message] of [
   });
 }
 
+// JSON types the direct API names (measured 2026-08-30 on `model`): a
+// decimal number is not "a number".
+for (const [model, got] of [[1.5, 'a decimal number'], [true, 'a boolean'], [{}, 'an object'], [[], 'an array']]) {
+  test(`generations: model ${JSON.stringify(model)} is a type error naming ${got}`, async () => {
+    const { status, payload } = await postImages(GEN, { model, prompt: 'a dot' });
+    assert.equal(status, 400);
+    assert.equal(payload.error.code, 'invalid_type');
+    assert.equal(payload.error.message, `Invalid type for 'model': expected a string, but got ${got} instead.`);
+  });
+}
+
+test('generations: size that is not a string is a type error, not a bad size', async () => {
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', size: 123 });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'size': expected a string, but got an integer instead.");
+});
+
+// Multipart, measured 2026-08-30 with a real form: the enum envelopes are the
+// JSON ones (an empty field is a value outside the set), a non-digit integer
+// field has its own wording, and the file field spelled the JSON way is
+// pointed at the form spelling.
+test('multipart edits: a non-digit integer field has the direct wording', async () => {
+  for (const field of ['n', 'output_compression']) {
+    const { status, payload } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', [field]: 'abc' });
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, field);
+    assert.equal(payload.error.message, `Invalid type for '${field}': expected an integer, but got a string value that could not be converted into an integer.`);
+  }
+});
+
+test('multipart edits: an out-of-set or empty enum field is invalid_value, as in JSON', async () => {
+  for (const quality of ['ultra', '']) {
+    const { status, payload } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', quality });
+    assert.equal(status, 400, quality);
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.equal(payload.error.message, `Invalid value: '${quality}'. Supported values are: 'low', 'medium', 'high', and 'auto'.`);
+  }
+});
+
+test('multipart edits: a file named images is pointed at image / image[]', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const form = new FormData();
+    form.set('model', 'gpt-image-2');
+    form.set('prompt', 'a dot');
+    form.set('images', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'x.png');
+    const res = await fetch(`${started.url}/v1/images/edits`, { method: 'POST', body: form });
+    const payload = await res.json();
+    assert.equal(res.status, 400);
+    assert.equal(payload.error.param, 'images');
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.equal(payload.error.message, "Unknown parameter: 'images'. For multipart/form-data use 'image' or 'image[]'.");
+  } finally {
+    await started.close();
+  }
+});
+
 test('edits: images null is a type error, not omission', async () => {
   const { status, payload } = await postImages('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', images: null });
   assert.equal(status, 400);
