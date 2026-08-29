@@ -1,0 +1,4 @@
+{
+  "note": "Divergences from the vendor that the proxy makes on purpose. Each is data, not an exception in code: it carries the surface it applies to, the exact behavior, and why. A divergence that stops being true fails the same check that a new one does — a stale exemption hides a fixed defect and lets the next regression through. Seed of the manifest described in docs/conformance-suite-design.md §2.",
+  "divergences": []
+}

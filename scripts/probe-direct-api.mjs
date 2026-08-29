@@ -118,6 +118,12 @@ const probes = [
     read: (r) => ({ finishReason: r.json?.choices?.[0]?.finish_reason ?? null, content: r.json?.choices?.[0]?.message?.content ?? null }),
   },
   {
+    id: 'P-11', why: 'Chat Completions stream terminator — the pair for P-2, without which the "chat is unaffected" claim is unverified',
+    url: `${OPENAI}/v1/chat/completions`, provider: 'openai', stream: true,
+    body: { model: openAiModel, messages: [{ role: 'user', content: 'ping' }], max_completion_tokens: 16, stream: true },
+    read: (r) => ({ terminator: detect.sseTerminator(r.wire), events: dedupe(detect.sseEventNames(r.wire)), hasObfuscation: /"obfuscation"/.test(r.wire) }),
+  },
+  {
     id: 'P-10', why: 'Responses with an undocumented stream_options key', url: `${OPENAI}/v1/responses`, provider: 'openai', stream: true,
     body: { model: openAiModel, input: 'ping', max_output_tokens: 16, stream: true, stream_options: { include_usage: true } },
     read: (r) => ({ status: r.status, accepted: r.status === 200, error: r.json?.error ?? null, terminator: r.wire ? detect.sseTerminator(r.wire) : null }),

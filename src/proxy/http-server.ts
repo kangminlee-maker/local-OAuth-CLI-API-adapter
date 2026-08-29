@@ -2564,7 +2564,16 @@ async function writeOpenAiResponsesStream(
         response: openAiResponsesCompletedResponse(responseId, result, request, finalOutput),
       });
     }
-    res.write('data: [DONE]\n\n');
+    // The Responses surface ends at `response.completed`; the vendor sends no
+    // `[DONE]`. Captured 2026-08-29 against gpt-5.6-terra — nine events, same
+    // names and order as ours, and nothing after the last one. `[DONE]` is the
+    // Chat convention and stays there. An extra frame carrying a body that is
+    // not a Responses event is a shape a strict SDK has to skip or reject, and
+    // an adapter that emits what the vendor does not is diverging by addition.
+    //
+    // The error path below still writes one. That is NOT evidence-backed: no
+    // capture of a vendor Responses stream failing mid-flight exists yet, so
+    // changing it would be replacing a guess with another guess.
   } catch (err) {
     await writeResponseEvent('error', asRecordPayload(streamErrorPayload(err)));
     res.write('data: [DONE]\n\n');
