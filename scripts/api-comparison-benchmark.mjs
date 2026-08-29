@@ -37,7 +37,6 @@ const imageGenerationCaseNames = {
   generationB64: 'openai.images.generation.image2_via_gpt55.b64_json.schema_exact',
   generationB64N3Parallel: 'openai.images.generation.image2_via_gpt55.b64_json_n3_parallel.schema_exact',
   generationApiFields: 'openai.images.generation_api_fields.image2_via_gpt55.schema_exact',
-  generationUrl: 'openai.images.generation_url.image2_via_gpt55.schema_exact',
   generationStream: 'openai.images.generation_stream.image2_via_gpt55.schema_exact',
   generationStreamPaired: 'openai.images.generation_stream_paired.image2_via_gpt55.latency_compare',
   generationPhotorealProduct: 'openai.images.generation_photoreal_product.image2_via_gpt55.schema_exact',
@@ -50,7 +49,6 @@ const imageGenerationCaseNames = {
   editPreserveComposition: 'openai.images.edit_preserve_composition.image2_via_gpt55.schema_exact',
   editMultiImage: 'openai.images.edit_multi_image.image2_via_gpt55.schema_exact',
   editMultipartStream: 'openai.images.edit_multipart_stream.image2_via_gpt55.schema_exact',
-  variation: 'openai.images.variation.image2_via_gpt55.schema_exact',
   proxyGptImageResponseFormatUnsupported: 'openai.images.proxy_gpt_image_response_format_unsupported.schema_exact',
   directImagesGeneration: 'openai.images.direct_generation.gpt_image.schema_exact',
   directImagesEdit: 'openai.images.direct_edit.gpt_image.schema_exact',
@@ -1046,8 +1044,11 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     });
 
     await benchmarkCase(target, imageGenerationCaseNames.directImagesImage2Unsupported, repeats, async () => {
+      // The proxy's FORMER route name, sent to the direct API on purpose: the
+      // case pins that the vendor refuses it ("does not exist"). A live name
+      // here would run a billed generation and then fail the assertion.
       return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
-        model: 'gpt-image-2',
+        model: 'image-2',
         prompt: 'A simple flat red square centered on a white background. No text.',
       }, openAiHeaders(true), {
         status: 400,
@@ -1140,20 +1141,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
           kind: 'generation',
         });
   });
-
-  if (!isApi) {
-    await benchmarkCase(target, imageGenerationCaseNames.generationUrl, repeats, async () => {
-      const prompt = 'A simple flat red square centered on a white background. No text.';
-      return await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
-        prompt,
-        response_format: 'url',
-      }, {
-        prompt,
-        requirements: ['solid red square', 'white background', 'no text'],
-        kind: 'generation',
-      });
-    });
-  }
 
   await benchmarkCase(target, imageGenerationCaseNames.generationStream, repeats, async () => {
     return await openAiImageGenerationStreamSample(baseUrl, isApi);
@@ -1459,33 +1446,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       return imageStreamSummary(response, 'images');
     });
   }
-
-  await benchmarkCase(target, imageGenerationCaseNames.variation, repeats, async () => {
-    const prompt = 'Create a clean visual variation of the provided image. No text.';
-    return isApi
-      ? await directResponsesImageSample(baseUrl, prompt, {
-          action: 'edit',
-          images: [fixtureDataUrl('red_square')],
-          judge: {
-            prompt,
-            requirements: ['red visual variation', 'simple square-like composition', 'no text'],
-            kind: 'variation baseline through responses edit',
-          },
-        })
-      : await proxyImagesMultipartSample(`${baseUrl}/v1/images/variations`, {
-          model: 'gpt-image-2',
-          size: '1024x1024',
-        }, [{
-          name: 'image',
-          filename: 'red-square.png',
-          contentType: 'image/png',
-          data: fixtureImageBytes('red_square'),
-        }], {
-          prompt,
-          requirements: ['red visual variation', 'simple square-like composition', 'no text'],
-          kind: 'variation',
-        });
-  });
 
   await benchmarkCase(target, imageGenerationCaseNames.errorMissingPrompt, repeats, async () => {
     return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {

@@ -698,8 +698,11 @@ test('an unknown path is a 404 whatever method it arrives with', async () => {
     for (const method of ['GET', 'POST', 'DELETE', 'PUT']) {
       const res = await fetch(`${started.url}/v1/nope`, { method });
       assert.equal(res.status, 404, `${method} /v1/nope must be a 404`);
-      const body = await res.json();
-      assert.match(body.error.message, /Unknown endpoint/);
+      // As the direct API answers an unknown path (measured 2026-08-29): no
+      // body, no content-type, `x-content-type-options: nosniff`.
+      assert.equal(await res.text(), '', 'a bare 404, no JSON envelope');
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+      assert.equal(res.headers.get('content-type'), null);
     }
   } finally {
     await started.close();

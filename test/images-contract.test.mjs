@@ -142,15 +142,29 @@ test('generations: png with compression 99 is still rejected', async () => {
   assert.equal(payload.error.code, 'invalid_png_output_compression');
 });
 
-test('generations: input_fidelity belongs to edits', async () => {
-  const { status, payload } = await postImages(GEN, {
-    model: 'gpt-image-1', prompt: 'a dot', input_fidelity: 'high',
+// Measured on gpt-image-2 generations, 2026-08-29: the direct API does not
+// know `input_fidelity` there at all — by key, whatever the value, and it says
+// so before it looks at `n`. The enum parser used to run first, so null was a
+// 200 that generated, and an out-of-enum value was a generic 400.
+for (const [label, extra] of [
+  ['high', { input_fidelity: 'high' }],
+  ['null', { input_fidelity: null }],
+  ['out of the enum', { input_fidelity: 'bogus' }],
+  ['high, with n: 0 on the same body', { input_fidelity: 'high', n: 0 }],
+]) {
+  test(`generations: input_fidelity ${label} is an unknown parameter`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-1', prompt: 'a dot', ...extra });
+    assert.equal(status, 400, JSON.stringify(payload));
+    assert.equal(payload.error.code, 'unknown_parameter');
+    assert.equal(payload.error.param, 'input_fidelity');
   });
-  // Measured on gpt-image-2 generations, 2026-08-29: the direct API does not
-  // know the parameter there at all.
-  assert.equal(status, 400);
-  assert.equal(payload.error.code, 'unknown_parameter');
-  assert.equal(payload.error.param, 'input_fidelity');
+}
+
+test('edits: input_fidelity null is omission there, and the request runs', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'gpt-image-1', prompt: 'a dot', images: [{ image_url: PNG_DATA_URL }], input_fidelity: null,
+  });
+  assert.equal(status, 200);
 });
 
 test('generations: style is an unknown parameter on every image model the direct API serves', async () => {
@@ -798,9 +812,21 @@ for (const model of ['chatgpt-image-latest', 'gpt-image-1', 'gpt-image-1-mini', 
   });
 }
 
-test('the variations endpoint is gone, as it is on the direct API', async () => {
-  const { status } = await postImages('/v1/images/variations', { model: 'gpt-image-2' });
-  assert.equal(status, 404);
+test('the variations endpoint is gone, as it is on the direct API — a bare 404', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/images/variations`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-image-2' }),
+    });
+    assert.equal(res.status, 404);
+    assert.equal(await res.text(), '', 'no body, as measured on the direct API');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+  } finally {
+    await started.close();
+  }
 });
 
 test('multipart works with an uppercase media-type essence', async () => {

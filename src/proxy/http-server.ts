@@ -148,6 +148,12 @@ const POST_ENDPOINTS = new Set([
   // 2026-08-29, with the dall-e-2 model it served), so it is unknown here too.
 ]);
 
+class UnknownEndpointError extends ProxyRequestError {
+  constructor(path: string) {
+    super(`Unknown endpoint: ${path}`, 404);
+  }
+}
+
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
@@ -191,7 +197,7 @@ async function handleRequest(
     // including the GET route, so `POST /v1/models` is a method problem, not a
     // missing endpoint.
     if (!isGetRoute && !POST_ENDPOINTS.has(path)) {
-      throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
+      throw new UnknownEndpointError(path);
     }
     if (req.method !== (isGetRoute ? 'GET' : 'POST')) {
       throw new ProxyRequestError('Unsupported method.', 405);
@@ -263,7 +269,7 @@ async function handleRequest(
       return;
     }
 
-    throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
+    throw new UnknownEndpointError(path);
   } catch (err) {
     writeError(res, err, errorShape);
   }
@@ -473,7 +479,7 @@ function normalizeOpenAiImageRequest(
 ): OpenAiImageGenerationRequest {
   const input = asRecordPayload(body);
   const model = openAiImageModel(input.model);
-  rejectUnknownOpenAiImageParameters(input);
+  rejectUnknownOpenAiImageParameters(input, operation);
   const prompt = imagePrompt(input.prompt);
   if (!prompt.trim()) {
     throw new ProxyRequestError(
@@ -577,12 +583,22 @@ function openAiImageModel(value: unknown): string {
   return value;
 }
 
-// Parameters the direct API refuses on every model it serves today, with its
-// envelope: `response_format` (the GPT-image models always return base64) and
-// `style` (a dall-e-3 control, and dall-e-3 is gone). A present null counts —
-// measured: `response_format: null` is "Unknown parameter", not omission.
-function rejectUnknownOpenAiImageParameters(input: Record<string, unknown>): void {
-  for (const name of ['response_format', 'style']) {
+// Parameters the direct API does not know on this request, with its envelope:
+// `response_format` (the GPT-image models always return base64) and `style` (a
+// dall-e-3 control, and dall-e-3 is gone) on every operation; `input_fidelity`
+// on a generation, where it is an edits-only field. Presence is what counts,
+// not the value — measured: `response_format: null` is "Unknown parameter",
+// not omission — and these come right after `model`, before `prompt`, `n` and
+// the enums, which is the order the direct API reports them in (a body carrying
+// `input_fidelity` AND `n: 0` names `input_fidelity`).
+function rejectUnknownOpenAiImageParameters(
+  input: Record<string, unknown>,
+  operation: OpenAiImageOperation,
+): void {
+  const unknown = operation === 'edit'
+    ? ['response_format', 'style']
+    : ['response_format', 'style', 'input_fidelity'];
+  for (const name of unknown) {
     if (input[name] !== undefined) throw unknownImageParameter(name);
   }
 }
@@ -628,13 +644,9 @@ function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void
       'invalid_png_output_compression',
     );
   }
-  // `input_fidelity` is an edits parameter: on a generation the direct API
-  // does not know it at all (measured on gpt-image-2, 2026-08-29). Whether the
-  // backend image model honours it on an edit is the backend's answer,
-  // forwarded — it refuses today (`invalid_input_fidelity_model`).
-  if (request.inputFidelity && request.operation !== 'edit') {
-    throw unknownImageParameter('input_fidelity');
-  }
+  // `input_fidelity` on an edit is the backend's answer, forwarded — it
+  // refuses today (`invalid_input_fidelity_model`); on a generation it was
+  // refused as an unknown parameter before the body was parsed.
   if (request.background === 'transparent' && request.outputFormat === 'jpeg') {
     throw new ProxyRequestError('background transparent requires output_format to be png or webp.', 400);
   }
@@ -3091,6 +3103,16 @@ function writeError(
         code: err.code,
       },
     });
+    return;
+  }
+  // A path this proxy does not serve answers as the direct OpenAI API does for
+  // a path it does not serve (measured 2026-08-29 on `/v1/nope`,
+  // `/v1/images/foo`, `/v1/images/variations`): a bare 404, no body,
+  // `x-content-type-options: nosniff`. The native surface keeps its own
+  // envelope for its own unknown subpaths.
+  if (err instanceof UnknownEndpointError && shape !== 'local-cli') {
+    res.writeHead(404, { 'x-content-type-options': 'nosniff' });
+    res.end();
     return;
   }
   if (err instanceof ProxyRequestError) {

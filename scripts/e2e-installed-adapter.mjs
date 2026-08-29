@@ -53,7 +53,7 @@ try {
   await assertModels(openAiBaseUrl);
   await assertChatCompletion(openAiBaseUrl);
   await assertChatStream(openAiBaseUrl);
-  await assertImage2Generation(openAiBaseUrl);
+  await assertImageGeneration(openAiBaseUrl);
 
   process.stdout.write(`installed adapter E2E passed: ${openAiBaseUrl}\n`);
 } finally {
@@ -246,11 +246,10 @@ async function assertChatStream(baseUrl) {
   assert.ok(chunks.some((chunk) => chunk.usage?.prompt_tokens === 7));
 }
 
-async function assertImage2Generation(baseUrl) {
+async function assertImageGeneration(baseUrl) {
   const res = await postJson(`${baseUrl}/images/generations`, {
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'A small red square.',
-    response_format: 'b64_json',
   });
   assert.equal(res.status, 200);
   const body = await res.json();
