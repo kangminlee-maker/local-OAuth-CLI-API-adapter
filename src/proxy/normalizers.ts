@@ -31,7 +31,6 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
-    temperature: readOptionalNumber(input.temperature),
     reasoningEffort: readOpenAiReasoningEffort(input.reasoning_effort ?? asRecord(input.reasoning)?.effort),
     verbosity: readOpenAiVerbosity(input.verbosity ?? asRecord(input.text)?.verbosity),
     stream: input.stream === true,
@@ -62,7 +61,6 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_output_tokens),
-    temperature: readOptionalNumber(input.temperature),
     reasoningEffort: readOpenAiReasoningEffort(reasoning?.effort),
     verbosity: readOpenAiVerbosity(text?.verbosity),
     stream: input.stream === true,
@@ -160,6 +158,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   }
   const outputConfig = asRecord(input.output_config);
   const maxTokens = readRequiredMaxTokens(input.max_tokens);
+  rejectInvalidAnthropicSampling(input);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
   const toolChoice = readAnthropicToolChoice(input.tool_choice);
@@ -182,7 +181,6 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     model: readRequiredModel(input.model, 'anthropic'),
     messages,
     maxTokens,
-    temperature: readOptionalNumber(input.temperature),
     effort: readAnthropicEffort(outputConfig?.effort),
     taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
     thinking: readAnthropicThinking(input.thinking, maxTokens),
@@ -194,6 +192,31 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     toolChoice,
     raw: body,
   };
+}
+
+/**
+ * `temperature`, `top_p` and `top_k` are validated exactly as the direct
+ * Messages API validates them (measured 2026-08-30) and then NOT applied: the
+ * Claude CLI has no sampling control, and the response carries no such field
+ * to echo them as applied. Refusing a valid value would put this surface
+ * behind the direct one, which accepts it — the contract says the values are
+ * accepted and inert. Note null is not omission here, unlike the OpenAI
+ * surfaces: the direct API answers "Input should be a valid number".
+ */
+function rejectInvalidAnthropicSampling(input: Record<string, unknown>): void {
+  for (const field of ['temperature', 'top_p'] as const) {
+    const value = input[field];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new ProxyRequestError(`${field}: Input should be a valid number`, 400, 'anthropic');
+    }
+    if (value < 0 || value > 1) {
+      throw new ProxyRequestError(`${field}: range: 0..1`, 400, 'anthropic');
+    }
+  }
+  if (input.top_k !== undefined && !Number.isInteger(input.top_k)) {
+    throw new ProxyRequestError('top_k: Input should be a valid integer', 400, 'anthropic');
+  }
 }
 
 // Anthropic structured outputs: `output_config.format = {type:'json_schema', schema}`

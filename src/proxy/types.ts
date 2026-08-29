@@ -73,7 +73,6 @@ export interface NormalizedRequest {
   readonly model: string;
   readonly messages: readonly NormalizedMessage[];
   readonly maxTokens?: number;
-  readonly temperature?: number;
   readonly reasoningEffort?: NormalizedReasoningEffort;
   readonly verbosity?: NormalizedVerbosity;
   // Anthropic `output_config.effort`, routed to `claude --effort` (claude runtime).

@@ -234,9 +234,9 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-11 | `content[].type:"thinking"` / `"redacted_thinking"` | `{thinking, signature}` | — | required to replay a thinking turn; **signature is verified server-side** | 400 / `invalid_request_error` on a bad signature | **UNKNOWN — not in the contract's block table.** A client replaying a thinking turn is unhandled | DOC |
 | A-12 | `cache_control` (on any block) | `{type:"ephemeral", ttl?}` | absent | `usage.cache_creation_input_tokens` / `cache_read_input_tokens` | 400 / `invalid_request_error` | **accepted and ignored**, documented as such (contract `:405` ff., "Prompt caching") | DOC |
 | A-13 | `system` | string \| block array | absent | system steering | 400 / `invalid_request_error` | supported; flattened (`normalizers.ts:99-100`) | DOC |
-| A-14 | `temperature` | number **0..1** (note: not 0..2) | `1` (doc example shows `1`; **stated default UNKNOWN**) | sampling | 400 / `invalid_request_error` | parsed; forwarding to the Claude CLI is not asserted anywhere | DOC? |
-| A-15 | `top_p` | number 0..1 | UNKNOWN | nucleus | 400 / `invalid_request_error` | **silently ignored** — not read (`rg` finds no `top_p` in `normalizers.ts`) | DOC? |
-| A-16 | `top_k` | integer | UNKNOWN | top-K truncation | 400 / `invalid_request_error` | **silently ignored** | DOC? |
+| A-14 | `temperature` | number **0..1** | (not applied) | sampling | 400 `invalid_request_error` `temperature: range: 0..1`; non-number or **null** → `temperature: Input should be a valid number` (measured 2026-08-30) | mirrored (`rejectInvalidAnthropicSampling`); a valid value is accepted and inert — the Claude CLI has no sampling control, and nothing echoes it | VERIFIED (§5.5.4) |
+| A-15 | `top_p` | number 0..1 | (not applied) | nucleus | `top_p: range: 0..1` / `Input should be a valid number` (measured) | mirrored; accepted and inert | VERIFIED (§5.5.4) |
+| A-16 | `top_k` | integer (negatives accepted by the direct API) | (not applied) | top-K truncation | non-integer → `top_k: Input should be a valid integer` (measured); `-1` accepted | mirrored; accepted and inert | VERIFIED (§5.5.4) |
 | A-17 | `stop_sequences` | array of strings | `[]` | stops output; `stop_reason:"stop_sequence"` **and `stop_sequence` echoes the matched string** | 400 / `invalid_request_error` | **silently ignored** — never read, yet the response emits `stop_sequence: result.stopSequence ?? null` (`http-server.ts:1896`), which can therefore never reflect a client sequence | DOC |
 | A-18 | `stream` | boolean | `false` | SSE events | 400 / `invalid_request_error` | supported | VERIFIED-weak (`anthropic.messages.stream`) |
 | A-19 | `tools` | array of `{name, description, input_schema}` + server tools (`web_search`, `bash`, `text_editor`, `computer`, …) | absent | `tool_use` blocks; `stop_reason:"tool_use"` | 400 / `invalid_request_error` | **custom tools only**; server-tool entries UNKNOWN (probe P-35) | VERIFIED-weak (`anthropic.messages.tool_use`) |
@@ -257,7 +257,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-34 | `anthropic-version` header | e.g. `2023-06-01`; **required** | none — required | request is rejected without it | **400 / `invalid_request_error`** | **UNKNOWN — the proxy does not appear to require it**; a body missing the header succeeds here and fails there. Probe P-37 | DOC |
 | A-35 | `anthropic-beta` header | array/CSV of beta ids | absent | unlocks beta fields | 400 / `invalid_request_error` on an unknown id | silently ignored | DOC |
 | A-36 | `x-api-key` / `Authorization` | credential header | none — required | 401 without it | 401 / `authentication_error` | proxy has its own local access gate; **the credential semantics differ by construction** (not applicable) | DOC |
-| A-37 | *(behavioral)* unknown top-level field | — | — | — | Anthropic's schema is strict — expected **400 `invalid_request_error`** ("Extra inputs are not permitted") | **silently ignored** — the widest single divergence class on this surface | DOC? |
+| A-37 | *(behavioral)* unknown top-level field | — | — | — | 400 `invalid_request_error` `bogus_field: Extra inputs are not permitted` (**measured 2026-08-30**) | **silently ignored** — the widest single divergence class on this surface; mirroring it needs the direct schema's full key set, which was not measured | VERIFIED for the direct side |
 
 ---
 
@@ -499,6 +499,21 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 추가 실측 (2026-08-30 오후): `model`이 `1.5`/`true`/`{}`/`[]` → `invalid_type` "got a decimal number / a boolean / an object / an array instead"; `quality`가 `true`/`{}`/`[]` → 같은 패턴("expected one of … or 'auto', but got …"); `size: 123` → `invalid_type` "expected a string, but got an integer instead"; JSON `n: "abc"` → "got a string instead".
 **multipart edits** (실제 폼, `n=0` 또는 `output_compression=101` tripwire): `style`·`bogus_field`·`response_format` → `unknown_parameter`; 파트 이름 `images` → `invalid_value` "Unknown parameter: 'images'. For multipart/form-data use 'image' or 'image[]'."; `n=abc`·`n=2.5`·`output_compression=abc` → `invalid_type` "expected an integer, but got a string value that could not be converted into an integer."; `quality=ultra`·`quality=`(빈 값) → JSON과 같은 `invalid_value`; 순서: `quality`가 `output_compression`보다 먼저, `size`는 `output_compression` 뒤, `mask` 파일은 `size` 검사를 막지 않음.
 미측정: multipart `stream=yes`(검증 단계에서 `output_compression`보다 뒤라 tripwire로는 판정 불가 — 프록시는 `invalid_type`으로 거절), `output_compression < 100` + PNG의 최종 판정(검증 단계는 통과).
+
+### 5.5.4 Anthropic Messages 샘플링 필드 direct 실측 (2026-08-30)
+
+`claude-sonnet-5`, `max_tokens: 1`. 봉투는 전부 `{"type":"error","error":{"type":"invalid_request_error","message":…},"request_id":…}` — `param`·`code` 없음(P-5와 일치).
+
+| 요청 | direct 응답 |
+| --- | --- |
+| `temperature: 1.5` / `-0.1` | 400 "temperature: range: 0..1" |
+| `temperature: "abc"` / **`null`** | 400 "temperature: Input should be a valid number" — Anthropic에서 null은 생략이 아니다 |
+| `top_p: 1.5` | 400 "top_p: range: 0..1" |
+| `top_k: 1.5` | 400 "top_k: Input should be a valid integer" |
+| `top_k: -1` | **수용**(1토큰 생성) |
+| `bogus_field: 1` | 400 "bogus_field: Extra inputs are not permitted" |
+
+프록시는 세 필드를 같은 문구로 검증하고 유효값은 수용하되 적용하지 않는다(claude CLI에 샘플링 노브 없음, 응답에 에코 필드 없음). 미지 최상위 필드(A-37)는 미러하지 않았다 — direct 스키마의 전체 키 집합 미측정.
 
 ## 6. Probe plan — converting DOC into VERIFIED
 

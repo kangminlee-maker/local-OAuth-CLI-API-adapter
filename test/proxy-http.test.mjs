@@ -1622,3 +1622,34 @@ test('/v1/responses rejects top_p at any value, code null as on the direct surfa
   assert.equal(body.error.code, null);
   assert.equal(body.error.message, "Unsupported parameter: 'top_p' is not supported with this model.");
 });
+
+// Anthropic sampling fields are validated as the direct API validates them
+// (measured 2026-08-30) and then not applied — the Claude CLI has no sampling
+// control, and no response field echoes them.
+for (const [label, body, message] of [
+  ['temperature above the range', { temperature: 1.5 }, 'temperature: range: 0..1'],
+  ['temperature below the range', { temperature: -0.1 }, 'temperature: range: 0..1'],
+  ['temperature that is not a number', { temperature: 'abc' }, 'temperature: Input should be a valid number'],
+  ['temperature null (not omission on this surface)', { temperature: null }, 'temperature: Input should be a valid number'],
+  ['top_p above the range', { top_p: 1.5 }, 'top_p: range: 0..1'],
+  ['top_k that is not an integer', { top_k: 1.5 }, 'top_k: Input should be a valid integer'],
+]) {
+  test(`/v1/messages: ${label} is refused in the direct envelope`, async () => {
+    const res = await postJson('/v1/messages', {
+      model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }], ...body,
+    });
+    const payload = await res.json();
+    assert.equal(res.status, 400);
+    assert.equal(payload.type, 'error');
+    assert.equal(payload.error.type, 'invalid_request_error');
+    assert.equal(payload.error.message, message);
+  });
+}
+
+test('/v1/messages: valid sampling values are accepted and the turn runs', async () => {
+  const res = await postJson('/v1/messages', {
+    model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }],
+    temperature: 0.5, top_p: 0.9, top_k: -1,
+  });
+  assert.equal(res.status, 200, await res.text());
+});

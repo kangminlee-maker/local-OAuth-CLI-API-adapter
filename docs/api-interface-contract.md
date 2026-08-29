@@ -319,7 +319,9 @@ The request body is a JSON object compatible with Anthropic Messages for the imp
 | `output_config.effort` | `low`..`max` | One of `low`, `medium`, `high`, `xhigh`, `max`; anything else is 400. `null` is omission. Mapped to the CLI's effort control **for models that support it; on models that gate it (Haiku) the field is accepted and ignored** — the request succeeds and the CLI is invoked without `--effort`. |
 | `output_config.format` | object | `{type: "json_schema", schema}` (a nested `json_schema.schema` variant is accepted). A `json_schema` format with no resolvable schema is malformed input, 400 — not absence. Rejected together with `tools`: the proxy has one structured-output channel, and the two would collide with the format schema silently dropped. |
 | `output_config.task_budget` | object | `{type: "tokens", total: <integer ≥ 20000>}`; a wrong `type`, a non-integer or an undersized `total` are each a named 400. Every `output_config` LEAF treats `null` as omission — `effort` and `format` are declared nullable on the direct API and `task_budget` follows its siblings. The CONTAINERS are different: `output_config: null` and `thinking: null` are present non-objects and are 400, because neither container is nullable in the direct schema. |
-| `temperature` | number | Passed to backend as temperature hint. |
+| `temperature` | number 0..1 | Validated as the direct API validates it (measured 2026-08-30): a non-number — `null` included, which is not omission here — is 400 `temperature: Input should be a valid number`; outside 0..1 is 400 `temperature: range: 0..1`. A valid value is **accepted and not applied**: the Claude CLI has no sampling control, and the response carries no such field to echo it as applied. |
+| `top_p` | number 0..1 | Same validation and the same inertness (`top_p: range: 0..1`, `top_p: Input should be a valid number`). |
+| `top_k` | integer | A non-integer is 400 `top_k: Input should be a valid integer`; any integer — negatives included, as on the direct API — is accepted and not applied. |
 
 ### Output spec
 
