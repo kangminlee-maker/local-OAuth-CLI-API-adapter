@@ -1470,28 +1470,13 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     });
   });
 
-  await benchmarkCase(target, imageGenerationCaseNames.backgroundTransparentUnsupported, repeats, async () => {
+  // Proxy-only since 2026-08-30: the direct Responses image tool on
+  // gpt-5.6-terra ACCEPTS `background: transparent` and generates (measured —
+  // a paired run returned 200 and billed an image), while the Codex backend's
+  // image model refuses it. The refusal the proxy forwards is a documented
+  // capability gap of the backend, not a parity row.
+  if (!isApi) await benchmarkCase(target, imageGenerationCaseNames.backgroundTransparentUnsupported, repeats, async () => {
     const prompt = 'A clean app icon style illustration of a yellow rain boot with a small blue puddle, centered, transparent background, no text.';
-    if (isApi) {
-      return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/responses`, {
-        model: openAiModel,
-        input: image2ViaGpt55Prompt({ prompt }),
-        reasoning: { effort: openAiImageQualityReasoningEffort('medium') },
-        tools: [{
-          type: 'image_generation',
-          action: 'generate',
-          size: '1024x1024',
-          quality: 'medium',
-          output_format: 'png',
-          background: 'transparent',
-        }],
-      }, openAiHeaders(true), {
-        status: 400,
-        type: 'image_generation_user_error',
-        param: 'tools',
-        code: 'invalid_value',
-      });
-    }
     return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
       model: 'gpt-image-2',
       prompt,
@@ -1547,10 +1532,11 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       response_format: 'b64_json',
     }, openAiHeaders(isApi), {
       // Gone on both: the direct API removed the endpoint with dall-e-2, and
-      // the proxy answers its own 404 (a JSON envelope) since 2026-08-29.
+      // since 2026-08-30 the proxy answers an unknown path the same way it
+      // does — a bare 404, no body.
       status: 404,
-      type: isApi ? undefined : 'invalid_request_error',
-      allowEmptyBody: isApi,
+      type: undefined,
+      allowEmptyBody: true,
     });
   });
 }
