@@ -25,6 +25,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const input = objectBody(body);
   const messages = readOpenAiMessages(input.messages);
   const tools = readOpenAiTools(input.tools);
+  rejectUnsupportedOpenAiSampling(input, 'openai-chat');
   return {
     shape: 'openai-chat',
     model: readRequiredModel(input.model, 'openai'),
@@ -55,6 +56,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const text = asRecord(input.text);
   const format = asRecord(text?.format);
   const reasoning = asRecord(input.reasoning);
+  rejectUnsupportedOpenAiSampling(input, 'openai-responses');
   return {
     shape: 'openai-responses',
     model: readRequiredModel(input.model, 'openai'),
@@ -73,6 +75,55 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
   };
+}
+
+/**
+ * No backend behind the OpenAI surfaces applies `temperature` or `top_p`: the
+ * Codex backend refuses both in the request body outright, and the CLIs have
+ * no such knob. The proxy used to accept any value, forward none, and echo the
+ * caller's `temperature` back from `/v1/responses` as if it had run — an
+ * option accepted and not delivered. The direct API on the same model family
+ * (measured on `gpt-5.6-terra`, 2026-08-29) rejects everything but the
+ * default, with envelopes that differ by surface; those are mirrored here
+ * verbatim. Null is omission, as on the direct API.
+ */
+function rejectUnsupportedOpenAiSampling(
+  input: Record<string, unknown>,
+  shape: 'openai-chat' | 'openai-responses',
+): void {
+  const temperature = input.temperature;
+  if (temperature !== undefined && temperature !== null && temperature !== 1) {
+    if (shape === 'openai-chat') {
+      throw new ProxyRequestError(
+        `Unsupported value: 'temperature' does not support ${JSON.stringify(temperature)} with this model. Only the default (1) value is supported.`,
+        400,
+        'openai',
+        'invalid_request_error',
+        'temperature',
+        'unsupported_value',
+      );
+    }
+    throw new ProxyRequestError(
+      "Unsupported parameter: 'temperature' is not supported with this model.",
+      400,
+      'openai',
+      'invalid_request_error',
+      'temperature',
+    );
+  }
+  const topP = input.top_p;
+  // Chat accepts the default `top_p: 1`; Responses rejects the parameter even
+  // at its default. Both measured, neither guessed.
+  if (topP !== undefined && topP !== null && (shape === 'openai-responses' || topP !== 1)) {
+    throw new ProxyRequestError(
+      "Unsupported parameter: 'top_p' is not supported with this model.",
+      400,
+      'openai',
+      'invalid_request_error',
+      'top_p',
+      shape === 'openai-chat' ? 'unsupported_parameter' : null,
+    );
+  }
 }
 
 function readOpenAiReasoningEffort(value: unknown): NormalizedReasoningEffort | undefined {

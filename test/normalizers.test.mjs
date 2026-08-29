@@ -258,3 +258,56 @@ test('taking the tools off a turn lets an Anthropic client keep its own format',
     messages: [{ role: 'user', content: 'hi' }],
   }), /not supported together with tools/);
 });
+
+// `temperature` and `top_p` are applied by nothing behind the OpenAI surfaces,
+// and the direct API on this model family rejects everything but the default —
+// with envelopes that differ by surface. Measured on gpt-5.6-terra, 2026-08-29.
+test('OpenAI chat normalizer rejects a non-default temperature with the direct envelope', () => {
+  assert.throws(
+    () => normalizeOpenAiChatRequest({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'x' }], temperature: 0.5 }),
+    (err) => err.statusCode === 400
+      && err.param === 'temperature'
+      && err.code === 'unsupported_value'
+      && /does not support 0\.5 with this model\. Only the default \(1\) value is supported\./.test(err.message),
+  );
+});
+
+test('OpenAI chat normalizer keeps the default temperature and top_p, and null as omission', () => {
+  for (const body of [{ temperature: 1 }, { top_p: 1 }, { temperature: null, top_p: null }, {}]) {
+    const request = normalizeOpenAiChatRequest({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'x' }], ...body });
+    assert.equal(request.shape, 'openai-chat');
+  }
+});
+
+test('OpenAI chat normalizer rejects a non-default top_p as an unsupported parameter', () => {
+  assert.throws(
+    () => normalizeOpenAiChatRequest({ model: 'gpt-5.5', messages: [{ role: 'user', content: 'x' }], top_p: 0.5 }),
+    (err) => err.statusCode === 400
+      && err.param === 'top_p'
+      && err.code === 'unsupported_parameter'
+      && err.message === "Unsupported parameter: 'top_p' is not supported with this model.",
+  );
+});
+
+test('OpenAI responses normalizer rejects a non-default temperature without a code', () => {
+  assert.throws(
+    () => normalizeOpenAiResponsesRequest({ model: 'gpt-5.5', input: 'x', temperature: 0.5 }),
+    (err) => err.statusCode === 400
+      && err.param === 'temperature'
+      && err.code === null
+      && err.message === "Unsupported parameter: 'temperature' is not supported with this model.",
+  );
+  assert.equal(normalizeOpenAiResponsesRequest({ model: 'gpt-5.5', input: 'x', temperature: 1 }).shape, 'openai-responses');
+  assert.equal(normalizeOpenAiResponsesRequest({ model: 'gpt-5.5', input: 'x', temperature: null }).shape, 'openai-responses');
+});
+
+test('OpenAI responses normalizer rejects top_p even at its default — the surface refuses the parameter', () => {
+  for (const top_p of [0.5, 1]) {
+    assert.throws(
+      () => normalizeOpenAiResponsesRequest({ model: 'gpt-5.5', input: 'x', top_p }),
+      (err) => err.statusCode === 400 && err.param === 'top_p' && err.code === null,
+      `top_p ${top_p}`,
+    );
+  }
+  assert.equal(normalizeOpenAiResponsesRequest({ model: 'gpt-5.5', input: 'x', top_p: null }).shape, 'openai-responses');
+});

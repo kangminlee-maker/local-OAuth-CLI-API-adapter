@@ -2017,12 +2017,16 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     safety_identifier: typeof raw.safety_identifier === 'string' ? raw.safety_identifier : null,
     service_tier: 'default',
     store: raw.store === false ? false : true,
-    temperature: options.request.temperature ?? 1,
+    // Sampling is echoed at the direct API's defaults, which are the only
+    // values a request can still carry here: the normalizer rejects any other
+    // `temperature`, and `top_p` altogether, on this surface. The echo used to
+    // repeat whatever the caller sent, for a value no backend applied.
+    temperature: 1,
     text: responseTextConfig(raw.text),
     tool_choice: responseToolChoice(raw.tool_choice),
     tools: Array.isArray(raw.tools) ? raw.tools : [],
     top_logprobs: numberOrDefault(raw.top_logprobs, 0),
-    top_p: numberOrDefault(raw.top_p, 0.98),
+    top_p: 1,
     truncation: typeof raw.truncation === 'string' ? raw.truncation : 'disabled',
     usage: options.usage,
     user: typeof raw.user === 'string' ? raw.user : null,

@@ -1689,3 +1689,44 @@ test('auth-key gate: open proxy without a key allows unauthenticated requests', 
     await proxy.close();
   }
 });
+
+test('/v1/responses echoes sampling at the direct defaults, not the caller\'s value', async () => {
+  // The echo used to repeat `request.temperature` — a value no backend applied
+  // — and `top_p: 0.98` where the provider echoes `1`.
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    input: 'Say OK',
+    temperature: 1,
+  });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.temperature, 1);
+  assert.equal(body.top_p, 1);
+});
+
+test('/v1/chat/completions rejects a non-default temperature in the direct envelope', async () => {
+  const res = await postJson('/v1/chat/completions', {
+    model: 'fake-local-model',
+    messages: [{ role: 'user', content: 'Say OK' }],
+    temperature: 0.5,
+  });
+  const body = await res.json();
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.equal(body.error.param, 'temperature');
+  assert.equal(body.error.code, 'unsupported_value');
+  assert.match(body.error.message, /Only the default \(1\) value is supported/);
+});
+
+test('/v1/responses rejects top_p at any value, code null as on the direct surface', async () => {
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    input: 'Say OK',
+    top_p: 1,
+  });
+  const body = await res.json();
+  assert.equal(res.status, 400);
+  assert.equal(body.error.param, 'top_p');
+  assert.equal(body.error.code, null);
+  assert.equal(body.error.message, "Unsupported parameter: 'top_p' is not supported with this model.");
+});
