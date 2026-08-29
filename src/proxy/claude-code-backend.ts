@@ -121,7 +121,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
     this.timeoutMs = options.timeoutMs;
     this.extraArgs = options.extraArgs ?? [];
-    this.isolateUserSettings = options.isolateUserSettings ?? false;
+    // Defaults to isolated: see the note in proxy-cli.ts. A backend constructed
+    // without an opinion should not be the one that decides to load a machine's
+    // operator settings into an API request.
+    this.isolateUserSettings = options.isolateUserSettings ?? true;
   }
 
   /**

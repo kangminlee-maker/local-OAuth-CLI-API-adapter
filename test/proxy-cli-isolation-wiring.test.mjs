@@ -98,8 +98,13 @@ test('the CLI flag reaches the spawned child: isolated', async () => {
   assert.equal(settingSourcesIn(argv), '');
 });
 
-test('the CLI flag reaches the spawned child: default loads the user source', async () => {
+test('the spawned child isolates by default', async () => {
   const argv = await childArgvThroughProxy([]);
+  assert.equal(settingSourcesIn(argv), '');
+});
+
+test('the CLI flag reaches the spawned child: opted out', async () => {
+  const argv = await childArgvThroughProxy(['--isolate-user-settings', 'false']);
   assert.equal(settingSourcesIn(argv), 'user');
 });
 
@@ -138,7 +143,12 @@ test('the CLI flag reaches the native chat session child: isolated', async () =>
   assert.equal(settingSourcesIn(argv), '');
 });
 
-test('the CLI flag reaches the native chat session child: default loads the user source', async () => {
+test('the native chat session child isolates by default', async () => {
   const argv = await chatSessionArgvThroughProxy([]);
+  assert.equal(settingSourcesIn(argv), '');
+});
+
+test('the CLI flag reaches the native chat session child: opted out', async () => {
+  const argv = await chatSessionArgvThroughProxy(['--isolate-user-settings', 'false']);
   assert.equal(settingSourcesIn(argv), 'user');
 });

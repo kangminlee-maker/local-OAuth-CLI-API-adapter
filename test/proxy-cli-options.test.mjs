@@ -107,7 +107,17 @@ test('--isolate-user-settings reaches the runtime: the banner reports the effect
     [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'claude', '--port', String(20000 + (process.pid % 20000)), '--command', '/nonexistent-claude-binary'],
     { encoding: 'utf8', timeout: 30_000 },
   );
-  assert.match(loaded.stdout, /userSettings: loaded \(user source/);
+  assert.match(loaded.stdout, /userSettings: isolated \(no setting sources\) \[default\]/);
+
+  // Opting out is reported with the reason, so a banner never claims a state
+  // nobody chose. The default flipped on 2026-08-29; before that this argument
+  // list produced the loaded state and no flag was needed to get it.
+  const optedOut = spawnSync(
+    process.execPath,
+    [builtCli, 'proxy', '--accept-llm-guide=v1', '--runtime', 'claude', '--isolate-user-settings', 'false', '--port', String(20000 + (process.pid % 10000)), '--command', '/nonexistent-claude-binary'],
+    { encoding: 'utf8', timeout: 30_000 },
+  );
+  assert.match(optedOut.stdout, /userSettings: loaded \(user source.*--isolate-user-settings false/);
 });
 
 test('--isolate-user-settings refuses --extra-arg --settings, which would load them back', () => {
