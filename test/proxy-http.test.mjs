@@ -1653,3 +1653,30 @@ test('/v1/messages: valid sampling values are accepted and the turn runs', async
   });
   assert.equal(res.status, 200, await res.text());
 });
+
+// The direct Messages API's schema is strict (measured 2026-08-30): a key it
+// does not know is refused by name — at the top level, on a message item, a
+// present null included — after every known field's own validation.
+test('/v1/messages: an unknown top-level key is refused by name, after field validation', async () => {
+  const base = { model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }] };
+  for (const [body, message] of [
+    [{ ...base, bogus_field: 1 }, 'bogus_field: Extra inputs are not permitted'],
+    [{ ...base, bogus: null }, 'bogus: Extra inputs are not permitted'],
+    [{ ...base, zzz: 1, aaa: 1 }, 'zzz: Extra inputs are not permitted'],
+    [{ ...base, bogus: 1, temperature: 1.5 }, 'temperature: range: 0..1'],
+    [{ ...base, messages: [{ role: 'user', content: 'hi', bogus: 1 }] }, 'messages.0.bogus: Extra inputs are not permitted'],
+  ]) {
+    const res = await postJson('/v1/messages', body);
+    const payload = await res.json();
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.equal(payload.error.message, message);
+  }
+});
+
+test('/v1/messages: known keys this proxy does not apply are still accepted', async () => {
+  const res = await postJson('/v1/messages', {
+    model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }],
+    metadata: { user_id: 'u1' }, service_tier: 'auto', stop_sequences: ['ZZ'], inference_geo: 'us', container: null,
+  });
+  assert.equal(res.status, 200, await res.text());
+});

@@ -176,6 +176,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
       'anthropic',
     );
   }
+  rejectUnknownAnthropicKeys(input);
   return {
     shape: 'anthropic-messages',
     model: readRequiredModel(input.model, 'anthropic'),
@@ -192,6 +193,45 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     toolChoice,
     raw: body,
   };
+}
+
+// The top-level keys the direct Messages API accepts, measured 2026-08-30 by
+// sending each with a wrong type: a known key answers about its type, an
+// unknown one "Extra inputs are not permitted". Keys the SDK types list but
+// the API refused without a beta header (`user_profile_id`, `mcp_servers`,
+// `context_management`, `betas`) are unknown here too. Several known keys are
+// accepted by this proxy and not applied (`metadata`, `service_tier`,
+// `stop_sequences`, `container`, `inference_geo`, `cache_control`); refusing
+// them would put this surface behind the direct one.
+const ANTHROPIC_MESSAGES_KEYS: ReadonlySet<string> = new Set([
+  'model', 'messages', 'max_tokens', 'cache_control', 'container', 'inference_geo',
+  'metadata', 'output_config', 'service_tier', 'stop_sequences', 'stream', 'system',
+  'temperature', 'thinking', 'tool_choice', 'tools', 'top_k', 'top_p',
+]);
+const ANTHROPIC_MESSAGE_ITEM_KEYS: ReadonlySet<string> = new Set(['role', 'content']);
+
+// Strict schema, as the direct API's is: an unknown key is refused by name,
+// at the top level and on a message item (`messages.0.bogus`), a present null
+// included. Reported after every field's own validation, which is the order
+// the direct API reports in (a body with a bad `temperature` and an unknown
+// key is answered about `temperature`).
+function rejectUnknownAnthropicKeys(input: Record<string, unknown>): void {
+  for (const key of Object.keys(input)) {
+    if (!ANTHROPIC_MESSAGES_KEYS.has(key)) {
+      throw new ProxyRequestError(`${key}: Extra inputs are not permitted`, 400, 'anthropic');
+    }
+  }
+  if (Array.isArray(input.messages)) {
+    input.messages.forEach((item, index) => {
+      const record = asRecord(item);
+      if (!record) return;
+      for (const key of Object.keys(record)) {
+        if (!ANTHROPIC_MESSAGE_ITEM_KEYS.has(key)) {
+          throw new ProxyRequestError(`messages.${index}.${key}: Extra inputs are not permitted`, 400, 'anthropic');
+        }
+      }
+    });
+  }
 }
 
 /**

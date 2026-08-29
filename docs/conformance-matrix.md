@@ -257,7 +257,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-34 | `anthropic-version` header | e.g. `2023-06-01`; **required** | none — required | request is rejected without it | **400 / `invalid_request_error`** | **UNKNOWN — the proxy does not appear to require it**; a body missing the header succeeds here and fails there. Probe P-37 | DOC |
 | A-35 | `anthropic-beta` header | array/CSV of beta ids | absent | unlocks beta fields | 400 / `invalid_request_error` on an unknown id | silently ignored | DOC |
 | A-36 | `x-api-key` / `Authorization` | credential header | none — required | 401 without it | 401 / `authentication_error` | proxy has its own local access gate; **the credential semantics differ by construction** (not applicable) | DOC |
-| A-37 | *(behavioral)* unknown top-level field | — | — | — | 400 `invalid_request_error` `bogus_field: Extra inputs are not permitted` (**measured 2026-08-30**) | **silently ignored** — the widest single divergence class on this surface; mirroring it needs the direct schema's full key set, which was not measured | VERIFIED for the direct side |
+| A-37 | *(behavioral)* unknown top-level field | — | — | — | 400 `invalid_request_error` `bogus_field: Extra inputs are not permitted`; also `messages.0.bogus`; reported after field validation (measured 2026-08-30) | mirrored (`rejectUnknownAnthropicKeys`) against the measured key set of 18 — `user_profile_id`, `mcp_servers`, `context_management`, `betas` are unknown to the direct API without a beta and unknown here | VERIFIED (§5.5.4) |
 
 ---
 
@@ -513,7 +513,9 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 | `top_k: -1` | **수용**(1토큰 생성) |
 | `bogus_field: 1` | 400 "bogus_field: Extra inputs are not permitted" |
 
-프록시는 세 필드를 같은 문구로 검증하고 유효값은 수용하되 적용하지 않는다(claude CLI에 샘플링 노브 없음, 응답에 에코 필드 없음). 미지 최상위 필드(A-37)는 미러하지 않았다 — direct 스키마의 전체 키 집합 미측정.
+프록시는 세 필드를 같은 문구로 검증하고 유효값은 수용하되 적용하지 않는다(claude CLI에 샘플링 노브 없음, 응답에 에코 필드 없음).
+
+**최상위 키 집합 (같은 날, 각 키에 틀린 타입 `1`을 보내 판별)**: 아는 키 18개 — `model`·`messages`·`max_tokens`·`cache_control`("Input should be an object")·`container`·`inference_geo`·`metadata`·`output_config`·`service_tier`("Input should be 'auto' or 'standard_only'")·`stop_sequences`·`stream`("Input should be a valid boolean")·`system`·`temperature`·`thinking`·`tool_choice`·`tools`·`top_k`·`top_p`. 모르는 키 → "<key>: Extra inputs are not permitted": `user_profile_id`(SDK 타입엔 있음)·`mcp_servers`·`context_management`·`betas`·`speed`·`effort`·`seed`·`response_format`·`instructions`·`input`·`n`·`user`·`logprobs`·`stop`. 순서: `max_tokens: Field required`가 미지 키보다 먼저, `temperature: range: 0..1`도 미지 키보다 먼저, 미지 키 둘이면 본문 순서의 첫 키; `messages[0].bogus` → "messages.0.bogus: Extra inputs are not permitted"; `bogus: null`도 거절. 프록시는 이 집합을 그대로 미러한다(A-37).
 
 ## 6. Probe plan — converting DOC into VERIFIED
 

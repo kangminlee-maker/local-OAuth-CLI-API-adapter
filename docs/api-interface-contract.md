@@ -322,6 +322,7 @@ The request body is a JSON object compatible with Anthropic Messages for the imp
 | `temperature` | number 0..1 | Validated as the direct API validates it (measured 2026-08-30): a non-number — `null` included, which is not omission here — is 400 `temperature: Input should be a valid number`; outside 0..1 is 400 `temperature: range: 0..1`. A valid value is **accepted and not applied**: the Claude CLI has no sampling control, and the response carries no such field to echo it as applied. |
 | `top_p` | number 0..1 | Same validation and the same inertness (`top_p: range: 0..1`, `top_p: Input should be a valid number`). |
 | `top_k` | integer | A non-integer is 400 `top_k: Input should be a valid integer`; any integer — negatives included, as on the direct API — is accepted and not applied. |
+| *(any other key)* | — | The direct API's schema is strict, and so is this one (measured 2026-08-30): a top-level key outside `model`, `messages`, `max_tokens`, `cache_control`, `container`, `inference_geo`, `metadata`, `output_config`, `service_tier`, `stop_sequences`, `stream`, `system`, `temperature`, `thinking`, `tool_choice`, `tools`, `top_k`, `top_p` is 400 `<key>: Extra inputs are not permitted` (a present null included), reported after every known field's own validation; a message item may carry only `role` and `content` (`messages.0.bogus: Extra inputs are not permitted`). Of the known keys, `cache_control`, `container`, `inference_geo`, `metadata`, `service_tier` and `stop_sequences` are accepted and not applied by this proxy. |
 
 ### Output spec
 
