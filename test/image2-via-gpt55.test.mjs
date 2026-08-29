@@ -23,6 +23,13 @@ test('image-2 quality maps to gpt-5.5 reasoning effort — the whole documented 
   }
 });
 
+// The canvas sentences this used to assert are gone: `size` is on the
+// image_generation tool payload (`codex-backend-transport.ts:1459`), so saying
+// its value in prose as well was the adapter describing a request it had
+// already made structurally. The geometry, flat-graphic and negative-prompt
+// assertions below are still here and are still injections — they are triggered
+// by regexes over the caller's own text and have no Images API field behind
+// them, which is a separate removal.
 test('image2_via_gpt55 prompt preserves square geometry on portrait canvas', () => {
   const prompt = image2ViaGpt55Prompt({
     action: 'generate',
@@ -36,12 +43,9 @@ test('image2_via_gpt55 prompt preserves square geometry on portrait canvas', () 
 
   assert.match(prompt, /Original Images API prompt:/);
   assert.match(prompt, /A simple flat red square centered on a white background\. No text\./);
-  assert.match(prompt, /portrait canvas matching 1024x1536/);
-  assert.match(prompt, /do not stretch or deform/);
   assert.match(prompt, /true 1:1 square, not a rectangle/);
   assert.match(prompt, /equal pixel width and height/);
   assert.match(prompt, /centered at \(512, 768\)/);
-  assert.match(prompt, /appropriate vertical margins/);
   assert.match(prompt, /Reject any vertical bar, tall rectangle, stretched square/);
   assert.match(prompt, /uniform color regions and crisp edges/);
   assert.match(prompt, /single uniform tone/);
@@ -153,8 +157,8 @@ test('image2_via_gpt55 prompt applies proxy image route hints without rewriting 
   assert.match(prompt, /outer shape visually distinct from the background/);
   assert.match(prompt, /geometry_mode=strict/);
   assert.match(prompt, /exact requested geometry/);
-  assert.match(prompt, /suitable for webp output/);
-  assert.match(prompt, /output_compression=95/);
+  // `output_format` and `output_compression` are sent on the tool payload; the
+  // prose that repeated their values is gone.
 });
 
 test('image2_via_gpt55 treats image-2 input_fidelity as disabled API surface', () => {

@@ -57,7 +57,6 @@ export function image2ViaGpt55Prompt(
   const prompt = options.prompt.trim();
   const constraints = [
     'Preserve the user prompt exactly as the visual intent; the following constraints only translate Images API options for the image_generation tool.',
-    ...canvasConstraints(options.size),
     ...geometryConstraints(prompt, options.size),
     ...proxyRouteConstraints(options.proxyRoute),
     ...backgroundConstraints(options.background),
@@ -75,26 +74,6 @@ export function image2ViaGpt55Prompt(
   ].join('\n');
 }
 
-function canvasConstraints(size: string | undefined): string[] {
-  if (!size || size === 'auto') return [];
-  const parsed = parseSize(size);
-  if (!parsed) return [`Use the requested output size/aspect ratio ${size}.`];
-  const orientation = parsed.width === parsed.height
-    ? 'square'
-    : parsed.width < parsed.height
-    ? 'portrait'
-    : 'landscape';
-  return [
-    `Use a ${orientation} canvas matching ${size}.`,
-    'Canvas aspect ratio controls the output frame only; do not stretch or deform the requested subject to fill the frame.',
-    ...(orientation === 'portrait'
-      ? ['For a portrait frame, center the subject with appropriate vertical margins instead of elongating it.']
-      : []),
-    ...(orientation === 'landscape'
-      ? ['For a landscape frame, center the subject with appropriate horizontal margins instead of widening it.']
-      : []),
-  ];
-}
 
 function geometryConstraints(prompt: string, size: string | undefined): string[] {
   const lower = prompt.toLowerCase();
@@ -212,15 +191,11 @@ function backgroundConstraints(background: string | undefined): string[] {
 
 function formatConstraints(options: Image2ViaGpt55PromptOptions): string[] {
   const constraints: string[] = [];
-  if (options.outputFormat) {
-    constraints.push(`Prepare output content suitable for ${options.outputFormat} output.`);
-  }
-  if (options.outputCompression !== undefined) {
-    constraints.push(`Preserve visual quality while respecting output_compression=${options.outputCompression}.`);
-  }
-  if (options.quality) {
-    constraints.push(`Honor the requested Images API quality level ${options.quality} without reducing prompt fidelity.`);
-  }
+  // `size`, `quality`, `output_format` and `output_compression` are not described
+  // here because they are SENT: the image_generation tool payload carries each of
+  // them (`codex-backend-transport.ts:1459-1462`). Saying a field's value in prose
+  // as well as in the field is the adapter talking to the model about a request it
+  // has already made structurally, and the prose version is the one that can drift.
   if (options.moderation) {
     constraints.push(`Use moderation=${options.moderation}; do not add safety-related visual elements or text.`);
   }
