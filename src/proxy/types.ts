@@ -24,6 +24,16 @@ export interface NormalizedMessage {
   readonly role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
   readonly content: string;
   readonly images: readonly NormalizedImage[];
+  /**
+   * Set only when the normalizer itself flattened a tool turn into this text.
+   * Downstream readers turn tool history back into their transport's native
+   * items, and they used to decide by looking for the marker in the text — which
+   * a caller can write. A user message beginning `[tool result]` became a
+   * `function_call_output` with an empty body: the text was dropped and a tool
+   * result the caller never sent was invented. Provenance is a field, not a
+   * prefix.
+   */
+  readonly toolHistory?: boolean;
 }
 
 export type NormalizedImageDetail = 'low' | 'high' | 'auto' | 'original';

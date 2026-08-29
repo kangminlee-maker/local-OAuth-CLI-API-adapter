@@ -1689,6 +1689,12 @@ async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
  * beside these items instead; see `responseInputItemsForMessage`.
  */
 function responseToolHistoryItems(message: NormalizedMessage): unknown[] | null {
+  // Provenance, not pattern. The markers are written by the normalizer when it
+  // flattens a tool turn; a caller can type the same characters, and reading
+  // them as tool history turned a user message beginning `[tool result]` into an
+  // empty `function_call_output` — the text dropped, a result invented. The flag
+  // is set only where this proxy wrote the marker itself.
+  if (message.toolHistory !== true) return null;
   const text = message.content.trim();
   const callAt = markerIndex(text, ASSISTANT_TOOL_CALL_MARKER);
   if (callAt !== -1) {

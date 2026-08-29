@@ -17,6 +17,8 @@ import { ProxyRequestError } from './types.js';
 interface NormalizedContent {
   readonly text: string;
   readonly images: readonly NormalizedImage[];
+  /** True when this text is a tool turn this normalizer flattened. */
+  readonly toolHistory?: boolean;
 }
 
 export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
@@ -313,6 +315,7 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
       role,
       content: content.text,
       images: content.images,
+      ...(content.toolHistory ? { toolHistory: true } : {}),
     };
   });
 }
@@ -405,6 +408,7 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
       role: readResponsesRole(msg, index),
       content: content.text,
       images: content.images,
+      ...(content.toolHistory ? { toolHistory: true } : {}),
     };
   });
 }
@@ -493,6 +497,7 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
       role,
       content: flattened.text,
       images: flattened.images,
+      ...(flattened.toolHistory ? { toolHistory: true } : {}),
     };
   });
 }
@@ -516,11 +521,13 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
     return {
       text: [`[tool result]`, `tool_call_id: ${toolCallId}`, content.text].join('\n'),
       images: content.images,
+      toolHistory: true,
     };
   }
   return {
     text: [content.text, toolCalls].filter(Boolean).join('\n\n'),
     images: content.images,
+    ...(toolCalls ? { toolHistory: true } : {}),
   };
 }
 
@@ -534,6 +541,7 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
         output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? '')),
       ].join('\n'),
       images: output.images,
+      toolHistory: true,
     };
   }
   if (msg.type === 'function_call') {
@@ -545,6 +553,7 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
         `arguments: ${typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {})}`,
       ].join('\n'),
       images: [],
+      toolHistory: true,
     };
   }
   return flattenOpenAiContent(msg.content ?? msg);
@@ -582,7 +591,15 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
     }
     return '';
   }).filter(Boolean).join('\n\n');
-  return { text, images };
+  // Same rule as the OpenAI shapes: the flag is set where THIS function wrote a
+  // marker, so a caller who types the same characters is never mistaken for a
+  // tool turn. Checking the blocks rather than the rendered text keeps the two
+  // from drifting apart.
+  const wroteToolHistory = value.some((block) => {
+    const record = asRecord(block);
+    return record?.type === 'tool_use' || record?.type === 'tool_result';
+  });
+  return { text, images, ...(wroteToolHistory ? { toolHistory: true } : {}) };
 }
 
 function flattenOpenAiContent(value: unknown): NormalizedContent {
