@@ -772,7 +772,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
 
   private readonly timeoutMs: number;
   private readonly reasoningEffort?: NormalizedReasoningEffort;
-  private readonly verbosity: NormalizedVerbosity;
+  private readonly verbosity: NormalizedVerbosity | undefined;
   private readonly codexHome: string;
   private readonly onImageAttempt?: (diagnostic: CodexBackendImageAttemptDiagnostic) => void;
   private readonly honorRequestModel: boolean;
@@ -783,7 +783,12 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     this.model = options.model ?? DEFAULT_CODEX_BACKEND_MODEL;
     this.timeoutMs = options.timeoutMs;
     this.reasoningEffort = options.reasoningEffort;
-    this.verbosity = options.verbosity ?? 'medium';
+    // No default. `text.verbosity` is a length-governing field on an endpoint
+    // whose own no-field default we have not observed, and the direct API sends
+    // it only when the caller does. Filling it in with 'medium' made the adapter
+    // the author of a parameter nobody set — the same class as injecting prose,
+    // one layer down. An operator who wants a floor passes one explicitly.
+    this.verbosity = options.verbosity;
     this.codexHome = options.codexHome ?? sourceCodexHome();
     this.onImageAttempt = options.onImageAttempt;
     this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
@@ -1829,10 +1834,11 @@ function responseToolChoice(choice: NormalizedToolChoice): unknown {
 
 function responseTextControls(
   request: NormalizedRequest,
-  fallbackVerbosity: NormalizedVerbosity,
+  fallbackVerbosity: NormalizedVerbosity | undefined,
 ): Record<string, unknown> | undefined {
+  const verbosity = request.verbosity ?? fallbackVerbosity;
   const text: Record<string, unknown> = {
-    verbosity: request.verbosity ?? fallbackVerbosity,
+    ...(verbosity ? { verbosity } : {}),
   };
   if (request.jsonSchema) {
     // B1: preserve the client-supplied json_schema name/strict for fidelity. codex
@@ -1846,7 +1852,9 @@ function responseTextControls(
   } else if (request.jsonMode) {
     text.format = { type: 'json_object' };
   }
-  return text;
+  // Nothing to say means say nothing: an empty `text` object is still a field
+  // the caller did not send.
+  return Object.keys(text).length > 0 ? text : undefined;
 }
 
 function codexBackendReasoningEffort(

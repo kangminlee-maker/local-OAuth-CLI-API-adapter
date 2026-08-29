@@ -39,7 +39,7 @@ The request body is a JSON object compatible with Chat Completions for the imple
 | `response_format` | `{ type: "json_object" }` or `{ type: "json_schema", json_schema: { schema } }` | Enables JSON mode/schema steering where backend supports it. |
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` | Request value takes priority over fallback settings. Invalid values return 400. |
 | `reasoning.effort` | same enum | Accepted as an alternate source. |
-| `verbosity` | `low`, `medium`, `high` | Request value takes priority over fallback settings. |
+| `verbosity` | `low`, `medium`, `high` | Forwarded when the caller sends one. When they do not, nothing is sent — the field is omitted rather than filled in, since the direct API sends it only when the caller does and it governs response length. `--codex-transport app-server` still applies `codexProxy.fallbackVerbosity`; the default `codex-backend` transport applies only an explicitly configured value. |
 | `text.verbosity` | same enum | Accepted as an alternate source. |
 | `max_tokens`, `max_completion_tokens` | number | Passed to backend as max token hint. |
 | `temperature` | number | Passed to backend as temperature hint. |
@@ -117,7 +117,7 @@ The request body is a JSON object compatible with Responses for the implemented 
 | `stream` | boolean | `true` enables Responses SSE events. |
 | `stream_options.include_usage` | boolean | Parsed for shared stream options. |
 | `text.format` | `{ type: "text" }`, `{ type: "json_object" }`, `{ type: "json_schema", schema }` | JSON modes enable backend schema steering. |
-| `text.verbosity` | `low`, `medium`, `high` | Request value takes priority over fallback settings. |
+| `text.verbosity` | `low`, `medium`, `high` | Same as `verbosity`: forwarded when sent, omitted when not. |
 | `reasoning.effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` | Request value takes priority over fallback settings. |
 | `max_output_tokens` | number | Passed to backend as max token hint. |
 | `temperature` | number | Passed to backend as temperature hint. |

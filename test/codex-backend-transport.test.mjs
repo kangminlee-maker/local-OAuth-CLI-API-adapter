@@ -1568,3 +1568,34 @@ function chatToolResultRequest() {
     toolChoice: { type: 'auto' },
   };
 }
+
+// Verbosity is a length-governing field, and the adapter used to fill it in with
+// `'medium'` whenever the caller left it out — not from settings, not from the
+// operator, but from a constructor default in this file. The direct API sends
+// the field only when the caller does, so the proxy was authoring a parameter
+// nobody set: the same class as injecting prose, one layer down. Captured on the
+// wire, all four cases.
+test('text.verbosity is sent only when someone actually asked for it', async () => {
+  const codexHome = await createCodexHome();
+  let sent = null;
+  globalThis.fetch = async (_url, init) => {
+    sent = JSON.parse(init.body);
+    return new Response(sse([{ type: 'response.completed', response: { id: 'r', model: 'gpt-5.5' } }]), { status: 200 });
+  };
+
+  const base = textRequest();
+
+  const silent = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await silent.generate(base);
+  assert.equal(sent.text, undefined, 'nobody asked, so no text object at all — not even an empty one');
+
+  await silent.generate({ ...base, verbosity: 'high' });
+  assert.deepEqual(sent.text, { verbosity: 'high' }, "the caller's value is what goes on the wire");
+
+  const configured = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, verbosity: 'low' });
+  await configured.generate(base);
+  assert.deepEqual(sent.text, { verbosity: 'low' }, 'an operator who sets one explicitly still gets it');
+
+  await silent.generate({ ...base, jsonMode: true });
+  assert.deepEqual(sent.text, { format: { type: 'json_object' } }, 'json mode still carries its format, with no verbosity added');
+});
