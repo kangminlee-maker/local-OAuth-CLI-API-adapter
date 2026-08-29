@@ -952,6 +952,8 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
     ...imageRequest(),
     outputFormat: 'jpeg',
     outputCompression: 80,
+    background: 'opaque',
+    moderation: 'low',
   });
   const body = JSON.parse(calls[0].init.body);
 
@@ -964,7 +966,10 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
     quality: 'medium',
     output_format: 'jpeg',
     output_compression: 80,
+    background: 'opaque',
+    moderation: 'low',
   }]);
+  assert.doesNotMatch(body.input[0].content[0].text, /opaque|moderation/i);
   assert.deepEqual(body.tool_choice, { type: 'image_generation' });
   assert.equal(body.reasoning.effort, 'medium');
   assert.match(body.instructions, /Use the image_generation tool/);
@@ -1021,6 +1026,44 @@ test('CodexBackendTransport includes reference images for backend image edits', 
   assert.match(body.input[0].content[1].image_url, /^data:image\/png;base64,/);
   assert.match(body.input[0].content[0].text, /This is an edit request/);
   assert.match(body.input[0].content[0].text, /Attached images 1-1/);
+});
+
+test('CodexBackendTransport sends the edit mask and input_fidelity on the tool, not as prose', async () => {
+  // The mask has a slot on the backend tool (`input_image_mask`, probed live
+  // 2026-08-29). It used to be appended to the input images and the model told
+  // in prose that the last picture was a mask; the tool never knew.
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(sse([
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: { type: 'image_generation_call', id: 'ig_mask', status: 'completed', result: tinyPngBase64() },
+      },
+      { type: 'response.completed', response: { id: 'resp_image_mask', model: 'gpt-5.5' } },
+    ]), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const source = { source: { type: 'base64', mediaType: 'image/png', data: tinyPngBase64() }, raw: {} };
+
+  await backend.generate({
+    ...imageRequest(),
+    model: 'gpt-image-1',
+    operation: 'edit',
+    prompt: 'Make the leaf blue.',
+    images: [source],
+    mask: { source: { type: 'base64', mediaType: 'image/png', data: 'bWFzaw==' }, raw: {} },
+    inputFidelity: 'high',
+  });
+  const body = JSON.parse(calls[0].init.body);
+
+  assert.deepEqual(body.tools[0].input_image_mask, { image_url: 'data:image/png;base64,bWFzaw==' });
+  assert.equal(body.tools[0].input_fidelity, 'high');
+  const images = body.input[0].content.filter((part) => part.type === 'input_image');
+  assert.equal(images.length, 1, 'the mask is no longer attached as an input image');
+  assert.doesNotMatch(body.input[0].content[0].text, /mask|fidelity/i);
 });
 
 test('CodexBackendTransport retries backend image completions that contain no image result', async () => {

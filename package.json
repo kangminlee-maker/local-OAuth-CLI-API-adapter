@@ -48,6 +48,7 @@
     "catalog:runtime": "node scripts/update-runtime-capability-catalog.mjs",
     "smoke:runtime-capabilities": "node scripts/smoke-runtime-capabilities.mjs",
     "probe:codex-backend-image": "node scripts/probe-codex-backend-image.mjs",
+    "probe:codex-image-tool-slots": "node scripts/probe-codex-image-tool-slots.mjs",
     "verify:runtime-boundary": "node scripts/verify-runtime-boundary.mjs",
     "prepack": "pnpm build && pnpm verify:runtime-boundary",
     "postinstall": "node postinstall.mjs",

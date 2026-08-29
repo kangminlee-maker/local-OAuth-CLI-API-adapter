@@ -84,7 +84,6 @@ test('image2_via_gpt55 prompt makes edit preservation explicit', () => {
     size: '1024x1024',
     quality: 'low',
     outputFormat: 'png',
-    inputFidelity: 'high',
     imageCount: 1,
   });
 
@@ -98,7 +97,6 @@ test('image2_via_gpt55 prompt makes edit preservation explicit', () => {
   assert.match(prompt, /do not leave visible remnants of the original target color/);
   assert.match(prompt, /never turn the original target color into a new background field or border/);
   assert.match(prompt, /single uniform flat fill with crisp edges/);
-  assert.match(prompt, /Use high input fidelity/);
   assert.match(prompt, /Do not render any letters/);
 });
 
@@ -161,15 +159,21 @@ test('image2_via_gpt55 prompt applies proxy image route hints without rewriting 
   // prose that repeated their values is gone.
 });
 
-test('image2_via_gpt55 treats image-2 input_fidelity as disabled API surface', () => {
+test('image2_via_gpt55 says nothing about the options the tool payload carries', () => {
+  // `background`, `moderation`, `input_fidelity` and `mask` are sent on the
+  // image_generation tool (`codexBackendImageGenerationTool`). Each used to be
+  // restated here as prose — the one copy that could drift from what was sent.
   const prompt = image2ViaGpt55PromptFromRequest({
     operation: 'edit',
-    model: 'image-2',
+    model: 'gpt-image-1',
     prompt: 'Edit this image so the red square becomes green. No text.',
     n: 1,
     images: [{ source: { type: 'url', url: 'https://example.com/red.png' }, raw: {} }],
+    mask: { source: { type: 'url', url: 'https://example.com/mask.png' }, raw: {} },
     size: '1024x1024',
     quality: 'low',
+    background: 'opaque',
+    moderation: 'low',
     inputFidelity: 'high',
     responseFormat: 'b64_json',
     stream: false,
@@ -177,6 +181,9 @@ test('image2_via_gpt55 treats image-2 input_fidelity as disabled API surface', (
     raw: {},
   });
 
-  assert.doesNotMatch(prompt, /Use high input fidelity/);
+  assert.doesNotMatch(prompt, /input fidelity/i);
+  assert.doesNotMatch(prompt, /mask/i);
+  assert.doesNotMatch(prompt, /moderation/i);
+  assert.doesNotMatch(prompt, /opaque/i);
   assert.match(prompt, /preserve the source image canvas/);
 });

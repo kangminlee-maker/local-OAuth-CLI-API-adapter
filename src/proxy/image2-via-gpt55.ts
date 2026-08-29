@@ -13,11 +13,7 @@ export interface Image2ViaGpt55PromptOptions {
   readonly quality?: string;
   readonly outputFormat?: string;
   readonly outputCompression?: number;
-  readonly background?: string;
-  readonly moderation?: string;
-  readonly inputFidelity?: string;
   readonly imageCount?: number;
-  readonly hasMask?: boolean;
   readonly proxyRoute?: OpenAiImageProxyRoute;
 }
 
@@ -42,11 +38,7 @@ export function image2ViaGpt55PromptFromRequest(
     quality: request.quality,
     outputFormat: request.outputFormat,
     outputCompression: request.outputCompression,
-    background: request.background,
-    moderation: request.moderation,
-    inputFidelity: request.model === 'image-2' ? undefined : request.inputFidelity,
     imageCount: request.images.length,
-    hasMask: Boolean(request.mask),
     proxyRoute: request.proxyRoute,
   });
 }
@@ -55,12 +47,17 @@ export function image2ViaGpt55Prompt(
   options: Image2ViaGpt55PromptOptions,
 ): string {
   const prompt = options.prompt.trim();
+  // `size`, `quality`, `output_format`, `output_compression`, `background`,
+  // `moderation`, `input_fidelity` and `mask` are not described here because
+  // they are SENT: the image_generation tool payload carries each of them
+  // (`codexBackendImageGenerationTool` in `codex-backend-transport.ts`). Saying
+  // a field's value in prose as well as in the field is the adapter talking to
+  // the model about a request it has already made structurally, and the prose
+  // version is the one that can drift.
   const constraints = [
     'Preserve the user prompt exactly as the visual intent; the following constraints only translate Images API options for the image_generation tool.',
     ...geometryConstraints(prompt, options.size),
     ...proxyRouteConstraints(options.proxyRoute),
-    ...backgroundConstraints(options.background),
-    ...formatConstraints(options),
     ...editConstraints(options),
     ...flatGraphicConstraints(options),
     ...negativePromptConstraints(prompt),
@@ -182,26 +179,6 @@ function describesSquareFormat(lowerPrompt: string): boolean {
     || /\b(?:poster|canvas|image|background|frame|layout|composition|card|cover|page)\s+(?:is\s+|should\s+be\s+|must\s+be\s+)?square\b/.test(lowerPrompt);
 }
 
-function backgroundConstraints(background: string | undefined): string[] {
-  if (!background || background === 'auto') return [];
-  if (background === 'opaque') return ['Use an opaque background; do not introduce transparency.'];
-  if (background === 'transparent') return ['Use a transparent background when the output format supports it.'];
-  return [`Respect the requested background option: ${background}.`];
-}
-
-function formatConstraints(options: Image2ViaGpt55PromptOptions): string[] {
-  const constraints: string[] = [];
-  // `size`, `quality`, `output_format` and `output_compression` are not described
-  // here because they are SENT: the image_generation tool payload carries each of
-  // them (`codex-backend-transport.ts:1459-1462`). Saying a field's value in prose
-  // as well as in the field is the adapter talking to the model about a request it
-  // has already made structurally, and the prose version is the one that can drift.
-  if (options.moderation) {
-    constraints.push(`Use moderation=${options.moderation}; do not add safety-related visual elements or text.`);
-  }
-  return constraints;
-}
-
 function editConstraints(options: Image2ViaGpt55PromptOptions): string[] {
   if (options.action !== 'edit') return [];
   return [
@@ -212,14 +189,8 @@ function editConstraints(options: Image2ViaGpt55PromptOptions): string[] {
       ? [`The first ${options.imageCount} attached image${options.imageCount === 1 ? ' is the source image' : 's are source images'}; keep source identity and composition unless the prompt asks otherwise.`]
       : []),
     'Apply only the requested visual change; do not crop, zoom, repaint the whole frame, or remove unchanged background regions.',
-    ...(options.inputFidelity === 'high'
-      ? ['Use high input fidelity: keep source identity and non-target pixels as close as possible.']
-      : []),
     ...(options.imageCount && options.imageCount > 1
       ? [`Use all ${options.imageCount} source images only as references required by the prompt; do not ignore or invent extra references.`]
-      : []),
-    ...(options.hasMask
-      ? ['When a mask is provided, the final attached image is the edit mask; constrain edits to the masked region and preserve unmasked pixels.']
       : []),
   ];
 }

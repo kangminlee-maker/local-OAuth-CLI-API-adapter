@@ -200,16 +200,16 @@ Images requests accept JSON bodies, and edit/variation endpoints also accept `mu
 | `model` | optional | optional | optional | Defaults to `dall-e-2`. `image-2` is the local Codex image route. |
 | `prompt` | required | required | ignored | At most 32,000 UTF-16 code units (JavaScript string length); longer is 400. Variation uses `Create a variation of the provided image.` internally. |
 | `image`, `image[]`, `images` | ignored | required | required | JSON image references are accepted for edits. Variations require multipart. |
-| `mask` | ignored | optional | ignored | Accepted as image input. |
+| `mask` | ignored | optional | ignored | Sent to the backend as the `image_generation` tool's `input_image_mask` (a data URL for base64/path sources, the URL itself for URL sources); never attached as an input image. |
 | `n` | optional | optional | optional | Integer 1-10, default 1. |
 | `size` | optional | optional | optional | `auto` or `WIDTHxHEIGHT`. |
 | `quality` | optional | optional | optional | `standard`, `hd`, `low`, `medium`, `high`, `auto`. |
-| `background` | optional | optional | optional | `transparent`, `opaque`, `auto`. |
+| `background` | optional | optional | optional | `transparent`, `opaque`, `auto`. Sent on the `image_generation` tool. The backend image model refuses `transparent` (`image_generation_user_error` / `invalid_value`); `image-2` rejects it locally with that envelope, other models receive the backend's own rejection. |
 | `output_format` | optional | optional | optional | `png`, `jpeg`, `webp`. |
 | `output_compression` | optional | optional | optional | Integer 0-100. Values below 100 require `jpeg` or `webp`; `100` (no compression) is valid with PNG. `null` is omission — the field is nullable on the direct API. |
-| `moderation` | optional | optional | optional | `low`, `auto`. |
-| `input_fidelity` | invalid | optional | invalid | `high`, `low`; disabled for `image-2`. |
-| `style` | optional | invalid | invalid | `vivid`, `natural`. |
+| `moderation` | optional | optional | optional | `low`, `auto`. Sent on the `image_generation` tool. |
+| `input_fidelity` | invalid | optional | invalid | `high`, `low`; disabled for `image-2`. Sent on the `image_generation` tool for other models; the backend image model refuses it (`image_generation_user_error` / `invalid_input_fidelity_model`), and that rejection is forwarded. |
+| `style` | optional | invalid | invalid | `vivid`, `natural`. **Not forwarded** — the backend `image_generation` tool has no style slot, so the value has no effect. |
 | `user` | optional | optional | optional | Accepted. |
 | `response_format` | optional | optional | optional | `b64_json` or `url`, default `b64_json`. Rejected for `gpt-image-*` models. |
 | `stream` | optional | optional | optional | Boolean. |

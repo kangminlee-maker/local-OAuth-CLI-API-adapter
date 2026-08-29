@@ -1145,7 +1145,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         imageRetryInstruction(attempt),
       ].join('\n'),
       input: await responseInputItems(codexBackendImageInputRequest(request, prompt)),
-      tools: [codexBackendImageGenerationTool(request)],
+      tools: [await codexBackendImageGenerationTool(request)],
       tool_choice: { type: 'image_generation' },
       parallel_tool_calls: true,
       reasoning: { effort: codexBackendReasoningEffort(effort) },
@@ -1410,9 +1410,6 @@ function imageAttachmentNote(request: OpenAiImageGenerationRequest): string {
   if (request.images.length > 0) {
     notes.push(`Attached images 1-${request.images.length} are source/reference images for the ${request.operation} request.`);
   }
-  if (request.mask) {
-    notes.push(`Attached image ${request.images.length + 1} is the edit mask.`);
-  }
   return notes.join(' ');
 }
 
@@ -1438,10 +1435,10 @@ function codexBackendImageInputRequest(
     messages: [{
       role: 'user',
       content: prompt,
-      images: [
-        ...request.images,
-        ...(request.mask ? [request.mask] : []),
-      ],
+      // The mask is not an input image: it rides on the tool as
+      // `input_image_mask`. Attached here as well, it was one more reference
+      // picture the model had to be told in prose was actually a mask.
+      images: request.images,
     }],
     stream: false,
     streamOptions: { includeUsage: false, includeObfuscation: false },
@@ -1452,9 +1449,18 @@ function codexBackendImageInputRequest(
   };
 }
 
-function codexBackendImageGenerationTool(
+// Every Images API option with a slot on the backend's `image_generation` tool
+// is sent on that slot, and only when the caller sent it. The backend validates
+// this declaration strictly (an unknown key or an out-of-enum value is a 400
+// naming `tools[0].<field>`, probed live 2026-08-29), so what it accepts here
+// is what the image model receives. `background: transparent` and
+// `input_fidelity` are accepted by the schema and then refused by the backend
+// image model itself (`image_generation_user_error`) — that refusal is the
+// backend's to make and is forwarded as such, not pre-empted or asked for in
+// prose.
+async function codexBackendImageGenerationTool(
   request: OpenAiImageGenerationRequest,
-): Record<string, unknown> {
+): Promise<Record<string, unknown>> {
   const quality = codexBackendImageQuality(request.quality);
   return {
     type: 'image_generation',
@@ -1463,6 +1469,10 @@ function codexBackendImageGenerationTool(
     ...(quality ? { quality } : {}),
     ...(request.outputFormat ? { output_format: request.outputFormat } : {}),
     ...(request.outputCompression !== undefined ? { output_compression: request.outputCompression } : {}),
+    ...(request.background ? { background: request.background } : {}),
+    ...(request.moderation ? { moderation: request.moderation } : {}),
+    ...(request.inputFidelity ? { input_fidelity: request.inputFidelity } : {}),
+    ...(request.mask ? { input_image_mask: { image_url: await responseImageUrl(request.mask) } } : {}),
   };
 }
 
@@ -1780,28 +1790,22 @@ function markerValue(block: string, key: string): string | undefined {
 }
 
 async function responseImagePart(image: NormalizedImage): Promise<unknown> {
-  if (image.source.type === 'url') {
-    return {
-      type: 'input_image',
-      image_url: image.source.url,
-      ...(image.detail ? { detail: image.detail } : {}),
-    };
-  }
+  return {
+    type: 'input_image',
+    image_url: await responseImageUrl(image),
+    ...(image.detail ? { detail: image.detail } : {}),
+  };
+}
+
+async function responseImageUrl(image: NormalizedImage): Promise<string> {
+  if (image.source.type === 'url') return image.source.url;
   if (image.source.type === 'base64') {
-    return {
-      type: 'input_image',
-      image_url: `data:${image.source.mediaType};base64,${image.source.data}`,
-      ...(image.detail ? { detail: image.detail } : {}),
-    };
+    return `data:${image.source.mediaType};base64,${image.source.data}`;
   }
   if (image.source.type === 'path') {
     const mediaType = image.source.mediaType ?? mediaTypeForPath(image.source.path);
     const data = await readFile(image.source.path, 'base64');
-    return {
-      type: 'input_image',
-      image_url: `data:${mediaType};base64,${data}`,
-      ...(image.detail ? { detail: image.detail } : {}),
-    };
+    return `data:${mediaType};base64,${data}`;
   }
   throw new ProxyRequestError(
     'file_id image sources are not supported by codex-backend transport; use an image URL, data URL, base64, or local path source.',
