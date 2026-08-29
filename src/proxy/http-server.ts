@@ -1729,7 +1729,19 @@ async function writeOpenAiImageStream(
   generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
-  writeSseHeaders(res);
+  // The stream commits on the backend's first event, not before it. A backend
+  // that refuses the request outright — an option its image model does not
+  // support — answers with an HTTP error before any stream byte, and the
+  // client gets that error as an HTTP status, exactly as the non-streaming
+  // path reports it and as the local validators do. Writing the 200 first
+  // turned the same refusal into an in-band error frame for one model and a
+  // 400 for another.
+  let committed = false;
+  const commit = (): void => {
+    if (committed) return;
+    writeSseHeaders(res);
+    committed = true;
+  };
   // One pin set for the whole stream: sibling images of one response must not
   // evict each other, exactly as in the non-streaming path.
   const batch = new Set<string>();
@@ -1743,6 +1755,7 @@ async function writeOpenAiImageStream(
   let completedEmitted = 0;
   try {
     for await (const event of events) {
+      commit();
       if (event.type === 'partial_image') continue;
       if (completedEmitted >= (request.n ?? 1)) break;
       completedEmitted += 1;
@@ -1764,13 +1777,18 @@ async function writeOpenAiImageStream(
       };
       await writeSseEvent(res, type, payload);
     }
+    // A backend that ends without an event is still a stream that ran.
+    commit();
   } catch (err) {
+    // Nothing on the wire yet: the request handler's error path writes the
+    // status and envelope.
+    if (!committed) throw err;
     await writeSseEvent(res, 'error', streamErrorPayload(err));
     // The OpenAI mid-stream contract: an in-band error, then `data: [DONE]` —
     // the images stream was the one OpenAI surface that ended without it.
     res.write('data: [DONE]\n\n');
   } finally {
-    res.end();
+    if (committed) res.end();
   }
 }
 

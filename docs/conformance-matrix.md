@@ -306,7 +306,7 @@ POST /v1/chat/completions
 
 `output[]` items: `reasoning` (with `summary[]`), `message` (with `content[].type:"output_text"` + `annotations`), `function_call` (`call_id`, `name`, `arguments`), built-in tool-call items.
 
-**The doc's own `response.completed` transcript is the reference for the echoed defaults** and shows: `temperature: 1.0`, `top_p: 1.0`, `store: true`, `truncation: "disabled"`, `parallel_tool_calls: true`, `tool_choice: "auto"`, `reasoning: {effort: null, summary: null}`, `metadata: {}`, `user: null`, `max_output_tokens: null`. Our echo differs on `top_p` (0.98), `top_logprobs` (0 vs null), `prompt_cache_retention` ("24h" always), and adds `billing`, `moderation`, `max_tool_calls`, `frequency_penalty`, `presence_penalty` keys.
+**The doc's own `response.completed` transcript is the reference for the echoed defaults** and shows: `temperature: 1.0`, `top_p: 1.0`, `store: true`, `truncation: "disabled"`, `parallel_tool_calls: true`, `tool_choice: "auto"`, `reasoning: {effort: null, summary: null}`, `metadata: {}`, `user: null`, `max_output_tokens: null`. Our echo matches on `temperature` (1) and `top_p` (1, constants since 2026-08-29 — the `0.98` of earlier revisions is gone with row R-11), differs on `top_logprobs` (0 vs null) and `prompt_cache_retention` ("24h" always), and adds `billing`, `moderation`, `max_tool_calls`, `frequency_penalty`, `presence_penalty` keys.
 
 **Streaming — event sequence** (named SSE; every payload carries `sequence_number`, monotonically increasing from 0):
 

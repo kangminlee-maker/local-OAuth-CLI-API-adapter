@@ -260,8 +260,10 @@ test('default streaming Images API proxy reports unsupported without direct Open
     });
     const text = await res.text();
 
-    assert.equal(res.status, 200);
-    assert.match(text, /event: error/);
+    // Nothing was streamed before the refusal, so it is the HTTP status — the
+    // stream commits on the backend's first event, not before it.
+    assert.equal(res.status, 501);
+    assert.match(res.headers.get('content-type'), /application\/json/);
     assert.match(text, /"type":"unsupported_feature"/);
     assert.match(text, /Direct OpenAI API fallback is disabled/);
   } finally {
@@ -634,8 +636,10 @@ test('POST /v1/images/generations stream preserves provider error fields', async
   });
   const text = await res.text();
 
-  assert.equal(res.status, 200);
-  assert.match(text, /event: error/);
+  // The provider refused before any event, so the client gets its status and
+  // envelope as JSON, not a committed 200 carrying an error frame.
+  assert.equal(res.status, 429);
+  assert.match(res.headers.get('content-type'), /application\/json/);
   assert.match(text, /"type":"insufficient_quota"/);
   assert.match(text, /"code":"insufficient_quota"/);
   assert.match(text, /"message":"Image quota exceeded\."/);

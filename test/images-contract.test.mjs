@@ -864,11 +864,15 @@ test('generations: standard output_compression wins over the route hint', async 
 
 test('a failed image stream still ends with data: [DONE]', async () => {
   // The one OpenAI surface whose mid-stream error ended without the promised
-  // terminal frame.
+  // terminal frame. The failure comes AFTER a first event: that is what makes
+  // the stream committed — a failure before any event is an HTTP error (below).
   const backend = {
     name: 'test', model: 'configured-model',
     async generate() { return { created: 0, images: [{ b64Json: 'iVBORw0KGgo=', revisedPrompt: null }] }; },
-    async *stream() { throw new Error('backend exploded'); },
+    async *stream() {
+      yield { type: 'partial_image', created: 0, image: { b64Json: 'iVBORw0KGgo=' }, partialImageIndex: 0 };
+      throw new Error('backend exploded');
+    },
     async close() {},
   };
   const started = await startLocalApiProxy({
@@ -885,6 +889,72 @@ test('a failed image stream still ends with data: [DONE]', async () => {
     assert.match(text, /event: error/);
     const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
     assert.equal(frames.at(-1), 'data: [DONE]', `the last frame must be the terminal one: ${frames.at(-1)}`);
+  } finally {
+    await started.close();
+  }
+});
+
+// The backend refuses a request it will not run — an option its image model
+// does not support — before any stream byte. That refusal is an HTTP error to
+// the client, streamed or not: the SSE stream commits on the first backend
+// event, not before it. Until this, `gpt-image-1` + `background: transparent`
+// with `stream: true` was a 200 carrying an error frame while the identical
+// envelope for `image-2` (a local guard) was a 400.
+test('a backend refusal before the first event is an HTTP error on the streamed path too', async () => {
+  const { ProxyRequestError } = await import('../dist/proxy/types.js');
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { throw new Error('unused'); },
+    async *stream() {
+      // The envelope the live backend returned for `background: transparent`
+      // (artifacts/codex-backend-image-probe, `slot_background`), as the
+      // codex-backend transport forwards it.
+      throw new ProxyRequestError(
+        'Transparent background is not supported for this model.', 400, 'openai',
+        'image_generation_user_error', 'tools', 'invalid_value',
+      );
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-1', prompt: 'x', background: 'transparent', stream: true }),
+    });
+    assert.equal(res.status, 400, 'nothing was on the wire, so the refusal is the status');
+    assert.match(res.headers.get('content-type'), /application\/json/);
+    const payload = await res.json();
+    assert.equal(payload.error.type, 'image_generation_user_error');
+    assert.equal(payload.error.param, 'tools');
+    assert.equal(payload.error.code, 'invalid_value');
+  } finally {
+    await started.close();
+  }
+});
+
+test('a stream that ends with no event at all is still a committed, empty stream', async () => {
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { throw new Error('unused'); },
+    async *stream() {},
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'image-2', prompt: 'x', stream: true }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /text\/event-stream/);
+    assert.equal(await res.text(), '');
   } finally {
     await started.close();
   }
