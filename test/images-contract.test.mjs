@@ -45,21 +45,140 @@ async function postImages(path, body) {
 
 const GEN = '/v1/images/generations';
 
-// `n` is a documented domain: an integer in 1..10. Only the happy path was
-// covered, so widening the bound or dropping the integer check was invisible.
-for (const [label, n] of [
-  ['zero', 0],
-  ['above the maximum', 11],
-  ['fractional', 1.5],
-  ['a non-numeric string', 'two'],
-  ['negative', -1],
+// `n` is an integer in 1..10, and the direct API says which way a value is
+// wrong (measured 2026-08-30): the bound it crossed with the value it got, or
+// the JSON type it got. Each cell pins the whole envelope.
+for (const [label, n, code, message] of [
+  ['zero', 0, 'integer_below_min_value', "Invalid 'n': integer below minimum value. Expected a value >= 1, but got 0 instead."],
+  ['above the maximum', 11, 'integer_above_max_value', "Invalid 'n': integer above maximum value. Expected a value <= 10, but got 11 instead."],
+  ['fractional', 1.5, 'invalid_type', "Invalid type for 'n': expected an integer, but got a decimal number instead."],
+  ['a non-numeric string', 'two', 'invalid_type', "Invalid type for 'n': expected an integer, but got a string instead."],
+  ['a numeric string, in JSON', '2', 'invalid_type', "Invalid type for 'n': expected an integer, but got a string instead."],
+  ['a boolean', true, 'invalid_type', "Invalid type for 'n': expected an integer, but got a boolean instead."],
+  ['negative', -1, 'integer_below_min_value', "Invalid 'n': integer below minimum value. Expected a value >= 1, but got -1 instead."],
 ]) {
-  test(`generations: n ${label} is rejected`, async () => {
+  test(`generations: n ${label} is rejected in the direct envelope`, async () => {
     const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', n });
     assert.equal(status, 400, `expected a rejection for n=${n}`);
-    assert.match(payload.error.message, /n must be an integer between 1 and 10/);
+    assert.equal(payload.error.param, 'n');
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
   });
 }
+
+// The same three shapes for the other two integer fields.
+for (const [field, value, code, message] of [
+  ['output_compression', 101, 'integer_above_max_value', "Invalid 'output_compression': integer above maximum value. Expected a value <= 100, but got 101 instead."],
+  ['output_compression', -1, 'integer_below_min_value', "Invalid 'output_compression': integer below minimum value. Expected a value >= 0, but got -1 instead."],
+  ['output_compression', 1.5, 'invalid_type', "Invalid type for 'output_compression': expected an integer, but got a decimal number instead."],
+  ['output_compression', '50', 'invalid_type', "Invalid type for 'output_compression': expected an integer, but got a string instead."],
+  ['partial_images', 4, 'integer_above_max_value', "Invalid 'partial_images': integer above maximum value. Expected a value <= 3, but got 4 instead."],
+  ['partial_images', -1, 'integer_below_min_value', "Invalid 'partial_images': integer below minimum value. Expected a value >= 0, but got -1 instead."],
+]) {
+  test(`generations: ${field} ${JSON.stringify(value)} carries the direct integer envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', [field]: value });
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, field);
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
+  });
+}
+
+// Enums (measured 2026-08-30): a string outside the set lists the set with
+// "and"; a non-string lists it with "or" as a type error. `standard` and `hd`
+// were dall-e aliases and are outside the set now.
+for (const [field, value, code, message] of [
+  ['quality', 'ultra', 'invalid_value', "Invalid value: 'ultra'. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', 'standard', 'invalid_value', "Invalid value: 'standard'. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', 'hd', 'invalid_value', "Invalid value: 'hd'. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', '', 'invalid_value', "Invalid value: ''. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', 1, 'invalid_type', "Invalid type for 'quality': expected one of 'low', 'medium', 'high', or 'auto', but got an integer instead."],
+  ['output_format', 'gif', 'invalid_value', "Invalid value: 'gif'. Supported values are: 'png', 'webp', and 'jpeg'."],
+  ['moderation', 'bogus', 'invalid_value', "Invalid value: 'bogus'. Supported values are: 'auto' and 'low'."],
+  ['background', 'bogus', 'invalid_value', "Invalid value: 'bogus'. Supported values are: 'transparent', 'opaque', and 'auto'."],
+]) {
+  test(`generations: ${field} ${JSON.stringify(value)} carries the direct enum envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', [field]: value });
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, field);
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
+  });
+}
+
+for (const [size, message] of [
+  ['bogus', "Invalid size 'bogus'. Expected WIDTHxHEIGHT, for example '1824x1024'."],
+  ['0x0', "Invalid size '0x0'. Expected WIDTHxHEIGHT, for example '1824x1024'."],
+  ['9x9', "Invalid size '9x9'. Width and height must both be divisible by 16."],
+]) {
+  test(`generations: size ${size} carries the direct size envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', size });
+    assert.equal(status, 400);
+    assert.equal(payload.error.type, 'image_generation_user_error');
+    assert.equal(payload.error.param, 'size');
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.equal(payload.error.message, message);
+  });
+}
+
+test('generations: stream that is not a boolean is a type error in JSON', async () => {
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', stream: 'yes' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'stream': expected a boolean, but got a string instead.");
+});
+
+test('generations: an unknown top-level field is refused by name, as on the direct API', async () => {
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', bogus_field: 1 });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'unknown_parameter');
+  assert.equal(payload.error.param, 'bogus_field');
+  assert.equal(payload.error.message, "Unknown parameter: 'bogus_field'.");
+});
+
+test('generations: x_proxy_image_route is the one key the direct API refuses that this proxy keeps', async () => {
+  const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', x_proxy_image_route: { geometry_mode: 'strict' } });
+  assert.equal(status, 200);
+});
+
+// Ordering, measured with two faults in one body: unknown keys before prompt,
+// prompt before images, images before n, n before the enums.
+test('generations: faults are reported in the direct order', async () => {
+  const cases = [
+    [{ prompt: 'a dot', bogus: 1, n: 0 }, 'bogus'],
+    [{ prompt: '', n: 0 }, 'prompt'],
+    [{ prompt: 'a dot', n: 0, quality: 'ultra' }, 'n'],
+    [{ prompt: 'a dot', n: null, output_compression: 101 }, 'output_compression'],
+  ];
+  for (const [body, param] of cases) {
+    const { payload } = await postImages(GEN, { model: 'gpt-image-2', ...body });
+    assert.equal(payload.error.param, param, JSON.stringify(body));
+  }
+  const { payload } = await postImages('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', images: [], n: 0 });
+  assert.equal(payload.error.param, 'images');
+  assert.equal(payload.error.code, 'empty_array');
+});
+
+for (const [label, prompt, code, message] of [
+  ['empty', '', 'empty_string', "Invalid 'prompt': empty string. Expected a string with minimum length 1, but got an empty string instead."],
+  ['null', null, 'invalid_type', "Invalid type for 'prompt': expected a string, but got null instead."],
+  ['an integer', 123, 'invalid_type', "Invalid type for 'prompt': expected a string, but got an integer instead."],
+]) {
+  test(`generations: prompt ${label} carries the direct envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt });
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, 'prompt');
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
+  });
+}
+
+test('edits: images null is a type error, not omission', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', images: null });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'images': expected an array of objects, but got null instead.");
+});
 
 test('generations: nullable fields treat null as omission, per the direct types', async () => {
   // `n`, `partial_images`, `output_compression` are declared nullable
@@ -75,11 +194,17 @@ test('generations: nullable fields treat null as omission, per the direct types'
   assert.equal(payload.data.length, 1, 'null n means the default of 1');
 });
 
-test('generations: a numeric string n is accepted, because form fields are strings', async () => {
-  // `/v1/images/*` accepts multipart/form-data, where every field arrives as a
-  // string. Rejecting "2" would reject a well-formed form-encoded request.
-  const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', n: '2' });
+test('a numeric string n is accepted in multipart, where every field is a string', async () => {
+  // In JSON a string `n` is a type error (measured); a form field can only be
+  // a string, so there the digits are the integer they spell.
+  const { status } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', n: '2' });
   assert.equal(status, 200);
+});
+
+test('a multipart body with a key the direct API does not know is refused too', async () => {
+  const { status, payload } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', style: 'vivid' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'unknown_parameter');
 });
 
 test('generations: the n boundaries are accepted', async () => {
@@ -94,12 +219,19 @@ test('generations: a prompt is required', async () => {
   assert.equal(status, 400);
 });
 
-for (const [label, prompt] of [['empty', ''], ['whitespace-only', '   '], ['non-string', 42]]) {
+for (const [label, prompt] of [['empty', ''], ['non-string', 42]]) {
   test(`generations: a ${label} prompt is rejected`, async () => {
     const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt });
     assert.equal(status, 400);
   });
 }
+
+test('generations: a whitespace-only prompt is accepted, as the direct API accepts it', async () => {
+  // Measured 2026-08-30: `"   "` generated. Blank-detection is not the direct
+  // API's rule for this field; only the empty string is refused.
+  const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: '   ' });
+  assert.equal(status, 200);
+});
 
 test('edits: an image input is required', async () => {
   const { status, payload } = await postImages('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot' });
@@ -863,11 +995,15 @@ test('multipart works with an uppercase media-type essence', async () => {
 
 // --- round 46 ---
 
-test('generations ignore mask entirely, as the contract says', async () => {
-  // Round 45's mask validation leaked onto the operations whose row says
-  // "ignored" — a request the contract promises succeeds was 400.
-  const gen = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', mask: 42 });
-  assert.equal(gen.status, 200, 'a generation ignores mask, valid or not');
+test('generations: mask and images are unknown parameters, as on the direct API', async () => {
+  // Measured 2026-08-30: a generation body carrying either key is refused by
+  // name; the earlier contract said they were ignored.
+  for (const key of ['mask', 'images']) {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', [key]: 42 });
+    assert.equal(status, 400);
+    assert.equal(payload.error.code, 'unknown_parameter');
+    assert.equal(payload.error.param, key);
+  }
 });
 
 test('edits: a malformed array member keeps its index even when the parser throws', async () => {
@@ -1093,7 +1229,9 @@ test('a close-delimiter PREFIX is data too: later parts survive it', async () =>
     // the status. (A dropped `model` part merely falls back to the default —
     // the first version of this test passed against the broken close check.)
     const body = [
-      `--${B}`, 'Content-Disposition: form-data; name="junk"', '', `before\r\n--${B}--X\r\nafter`,
+      // A known field (`user` is free text) carries the fake close: an unknown
+      // part name is itself a 400 now, which would mask what this test pins.
+      `--${B}`, 'Content-Disposition: form-data; name="user"', '', `before\r\n--${B}--X\r\nafter`,
       `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
       `--${B}--`, 'epilogue',

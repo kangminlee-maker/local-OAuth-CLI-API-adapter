@@ -12,11 +12,11 @@ export interface Image2ViaGpt55PromptOptions {
 export function image2QualityToGpt55ReasoningEffort(
   quality: string | undefined,
 ): NormalizedReasoningEffort {
+  // `low`, `medium`, `high`, `auto` — the direct API's own set (the dall-e
+  // aliases `standard`/`hd` are refused at the door since 2026-08-30, as the
+  // direct API refuses them). `auto` and an omitted quality run at high.
   if (quality === 'low') return 'low';
-  // `standard` is the documented alias of `medium` in BOTH halves of the
-  // quality mapping; this half had dropped it, sending standard-quality
-  // requests to high effort against the stated table.
-  if (quality === 'medium' || quality === 'standard') return 'medium';
+  if (quality === 'medium') return 'medium';
   return 'high';
 }
 

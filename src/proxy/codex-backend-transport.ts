@@ -1478,7 +1478,7 @@ async function codexBackendImageGenerationTool(
 
 function codexBackendImageQuality(quality: string | undefined): 'low' | 'medium' | 'high' {
   if (quality === 'low') return 'low';
-  if (quality === 'medium' || quality === 'standard') return 'medium';
+  if (quality === 'medium') return 'medium';
   return 'high';
 }
 

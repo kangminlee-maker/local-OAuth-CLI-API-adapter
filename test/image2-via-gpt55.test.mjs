@@ -7,14 +7,12 @@ import {
 } from '../dist/proxy/image2-via-gpt55.js';
 
 test('Images quality maps to gpt-5.5 reasoning effort — the whole documented table', () => {
-  // Every documented cell, because a one-cell regression (standard->high, the
-  // defect this table caught) survives spot checks.
+  // Every cell of the direct API's set (`standard`/`hd` were dall-e aliases;
+  // the direct API refuses them now, and so does the request parser).
   for (const [quality, effort] of [
     ['low', 'low'],
     ['medium', 'medium'],
-    ['standard', 'medium'],
     ['high', 'high'],
-    ['hd', 'high'],
     ['auto', 'high'],
     [undefined, 'high'],
   ]) {
