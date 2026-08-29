@@ -29,7 +29,7 @@ Confirmed from `docs/api-interface-contract.md:10-18` (Supported surfaces table)
 Two more scope notes the packet did not state:
 
 - `POST /v1/messages/count_tokens` is a documented Anthropic surface that clients (including the Anthropic SDKs' token-counting helpers) call. The contract does not claim it, and the proxy does not serve it, so a client hitting it gets `404 Unknown endpoint` (`:405` ff., "Method and path dispatch"). Out of matrix scope; flagged as a known client-visible gap.
-- The proxy serves a **proxy-only** surface not on either provider: `GET /v1/images/generated/{id}` (`http-server.ts:1314`), the target of `response_format: "url"`. It has no provider counterpart and cannot diverge; noted for completeness.
+- The proxy used to serve a **proxy-only** surface, `GET /v1/images/generated/{id}`, the target of `response_format: "url"`. Removed 2026-08-29: every live image model refuses `response_format`, so the surface was unreachable (row I-14).
 
 ### 0.1 What "our verification authority" actually is today
 
@@ -186,31 +186,31 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 
 ---
 
-## 3. OpenAI Images — `/v1/images/generations`, `/edits`, `/variations`
+## 3. OpenAI Images — `/v1/images/generations`, `/edits` (`/variations` is gone — 404 on both, 2026-08-29)
 
-20 rows. `G`/`E`/`V` = applicability to generations / edits / variations per the provider spec.
+20 rows. `G`/`E`/`V` = applicability to generations / edits / variations per the provider spec as it stood before 2026-08-29; the `V` column is historical — the direct API answers a bare 404 on `/v1/images/variations` (measured 2026-08-29), and so does the proxy.
 
 | # | Field | G/E/V | Type & values | Provider default | Observable effect | Invalid-value error | This proxy | Ev |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| I-1 | `model` | G E V | string | **`dall-e-2`** (doc: the only model for which the `url` default and 1000-char prompt cap apply) | picks the generator; changes which other fields are legal | 400 / `invalid_request_error` / `model` / `model_not_found` | supported; defaults to `dall-e-2`; `image-2` is the local route (contract `:242`) | VERIFIED (`openai.images.direct_generation.gpt_image.schema_exact`) |
+| I-1 | `model` | G E V | string | **none — required** (2026-08-29: absent → 400 `missing_required_parameter`; null/number → 400 `invalid_type`) | picks the generator; changes which other fields are legal | 400 / `image_generation_user_error` / `model` / `invalid_value` `The model 'X' does not exist.` — for `dall-e-2`, `dall-e-3`, `image-2`, `''`, anything not in the live list | required; live list `gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`, `gpt-image-2-2026-04-21`, `chatgpt-image-latest` (`OPENAI_IMAGE_MODELS`, `http-server.ts`); every name runs on the local backend; the former `image-2` is refused like any other unknown name | VERIFIED (direct 2026-08-29, §5.5.2) |
 | I-2 | `prompt` | G E, ignored on V | string; ≤32000 chars GPT-image, ≤1000 `dall-e-2`, ≤4000 `dall-e-3` | required on G/E | the image | 400 / `invalid_request_error` / `prompt` / — | supported; cap enforced as **32000 UTF-16 code units** (contract `:243`) — the provider's caps are model-dependent and character-based, so `dall-e-2` prompts of 1001-32000 chars are accepted here and rejected there | VERIFIED for the missing-prompt error (`openai.images.error_missing_prompt.schema_exact`) |
-| I-3 | `image` / `image[]` / `images` | — E V | binary (multipart) | required on E/V | the source image | 400 / `invalid_request_error` / `image` / — | supported; **JSON image references also accepted on edits** (a proxy extension); variations require multipart (contract `:245`) | VERIFIED (`openai.images.direct_edit.gpt_image.schema_exact`, `…error_variation_json…`) |
+| I-3 | `images` (JSON) / `image`, `image[]` (multipart) | — E — | JSON: array of objects; multipart: file parts | required on E | the source image | JSON `image`/`image[]` → 400 `invalid_value` "Unknown parameter: 'image'. For application/json on /v1/images/edits, use 'images' (array)."; non-array `images` → 400 `invalid_type`; string member → 400 `invalid_type` param `images[0]`; absent → 400 `missing_required_parameter` (all measured 2026-08-29) | mirrored: JSON takes `images` only with those envelopes, multipart takes `image`/`image[]` (`imageInputsForOperation`) | VERIFIED (direct 2026-08-29, §5.5.2) |
 | I-4 | `mask` | — E — | binary PNG, <4MB, same dims as `image` | absent | edit region | 400 / `invalid_request_error` / `mask` / — | sent as the tool's `input_image_mask` (`codexBackendImageGenerationTool`); the slot accepts a data URL and an https URL, and 500s on `{}` (never sent empty) | VERIFIED (tool-slot probe 2026-08-29: `slot_input_image_mask`, `slot_mask_https_url`, `slot_mask_empty_object`) |
 | I-5 | `n` | G E V | integer 1-10 (`dall-e-3`: only 1) | `1` | `data` array length | 400 / `invalid_request_error` / `n` / — | supported 1-10 (`http-server.ts:556`) — **does not enforce the `dall-e-3` n=1 rule** | VERIFIED (`…b64_json_n3_parallel…`) |
 | I-6 | `size` | G E V | model-dependent: `1024x1024`\|`1024x1536`\|`1536x1024`\|`auto` (GPT-image); `256x256`\|`512x512`\|`1024x1024` (`dall-e-2`); `1024x1792`\|`1792x1024` (`dall-e-3`) | `auto` on GPT-image; `1024x1024` on dall-e | output dimensions; echoed | 400 / `invalid_request_error` / `size` / — | **divergent**: accepts `auto` or **any** `WIDTHxHEIGHT` with positive ints (`http-server.ts:938-950`) — a free-form grammar the provider rejects | DOC |
 | I-7 | `quality` | G E V | `standard`\|`hd`\|`low`\|`medium`\|`high`\|`auto` | `auto` | fidelity, cost, latency; echoed | 400 / `invalid_request_error` / `quality` / — | supported, full enum (`http-server.ts:563`) — **not model-gated** (`hd` on a GPT-image model is accepted here, rejected there) | VERIFIED (`…generation_api_fields…`) |
-| I-8 | `style` | G — — | `vivid`\|`natural` (dall-e-3 only) | `vivid` | aesthetic | 400 / `invalid_request_error` / `style` / — | accepted on generations, 400 elsewhere (`http-server.ts:660`); **not forwarded** — the backend tool has no style slot and rejects unknown keys (`unknown_parameter`), so the value has no effect | VERIFIED (tool-slot probe 2026-08-29: `control_bogus_field`) |
+| I-8 | `style` | G — — | `vivid`\|`natural` (dall-e-3 only, and dall-e-3 is gone) | — | aesthetic | 400 / `invalid_request_error` / `style` / `unknown_parameter` (measured on gpt-image-2) | rejected whenever present, the same envelope (`rejectUnknownOpenAiImageParameters`) | VERIFIED (direct 2026-08-29, §5.5.2) |
 | I-9 | `background` | G E V | `transparent`\|`opaque`\|`auto` (GPT-image only) | `auto` | alpha channel; echoed | 400 / `invalid_request_error` / `background` / — | sent on the tool; `transparent` rejected for `image-2` and with `jpeg` (`http-server.ts:647-658`) — the backend image model (`gpt-image-2-codex`) refuses `transparent` with the same envelope, so other models get the backend's rejection forwarded; `opaque`/`auto` accepted | VERIFIED (`…background_transparent_unsupported…`; tool-slot probe 2026-08-29: `slot_background`, `slot_background_opaque`, `slot_background_auto`) |
 | I-10 | `output_format` | G E V | `png`\|`jpeg`\|`webp` (GPT-image only) | `png` | encoding; echoed | 400 / `invalid_request_error` / `output_format` / — | supported | VERIFIED (`…generation_api_fields…`) |
 | I-11 | `output_compression` | G E V | integer 0-100; **provider: only with `webp`/`jpeg`** | `100` | file size | 400 / `invalid_request_error` / `output_compression` / — | supported; **PNG + `100` explicitly allowed** (contract `:250`), and `null` treated as omission — the provider documents the param as webp/jpeg-only, so the PNG carve-out is an unverified reading | VERIFIED for the error case (`…error_invalid_output_compression…`) |
 | I-12 | `moderation` | G E V | `low`\|`auto` (GPT-image only) | `auto` | filter strictness | 400 / `invalid_request_error` / `moderation` / — | sent on the tool (`http-server.ts:567` → `codexBackendImageGenerationTool`); backend accepts `low`, rejects out-of-enum values | VERIFIED (tool-slot probe 2026-08-29: `slot_moderation`, `control_bogus_enum_moderation`) |
-| I-13 | `input_fidelity` | — E — | `high`\|`low` (gpt-image-1/1.5, **not** `-mini`) | `low` | face/style preservation | 400 / `invalid_request_error` / `input_fidelity` / — | sent on the tool for edits; 400 `invalid_input_fidelity_model` for `image-2` (`http-server.ts:636-645`) — the backend image model (`gpt-image-2-codex`) refuses it with that exact envelope, forwarded for other models | VERIFIED (`…input_fidelity_disabled…`; tool-slot probe 2026-08-29: `slot_input_fidelity`) |
-| I-14 | `response_format` | G E V | `url`\|`b64_json`; **dall-e only** — GPT-image models reject it | **`url`** (dall-e-2/3) | `data[].url` vs `data[].b64_json` | 400 / `invalid_request_error` / `response_format` / `unknown_parameter` on GPT-image | **divergent default**: proxy defaults to **`b64_json`** (contract `:255`) where the provider defaults to `url`; correctly 400s it for `gpt-image-*` (`http-server.ts:588-593`) | VERIFIED for the rejection (`…proxy_gpt_image_response_format_unsupported…`, `…direct_image2_unsupported…`) |
+| I-13 | `input_fidelity` | — E — | `high`\|`low` (gpt-image-1/1.5, **not** `-mini`) | `low` | face/style preservation | on a generation: 400 `unknown_parameter` (measured on gpt-image-2); on `gpt-image-1-mini`: 400 `unknown_parameter` (measured) | generation → `unknown_parameter`; edit → sent on the tool, and the backend image model (`gpt-image-2-codex`) refuses it with `invalid_input_fidelity_model`, forwarded | VERIFIED (direct 2026-08-29 + tool-slot probe) |
+| I-14 | `response_format` | G E V | — | — | — | 400 / `invalid_request_error` / `response_format` / `unknown_parameter` on every live model, **null included** (measured on gpt-image-2, chatgpt-image-latest, gpt-image-2-2026-04-21) | rejected whenever present; the `url` format and the `GET /v1/images/generated/{id}` store are removed (2026-08-29) | VERIFIED (direct 2026-08-29, §5.5.2) |
 | I-15 | `stream` | G E — | boolean (GPT-image only) | `false` | SSE partial/completed image events | 400 / `invalid_request_error` / `stream` / — | supported | VERIFIED (`…generation_stream…`) |
 | I-16 | `partial_images` | G E — | integer 0-3 | `0`… (doc's rendered scalar is `1`; **the documented default is not distinguishable** — UNKNOWN) | number of `image_generation.partial_image` events | 400 / `invalid_request_error` / `partial_images` / — | **only 0/null/omitted**; >0 → 400 `partial_images is not supported by this local image proxy` (`http-server.ts:823-833`) | DOC? |
 | I-17 | `user` | G E V | string | absent | abuse signal | UNKNOWN | accepted (contract `:254`) | DOC? |
 | I-18 | `x_proxy_image_route` | G E V | object: `visual_class`, `geometry_mode`, `output_format`, `output_compression` | n/a | route-specific generation constraints | 400 / `invalid_request_error` / `x_proxy_image_route.*` / — | **proxy-only extension** (`http-server.ts:880-934`). Sending it to the direct API is expected to 400 as an unknown parameter | CODE |
-| I-19 | *(behavioral)* body encoding | G E V | JSON on G; multipart on E/V per provider | — | — | 400 on wrong encoding | proxy accepts **JSON on edits** too, and requires multipart only for variations (contract `:245`) | VERIFIED for the variation-JSON rejection (`…error_variation_json…`) |
+| I-19 | *(behavioral)* body encoding | G E — | JSON or multipart on both (the direct API takes JSON `images` on edits, measured) | — | — | 400 on wrong encoding | JSON and multipart on both operations; variations gone | VERIFIED (direct 2026-08-29) |
 | I-20 | *(behavioral)* unknown top-level field | G E V | — | — | — | expected 400 `unknown_parameter` | unknown fields other than `response_format` are silently ignored | DOC? |
 
 ---
@@ -452,6 +452,27 @@ Chat 표면에서는 `[DONE]`이 맞다(direct도 보낸다). Responses에서만
 | `slot_edit_combo` | `action: edit` + `opaque` + `moderation: low` + 마스크 + size/quality/output_format 동시 → 200 | VERIFIED |
 | `body_temperature_*`, `body_top_p_0_5` | 요청 본문의 `temperature`(0.5, 1 모두)·`top_p` → 400 `{"detail": "Unsupported parameter: temperature"}`. 프록시는 보내지 않았고 `/v1/responses` 응답이 호출자 값을 그대로 에코했다 — 적용된 적 없는 값의 에코. 같은 날 direct API(`gpt-5.6-terra`) 실측: Chat은 `temperature` 0.5 → 400 `unsupported_value`("Only the default (1) value is supported"), 1 → 200, `top_p` 0.5 → 400 `unsupported_parameter`, 1 → 200; Responses는 `temperature` 0.5 → 400(code null), 1 → 200, `top_p`는 **1이어도** 400(code null). 프록시는 이 봉투를 표면별로 그대로 미러링하고 에코는 상수 1로 고정했다(행 13·14·R-10·R-11) | VERIFIED |
 
+### 5.5.2 Images 모델 네임스페이스 direct 실측 (2026-08-29)
+
+`GET /v1/models`의 이미지 모델: `chatgpt-image-latest`, `gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`,
+`gpt-image-2-2026-04-21`. **`dall-e-2`·`dall-e-3`는 없다.** 아래는 전부 생성 없이 거절된 호출(`n: 0` 등으로 검증 단계에서 멈춤).
+
+| 요청 | direct 응답 | 등급 |
+| --- | --- | --- |
+| `model` 생략 | 400 `invalid_request_error` / `model` / `missing_required_parameter` | VERIFIED |
+| `model: null` / `123` | 400 `invalid_type` "expected a string, but got null / an integer instead" | VERIFIED |
+| `model: "dall-e-2"`, `"dall-e-3"`, `"image-2"`, `"foo-model"`, `""` | 400 `image_generation_user_error` / `model` / `invalid_value` "The model 'X' does not exist." | VERIFIED |
+| `gpt-image-2` + `response_format` (`url`, `null` 모두), `chatgpt-image-latest`·`gpt-image-2-2026-04-21` + `response_format` | 400 `unknown_parameter` | VERIFIED |
+| `gpt-image-2` generations + `input_fidelity`, `gpt-image-1-mini` + `input_fidelity` | 400 `unknown_parameter` | VERIFIED |
+| `gpt-image-2` + `style: vivid` | 400 `unknown_parameter` | VERIFIED |
+| `gpt-image-2` + `user` | 수용(다음 검증인 `n`에서 거절됨) | VERIFIED |
+| edits JSON `image` / `image[]` | 400 `invalid_value` "Unknown parameter: 'image'. For application/json on /v1/images/edits, use 'images' (array)." | VERIFIED |
+| edits JSON `images: {}` / `images: ["str"]` / `images` 생략 | 400 `invalid_type` (param `images` / `images[0]`) / `missing_required_parameter` | VERIFIED |
+| edits JSON `images: [{image_url}]` + `mask: {image_url}` + `input_fidelity` | 수용(`n`에서 거절됨) | VERIFIED |
+| `POST`/`GET /v1/images/variations` (어느 모델이든) | **404**, 본문 없음, `x-content-type-options: nosniff` — `/v1/images/foo`·`/v1/nope`도 동일 | VERIFIED |
+
+프록시는 이 표를 그대로 미러한다(행 I-1·I-3·I-8·I-13·I-14·I-19). 미측정: `model`이 boolean/object/array일 때의 정확한 문구(같은 패턴으로 추정), `images: null`.
+
 ## 6. Probe plan — converting DOC into VERIFIED
 
 **Ranking.** risk = P(our proxy diverges) × client visibility. Tier A = a divergence a normal SDK client would hit on an ordinary request. Tier B = a divergence a client hits when it uses the feature. Tier C = completeness.
@@ -476,7 +497,7 @@ Standing rules for every probe: minimal token spend (`max_tokens`/`max_completio
 | P-14 | B | Chat, model omitted; then `""`; then `"   "` | status/type/param/code per case | row 1 | 3 |
 | P-15 | B | Responses **with `model` omitted** | whether the provider really requires it | R-1 | 1 |
 | P-16 | B | `POST /v1/images/generations` `{"model":"gpt-image-1","prompt":"a red dot","size":"1024x1024","quality":"low"}` | Exact key set + **`usage` sub-shape** (settles the contract's Responses-shaped image usage) | I-1, I-7, §5.3 | 1 |
-| P-17 | B | Images generations with `"model":"dall-e-2","prompt":"a red dot"`, `response_format` omitted | whether `data[0]` carries `url` (provider default) — settles our `b64_json` default | I-14 | 1 |
+| P-17 | B | ~~Images generations with `dall-e-2`, `response_format` omitted~~ — settled 2026-08-29 without a generation: `dall-e-2` does not exist and `response_format` is refused on every live model (§5.5.2) | — | I-14 | 0 |
 | P-18 | B | Images generations, `"size":"777x333"` on gpt-image | status/type/param/code — settles our free-form `WIDTHxHEIGHT` grammar | I-6 | 1 |
 | P-19 | B | Chat `tool_choice:"banana"`; Responses same | 400 vs silent `auto` fallback | row 31, R-19 | 2 |
 | P-20 | B | Chat with a tool + `"parallel_tool_calls":false` on a prompt that would call twice | `tool_calls` length; echo | row 32 | 1 |

@@ -628,7 +628,7 @@ async function createCodexHome() {
 function imageRequest() {
   return {
     operation: 'generation',
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'A simple flat red square centered on a white background. No text.',
     n: 1,
     images: [],
@@ -638,7 +638,6 @@ function imageRequest() {
     outputCompression: 80,
     background: 'opaque',
     moderation: 'low',
-    responseFormat: 'b64_json',
     stream: false,
     partialImages: 0,
     raw: {},

@@ -446,7 +446,7 @@ test('the access gate rejects /v1/messages in the Anthropic envelope', async () 
 });
 
 test('the access gate rejects an images route too', async () => {
-  const { status, body } = await unauthorized('/v1/images/generations', { model: 'image-2', prompt: 'hi' });
+  const { status, body } = await unauthorized('/v1/images/generations', { model: 'gpt-image-2', prompt: 'hi' });
   assert.equal(status, 401);
   assert.equal(body.error.type, 'invalid_request_error');
 });

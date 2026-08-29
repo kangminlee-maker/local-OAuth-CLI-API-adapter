@@ -152,7 +152,7 @@ export interface LocalCompletionResult {
 }
 
 export interface OpenAiImageGenerationRequest {
-  readonly operation: 'generation' | 'edit' | 'variation';
+  readonly operation: 'generation' | 'edit';
   readonly model: string;
   readonly prompt: string;
   readonly n: number;
@@ -165,9 +165,7 @@ export interface OpenAiImageGenerationRequest {
   readonly outputCompression?: number;
   readonly moderation?: string;
   readonly inputFidelity?: string;
-  readonly style?: string;
   readonly user?: string;
-  readonly responseFormat: 'b64_json' | 'url';
   readonly stream: boolean;
   readonly partialImages: number;
   readonly proxyRoute?: OpenAiImageProxyRoute;
@@ -301,23 +299,10 @@ export interface LocalCliBackend {
   close(): Promise<void>;
 }
 
-/**
- * The generated-image store's public surface. The implementation lives with the
- * HTTP server; this names only what the server needs, so a test can inject the
- * same class built with smaller budgets — eviction and pinning are behaviour
- * that HTTP-level tests cannot exercise against the production 128 MiB.
- */
-export interface GeneratedImageStoreLike {
-  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string;
-  get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null;
-  clear(): void;
-}
-
 export interface ProxyServerOptions {
   readonly backend: LocalCliBackend;
   readonly imageGenerationClient?: OpenAiImageGenerationClient;
   readonly chatSessionManager?: LocalCliChatSessionManager;
-  readonly generatedImageStore?: GeneratedImageStoreLike;
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;

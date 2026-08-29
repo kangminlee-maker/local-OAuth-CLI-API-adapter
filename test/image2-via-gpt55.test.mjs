@@ -6,7 +6,7 @@ import {
   image2ViaGpt55PromptFromRequest,
 } from '../dist/proxy/image2-via-gpt55.js';
 
-test('image-2 quality maps to gpt-5.5 reasoning effort — the whole documented table', () => {
+test('Images quality maps to gpt-5.5 reasoning effort — the whole documented table', () => {
   // Every documented cell, because a one-cell regression (standard->high, the
   // defect this table caught) survives spot checks.
   for (const [quality, effort] of [
@@ -49,7 +49,6 @@ test('image2_via_gpt55 passes an edit prompt through verbatim, options and all',
     background: 'opaque',
     moderation: 'low',
     inputFidelity: 'high',
-    responseFormat: 'b64_json',
     stream: false,
     partialImages: 0,
     raw: {},

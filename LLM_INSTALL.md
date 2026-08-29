@@ -9,7 +9,7 @@ Read it before running the proxy or generating integration code.
 
 - OpenAI-compatible `/v1/chat/completions`
 - OpenAI-compatible `/v1/responses`
-- OpenAI-compatible `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations`
+- OpenAI-compatible `/v1/images/generations`, `/v1/images/edits`
 - Anthropic-compatible `/v1/messages`
 - Native local CLI chat endpoints under `/local/cli/sessions`
 
@@ -62,8 +62,10 @@ Native local chat:    http://127.0.0.1:8787/local/cli/sessions
 
 ## Images API Notes
 
-`image-2` is implemented through the local Codex image route, not direct OpenAI
-`image-2` execution.
+`model` must be one of the direct API's live image models (`gpt-image-2`, `gpt-image-1`,
+`gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2-2026-04-21`, `chatgpt-image-latest`);
+every one runs on the local Codex image route. `dall-e-*`, the former `image-2` and any
+other name are refused as the direct API refuses them. `/v1/images/variations` is 404.
 
 Standard Images fields keep provider-compatible priority:
 
@@ -72,11 +74,11 @@ Standard Images fields keep provider-compatible priority:
 - `background`
 - `output_format`
 - `output_compression`
-- `response_format`
 - `stream`
 
 `partial_images > 0` is unsupported and must return an error.
-`input_fidelity` is disabled for `image-2`.
+`input_fidelity` is edits-only, and the backend image model refuses it today.
+`response_format` and `style` are unknown parameters, as on the direct API.
 
 ## Proxy-only Image Route Hints
 
@@ -87,10 +89,9 @@ Example:
 
 ```json
 {
-  "model": "image-2",
+  "model": "gpt-image-2",
   "prompt": "Create a simple flat circular badge: teal outer circle, white inner circle, and one small orange star in the center. No text.",
   "quality": "low",
-  "response_format": "b64_json",
   "x_proxy_image_route": {
     "visual_class": "badge_or_emblem",
     "geometry_mode": "strict",
@@ -112,7 +113,7 @@ Supported `x_proxy_image_route` fields:
 Standard fields win over extension fields. If both `output_format` and
 `x_proxy_image_route.output_format` are present, use `output_format`.
 
-For multipart image edits or variations, pass `x_proxy_image_route` as a JSON
+For multipart image edits, pass `x_proxy_image_route` as a JSON
 string form field.
 
 ## Benchmark Labels

@@ -106,9 +106,8 @@ lives in [`docs/api-interface-contract.md`](docs/api-interface-contract.md).
 | OpenAI Models | `GET /v1/models` | Configured model plus models the local runtime advertises |
 | OpenAI Chat Completions | `POST /v1/chat/completions` | Text, tools, JSON mode/schema, streaming, image inputs |
 | OpenAI Responses | `POST /v1/responses` | Text, function calls, function outputs, streaming, image inputs |
-| OpenAI Images | `POST /v1/images/generations` | `image-2` via local Codex image generation |
-| OpenAI Images | `POST /v1/images/edits` | JSON image references and multipart edits |
-| OpenAI Images | `POST /v1/images/variations` | Multipart variations |
+| OpenAI Images | `POST /v1/images/generations` | Every live direct image model name (`gpt-image-2` and siblings) via local Codex image generation |
+| OpenAI Images | `POST /v1/images/edits` | JSON `images` references and multipart edits, with `mask` |
 | Anthropic Messages | `POST /v1/messages` | Text, tools, images, streaming, `thinking`/`output_config` tuning |
 
 Planned local CLI chat sessions are intentionally separate from the
@@ -141,9 +140,6 @@ Common supported features:
 - Anthropic Messages image blocks
 - image sources as remote URLs, data URLs/base64, local `file://` URLs, and
   multipart files where the endpoint supports multipart
-- Images `response_format` `b64_json` or `url`; URL responses are served from
-  `/v1/images/generated/<id>` out of an in-memory store bounded by a one-hour
-  TTL, 128 MiB, and 10,000 entries
 - Anthropic `thinking` and `output_config` (effort, JSON-schema format, task
   budget) mapped to Claude CLI controls where the model supports them
 - provider token usage details when the CLI exposes them, with estimated usage
@@ -165,8 +161,9 @@ direct APIs. Which model executes is controlled by
   unavailable list passes models through rather than failing them), Claude
   models by the CLI's own refusal.
 
-`/v1/images/*` is exempt: the Images `model` (`image-2`, `dall-e-2`,
-`gpt-image-*`) is a route selector with its own validation, and the Codex
+`/v1/images/*` is exempt: the Images `model` must be one of the direct API's
+live image model names (`gpt-image-2` and its siblings; `dall-e-*` and the
+former `image-2` are refused as the direct API refuses them), and the Codex
 model that actually runs image turns is `codexProxy.imageModel`.
 
 ## Important Differences From Full Provider APIs
@@ -184,11 +181,11 @@ OpenAI or Anthropic APIs.
 | Claude user settings | By default the Claude runtime loads your `user` settings into every spawned child, so your global CLAUDE.md enters each request's context and your configured hooks run once per API turn. Start the proxy with `--isolate-user-settings` to load no setting source instead (keychain OAuth still works; credentials supplied through the settings file do not). |
 | Codex transport | `codexProxy.transport` defaults to `codex-backend`; text/tool uses ChatGPT Codex backend directly. |
 | Codex image transport | `codexProxy.imageTransport` defaults to `codex-backend`; Images API uses backend `image_generation` tool results, while native chat uses app-server. |
-| Images `image-2` | Implemented through the local Codex `gpt-5.5` image-generation route. |
+| Images models | `model` is required and validated against the direct API's live image models (2026-08-29: `gpt-image-1`, `-1-mini`, `-1.5`, `gpt-image-2`, `gpt-image-2-2026-04-21`, `chatgpt-image-latest`); all run on the local Codex image route. `dall-e-*` and the former `image-2` are refused; `/v1/images/variations` is 404; `response_format` and `style` are unknown parameters — each exactly as on the direct API. |
 | Images proxy route hints | Optional `x_proxy_image_route` is a proxy-only extension for explicit visual class, geometry mode, and output format routing. |
 | Images flat/vector references | PNG flat/vector reference-style outputs may receive deterministic edge-preserving flattening to reduce gradients while preserving small accent colors and outlines. |
 | Images partial streaming | `partial_images > 0` is rejected; streams emit completed images only. |
-| Images `input_fidelity` | Treated as disabled for `image-2`. |
+| Images `input_fidelity` | Edits only; the backend image model refuses it today and that refusal is forwarded. |
 | Provider `file_id` images | Rejected because the local CLI proxy cannot read provider Files API storage. |
 | Token usage | Provider CLI usage is preferred; estimated usage is fallback only. |
 | Audio / embeddings | Not implemented. |
@@ -272,18 +269,17 @@ curl http://127.0.0.1:8787/v1/responses \
   }'
 ```
 
-OpenAI Images through the local `image-2` route:
+OpenAI Images through the local route (`gpt-image-2` names the backend's own image model):
 
 ```bash
 curl http://127.0.0.1:8787/v1/images/generations \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer local' \
   -d '{
-    "model": "image-2",
+    "model": "gpt-image-2",
     "prompt": "A simple flat red square on a pure white background.",
     "size": "1024x1024",
-    "quality": "medium",
-    "response_format": "b64_json"
+    "quality": "medium"
   }'
 ```
 
@@ -294,10 +290,9 @@ curl http://127.0.0.1:8787/v1/images/generations \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer local' \
   -d '{
-    "model": "image-2",
+    "model": "gpt-image-2",
     "prompt": "Create a simple flat circular badge: teal outer circle, white inner circle, and one small orange star in the center. No text.",
     "quality": "low",
-    "response_format": "b64_json",
     "x_proxy_image_route": {
       "visual_class": "badge_or_emblem",
       "geometry_mode": "strict",
@@ -321,7 +316,7 @@ Supported proxy route fields:
 | `output_format` | `png`, `jpeg`, `webp` | Used as the effective output format only when standard `output_format` is omitted. |
 | `output_compression` | integer `0-100` | Used as the effective compression only when standard `output_compression` is omitted; valid only with JPEG/WebP output. |
 
-For multipart image edits or variations, pass `x_proxy_image_route` as a JSON
+For multipart image edits, pass `x_proxy_image_route` as a JSON
 string form field.
 
 Anthropic Messages:

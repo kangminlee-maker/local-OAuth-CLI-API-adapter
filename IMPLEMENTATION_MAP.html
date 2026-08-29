@@ -305,9 +305,9 @@
           <td class="ok"><code>test/proxy-http.test.mjs</code> json_schema 행, <code>contract-smoke</code> 통과</td>
         </tr>
         <tr>
-          <td><code>image-2</code> 대체 경로</td>
+          <td>Images 모델 라우트(<code>gpt-image-2</code> 등)</td>
           <td><code>src/proxy/image2-via-gpt55.ts</code>, Images API 정규화 로직</td>
-          <td><code>image-2</code> 요청을 정식 프록시 경로로 받아 Codex OAuth의 <code>gpt-5.5</code> 이미지 생성 능력에 매핑합니다. 현재 품질 매핑은 <code>high→high</code>, <code>medium→medium</code>, <code>low→low</code>입니다.</td>
+          <td>direct API의 라이브 이미지 모델명(2026-08-29 기준 <code>gpt-image-1</code>·<code>-1-mini</code>·<code>-1.5</code>·<code>gpt-image-2</code>·<code>gpt-image-2-2026-04-21</code>·<code>chatgpt-image-latest</code>)만 받아 Codex OAuth의 <code>gpt-5.5</code> 이미지 생성 능력에 매핑합니다. 발명된 이름 <code>image-2</code>·소멸한 <code>dall-e-*</code>는 direct와 같은 봉투로 거절하고, <code>/v1/images/variations</code>는 404, <code>response_format</code>·<code>style</code>은 unknown_parameter입니다(0.3.0, breaking). 현재 품질 매핑은 <code>high→high</code>, <code>medium→medium</code>, <code>low→low</code>입니다.</td>
           <td class="ok">generation, URL 응답, streaming, edit, variation, disabled field, square format, background-only preservation 테스트</td>
         </tr>
         <tr>

@@ -125,9 +125,9 @@ test('flat/vector postprocessing crosses the HTTP seam', async () => {
       const res = await originalFetch(`${started.url}/v1/images/edits`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
-          model: 'image-2',
+          model: 'gpt-image-2',
           prompt: 'Use the attached style reference image to create a new flat vector icon. No text.',
-          image: `data:image/png;base64,${tinyPngBase64()}`,
+          images: [{ image_url: `data:image/png;base64,${tinyPngBase64()}` }],
           output_format: 'png',
         }),
       });

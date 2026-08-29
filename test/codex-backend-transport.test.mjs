@@ -879,8 +879,8 @@ test('an id-less completed call never overwrites a different streamed call', asy
 
 test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
   // The contract exempts `/v1/images/*` from the switch: the request `model` is
-  // an Images route selector (`image-2`), not a Codex slug. Honouring it would
-  // send `image-2` where a Codex model belongs. The exemption currently holds by
+  // an Images model name (`gpt-image-2`), not a Codex slug. Honouring it would
+  // send `gpt-image-2` where a Codex model belongs. The exemption currently holds by
   // construction — the image path never consults the setting — which is exactly
   // the kind of fact that a later edit can undo silently.
   const codexHome = await createCodexHome();
@@ -901,10 +901,10 @@ test('Images requests ignore honorRequestModel: the configured image model runs'
   const backend = new CodexBackendTransport({
     codexHome, timeoutMs: 30_000, model: 'gpt-5.5', honorRequestModel: true,
   });
-  await backend.generate({ ...imageRequest(), model: 'image-2' });
+  await backend.generate({ ...imageRequest(), model: 'gpt-image-2' });
   const body = JSON.parse(calls[0].init.body);
   assert.equal(body.model, 'gpt-5.5', 'the configured Codex model runs, not the Images route selector');
-  assert.notEqual(body.model, 'image-2');
+  assert.notEqual(body.model, 'gpt-image-2');
 });
 
 test('CodexBackendTransport maps Images API requests to backend image_generation tool results', async () => {
@@ -1547,13 +1547,12 @@ function toolRequest() {
 function imageRequest() {
   return {
     operation: 'generation',
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'Create a simple green leaf icon on a white background. No text.',
     n: 1,
     images: [],
     size: '1024x1024',
     quality: 'medium',
-    responseFormat: 'b64_json',
     stream: false,
     partialImages: 0,
     raw: {},

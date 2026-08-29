@@ -25,7 +25,7 @@ import type {
 } from './types.js';
 import { honorRequestModel } from '../settings.js';
 import {
-  GeneratedImageStoreLike, BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
+  BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { missingToolCallArgumentDelta } from './tool-call-stream.js';
@@ -81,12 +81,8 @@ interface ParsedImageRequestBody {
 export async function startLocalApiProxy(
   options: ProxyServerOptions,
 ): Promise<StartedProxyServer> {
-  // Injectable like the backends: the store's budgets are real behaviour
-  // (eviction, pinning) that HTTP-level tests cannot exercise against the
-  // production 128 MiB constant.
-  const generatedImages = options.generatedImageStore ?? new GeneratedImageStore();
   const server = createServer((req, res) => {
-    void handleRequest(req, res, options, generatedImages);
+    void handleRequest(req, res, options);
   });
   // Node routes CONNECT to this event and, with no listener, destroys the
   // socket — the one method that got no HTTP answer at all. It is a tunnel
@@ -129,7 +125,6 @@ export async function startLocalApiProxy(
         closeImageGenerationClient(options),
         options.chatSessionManager?.closeAll() ?? Promise.resolve(),
       ]);
-      generatedImages.clear();
     },
   };
 }
@@ -149,14 +144,14 @@ const POST_ENDPOINTS = new Set([
   '/v1/messages',
   '/v1/images/generations',
   '/v1/images/edits',
-  '/v1/images/variations',
+  // `/v1/images/variations` is gone from the direct API (404, measured
+  // 2026-08-29, with the dall-e-2 model it served), so it is unknown here too.
 ]);
 
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStoreLike,
 ): Promise<void> {
   const { backend, requestTimeoutMs } = options;
   setCorsHeaders(res);
@@ -190,18 +185,10 @@ async function handleRequest(
       await handleLocalCliChatRequest(req, res, options, path);
       return;
     }
-    // The generated route is exactly one nonempty, slash-free id segment. A
-    // doubled slash or a deeper path is a DIFFERENT path, which the dispatch
-    // row promises is a 404 whatever the method — prefix matching was
-    // classifying it as served and answering 405.
-    const generatedId = path.startsWith('/v1/images/generated/')
-      ? path.slice('/v1/images/generated/'.length)
-      : null;
-    const isGetRoute = path === '/v1/models'
-      || (generatedId !== null && generatedId !== '' && !generatedId.includes('/'));
+    const isGetRoute = path === '/v1/models';
     // Path first, method second: `GET /v1/nope` is an unknown endpoint, not an
     // unsupported method. 405 is reserved for a path this proxy does serve —
-    // including the GET routes, so `POST /v1/models` is a method problem, not a
+    // including the GET route, so `POST /v1/models` is a method problem, not a
     // missing endpoint.
     if (!isGetRoute && !POST_ENDPOINTS.has(path)) {
       throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
@@ -213,27 +200,17 @@ async function handleRequest(
       writeJson(res, 200, await openAiModelsResponse(backend));
       return;
     }
-    if (path.startsWith('/v1/images/generated/')) {
-      writeGeneratedImage(res, generatedImages, path);
-      return;
-    }
 
     if (path === '/v1/images/generations') {
       const { body, isMultipart } = await readImageRequestBody(req);
       const normalized = normalizeOpenAiImageRequest(body, 'generation', isMultipart);
-      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
+      await handleOpenAiImageRequest(res, options, normalized);
       return;
     }
     if (path === '/v1/images/edits') {
       const { body, isMultipart } = await readImageRequestBody(req);
       const normalized = normalizeOpenAiImageRequest(body, 'edit', isMultipart);
-      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
-      return;
-    }
-    if (path === '/v1/images/variations') {
-      const { body, isMultipart } = await readImageRequestBody(req);
-      const normalized = normalizeOpenAiImageRequest(body, 'variation', isMultipart);
-      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
+      await handleOpenAiImageRequest(res, options, normalized);
       return;
     }
     const body = await readJsonBody(req);
@@ -466,19 +443,15 @@ async function handleLocalCliChatRequest(
 }
 
 async function handleOpenAiImageRequest(
-  req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
   const client = options.imageGenerationClient ?? unsupportedLocalOAuthImageGenerationClient();
   if (request.stream) {
     await writeOpenAiImageStream(
-      req,
       res,
       runImageGenerationStreamWithTimeout(client, request, options.requestTimeoutMs, res),
-      generatedImages,
       request,
     );
     return;
@@ -490,7 +463,7 @@ async function handleOpenAiImageRequest(
   
     res,
   );
-  writeJson(res, 200, openAiImagesGenerationResponse(req, generatedImages, result, request));
+  writeJson(res, 200, openAiImagesGenerationResponse(result, request));
 }
 
 function normalizeOpenAiImageRequest(
@@ -499,11 +472,9 @@ function normalizeOpenAiImageRequest(
   isMultipart: boolean,
 ): OpenAiImageGenerationRequest {
   const input = asRecordPayload(body);
-  // "Explicit" means a real value: null is omission (the field is nullable on
-  // the direct API), so a GPT-image request carrying response_format: null must
-  // behave exactly like one without the property.
-  const explicitResponseFormat = input.response_format !== undefined && input.response_format !== null;
-  const prompt = imagePrompt(input.prompt, operation);
+  const model = openAiImageModel(input.model);
+  rejectUnknownOpenAiImageParameters(input);
+  const prompt = imagePrompt(input.prompt);
   if (!prompt.trim()) {
     throw new ProxyRequestError(
       "Missing required parameter: 'prompt'.",
@@ -517,32 +488,9 @@ function normalizeOpenAiImageRequest(
   if (prompt.length > 32_000) {
     throw new ProxyRequestError('prompt must be 32000 characters or fewer.', 400);
   }
-  // Absence and null get the default (the direct API declares the field
-  // nullable); any other present value is validated rather than silently
-  // replaced with `b64_json`.
-  const responseFormat = input.response_format === undefined || input.response_format === null
-    ? 'b64_json'
-    : input.response_format;
-  if (responseFormat !== 'b64_json' && responseFormat !== 'url') {
-    throw new ProxyRequestError('response_format must be one of url or b64_json.', 400);
-  }
-  // Absence and null default (the field is nullable on the direct API); a
-  // present non-string or blank string is malformed input, not a request for
-  // dall-e-2 — substituting a model the client never named ran the wrong route.
-  if (input.model !== undefined && input.model !== null
-    && (typeof input.model !== 'string' || !input.model.trim())) {
-    throw new ProxyRequestError('model must be a non-empty string.', 400, 'openai', 'invalid_request_error', 'model');
-  }
-  const model = typeof input.model === 'string' && input.model.trim()
-    ? input.model
-    : 'dall-e-2';
-  validateOpenAiImageModelSurface(model, operation, explicitResponseFormat);
   const images = imageInputsForOperation(input, operation, isMultipart);
-  if ((operation === 'edit' || operation === 'variation') && images.length === 0) {
-    throw new ProxyRequestError('image input is required for image edits and variations.', 400);
-  }
-  if (operation === 'variation' && !isMultipart) {
-    throw new ProxyRequestError('image variations require multipart/form-data with an image file.', 400);
+  if (operation === 'edit' && images.length === 0) {
+    throw new ProxyRequestError('image input is required for image edits.', 400);
   }
   const proxyRoute = optionalImageProxyRoute(input.x_proxy_image_route);
   const outputFormat = optionalEnum(input.output_format, 'output_format', ['png', 'jpeg', 'webp'])
@@ -555,9 +503,9 @@ function normalizeOpenAiImageRequest(
     prompt,
     n: imageGenerationCount(input.n),
     images,
-    // Validated only where the contract gives it meaning. On generations and
-    // variations the row says "ignored" — validating an ignored field rejected
-    // requests the contract promises succeed.
+    // Validated only where the contract gives it meaning. On generations the
+    // row says "ignored" — validating an ignored field rejected requests the
+    // contract promises succeed.
     mask: operation === 'edit' ? requiredValidImageInput(input.mask, 'mask') : undefined,
     size: optionalImageSize(input.size),
     quality: optionalEnum(input.quality, 'quality', ['standard', 'hd', 'low', 'medium', 'high', 'auto']),
@@ -566,9 +514,7 @@ function normalizeOpenAiImageRequest(
     outputCompression,
     moderation: optionalEnum(input.moderation, 'moderation', ['low', 'auto']),
     inputFidelity: optionalEnum(input.input_fidelity, 'input_fidelity', ['high', 'low']),
-    style: optionalEnum(input.style, 'style', ['vivid', 'natural']),
     user: optionalString(input.user),
-    responseFormat,
     stream: optionalBoolean(input.stream, 'stream') ?? false,
     partialImages: partialImageCount(input.partial_images),
     ...(proxyRoute ? { proxyRoute } : {}),
@@ -578,35 +524,89 @@ function normalizeOpenAiImageRequest(
   return request;
 }
 
-function validateOpenAiImageModelSurface(
-  model: string,
-  operation: OpenAiImageOperation,
-  explicitResponseFormat: boolean,
-): void {
-  if (explicitResponseFormat && openAiGptImageModelPattern().test(model)) {
+// The Images models the direct API serves, read from its `GET /v1/models` on
+// 2026-08-29. Every one of them runs on the local image backend; the name a
+// client sends selects nothing but its own validation. `dall-e-2`, `dall-e-3`
+// and the proxy's former invented route name `image-2` are refused exactly as
+// the direct API refuses them, because it does: "The model 'dall-e-2' does not
+// exist." Refresh against the live list when the vendor's changes.
+const OPENAI_IMAGE_MODELS: ReadonlySet<string> = new Set([
+  'chatgpt-image-latest',
+  'gpt-image-1',
+  'gpt-image-1-mini',
+  'gpt-image-1.5',
+  'gpt-image-2',
+  'gpt-image-2-2026-04-21',
+]);
+
+// `model` is required on the direct API (measured 2026-08-29: absent is
+// `missing_required_parameter`, null and a number are `invalid_type`, an
+// unknown or empty name "does not exist"). The proxy used to default an absent
+// model to dall-e-2, a model that no longer exists to default to.
+function openAiImageModel(value: unknown): string {
+  if (value === undefined) {
     throw new ProxyRequestError(
-      "Unknown parameter: 'response_format'.",
-      400,
-      'openai',
-      'invalid_request_error',
-      'response_format',
-      'unknown_parameter',
-    );
-  }
-  if (operation === 'variation' && model !== 'dall-e-2' && model !== 'image-2') {
-    throw new ProxyRequestError(
-      'This endpoint only supports dall-e-2.',
+      "Missing required parameter: 'model'.",
       400,
       'openai',
       'invalid_request_error',
       'model',
+      'missing_required_parameter',
+    );
+  }
+  if (typeof value !== 'string') {
+    throw new ProxyRequestError(
+      `Invalid type for 'model': expected a string, but got ${jsonTypeName(value)} instead.`,
+      400,
+      'openai',
+      'invalid_request_error',
+      'model',
+      'invalid_type',
+    );
+  }
+  if (!OPENAI_IMAGE_MODELS.has(value)) {
+    throw new ProxyRequestError(
+      `The model '${value}' does not exist.`,
+      400,
+      'openai',
+      'image_generation_user_error',
+      'model',
       'invalid_value',
     );
   }
+  return value;
 }
 
-function openAiGptImageModelPattern(): RegExp {
-  return /^gpt-image-/;
+// Parameters the direct API refuses on every model it serves today, with its
+// envelope: `response_format` (the GPT-image models always return base64) and
+// `style` (a dall-e-3 control, and dall-e-3 is gone). A present null counts —
+// measured: `response_format: null` is "Unknown parameter", not omission.
+function rejectUnknownOpenAiImageParameters(input: Record<string, unknown>): void {
+  for (const name of ['response_format', 'style']) {
+    if (input[name] !== undefined) throw unknownImageParameter(name);
+  }
+}
+
+function unknownImageParameter(name: string): ProxyRequestError {
+  return new ProxyRequestError(
+    `Unknown parameter: '${name}'.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    name,
+    'unknown_parameter',
+  );
+}
+
+// The direct API's wording for a wrong JSON type: "got null instead", "got an
+// integer instead" (both measured); the other names follow the same pattern.
+function jsonTypeName(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a number';
+  if (typeof value === 'boolean') return 'a boolean';
+  if (typeof value === 'object') return 'an object';
+  return `a ${typeof value}`;
 }
 
 function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void {
@@ -628,42 +628,19 @@ function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void
       'invalid_png_output_compression',
     );
   }
-  if (request.inputFidelity && request.model === 'image-2') {
-    // The model-specific rejection carries its documented envelope
-    // (image_generation_user_error); the generic operation guard below used to
-    // shadow it for generations and variations.
-    throw new ProxyRequestError(
-      'input_fidelity is disabled for image-2.',
-      400,
-      'openai',
-      'image_generation_user_error',
-      'tools',
-      'invalid_input_fidelity_model',
-    );
-  }
+  // `input_fidelity` is an edits parameter: on a generation the direct API
+  // does not know it at all (measured on gpt-image-2, 2026-08-29). Whether the
+  // backend image model honours it on an edit is the backend's answer,
+  // forwarded — it refuses today (`invalid_input_fidelity_model`).
   if (request.inputFidelity && request.operation !== 'edit') {
-    throw new ProxyRequestError('input_fidelity is only supported for image edits.', 400);
-  }
-  if (request.model === 'image-2' && request.background === 'transparent') {
-    throw new ProxyRequestError(
-      'Transparent background is not supported for this model.',
-      400,
-      'openai',
-      'image_generation_user_error',
-      'tools',
-      'invalid_value',
-    );
+    throw unknownImageParameter('input_fidelity');
   }
   if (request.background === 'transparent' && request.outputFormat === 'jpeg') {
     throw new ProxyRequestError('background transparent requires output_format to be png or webp.', 400);
   }
-  if (request.style && request.operation !== 'generation') {
-    throw new ProxyRequestError('style is only supported for image generations.', 400);
-  }
 }
 
-function imagePrompt(value: unknown, operation: OpenAiImageOperation): string {
-  if (operation === 'variation') return 'Create a variation of the provided image.';
+function imagePrompt(value: unknown): string {
   if (typeof value === 'string' && value.trim()) return value;
   return '';
 }
@@ -674,10 +651,58 @@ function imageInputsForOperation(
   isMultipart: boolean,
 ): readonly NormalizedImage[] {
   if (operation === 'generation') return [];
-  // The documented aliases hold in BOTH encodings: a JSON edit naming its
-  // image with the singular `image` field was rejected as having none.
-  const value = input.image ?? input['image[]'] ?? input.images;
-  return imageInputArray(value);
+  // A multipart edit names its files `image` or `image[]`, as the direct
+  // API's form does.
+  if (isMultipart) return imageInputArray(input.image ?? input['image[]']);
+  // A JSON edit carries `images`, an array of objects, and nothing else —
+  // measured 2026-08-29: the direct API refuses `image` and `image[]` in JSON,
+  // a non-array `images`, and a string member, each with its own envelope.
+  // The proxy used to take all of them as aliases.
+  for (const alias of ['image', 'image[]']) {
+    if (input[alias] !== undefined) {
+      throw new ProxyRequestError(
+        `Unknown parameter: '${alias}'. For application/json on /v1/images/edits, use 'images' (array).`,
+        400,
+        'openai',
+        'invalid_request_error',
+        alias,
+        'invalid_value',
+      );
+    }
+  }
+  if (input.images === undefined) {
+    throw new ProxyRequestError(
+      "Missing required parameter: 'images'.",
+      400,
+      'openai',
+      'invalid_request_error',
+      'images',
+      'missing_required_parameter',
+    );
+  }
+  if (!Array.isArray(input.images)) {
+    throw new ProxyRequestError(
+      `Invalid type for 'images': expected an array of objects, but got ${jsonTypeName(input.images)} instead.`,
+      400,
+      'openai',
+      'invalid_request_error',
+      'images',
+      'invalid_type',
+    );
+  }
+  input.images.forEach((member, index) => {
+    if (!member || typeof member !== 'object' || Array.isArray(member)) {
+      throw new ProxyRequestError(
+        `Invalid type for 'images[${index}]': expected an object, but got ${jsonTypeName(member)} instead.`,
+        400,
+        'openai',
+        'invalid_request_error',
+        `images[${index}]`,
+        'invalid_type',
+      );
+    }
+  });
+  return imageInputArray(input.images);
 }
 
 function imageInputArray(value: unknown): readonly NormalizedImage[] {
@@ -1205,138 +1230,10 @@ interface MultipartFilePart {
   readonly data: string;
 }
 
-export class GeneratedImageStore {
-  private readonly images = new Map<string, {
-    readonly bytes: Buffer;
-    readonly contentType: string;
-    readonly expiresAt: number;
-  }>();
-
-  private heldBytes = 0;
-
-  constructor(
-    private readonly ttlMs: number = GENERATED_IMAGE_TTL_MS,
-    private readonly maxBytes: number = GENERATED_IMAGE_MAX_BYTES,
-    private readonly maxEntries: number = GENERATED_IMAGE_MAX_ENTRIES,
-  ) {}
-
-  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string {
-    this.cleanupExpired();
-    const id = randomUUID();
-    const bytes = Buffer.from(b64Json, 'base64');
-    this.images.set(id, {
-      bytes,
-      contentType: imageContentType(outputFormat),
-      expiresAt: Date.now() + this.ttlMs,
-    });
-    this.heldBytes += bytes.byteLength;
-    // Map preserves insertion order, so iteration meets oldest entries first.
-    // Never evicted: the image just stored, and any id in `pinned` — the other
-    // images of the SAME response, whose URLs are about to be handed out
-    // together. Without the pin, an oversized first image was evicted by its
-    // own sibling before the response was even sent.
-    for (const [oldest] of this.images) {
-      if (this.heldBytes <= this.maxBytes && this.images.size <= this.maxEntries) break;
-      if (oldest === id) break;
-      if (pinned?.has(oldest)) continue;
-      this.drop(oldest);
-    }
-    return id;
-  }
-
-  private drop(id: string): void {
-    const image = this.images.get(id);
-    if (!image) return;
-    this.heldBytes -= image.bytes.byteLength;
-    this.images.delete(id);
-  }
-
-  get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null {
-    const image = this.images.get(id);
-    if (!image) return null;
-    if (image.expiresAt <= Date.now()) {
-      this.drop(id);
-      return null;
-    }
-    return image;
-  }
-
-  clear(): void {
-    this.images.clear();
-    this.heldBytes = 0;
-  }
-
-  private cleanupExpired(): void {
-    const now = Date.now();
-    for (const [id, image] of this.images.entries()) {
-      if (image.expiresAt <= now) this.drop(id);
-    }
-  }
-}
-
-function writeGeneratedImage(
-  res: ServerResponse,
-  generatedImages: GeneratedImageStoreLike,
-  path: string,
-): void {
-  // Byte-for-byte, no percent-decoding: issued ids are plain UUIDs, so no
-  // client ever needs encoding, and decoding created aliases — `%61bc...` and
-  // `abc...` named the same image, while `%2F` decoded into a separator the
-  // route grammar had already excluded. A `%FF` or `%2F` segment is simply an
-  // id that was never issued: the ordinary miss.
-  const id = path.slice('/v1/images/generated/'.length);
-  const image = generatedImages.get(id);
-  if (!image) {
-    writeJson(res, 404, {
-      error: {
-        message: 'Generated image URL has expired or does not exist.',
-        type: 'invalid_request_error',
-        param: null,
-        code: null,
-      },
-    });
-    return;
-  }
-  res.writeHead(200, {
-    'content-type': image.contentType,
-    'cache-control': 'private, max-age=3600',
-  });
-  res.end(image.bytes);
-}
-
 // An IPv6 literal needs brackets inside a URL authority — `http://::1:8080`
 // does not parse. Hostnames and IPv4 pass through untouched.
 function urlHostname(host: string): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-}
-
-/**
- * The link handed back for `response_format: url`.
- *
- * The authority is the one the client addressed — `Host` is how it reached this
- * proxy, and rewriting it to the bound address would break every tunnelled
- * client. When there is no `Host` (HTTP/1.0) the bound address is the only
- * authority we know.
- *
- * The scheme is NOT hard-coded: behind an HTTPS tunnel a hard-coded `http://`
- * hands the client a link its own page will refuse as mixed content, for bytes
- * that are on the other side of the same TLS connection.
- */
-function generatedImageUrl(req: IncomingMessage, id: string): string {
-  const socket = req.socket as { encrypted?: boolean; localAddress?: string; localPort?: number };
-  const host = headerValue(req.headers.host)
-    || (socket.localAddress ? `${urlHostname(socket.localAddress)}:${socket.localPort}` : '127.0.0.1');
-  const forwarded = stripOws(headerValue(req.headers['x-forwarded-proto']).split(',')[0] ?? '').toLowerCase();
-  const scheme = forwarded === 'https' || forwarded === 'http'
-    ? forwarded
-    : (socket.encrypted ? 'https' : 'http');
-  return `${scheme}://${host}/v1/images/generated/${encodeURIComponent(id)}`;
-}
-
-function imageContentType(outputFormat: string): string {
-  if (outputFormat === 'jpeg' || outputFormat === 'jpg') return 'image/jpeg';
-  if (outputFormat === 'webp') return 'image/webp';
-  return 'image/png';
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -1644,22 +1541,14 @@ async function advertisedModels(backend: LocalCliBackend): Promise<readonly stri
 }
 
 function openAiImagesGenerationResponse(
-  req: IncomingMessage,
-  generatedImages: GeneratedImageStoreLike,
   result: OpenAiImageGenerationResult,
   request: OpenAiImageGenerationRequest,
 ): unknown {
   return {
     created: result.created,
-    // One pin set for the whole response: sibling images must not evict each
-    // other before their URLs are even sent. And at most `n` of them — the
-    // count is backend-controlled, `n` is the request's, the same rule the
-    // streamed path applies.
-    data: (() => {
-      const batch = new Set<string>();
-      return result.images.slice(0, request.n ?? 1)
-        .map((image) => openAiImageObject(req, generatedImages, image, request, batch, result.outputFormat));
-    })(),
+    // At most `n` images: the count is backend-controlled, `n` is the
+    // request's, the same rule the streamed path applies.
+    data: result.images.slice(0, request.n ?? 1).map(openAiImageObject),
     ...openAiImageResponseMetadata(result, request),
     ...(result.usage ? { usage: openAiImagesUsage(result.usage) } : {}),
   };
@@ -1693,29 +1582,7 @@ function responseSize(value: string | undefined): string | undefined {
   return value && value !== 'auto' ? value : undefined;
 }
 
-function openAiImageObject(
-  req: IncomingMessage,
-  generatedImages: GeneratedImageStoreLike,
-  image: OpenAiGeneratedImage,
-  request: OpenAiImageGenerationRequest,
-  batch?: Set<string>,
-  producedFormat?: string,
-): unknown {
-  if (request.responseFormat === 'url') {
-    const id = generatedImages.put(
-      image.b64Json,
-      // What the bytes ARE, not what was asked for: the JSON body already
-      // reports the produced format, so labelling the stored bytes from the
-      // request let one response advertise webp and serve image/png.
-      producedFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
-      batch,
-    );
-    batch?.add(id);
-    return {
-      url: generatedImageUrl(req, id),
-      ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
-    };
-  }
+function openAiImageObject(image: OpenAiGeneratedImage): unknown {
   return {
     b64_json: image.b64Json,
     ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
@@ -1723,10 +1590,8 @@ function openAiImageObject(
 }
 
 async function writeOpenAiImageStream(
-  req: IncomingMessage,
   res: ServerResponse,
   events: AsyncIterable<OpenAiImageGenerationStreamEvent>,
-  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
   // The stream commits on the backend's first event, not before it. A backend
@@ -1741,14 +1606,6 @@ async function writeOpenAiImageStream(
     if (committed) return;
     writeSseHeaders(res);
     committed = true;
-  };
-  // One pin set for the whole stream: sibling images of one response must not
-  // evict each other, exactly as in the non-streaming path.
-  const batch = new Set<string>();
-  const putPinned = (b64Json: string, outputFormat?: string): string => {
-    const id = generatedImages.put(b64Json, outputFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
-    batch.add(id);
-    return id;
   };
   // The event count is backend-controlled; `n` is the request's. A runaway
   // stream must not emit more images than were asked for — nor pin more.
@@ -1767,9 +1624,7 @@ async function writeOpenAiImageStream(
         output_format: event.outputFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
         quality: event.quality ?? request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
         size: event.size ?? request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
-        ...(request.responseFormat === 'url'
-          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json, event.outputFormat)) }
-          : { b64_json: event.image.b64Json }),
+        b64_json: event.image.b64Json,
         // The provider's rewrite of the prompt, which the non-streaming
         // response carries: a client comparing the two modes saw it vanish.
         ...(event.image.revisedPrompt ? { revised_prompt: event.image.revisedPrompt } : {}),
@@ -1796,9 +1651,7 @@ function imageStreamEventType(
   operation: OpenAiImageOperation,
   eventType: OpenAiImageGenerationStreamEvent['type'],
 ): string {
-  const prefix = operation === 'edit' || operation === 'variation'
-    ? 'image_edit'
-    : 'image_generation';
+  const prefix = operation === 'edit' ? 'image_edit' : 'image_generation';
   return eventType === 'partial_image'
     ? `${prefix}.partial_image`
     : `${prefix}.completed`;

@@ -356,8 +356,9 @@ function createCodexImageGenerationClient(options: {
   readonly timeoutMs: number;
 }): OpenAiImageGenerationClient {
   // Images are out of scope for `modelSelection.honorRequestModel`: an Images API
-  // `model` is a route selector (`image-2`, `dall-e-2`, `gpt-image-*`), not a
-  // Codex slug, and the Codex model for an image turn comes from
+  // `model` is one of the direct API's image model names (`gpt-image-2` and
+  // its siblings), validated as such and routed here regardless — not a
+  // Codex slug — and the Codex model for an image turn comes from
   // `codexProxy.imageModel`. The image paths do not consult request models today;
   // pinning the flag off keeps that true if they ever come to share more code.
   if (options.transport === 'codex-backend') {
@@ -405,7 +406,7 @@ Options:
   --codex-transport <transport>      Codex text/tool transport: app-server or codex-backend. Default: settings.json (${codexProxyTransport()}).
   --codex-image-transport <transport>
                                      Codex Images transport: app-server or codex-backend. Default: settings.json (${codexProxyImageTransport()}).
-  --image-model <model>              Codex model for image-2 via gpt-5.5 route. Default: settings.json (${codexProxyImageModel()}).
+  --image-model <model>              Codex model that runs Images API turns (every image model name routes here). Default: settings.json (${codexProxyImageModel()}).
   --auth-key <key>                   Require this key on every request via Authorization: Bearer <key> or x-api-key. Env: LOCAL_OAUTH_PROXY_KEY. Default: open (no gate).
 
 Examples:

@@ -1283,7 +1283,6 @@ function isOpenAiImageGenerationRequest(
   return 'operation' in request && (
     request.operation === 'generation'
     || request.operation === 'edit'
-    || request.operation === 'variation'
   );
 }
 
