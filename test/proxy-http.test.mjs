@@ -1680,3 +1680,21 @@ test('/v1/messages: known keys this proxy does not apply are still accepted', as
   });
   assert.equal(res.status, 200, await res.text());
 });
+
+test('/v1/messages: a known field fault is reported before an unknown key, whichever field', async () => {
+  // The direct API validates every known field before it complains about an
+  // extra key (measured with max_tokens and temperature); the proxy used to
+  // check the extra key before output_config, thinking and model.
+  const base = { model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }] };
+  for (const [body, fragment] of [
+    [{ ...base, output_config: { effort: 'bogus' }, zzz: 1 }, /effort/],
+    [{ ...base, thinking: { type: 'sideways' }, zzz: 1 }, /thinking/],
+    [{ ...base, model: '', zzz: 1 }, /model/],
+  ]) {
+    const res = await postJson('/v1/messages', body);
+    const payload = await res.json();
+    assert.equal(res.status, 400);
+    assert.match(payload.error.message, fragment, JSON.stringify(payload));
+    assert.doesNotMatch(payload.error.message, /Extra inputs/);
+  }
+});

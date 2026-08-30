@@ -246,14 +246,14 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-23 | `output_config.effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max` | UNKNOWN | reasoning/effort spend | 400 / `invalid_request_error` | supported; **accepted-and-ignored on models that gate it (Haiku)** — documented (contract `:318`) | DOC? |
 | A-24 | `output_config.format` | `{type:"json_schema", schema}` | absent | structured output | 400 / `invalid_request_error` | supported; **rejected together with tools unless `tool_choice:"none"`** (`normalizers.ts:110-125`) — a restriction the provider does not impose | DOC |
 | A-25 | `output_config.task_budget` | `{type:"tokens", total ≥ 20000}` | UNKNOWN | total task token budget | 400 / `invalid_request_error` | validated; forwarding UNKNOWN (contract `:320`) | DOC? |
-| A-26 | `output_format` (top level, deprecated) | object | absent | superseded by `output_config.format` | 400 / `invalid_request_error` | **silently ignored** | DOC |
+| A-26 | `output_format` (top level, deprecated) | object | absent | superseded by `output_config.format` | 400 / `invalid_request_error` | refused as an unknown key (`output_format: Extra inputs are not permitted`) since 7a8bef6 — not in the measured key set | VERIFIED (§5.5.4 key set) |
 | A-27 | `metadata.user_id` | opaque string | absent | abuse detection | 400 / `invalid_request_error` | **silently ignored** | DOC |
 | A-28 | `service_tier` | `auto`\|`standard_only` | `"auto"` | **`usage.service_tier` in the response** ( `"priority"` / `"standard"` ) | 400 / `invalid_request_error` | **silently ignored**; `usage.service_tier` never emitted | DOC |
-| A-29 | `speed` | `standard`\|`fast` | UNKNOWN (beta) | latency mode | 400 / `invalid_request_error` | silently ignored | DOC? |
+| A-29 | `speed` | `standard`\|`fast` | UNKNOWN (beta) | latency mode | 400 / `invalid_request_error` `speed: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
 | A-30 | `inference_geo` | string (beta) | UNKNOWN | inference region | 400 / `invalid_request_error` | silently ignored | DOC? |
-| A-31 | `mcp_servers` | array of MCP server defs (beta) | absent | `mcp_tool_use` blocks | 400 / `invalid_request_error` | silently ignored | DOC |
+| A-31 | `mcp_servers` | array of MCP server defs (beta) | absent | `mcp_tool_use` blocks | 400 `mcp_servers: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
 | A-32 | `container` | string (code-execution container id) | absent | container reuse | 400 / `invalid_request_error` | silently ignored | DOC? |
-| A-33 | `context_management` | object (beta) | absent | context editing/compaction | 400 / `invalid_request_error` | silently ignored | DOC? |
+| A-33 | `context_management` | object (beta) | absent | context editing/compaction | 400 `context_management: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
 | A-34 | `anthropic-version` header | e.g. `2023-06-01`; **required** | none — required | request is rejected without it | **400 / `invalid_request_error`** | **UNKNOWN — the proxy does not appear to require it**; a body missing the header succeeds here and fails there. Probe P-37 | DOC |
 | A-35 | `anthropic-beta` header | array/CSV of beta ids | absent | unlocks beta fields | 400 / `invalid_request_error` on an unknown id | silently ignored | DOC |
 | A-36 | `x-api-key` / `Authorization` | credential header | none — required | 401 without it | 401 / `authentication_error` | proxy has its own local access gate; **the credential semantics differ by construction** (not applicable) | DOC |

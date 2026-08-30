@@ -807,3 +807,24 @@ test('CodexAppServerBackend answers transparent and input_fidelity as the backen
     await backend.close();
   }
 });
+
+test('CodexAppServerBackend refuses an unusable mask before the turn, as the caller\'s 400', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  setProviderEnv();
+  const backend = new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, model: 'gpt-5.5', imageGeneration: true });
+  const source = { source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEklEQVQImWP4z8DwHxkzkC4AADxAH+HdRw9wAAAAAElFTkSuQmCC' }, raw: {} };
+  try {
+    // Garbage bytes in a valid reference shape: decodable is checked up front.
+    await assert.rejects(
+      backend.generate({ ...imageRequest(), operation: 'edit', images: [source], mask: { source: { type: 'base64', mediaType: 'image/png', data: Buffer.from('not a png').toString('base64') }, raw: {} } }),
+      (err) => err.statusCode === 400 && err.param === 'mask' && /not a decodable image/.test(err.message),
+    );
+    // A remote URL the proxy will not fetch: also before the turn.
+    await assert.rejects(
+      backend.generate({ ...imageRequest(), operation: 'edit', images: [source], mask: { source: { type: 'url', url: 'https://example.com/mask.png' }, raw: {} } }),
+      (err) => err.statusCode === 400 && err.param === 'mask' && /remote image URL/.test(err.message),
+    );
+  } finally {
+    await backend.close();
+  }
+});

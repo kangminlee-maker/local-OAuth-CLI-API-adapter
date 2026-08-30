@@ -26,7 +26,7 @@ import {
   image2QualityToGpt55ReasoningEffort,
   image2ViaGpt55PromptFromRequest,
 } from './image2-via-gpt55.js';
-import { realizeImageOptions } from './image-realize.js';
+import { prepareImageRealization, realizeImageOptions, type PreparedImageRealization } from './image-realize.js';
 import { prepareCodexInput } from './multimodal.js';
 import { proxyChildProcessEnv } from './process-env.js';
 import type {
@@ -299,6 +299,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   ): Promise<OpenAiImageGenerationResult> {
     if (!this.imageGeneration) throw unsupportedImageGenerationError();
     rejectWhatTheBackendImageModelRefuses(request);
+    const prepared = await prepareImageRealization(request);
     const startedAt = Date.now();
     const images: OpenAiGeneratedImage[] = [];
     let usage: LocalUsage | undefined;
@@ -306,7 +307,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     const results = await Promise.all(
       Array.from(
         { length: request.n },
-        (_, index) => this.runSingleImageTurn(request, index, signal, emitPerTurnTiming),
+        (_, index) => this.runSingleImageTurn(request, index, signal, emitPerTurnTiming, prepared),
       ),
     );
     for (const result of results) {
@@ -337,8 +338,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   ): AsyncIterable<OpenAiImageGenerationStreamEvent> {
     if (!this.imageGeneration) throw unsupportedImageGenerationError();
     rejectWhatTheBackendImageModelRefuses(request);
+    const prepared = await prepareImageRealization(request);
     for (let index = 0; index < request.n; index += 1) {
-      const result = await this.runSingleImageTurn(request, index, signal);
+      const result = await this.runSingleImageTurn(request, index, signal, true, prepared);
       for (const image of result.images) {
         yield {
           type: 'completed',
@@ -360,6 +362,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     imageIndex: number,
     signal?: AbortSignal,
     emitTiming = true,
+    prepared: PreparedImageRealization = {},
   ): Promise<ImageTurnResult> {
     const startedAt = Date.now();
     const timing = {
@@ -440,7 +443,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       }
       // This transport has no tool declaration to carry the Images API
       // options, so the ones with a meaning on bytes are applied to the bytes.
-      const images = await Promise.all(result.images.map((image) => realizeImageOptions(request, image)));
+      const images = await Promise.all(result.images.map((image) => realizeImageOptions(request, image, prepared)));
       const completedTiming = {
         ...timing,
         totalMs: Date.now() - startedAt,
@@ -1391,9 +1394,6 @@ function imageAttachmentNote(request: OpenAiImageGenerationRequest): string {
   if (request.images.length > 0) {
     notes.push(`Attached images 1-${request.images.length} are source/reference images for the ${request.operation} request.`);
   }
-  if (request.mask) {
-    notes.push(`Attached image ${request.images.length + 1} is the edit mask.`);
-  }
   return notes.join(' ');
 }
 
@@ -1406,10 +1406,10 @@ function codexImageGenerationInputRequest(
     messages: [{
       role: 'user',
       content: '',
-      images: [
-        ...request.images,
-        ...(request.mask ? [request.mask] : []),
-      ],
+      // The mask is not an input image: it is realized on the returned bytes
+      // (`realizeImageOptions`). Attached as well, it was one more reference
+      // picture with a sentence telling the model it was a mask.
+      images: request.images,
     }],
     stream: false,
     streamOptions: { includeUsage: false, includeObfuscation: false },

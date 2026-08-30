@@ -213,6 +213,27 @@ test('multipart edits: an out-of-set or empty enum field is invalid_value, as in
   }
 });
 
+test('multipart edits: an enum field sent as a file part is a type error, not a silent omission', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const form = new FormData();
+    form.set('model', 'gpt-image-2');
+    form.set('prompt', 'a dot');
+    form.set('image', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'x.png');
+    form.set('quality', new Blob([Buffer.from('low')], { type: 'text/plain' }), 'q.txt');
+    const res = await fetch(`${started.url}/v1/images/edits`, { method: 'POST', body: form });
+    const payload = await res.json();
+    assert.equal(res.status, 400, JSON.stringify(payload));
+    assert.equal(payload.error.param, 'quality');
+    assert.equal(payload.error.code, 'invalid_type');
+  } finally {
+    await started.close();
+  }
+});
+
 test('multipart edits: a file named images is pointed at image / image[]', async () => {
   const started = await startLocalApiProxy({
     backend: imageBackend(), imageGenerationClient: imageBackend(),

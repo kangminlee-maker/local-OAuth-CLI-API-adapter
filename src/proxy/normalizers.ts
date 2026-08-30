@@ -176,15 +176,22 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
       'anthropic',
     );
   }
+  // Every known field is validated before an unknown key is reported — the
+  // order the direct API reports in (measured with `max_tokens` and
+  // `temperature` faults beside an unknown key).
+  const model = readRequiredModel(input.model, 'anthropic');
+  const effort = readAnthropicEffort(outputConfig?.effort);
+  const taskBudgetTokens = readAnthropicTaskBudget(outputConfig?.task_budget);
+  const thinking = readAnthropicThinking(input.thinking, maxTokens);
   rejectUnknownAnthropicKeys(input);
   return {
     shape: 'anthropic-messages',
-    model: readRequiredModel(input.model, 'anthropic'),
+    model,
     messages,
     maxTokens,
-    effort: readAnthropicEffort(outputConfig?.effort),
-    taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
-    thinking: readAnthropicThinking(input.thinking, maxTokens),
+    effort,
+    taskBudgetTokens,
+    thinking,
     stream: input.stream === true,
     streamOptions: readStreamOptions(undefined),
     jsonMode: outputFormat !== undefined,

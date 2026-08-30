@@ -21,9 +21,42 @@ import { ProxyRequestError } from './types.js';
  * answers `input_fidelity` and `background: transparent` as the backend's
  * image model does.
  */
+export interface PreparedImageRealization {
+  readonly sourceBytes?: Buffer;
+  readonly maskBytes?: Buffer;
+}
+
+/**
+ * Everything the realization needs from the CALLER is checked here, before
+ * the transport starts a turn: a mask or source that cannot be read (a remote
+ * URL, a file id) or cannot be decoded is the caller's 400 now, not a 500
+ * after a billed generation that an SDK would then retry.
+ */
+export async function prepareImageRealization(
+  request: OpenAiImageGenerationRequest,
+): Promise<PreparedImageRealization> {
+  if (!request.mask) return {};
+  const source = request.images[0];
+  if (!source) throw new ProxyRequestError('an edit with a mask carries no source image', 400);
+  const sharp = await loadSharp();
+  const decodable = async (bytes: Buffer, field: string): Promise<Buffer> => {
+    try {
+      await sharp(bytes).metadata();
+    } catch {
+      throw new ProxyRequestError(`${field} is not a decodable image.`, 400, 'openai', 'invalid_request_error', field);
+    }
+    return bytes;
+  };
+  return {
+    sourceBytes: await decodable(await imageBytes(source, 'image'), 'image'),
+    maskBytes: await decodable(await imageBytes(request.mask, 'mask'), 'mask'),
+  };
+}
+
 export async function realizeImageOptions(
   request: OpenAiImageGenerationRequest,
   image: OpenAiGeneratedImage,
+  prepared: PreparedImageRealization = {},
 ): Promise<OpenAiGeneratedImage> {
   const size = requestedSize(request.size);
   const format = request.outputFormat === 'jpeg' || request.outputFormat === 'webp' ? request.outputFormat : 'png';
@@ -37,9 +70,11 @@ export async function realizeImageOptions(
   const sharp = await loadSharp();
   let pipeline = sharp(Buffer.from(image.b64Json, 'base64'));
   if (request.mask) {
-    const source = request.images[0];
-    if (!source) throw new Error('an edit with a mask carries no source image');
-    pipeline = await compositeThroughMask(sharp, pipeline, await imageBytes(source), await imageBytes(request.mask));
+    const { sourceBytes, maskBytes } = Object.keys(prepared).length > 0
+      ? prepared
+      : await prepareImageRealization(request);
+    if (!sourceBytes || !maskBytes) throw new Error('an edit with a mask carries no source image');
+    pipeline = await compositeThroughMask(sharp, pipeline, sourceBytes, maskBytes);
   }
   if (size) pipeline = pipeline.resize(size.width, size.height, { fit: 'cover' });
   if (flatten) pipeline = pipeline.flatten({ background: '#ffffff' });
@@ -84,7 +119,7 @@ async function compositeThroughMask(
   return sharp(out, { raw: { width, height, channels: 4 } });
 }
 
-async function imageBytes(image: NormalizedImage): Promise<Buffer> {
+async function imageBytes(image: NormalizedImage, field: string): Promise<Buffer> {
   const { source } = image;
   if (source.type === 'base64') return Buffer.from(source.data, 'base64');
   if (source.type === 'path') return readFile(source.path);
@@ -97,9 +132,12 @@ async function imageBytes(image: NormalizedImage): Promise<Buffer> {
   // needs the bytes locally cannot start from a remote URL.
   throw new ProxyRequestError(
     source.type === 'url'
-      ? 'The app-server image transport composites a mask from a data URL, base64 or local path source; a remote image URL cannot be fetched by the proxy.'
-      : 'file_id image sources are not supported by the app-server image transport; use a data URL, base64, or local path source.',
+      ? `The app-server image transport composites a mask from a data URL, base64 or local path source; a remote image URL for '${field}' cannot be fetched by the proxy.`
+      : `file_id image sources are not supported by the app-server image transport; use a data URL, base64, or local path source for '${field}'.`,
     400,
+    'openai',
+    'invalid_request_error',
+    field,
   );
 }
 

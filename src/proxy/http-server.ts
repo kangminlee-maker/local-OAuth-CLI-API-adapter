@@ -926,7 +926,8 @@ function imageEnum<T extends string>(
 ): T | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== 'string') {
-    if (isMultipart) return undefined;
+    // A file part or a repeated field is not a value in the set either — in
+    // a form as in JSON, it is a type error, never a silent omission.
     throw invalidImageType(field, `one of ${quotedList(allowed, 'or')}`, jsonTypeName(value));
   }
   if (!allowed.includes(value as T)) {
