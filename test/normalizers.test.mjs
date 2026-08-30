@@ -89,7 +89,9 @@ test('OpenAI normalizer rejects invalid verbosity', () => {
       text: { verbosity: 'tiny' },
       input: 'Say OK',
     }),
-    /verbosity must be one of/,
+    // Measured: the direct API's `invalid_value` at `text.verbosity`, not a
+    // sentence of the proxy's own.
+    /Invalid value: 'tiny'\. Supported values are: 'low', 'medium', and 'high'\./,
   );
 });
 

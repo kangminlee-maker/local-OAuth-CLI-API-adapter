@@ -347,6 +347,12 @@ function unknownParameter(field: string, suggestions: readonly string[] = []): P
 function spellingSuggestions(unknown: string, known: ReadonlySet<string>, body: Record<string, unknown>): string[] {
   return [...known]
     .filter((key) => !(key in body))
+    // A length gap over 2 IS a distance over 2 — each edit changes the length
+    // by at most one — so this drops candidates without computing anything.
+    // Without it the cost is the unknown key's length times every known key's,
+    // synchronously: a 45 MB key inside the body cap held the whole server for
+    // 50 seconds, and every other client with it.
+    .filter((key) => Math.abs(key.length - unknown.length) <= 2)
     .map((key) => ({ key, distance: editDistance(unknown, key) }))
     .filter((candidate) => candidate.distance <= 2)
     .sort((a, b) => a.distance - b.distance || (a.key < b.key ? -1 : 1))
@@ -564,7 +570,7 @@ function readOpenAiLegacyFunctionCall(value: unknown): NormalizedToolChoice {
 // The top-level keys the direct Responses API knows, measured 2026-08-30
 // (§5.5.6). `n`, `stop`, `seed`, `logprobs` and `max_tokens` are Chat keys and
 // unknown here; `messages` is unknown with a sentence of its own.
-const OPENAI_RESPONSES_KEYS: ReadonlySet<string> = new Set([
+export const OPENAI_RESPONSES_KEYS: ReadonlySet<string> = new Set([
   'model', 'input', 'instructions', 'max_output_tokens', 'max_tool_calls', 'temperature', 'top_p',
   'top_logprobs', 'stream', 'stream_options', 'text', 'tools', 'tool_choice', 'parallel_tool_calls',
   'reasoning', 'include', 'store', 'background', 'previous_response_id', 'conversation',
@@ -675,10 +681,7 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
     // Inside the item, at the `input` position of the order — a fault here
     // beats every later field's, which is what the measurement shows.
     if (Array.isArray(input.input)) {
-      input.input.forEach((item, index) => {
-        const msg = asRecord(item);
-        if (msg) rejectUnknownResponsesMessageKeys(msg, index);
-      });
+      input.input.forEach((item, index) => validateOpenAiResponsesInputItem(item, index));
     }
   }
   if (present('previous_response_id') && typeof input.previous_response_id !== 'string') {
@@ -702,10 +705,22 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
     });
 
   }
-  if (present('tools') && !Array.isArray(input.tools)) throw invalidType('tools', 'an array of tools', input.tools);
+  if (present('tools')) {
+    if (!Array.isArray(input.tools)) throw invalidType('tools', 'an array of tools', input.tools);
+    input.tools.forEach((tool, index) => {
+      const record = asRecord(tool);
+      if (!record) throw invalidType(`tools[${index}]`, 'an object', tool);
+      if (record.type === undefined) throw missingRequiredParameter(`tools[${index}].type`);
+      // A function tool with no name used to be run under the invented name
+      // `tool` — a tool the caller never asked for.
+      if (record.type === 'function' && typeof record.name !== 'string') {
+        throw missingRequiredParameter(`tools[${index}].name`);
+      }
+    });
+  }
   if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice, 'openai-responses');
   if (present('metadata')) validateOpenAiMetadata(input.metadata);
-  if (present('text') && !asRecord(input.text)) throw invalidType('text', 'an object', input.text);
+  if (present('text')) validateOpenAiResponsesText(input.text);
   if (present('temperature') && typeof input.temperature !== 'number') {
     throw invalidType('temperature', 'a decimal', input.temperature);
   }
@@ -1617,11 +1632,117 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
  * valid items for no measurement's sake.
  */
 const OPENAI_RESPONSES_MESSAGE_KEYS: ReadonlySet<string> = new Set(['type', 'role', 'content', 'status', 'id']);
+/**
+ * `phase` belongs to an ASSISTANT message item and to no other (measured): the
+ * direct API emits it on the items it produces and takes them back verbatim,
+ * while the same member on a user item is `unknown_parameter`. Refusing it
+ * everywhere made this proxy reject its own output — and feeding `output` back
+ * as input is how a client holds a conversation on a surface that stores none.
+ */
+const OPENAI_RESPONSES_ASSISTANT_KEYS: ReadonlySet<string> = new Set(['phase']);
+const OPENAI_RESPONSES_PHASES = ['commentary', 'final_answer'] as const;
+const OPENAI_RESPONSES_ROLES = ['assistant', 'system', 'developer', 'user'] as const;
+/** The item union the direct API prints when `type` is not one of them. */
+const OPENAI_RESPONSES_ITEM_TYPES = [
+  'additional_tools', 'agent_message', 'apply_patch_call', 'apply_patch_call_output',
+  'code_interpreter_call', 'compaction', 'compaction_trigger', 'computer_call',
+  'computer_call_output', 'custom_tool_call', 'custom_tool_call_output', 'file_search_call',
+  'function_call', 'function_call_output', 'image_generation_call', 'item_reference',
+  'local_shell_call', 'local_shell_call_output', 'mcp_approval_request', 'mcp_approval_response',
+  'mcp_call', 'mcp_list_tools', 'message', 'multi_agent_call', 'multi_agent_call_output',
+  'program', 'program_output', 'reasoning', 'shell_call', 'shell_call_output', 'tool_search_call',
+  'tool_search_output', 'web_search_call',
+] as const;
+/**
+ * Content blocks answer in two steps (measured): a type outside the WHOLE union
+ * names `content[N].type` and lists all nine, while a type inside the union but
+ * outside this role's variant names `content[N]` and lists that variant's own.
+ */
+const OPENAI_RESPONSES_CONTENT_TYPES = [
+  'input_text', 'input_image', 'input_audio', 'output_text', 'refusal', 'input_file',
+  'computer_screenshot', 'summary_text', 'encrypted_content',
+] as const;
+const OPENAI_RESPONSES_INPUT_BLOCKS = ['input_text', 'input_image', 'input_file', 'scoped_content', 'input_audio'] as const;
+const OPENAI_RESPONSES_OUTPUT_BLOCKS = ['output_text', 'refusal'] as const;
+const OPENAI_RESPONSES_TEXT_KEYS: ReadonlySet<string> = new Set(['format', 'verbosity']);
+// This surface lists the three formats in its own order — not Chat's.
+const OPENAI_RESPONSES_FORMATS = ['json_object', 'text', 'json_schema'] as const;
+
+/**
+ * A whole input item, at the `input` slot of the measured order. All of this
+ * used to live in `readResponsesInput`, which runs AFTER the field walk, the
+ * server-state phase and the capability pass — so a malformed item lost to a
+ * bad `truncation`, to an unknown `previous_response_id`, and to a refused
+ * `temperature`, and answered in five sentences no measurement backs.
+ */
+function validateOpenAiResponsesInputItem(item: unknown, index: number): void {
+  const msg = asRecord(item);
+  if (!msg) throw invalidType(`input[${index}]`, 'an input item', item);
+  const shown = (value: unknown): string => (typeof value === 'string' ? value : '');
+  if (msg.type !== undefined && !OPENAI_RESPONSES_ITEM_TYPES.some((type) => type === msg.type)) {
+    throw invalidValue(`input[${index}]`, shown(msg.type), OPENAI_RESPONSES_ITEM_TYPES);
+  }
+  // A typed item that is not a message belongs to a union that grows with the
+  // API; pinning its members here would refuse tomorrow's valid items.
+  if (msg.type !== undefined && msg.type !== 'message') return;
+  if (!OPENAI_RESPONSES_ROLES.some((role) => role === msg.role)) {
+    throw invalidValue(`input[${index}]`, shown(msg.role), OPENAI_RESPONSES_ROLES);
+  }
+  if (msg.content === undefined) throw missingRequiredParameter(`input[${index}].content`);
+  rejectUnknownResponsesMessageKeys(msg, index);
+  if (!Array.isArray(msg.content)) return;
+  const allowed = msg.role === 'assistant' ? OPENAI_RESPONSES_OUTPUT_BLOCKS : OPENAI_RESPONSES_INPUT_BLOCKS;
+  msg.content.forEach((part, at) => {
+    const block = asRecord(part);
+    const where = `input[${index}].content[${at}]`;
+    if (!block) throw invalidType(where, 'a content block', part);
+    if (!OPENAI_RESPONSES_CONTENT_TYPES.some((type) => type === block.type)) {
+      throw invalidValue(`${where}.type`, shown(block.type), OPENAI_RESPONSES_CONTENT_TYPES);
+    }
+    if (!allowed.some((type) => type === block.type)) {
+      throw invalidValue(where, shown(block.type), allowed);
+    }
+    if (block.type === 'input_text' && block.text === undefined) {
+      throw missingRequiredParameter(`${where}.text`);
+    }
+  });
+}
+
+/** The `text` slot: its member set, its format union and its verbosity enum. */
+function validateOpenAiResponsesText(value: unknown): void {
+  const text = asRecord(value);
+  if (!text) throw invalidType('text', 'an object', value);
+  for (const key of Object.keys(text)) {
+    if (!OPENAI_RESPONSES_TEXT_KEYS.has(key)) throw unknownParameter(`text.${key}`);
+  }
+  if (text.format !== undefined && text.format !== null) {
+    const format = asRecord(text.format);
+    if (!format) throw invalidType('text.format', 'an object', text.format);
+    if (!OPENAI_RESPONSES_FORMATS.some((type) => type === format.type)) {
+      throw invalidValue('text.format.type', typeof format.type === 'string' ? format.type : '', OPENAI_RESPONSES_FORMATS);
+    }
+    // The proxy used to run a `json_schema` format with no schema and no name
+    // at all — structured output the caller asked for and never got.
+    if (format.type === 'json_schema' && typeof format.name !== 'string') {
+      throw missingRequiredParameter('text.format.name');
+    }
+  }
+  if (text.verbosity !== undefined && text.verbosity !== null
+      && !OPENAI_CHAT_VERBOSITIES.some((level) => level === text.verbosity)) {
+    throw invalidValue('text.verbosity', typeof text.verbosity === 'string' ? text.verbosity : '', OPENAI_CHAT_VERBOSITIES);
+  }
+}
 
 function rejectUnknownResponsesMessageKeys(msg: Record<string, unknown>, index: number): void {
   if (msg.type !== undefined && msg.type !== 'message') return;
+  const assistant = msg.role === 'assistant';
   for (const key of Object.keys(msg)) {
-    if (!OPENAI_RESPONSES_MESSAGE_KEYS.has(key)) throw unknownParameter(`input[${index}].${key}`);
+    if (OPENAI_RESPONSES_MESSAGE_KEYS.has(key)) continue;
+    if (assistant && OPENAI_RESPONSES_ASSISTANT_KEYS.has(key)) continue;
+    throw unknownParameter(`input[${index}].${key}`);
+  }
+  if (assistant && msg.phase !== undefined && !OPENAI_RESPONSES_PHASES.some((phase) => phase === msg.phase)) {
+    throw invalidValue(`input[${index}].phase`, String(msg.phase), OPENAI_RESPONSES_PHASES);
   }
 }
 

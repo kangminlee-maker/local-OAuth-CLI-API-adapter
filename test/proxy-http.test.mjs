@@ -1251,7 +1251,7 @@ test('OpenAI responses stream forwards live function argument deltas', async () 
       model: 'fake-local-model',
       stream: true,
       input: 'Use weather tool',
-      tools: [openAiWeatherTool()],
+      tools: [responsesWeatherTool()],
       tool_choice: 'required',
     });
     const text = await res.text();
@@ -1411,6 +1411,18 @@ function openAiWeatherTool() {
       description: 'Get current weather by city.',
       parameters: weatherSchema(),
     },
+  };
+}
+
+// The same tool in the Responses shape: flat, not nested under `function`.
+// Sending the Chat shape here is 400 `tools[0].name` on the direct API
+// (measured 2026-08-31) and now on this proxy too.
+function responsesWeatherTool() {
+  return {
+    type: 'function',
+    name: 'get_weather',
+    description: 'Get current weather by city.',
+    parameters: weatherSchema(),
   };
 }
 

@@ -3441,7 +3441,13 @@ function isAddressInfo(value: string | AddressInfo | null): value is AddressInfo
 // name a client chose, a runtime diagnostic, an upstream's prose — each reaches a
 // response through some branch below, and bounding at each source has already
 // been missed once.
-const MAX_ERROR_MESSAGE_CHARS = 500;
+//
+// The ceiling bounds GROWTH; it is not a target. It has to clear the longest
+// sentence the surfaces this proxy mirrors actually emit, or it turns a
+// faithful message into a divergence — which is what 500 did to the Responses
+// item-type union (713 characters, measured 2026-08-31, and the parity row
+// `responses input item type unknown` is what catches a regression here).
+export const MAX_ERROR_MESSAGE_CHARS = 1024;
 const ERROR_TRUNCATION_MARKER = '...[truncated]';
 
 function boundedErrorMessage(message: string): string {

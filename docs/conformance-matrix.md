@@ -560,6 +560,27 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 `context_management`. **Chat의 순서와 완전히 다르다** — 표면마다 자기 스키마 순서이므로 옮겨 쓸 수 없다.
 (`previous_response_id`·`prompt`의 이 자리는 **타입 결함**의 자리다. 조회 실패는 위에 적은 대로 별도 단계다.)
 
+**2라운드 교차리뷰(Claude, 8e6fd35)가 더 찾아낸 것** — 아래는 전부 그 뒤 실측·미러 완료:
+
+| 요청 | direct 응답 |
+| --- | --- |
+| **프록시 자신의 `output` 항목을 `input`으로 되먹임** | **200**. `phase`는 **assistant 항목의 멤버**이고(`commentary`·`final_answer`), user 항목에 붙이면 `unknown_parameter`. 프록시는 `phase`를 어디서든 거절해 **자기 출력을 자기가 거절하고 있었다** — 상태를 저장하지 않는 이 표면에서 대화를 잇는 유일한 방법인데도 |
+| `input[0]`이 원시값 / `null` | `invalid_type` `expected an input item, but got an integer instead.` |
+| `input[0].type`이 문자열 아님 / 미지 문자열 | 둘 다 `invalid_value` `input[0]` + **33개 항목 타입 전체 목록**(비문자열은 `''`로 표기). 미지 문자열 타입도 거절한다 — 프록시는 "유니온이 자란다"는 이유로 수용하고 있었다 |
+| `input[0].role` 없음 / 미지 | `invalid_value` `input[0]` + `'assistant', 'system', 'developer', and 'user'` (없으면 `''`) |
+| `role` 있고 `content` 없음 | `missing_required_parameter` `input[0].content` |
+| 콘텐츠 블록 | **두 단계**: 유니온 밖이면 `content[N].type` + 9개 목록, 유니온 안이지만 이 role의 variant 밖이면 `content[N]` + 그 variant 목록(user는 5개, assistant는 `output_text`·`refusal`) |
+| `text.zzz` / `text.format.type` 밖 / `json_schema`에 name 없음 | `unknown_parameter` / `invalid_value` **`'json_object', 'text', and 'json_schema'`(Chat과 순서가 다르다)** / `missing_required_parameter` `text.format.name` |
+| `text.verbosity` 밖 | `invalid_value` `text.verbosity` — 프록시는 자기 문장을 쓰고 있었다 |
+| `tools[0]`에 type 없음 / function에 name 없음 / **Chat 모양** | `missing_required_parameter` `tools[0].type` / `tools[0].name` / `tools[0].name` — Responses의 도구는 **평평하다**. 프록시는 이름 없는 도구를 `tool`이라는 **지어낸 이름**으로 실행하고 있었다 |
+| `include`·`context_management` 에코 | **에코하지 않는다** — 위 표의 "전부 에코된다"가 틀렸다. `context_management`의 미지 type은 400이지만 유효 집합을 알 수 없어 미러하지 않음(알려진 격차) |
+
+**두 개의 비-스키마 결함도 같이 나왔다**:
+① 미지 키 철자 도움이 편집거리를 **문자 수 × 알려진 키 수**만큼 동기 계산해서, 본문 상한(50MB) 안의 긴 키 하나가 서버 전체를 **약 50초** 멈췄다.
+길이 차가 2를 넘으면 거리도 2를 넘는다 — 계산 전에 걸러내면 끝. ② 클라이언트에 보이는 error.message 상한이 500자였는데
+direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 잘려 나갔다. 상한은 성장을 막는 장치이지 목표가 아니므로 1024로 올렸고,
+값은 `MAX_ERROR_MESSAGE_CHARS` 한 곳에 있으며 테스트 픽스처도 그 상수에서 파생한다.
+
 **계기 검증**: 심은 변이 3개 — 철자 도움 제거, 하한을 1로 되돌리기, `conversation`보다 `prompt`를 먼저 조회 — 모두 빨간불.
 오프라인 골든은 ALL PASS 실행의 프록시에서 **생성**했고(손으로 옮겨 적지 않았다), 거리 임계값 변이가 그중 4행을 죽인다.
 

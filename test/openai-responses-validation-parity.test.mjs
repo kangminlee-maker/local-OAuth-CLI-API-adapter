@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { OPENAI_RESPONSES_KEYS } from '../dist/proxy/normalizers.js';
 
 // The Responses twin of `openai-chat-validation-parity.test.mjs`, and the same
 // rule: every row is a DIRECT API observation taken 2026-08-30 against
@@ -21,6 +22,10 @@ const M = [{ role: 'user', content: 'ping' }];
 const I = 'ping';
 const OUT = { input: I, max_output_tokens: 16 };
 const RTOOL = { type: 'function', name: 'f', parameters: { type: 'object', properties: {} } };
+const ASSISTANT_ITEM = (phase = 'final_answer') => ({
+  id: 'msg_probe', type: 'message', status: 'completed', role: 'assistant', phase,
+  content: [{ type: 'output_text', annotations: [], logprobs: [], text: 'OK' }],
+});
 
 function backend() {
   return {
@@ -69,6 +74,38 @@ const REJECTIONS = [
   ["input item status", { ...OUT, input: [{ role: 'user', content: I, status: 'completed' }], temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
   ["input item id", { ...OUT, input: [{ role: 'user', content: I, id: 'msg_x' }], temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
   ["input item type", { ...OUT, input: [{ type: 'message', role: 'user', content: I }], temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
+  // `phase` is the assistant item's own member — the shape this proxy emits.
+  ["input item phase on a user item", { ...OUT, input: [{ role: 'user', content: I, phase: 'final_answer' }] }, { param: "input[0].phase", code: "unknown_parameter", message: "Unknown parameter: 'input[0].phase'." }],
+  ["input item phase unknown value", { ...OUT, input: [ASSISTANT_ITEM('bogus'), { role: 'user', content: I }] }, { param: "input[0].phase", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'commentary' and 'final_answer'." }],
+  ["input item assistant unknown member", { ...OUT, input: [{ ...ASSISTANT_ITEM(), zzz: 1 }, { role: 'user', content: I }] }, { param: "input[0].zzz", code: "unknown_parameter", message: "Unknown parameter: 'input[0].zzz'." }],
+  ["input item assistant with input_text", { ...OUT, input: [{ role: 'assistant', content: [{ type: 'input_text', text: 'x' }] }, { role: 'user', content: I }] }, { param: "input[0].content[0]", code: "invalid_value", message: "Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'." }],
+  ["input item round trip", { ...OUT, input: [{ role: 'user', content: I }, ASSISTANT_ITEM(), { role: 'user', content: 'again' }], temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
+  // The item schema, at the `input` slot rather than after the whole walk.
+  ["input item primitive", { ...OUT, input: [7] }, { param: "input[0]", code: "invalid_type", message: "Invalid type for 'input[0]': expected an input item, but got an integer instead." }],
+  ["input item null", { ...OUT, input: [null] }, { param: "input[0]", code: "invalid_type", message: "Invalid type for 'input[0]': expected an input item, but got null instead." }],
+  ["input item type not a string", { ...OUT, input: [{ type: 7, role: 'user', content: I }] }, { param: "input[0]", code: "invalid_value", message: "Invalid value: ''. Supported values are: 'additional_tools', 'agent_message', 'apply_patch_call', 'apply_patch_call_output', 'code_interpreter_call', 'compaction', 'compaction_trigger', 'computer_call', 'computer_call_output', 'custom_tool_call', 'custom_tool_call_output', 'file_search_call', 'function_call', 'function_call_output', 'image_generation_call', 'item_reference', 'local_shell_call', 'local_shell_call_output', 'mcp_approval_request', 'mcp_approval_response', 'mcp_call', 'mcp_list_tools', 'message', 'multi_agent_call', 'multi_agent_call_output', 'program', 'program_output', 'reasoning', 'shell_call', 'shell_call_output', 'tool_search_call', 'tool_search_output', and 'web_search_call'." }],
+  ["input item type unknown", { ...OUT, input: [{ type: 'bogus_item' }] }, { param: "input[0]", code: "invalid_value", message: "Invalid value: 'bogus_item'. Supported values are: 'additional_tools', 'agent_message', 'apply_patch_call', 'apply_patch_call_output', 'code_interpreter_call', 'compaction', 'compaction_trigger', 'computer_call', 'computer_call_output', 'custom_tool_call', 'custom_tool_call_output', 'file_search_call', 'function_call', 'function_call_output', 'image_generation_call', 'item_reference', 'local_shell_call', 'local_shell_call_output', 'mcp_approval_request', 'mcp_approval_response', 'mcp_call', 'mcp_list_tools', 'message', 'multi_agent_call', 'multi_agent_call_output', 'program', 'program_output', 'reasoning', 'shell_call', 'shell_call_output', 'tool_search_call', 'tool_search_output', and 'web_search_call'." }],
+  ["input item role unknown", { ...OUT, input: [{ role: 'bogus', content: I }] }, { param: "input[0]", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'assistant', 'system', 'developer', and 'user'." }],
+  ["input item empty object", { ...OUT, input: [{}] }, { param: "input[0]", code: "invalid_value", message: "Invalid value: ''. Supported values are: 'assistant', 'system', 'developer', and 'user'." }],
+  ["input item without content", { ...OUT, input: [{ role: 'user' }] }, { param: "input[0].content", code: "missing_required_parameter", message: "Missing required parameter: 'input[0].content'." }],
+  ["input item developer role", { ...OUT, input: [{ role: 'developer', content: I }, { role: 'user', content: I }], temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
+  ["input item beats a later field", { ...OUT, input: [{}], truncation: 'bogus' }, { param: "input[0]", code: "invalid_value", message: "Invalid value: ''. Supported values are: 'assistant', 'system', 'developer', and 'user'." }],
+  ["input item beats the state phase", { ...OUT, input: [{}], previous_response_id: 'resp_x' }, { param: "input[0]", code: "invalid_value", message: "Invalid value: ''. Supported values are: 'assistant', 'system', 'developer', and 'user'." }],
+  ["input item beats the capability pass", { ...OUT, input: [{}], temperature: 0.5 }, { param: "input[0]", code: "invalid_value", message: "Invalid value: ''. Supported values are: 'assistant', 'system', 'developer', and 'user'." }],
+  ["content block unknown type", { ...OUT, input: [{ role: 'user', content: [{ type: 'bogus', text: 'x' }] }] }, { param: "input[0].content[0].type", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'input_text', 'input_image', 'input_audio', 'output_text', 'refusal', 'input_file', 'computer_screenshot', 'summary_text', and 'encrypted_content'." }],
+  ["content block wrong variant", { ...OUT, input: [{ role: 'user', content: [{ type: 'output_text', text: 'x' }] }] }, { param: "input[0].content[0]", code: "invalid_value", message: "Invalid value: 'output_text'. Supported values are: 'input_text', 'input_image', 'input_file', 'scoped_content', and 'input_audio'." }],
+  ["content block without text", { ...OUT, input: [{ role: 'user', content: [{ type: 'input_text' }] }] }, { param: "input[0].content[0].text", code: "missing_required_parameter", message: "Missing required parameter: 'input[0].content[0].text'." }],
+  ["content block refusal on assistant", { ...OUT, input: [{ role: 'assistant', content: [{ type: 'refusal', refusal: 'no' }] }, { role: 'user', content: I }], temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
+  // `text` and `tools`, which were array/object checks and nothing more.
+  ["text unknown member", { ...OUT, text: { zzz: 1 } }, { param: "text.zzz", code: "unknown_parameter", message: "Unknown parameter: 'text.zzz'." }],
+  ["text format unknown type", { ...OUT, text: { format: { type: 'bogus' } } }, { param: "text.format.type", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'json_object', 'text', and 'json_schema'." }],
+  ["text json_schema without a name", { ...OUT, text: { format: { type: 'json_schema' } } }, { param: "text.format.name", code: "missing_required_parameter", message: "Missing required parameter: 'text.format.name'." }],
+  ["text verbosity unknown", { ...OUT, text: { verbosity: 'bogus' } }, { param: "text.verbosity", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'low', 'medium', and 'high'." }],
+  ["text beats a later field", { ...OUT, text: { verbosity: 'bogus' }, context_management: 'x' }, { param: "text.verbosity", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'low', 'medium', and 'high'." }],
+  ["text beats the capability pass", { ...OUT, text: { verbosity: 'bogus' }, temperature: 0.5 }, { param: "text.verbosity", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'low', 'medium', and 'high'." }],
+  ["tools member without a type", { ...OUT, tools: [{}] }, { param: "tools[0].type", code: "missing_required_parameter", message: "Missing required parameter: 'tools[0].type'." }],
+  ["tools function without a name", { ...OUT, tools: [{ type: 'function' }] }, { param: "tools[0].name", code: "missing_required_parameter", message: "Missing required parameter: 'tools[0].name'." }],
+  ["chat-shaped tool", { ...OUT, tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }] }, { param: "tools[0].name", code: "missing_required_parameter", message: "Missing required parameter: 'tools[0].name'." }],
   // reasoning — its own enum, wider than Chat's.
   ["reasoning as a string", { ...OUT, reasoning: 'low' }, { param: "reasoning", code: "invalid_type", message: "Invalid type for 'reasoning': expected an object, but got a string instead." }],
   ["reasoning.effort unknown", { ...OUT, reasoning: { effort: 'bogus' } }, { param: "reasoning.effort", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'." }],
@@ -209,17 +246,66 @@ for (const [name, fragment, expected] of REJECTIONS) {
   });
 }
 
+// The accepted half. Every row above is a rejection, so nothing pinned what a
+// 200 carries — reverting each echo this surface gained left the suite green.
+test('/v1/responses echoes the accepted keys it was sent', async () => {
+  const started = await startLocalApiProxy({
+    backend: {
+      name: 'test', model: 'configured-model',
+      async generate() {
+        return { id: 'x', model: 'configured-model', text: 'pong', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 };
+      },
+      async *stream() { throw new Error('unused'); },
+      async close() {},
+    },
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const sent = {
+      model: 'gpt-5.6-terra', input: 'ping', max_output_tokens: 16,
+      background: true, max_tool_calls: 3, parallel_tool_calls: false, store: false,
+      truncation: 'auto', instructions: 'be terse', user: 'probe', safety_identifier: 'probe',
+      prompt_cache_key: 'probe-key', prompt_cache_options: { mode: 'implicit', ttl: '30m' },
+      metadata: { a: 'b' }, service_tier: 'fast',
+    };
+    const res = await fetch(`${started.url}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(sent),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    // What the request said, read back — each of these was a constant before.
+    assert.equal(body.background, true);
+    assert.equal(body.max_tool_calls, 3);
+    assert.equal(body.parallel_tool_calls, false);
+    assert.equal(body.store, false);
+    assert.equal(body.truncation, 'auto');
+    assert.equal(body.instructions, 'be terse');
+    assert.equal(body.user, 'probe');
+    assert.equal(body.safety_identifier, 'probe');
+    assert.equal(body.prompt_cache_key, 'probe-key');
+    assert.deepEqual(body.prompt_cache_options, { mode: 'implicit', ttl: '30m' });
+    assert.deepEqual(body.metadata, { a: 'b' });
+    // The two that are NOT the request: the tier resolves, and sampling reports
+    // the direct defaults rather than anything the caller could set.
+    assert.equal(body.service_tier, 'priority');
+    assert.equal(body.temperature, 1);
+    assert.equal(body.top_p, 0.98);
+    // And the two the direct API does not echo at all (measured 2026-08-31 —
+    // §5.5.6's first draft said it did).
+    assert.equal(body.include, undefined);
+    assert.equal(body.context_management, undefined);
+  } finally {
+    await started.close();
+  }
+});
+
 test('the rows cover every key this surface knows', () => {
   // A key that gains a validation rule and no row is the drift this catches.
   const sent = new Set();
   for (const [, fragment] of REJECTIONS) for (const key of Object.keys(fragment)) sent.add(key);
-  const known = [
-    'model', 'input', 'instructions', 'max_output_tokens', 'max_tool_calls', 'temperature', 'top_p',
-    'top_logprobs', 'stream', 'stream_options', 'text', 'tools', 'tool_choice', 'parallel_tool_calls',
-    'reasoning', 'include', 'store', 'background', 'previous_response_id', 'conversation',
-    'truncation', 'metadata', 'user', 'safety_identifier', 'prompt_cache_key',
-    'prompt_cache_retention', 'prompt_cache_options', 'service_tier', 'prompt', 'context_management',
-    'moderation', 'presence_penalty', 'frequency_penalty',
-  ];
+  // Imported, not copied: a hand-written duplicate of the key set cannot fail
+  // when a key is ADDED to the source, which is the drift this claims to catch.
+  const known = [...OPENAI_RESPONSES_KEYS];
+  assert.ok(known.length >= 33, `the key set must actually load: ${known.length}`);
   assert.deepEqual(known.filter((key) => !sent.has(key)), [], 'these known keys have no row');
 });

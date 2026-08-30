@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import http from 'node:http';
-import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { MAX_ERROR_MESSAGE_CHARS, startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { unsupportedModelError } from '../dist/proxy/types.js';
 import { LocalCliChatError } from '../dist/chat/types.js';
 
@@ -171,7 +171,9 @@ test('/v1/messages: a failure with no provider mapping still uses the Anthropic 
 // A client picks the model, and the runtime echoes it into its refusal. Without a
 // ceiling at the boundary, that is a response as large as the client cares to
 // make it — on every surface and in every envelope.
-const OVERSIZED = 'X'.repeat(900);
+// Sized from the bound rather than beside it: raising the ceiling used to
+// leave these fixtures under it, so the tests stopped testing anything.
+const OVERSIZED = 'X'.repeat(MAX_ERROR_MESSAGE_CHARS * 2);
 
 for (const [path, body, shape] of [
   ['/v1/chat/completions', { ...CHAT, model: OVERSIZED }, 'openai-chat'],
@@ -185,7 +187,7 @@ for (const [path, body, shape] of [
       body,
     );
     const message = JSON.parse(text).error.message;
-    assert.ok(message.length <= 500, `error message must be bounded, got ${message.length}`);
+    assert.ok(message.length <= MAX_ERROR_MESSAGE_CHARS, `error message must be bounded, got ${message.length}`);
     assert.ok(message.endsWith('...[truncated]'), `expected the marker: ${message.slice(-20)}`);
   });
 }
@@ -209,12 +211,12 @@ for (const [label, length] of [['just under', 499], ['exactly at', 500]]) {
 
 test('a message one character over the bound is truncated to the bound', async () => {
   const { text } = await call(
-    backendThat({ fail: () => new Error('M'.repeat(501)) }),
+    backendThat({ fail: () => new Error('M'.repeat(MAX_ERROR_MESSAGE_CHARS + 1)) }),
     '/v1/chat/completions',
     CHAT,
   );
   const message = JSON.parse(text).error.message;
-  assert.equal(message.length, 500);
+  assert.equal(message.length, MAX_ERROR_MESSAGE_CHARS);
   assert.ok(message.endsWith('...[truncated]'));
 });
 
@@ -231,19 +233,19 @@ test('a mid-stream model refusal is bounded in the SSE error frame', async () =>
   assert.ok(frame, `expected an error frame: ${text}`);
   const payload = JSON.parse(frame.replace(/^data: /, '')).error;
   assert.equal(payload.code, 'model_not_found');
-  assert.ok(payload.message.length <= 500, `SSE refusal must be bounded, got ${payload.message.length}`);
+  assert.ok(payload.message.length <= MAX_ERROR_MESSAGE_CHARS, `SSE refusal must be bounded, got ${payload.message.length}`);
 });
 
 test('a mid-stream failure is bounded in the SSE error frame too', async () => {
   const { text } = await call(
-    backendThat({ delta: true, fail: () => new Error('Y'.repeat(900)) }),
+    backendThat({ delta: true, fail: () => new Error('Y'.repeat(MAX_ERROR_MESSAGE_CHARS * 2)) }),
     '/v1/chat/completions',
     { ...CHAT, stream: true },
   );
   const frame = text.split('\n').find((line) => line.includes('"error"'));
   assert.ok(frame, `expected an error frame: ${text}`);
   const message = JSON.parse(frame.replace(/^data: /, '')).error.message;
-  assert.ok(message.length <= 500, `SSE error must be bounded, got ${message.length}`);
+  assert.ok(message.length <= MAX_ERROR_MESSAGE_CHARS, `SSE error must be bounded, got ${message.length}`);
 });
 
 test('/v1/messages: a mid-stream failure ends with an Anthropic error event and no message_stop', async () => {
@@ -321,7 +323,7 @@ function providerError(status, message) {
   }));
 }
 
-const LONG_PROVIDER_MESSAGE = 'M'.repeat(600);
+const LONG_PROVIDER_MESSAGE = 'M'.repeat(MAX_ERROR_MESSAGE_CHARS + 100);
 
 test('a provider error survives mapping even when its message is oversized', async () => {
   const { status, text } = await call(
@@ -334,7 +336,7 @@ test('a provider error survives mapping even when its message is oversized', asy
   assert.equal(body.error.type, 'rate_limit_error');
   assert.equal(body.error.code, 'rate_limit_exceeded');
   assert.ok(body.error.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
-  assert.ok(body.error.message.length <= 500, `bounded, got ${body.error.message.length}`);
+  assert.ok(body.error.message.length <= MAX_ERROR_MESSAGE_CHARS, `bounded, got ${body.error.message.length}`);
 });
 
 test('/v1/messages: a mapped provider error uses the Anthropic envelope', async () => {
@@ -361,12 +363,12 @@ test('a mid-stream provider error keeps its mapping in the SSE frame', async () 
   const payload = JSON.parse(frame.replace(/^data: /, '')).error;
   assert.equal(payload.type, 'rate_limit_error');
   assert.ok(payload.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
-  assert.ok(payload.message.length <= 500);
+  assert.ok(payload.message.length <= MAX_ERROR_MESSAGE_CHARS);
 });
 
 // The generic branch: an unmapped failure whose own message is oversized. The
 // oversized-model tests exercise `ProxyRequestError`, which is a different one.
-const LONG_GENERIC = 'G'.repeat(900);
+const LONG_GENERIC = 'G'.repeat(MAX_ERROR_MESSAGE_CHARS * 2);
 
 for (const [path, body] of [
   ['/v1/chat/completions', CHAT],
@@ -376,7 +378,7 @@ for (const [path, body] of [
   test(`${path}: an oversized unmapped failure is bounded`, async () => {
     const { text } = await call(backendThat({ fail: () => new Error(LONG_GENERIC) }), path, body);
     const message = JSON.parse(text).error.message;
-    assert.ok(message.length <= 500, `expected a bound, got ${message.length}`);
+    assert.ok(message.length <= MAX_ERROR_MESSAGE_CHARS, `expected a bound, got ${message.length}`);
     assert.ok(message.startsWith('GGGG'));
   });
 }
@@ -593,7 +595,7 @@ test('/v1/messages: a mid-stream provider error keeps its mapping and bound', as
   const payload = JSON.parse(frame.slice(6)).error;
   assert.equal(payload.type, 'rate_limit_error', 'the provider type must survive');
   assert.ok(payload.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
-  assert.ok(payload.message.length <= 500, `bounded, got ${payload.message.length}`);
+  assert.ok(payload.message.length <= MAX_ERROR_MESSAGE_CHARS, `bounded, got ${payload.message.length}`);
 });
 
 test('an empty authKey is a configuration error, not an open proxy', async () => {
@@ -993,7 +995,11 @@ test('/v1/responses: a primitive input item is rejected', async () => {
     { model: 'a-model', input: [7] },
   );
   assert.equal(status, 400);
-  assert.match(JSON.parse(text).error.message, /input\[0\] must be an object/);
+  // Measured 2026-08-31: the direct API's own sentence, not the proxy's.
+  const error = JSON.parse(text).error;
+  assert.equal(error.code, 'invalid_type');
+  assert.equal(error.param, 'input[0]');
+  assert.equal(error.message, "Invalid type for 'input[0]': expected an input item, but got an integer instead.");
 });
 
 test('/v1/responses: a message item with no role is rejected, a typed item needs none', async () => {
@@ -1005,7 +1011,12 @@ test('/v1/responses: a message item with no role is rejected, a typed item needs
     { model: 'a-model', input: [{ content: 'hi' }] },
   );
   assert.equal(missing.status, 400);
-  assert.equal(JSON.parse(missing.text).error.param, 'input[0].role');
+  // A missing role is not its own fault on this surface — the item simply
+  // fails the role enum, with the empty string standing in for what was sent.
+  const missingError = JSON.parse(missing.text).error;
+  assert.equal(missingError.param, 'input[0]');
+  assert.equal(missingError.code, 'invalid_value');
+  assert.equal(missingError.message, "Invalid value: ''. Supported values are: 'assistant', 'system', 'developer', and 'user'.");
 
   const typed = await call(
     backendThat({}),
@@ -1272,20 +1283,22 @@ test('/v1/responses: a non-string non-array input is rejected, omission is not',
   assert.equal(omitted.status, 200, 'omission keeps its existing behaviour');
 });
 
-test('/v1/responses: a non-string item type is rejected, an unknown string type is not', async () => {
-  // `type: null` took the typed-item exemption and skipped role validation.
-  // Unknown STRING types stay accepted deliberately: the direct item union
-  // grows with the API, and pinning it here would 400 tomorrow's valid items.
-  const bad = await call(backendThat({}), '/v1/responses', {
-    model: 'a-model', input: [{ type: null, content: 'hi' }],
-  });
-  assert.equal(bad.status, 400);
-  assert.equal(JSON.parse(bad.text).error.param, 'input[0].type');
-
-  const unknown = await call(backendThat({}), '/v1/responses', {
-    model: 'a-model', input: [{ type: 'not_yet_invented', content: 'hi' }],
-  });
-  assert.equal(unknown.status, 200);
+test('/v1/responses: an item type outside the union is rejected, whatever its JSON type', async () => {
+  // This file used to accept any unknown STRING type, reasoning that the union
+  // grows with the API. The direct API does not: it answers `invalid_value`
+  // naming its 33 members (measured 2026-08-31), and a non-string renders as
+  // the empty string. When the union grows, `pnpm e2e:text:parity` is what
+  // says so — the forward-compatibility worry has an instrument, not a guess.
+  for (const [label, type] of [['null', null], ['an integer', 7], ['an unknown string', 'not_yet_invented']]) {
+    const { status, text } = await call(backendThat({}), '/v1/responses', {
+      model: 'a-model', input: [{ type, content: 'hi' }],
+    });
+    assert.equal(status, 400, `${label} is not an item type`);
+    const error = JSON.parse(text).error;
+    assert.equal(error.param, 'input[0]');
+    assert.equal(error.code, 'invalid_value');
+    assert.match(error.message, /Supported values are: 'additional_tools'.+'web_search_call'\.$/);
+  }
 });
 
 // --- round 39 coverage: promises the inventory showed nothing pins ---
@@ -1501,7 +1514,9 @@ test('/v1/responses: an unknown role on a message item is rejected there too', a
   for (const item of [{ role: 'tool', content: 'hi' }, { type: 'message', role: 'tool', content: 'hi' }]) {
     const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input: [item] });
     assert.equal(status, 400, `role tool is not in the Responses message set: ${JSON.stringify(item)}`);
-    assert.equal(JSON.parse(text).error.param, 'input[0].role');
+    const error = JSON.parse(text).error;
+    assert.equal(error.param, 'input[0]');
+    assert.equal(error.message, "Invalid value: 'tool'. Supported values are: 'assistant', 'system', 'developer', and 'user'.");
   }
 });
 
@@ -2098,7 +2113,7 @@ test('an oversized native error message is bounded like every other surface', as
   const started = await startLocalApiProxy({
     backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
     chatSessionManager: {
-      async create() { throw new LocalCliChatError('N'.repeat(900), 502, 'runtime_failed'); },
+      async create() { throw new LocalCliChatError('N'.repeat(MAX_ERROR_MESSAGE_CHARS * 2), 502, 'runtime_failed'); },
       async closeAll() {},
     },
   });
@@ -2109,7 +2124,7 @@ test('an oversized native error message is bounded like every other surface', as
     assert.equal(res.status, 502);
     const body = await res.json();
     assert.equal(body.error.type, 'local_cli_chat_error');
-    assert.ok(body.error.message.length <= 500, `bounded, got ${body.error.message.length}`);
+    assert.ok(body.error.message.length <= MAX_ERROR_MESSAGE_CHARS, `bounded, got ${body.error.message.length}`);
     assert.ok(body.error.message.endsWith('...[truncated]'), body.error.message.slice(-20));
   } finally {
     await started.close();

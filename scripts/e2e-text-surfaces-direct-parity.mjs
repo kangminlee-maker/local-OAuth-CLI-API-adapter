@@ -285,6 +285,12 @@ const chatCases = [
 const I = 'ping';
 const OUT = { input: I, max_output_tokens: 16 };
 const RTOOL = { type: 'function', name: 'f', parameters: { type: 'object', properties: {} } };
+// The item shape this proxy's own `output` carries, which a client feeds back
+// as input to hold a conversation on a surface that stores none.
+const ASSISTANT_ITEM = (phase = 'final_answer') => ({
+  id: 'msg_probe', type: 'message', status: 'completed', role: 'assistant', phase,
+  content: [{ type: 'output_text', annotations: [], logprobs: [], text: 'OK' }],
+});
 const responsesCases = [
   // Keys this surface does not know — four of them are Chat's.
   ['responses unknown key', { ...OUT, zzz_unknown: 1 }],
@@ -305,6 +311,38 @@ const responsesCases = [
   ['responses input item status', { ...OUT, input: [{ role: 'user', content: I, status: 'completed' }], temperature: 0.5 }],
   ['responses input item id', { ...OUT, input: [{ role: 'user', content: I, id: 'msg_x' }], temperature: 0.5 }],
   ['responses input item type', { ...OUT, input: [{ type: 'message', role: 'user', content: I }], temperature: 0.5 }],
+  // `phase` is the assistant item's own member — the shape this proxy emits.
+  ['responses input item phase on a user item', { ...OUT, input: [{ role: 'user', content: I, phase: 'final_answer' }] }],
+  ['responses input item phase unknown value', { ...OUT, input: [ASSISTANT_ITEM('bogus'), { role: 'user', content: I }] }],
+  ['responses input item assistant unknown member', { ...OUT, input: [{ ...ASSISTANT_ITEM(), zzz: 1 }, { role: 'user', content: I }] }],
+  ['responses input item assistant with input_text', { ...OUT, input: [{ role: 'assistant', content: [{ type: 'input_text', text: 'x' }] }, { role: 'user', content: I }] }],
+  ['responses input item round trip', { ...OUT, input: [{ role: 'user', content: I }, ASSISTANT_ITEM(), { role: 'user', content: 'again' }], temperature: 0.5 }],
+  // The item schema, at the `input` slot rather than after the whole walk.
+  ['responses input item primitive', { ...OUT, input: [7] }],
+  ['responses input item null', { ...OUT, input: [null] }],
+  ['responses input item type not a string', { ...OUT, input: [{ type: 7, role: 'user', content: I }] }],
+  ['responses input item type unknown', { ...OUT, input: [{ type: 'bogus_item' }] }],
+  ['responses input item role unknown', { ...OUT, input: [{ role: 'bogus', content: I }] }],
+  ['responses input item empty object', { ...OUT, input: [{}] }],
+  ['responses input item without content', { ...OUT, input: [{ role: 'user' }] }],
+  ['responses input item developer role', { ...OUT, input: [{ role: 'developer', content: I }, { role: 'user', content: I }], temperature: 0.5 }],
+  ['responses input item beats a later field', { ...OUT, input: [{}], truncation: 'bogus' }],
+  ['responses input item beats the state phase', { ...OUT, input: [{}], previous_response_id: 'resp_x' }],
+  ['responses input item beats the capability pass', { ...OUT, input: [{}], temperature: 0.5 }],
+  ['responses content block unknown type', { ...OUT, input: [{ role: 'user', content: [{ type: 'bogus', text: 'x' }] }] }],
+  ['responses content block wrong variant', { ...OUT, input: [{ role: 'user', content: [{ type: 'output_text', text: 'x' }] }] }],
+  ['responses content block without text', { ...OUT, input: [{ role: 'user', content: [{ type: 'input_text' }] }] }],
+  ['responses content block refusal on assistant', { ...OUT, input: [{ role: 'assistant', content: [{ type: 'refusal', refusal: 'no' }] }, { role: 'user', content: I }], temperature: 0.5 }],
+  // `text` and `tools`, which were array/object checks and nothing more.
+  ['responses text unknown member', { ...OUT, text: { zzz: 1 } }],
+  ['responses text format unknown type', { ...OUT, text: { format: { type: 'bogus' } } }],
+  ['responses text json_schema without a name', { ...OUT, text: { format: { type: 'json_schema' } } }],
+  ['responses text verbosity unknown', { ...OUT, text: { verbosity: 'bogus' } }],
+  ['responses text beats a later field', { ...OUT, text: { verbosity: 'bogus' }, context_management: 'x' }],
+  ['responses text beats the capability pass', { ...OUT, text: { verbosity: 'bogus' }, temperature: 0.5 }],
+  ['responses tools member without a type', { ...OUT, tools: [{}] }],
+  ['responses tools function without a name', { ...OUT, tools: [{ type: 'function' }] }],
+  ['responses chat-shaped tool', { ...OUT, tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }] }],
   // reasoning — its own enum, wider than Chat's.
   ['responses reasoning as a string', { ...OUT, reasoning: 'low' }],
   ['responses reasoning.effort unknown', { ...OUT, reasoning: { effort: 'bogus' } }],
@@ -399,6 +437,15 @@ const responsesCases = [
   ['responses order service_tier beats top_logprobs', { ...OUT, service_tier: 'bogus', top_logprobs: 'x' }],
   ['responses order top_logprobs beats context_management', { ...OUT, top_logprobs: 'x', context_management: 'x' }],
   ['responses order moderation beats include', { ...OUT, moderation: 'x', include: ['bogus.thing'] }],
+  // The adjacencies no row pinned, as SAME-KIND (type) faults so they test the
+  // field order rather than the phase boundary.
+  ['responses order input beats previous_response_id (type)', { ...OUT, previous_response_id: 7, input: 7 }],
+  ['responses order previous_response_id beats prompt (type)', { ...OUT, prompt: 'x', previous_response_id: 7 }],
+  ['responses order prompt beats moderation (type)', { ...OUT, moderation: 'x', prompt: 'x' }],
+  ['responses order tools beats tool_choice', { ...OUT, tool_choice: 7, tools: 'x' }],
+  ['responses order tool_choice beats metadata', { ...OUT, metadata: 'x', tool_choice: 7 }],
+  ['responses order presence_penalty beats frequency_penalty', { ...OUT, frequency_penalty: 'x', presence_penalty: 'x' }],
+  ['responses order frequency_penalty beats parallel_tool_calls', { ...OUT, parallel_tool_calls: 'x', frequency_penalty: 'x' }],
   // Spelling help, and its two measured limits: distance 2 suggests, 3 does
   // not, and a key already in the body is never suggested.
   ['responses unknown near store at 2', { ...OUT, sto: 1 }],

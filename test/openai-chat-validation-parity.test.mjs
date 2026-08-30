@@ -47,6 +47,15 @@ const REJECTIONS = [
   ['the Responses-shaped reasoning', { reasoning: { effort: 'low' } }, { param: 'reasoning', code: 'unknown_parameter', message: "Unknown parameter: 'reasoning'." }],
   ['the Responses-shaped text', { text: { verbosity: 'low' } }, { param: 'text', code: 'unknown_parameter', message: "Unknown parameter: 'text'." }],
 
+  // Spelling help on an unknown key, and its two measured limits. The six rows
+  // above all use keys far from every known one, so they pass with or without
+  // suggestions — reverting the whole feature left this file green.
+  ['an unknown key near store', { stor: 1 }, { param: 'stor', code: 'unknown_parameter', message: "Unknown parameter: 'stor'. Did you mean 'stop' or 'store'?" }],
+  ['an unknown key near temperature', { temperatur: 1 }, { param: 'temperatur', code: 'unknown_parameter', message: "Unknown parameter: 'temperatur'. Did you mean 'temperature'?" }],
+  ['an unknown key near a key the body already sent', { messagess: 1 }, { param: 'messagess', code: 'unknown_parameter', message: "Unknown parameter: 'messagess'." }],
+  // Chat's own terse sentence, which Responses answers as an `invalid_value`.
+  ['prompt_cache_retention outside the enum', { prompt_cache_retention: 'x' }, { param: 'prompt_cache_retention', code: null, message: 'Invalid prompt_cache_retention argument' }],
+
   // Refused by this model family whatever the value.
   ['stop', { stop: ['ZZ'] }, { param: 'stop', code: 'unsupported_parameter', message: "Unsupported parameter: 'stop' is not supported with this model." }],
   ['max_tokens', { max_tokens: 32 }, { param: 'max_tokens', code: 'unsupported_parameter', message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead." }],
