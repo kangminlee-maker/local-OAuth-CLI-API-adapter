@@ -65,7 +65,9 @@
     "smoke:real:claude": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model opus",
     "smoke:real:codex:multimodal": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime codex --only multimodal",
     "smoke:real:claude:multimodal": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model opus --only multimodal",
-    "bench:api": "pnpm build && node scripts/api-comparison-benchmark.mjs"
+    "bench:api": "pnpm build && node scripts/api-comparison-benchmark.mjs",
+    "conformance:manifest": "node scripts/build-conformance-manifest.mjs",
+    "conformance:coverage": "node scripts/conformance-coverage.mjs"
   },
   "dependencies": {
     "sharp": "^0.35.4"
