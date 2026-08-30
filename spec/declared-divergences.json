@@ -9,6 +9,24 @@
       "measuredAt": "2026-08-30",
       "evidence": "docs/conformance-matrix.md §5.5.5",
       "claim": "chat-function-tools-with-reasoning-effort"
+    },
+    {
+      "id": "messages-output-config-task-budget",
+      "surface": "/v1/messages",
+      "behavior": "The proxy accepts `output_config.task_budget` ({type:'tokens', total: >= 20000}) and uses it. The direct API does not know the member and answers 400 `output_config.task_budget: Extra inputs are not permitted` — its `output_config` takes only `format` and `effort`.",
+      "why": "Measured 2026-08-31: the direct API's output_config member set is {format, effort}. `task_budget` is this proxy's own extension over the Claude CLI's task budget, so it is an ADDITION to the surface rather than a difference in shared behaviour. Nothing a direct-API client sends is answered differently; a client that sends it gets the CLI knob it names. Removing it would take a capability away with no parity gain.",
+      "measuredAt": "2026-08-31",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "claim": "messages-output-config-task-budget"
+    },
+    {
+      "id": "messages-whitespace-model-is-a-400",
+      "surface": "/v1/messages",
+      "behavior": "The proxy answers 400 `model: String should have at least 1 character` for a whitespace-only model name. The direct API treats it as a NAME and answers 404 model-not-found.",
+      "why": "Measured 2026-08-31: `model: '   '` returns 404 on the direct API, the same answer it gives any name it does not know. This proxy runs every model name on its configured backend and so has no name it does not know — it cannot mirror that 404 for one input without mirroring it for all of them, which would break its purpose. It keeps a 400 for the one shape that is plainly a slip rather than dispatching a turn for it.",
+      "measuredAt": "2026-08-31",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "claim": "messages-whitespace-model-is-a-400"
     }
   ]
 }

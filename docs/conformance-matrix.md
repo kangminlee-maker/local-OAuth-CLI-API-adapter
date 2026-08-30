@@ -518,41 +518,84 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 
 **최상위 키 집합 (같은 날, 각 키에 틀린 타입 `1`을 보내 판별)**: 아는 키 18개 — `model`·`messages`·`max_tokens`·`cache_control`("Input should be an object")·`container`·`inference_geo`·`metadata`·`output_config`·`service_tier`("Input should be 'auto' or 'standard_only'")·`stop_sequences`·`stream`("Input should be a valid boolean")·`system`·`temperature`·`thinking`·`tool_choice`·`tools`·`top_k`·`top_p`. 모르는 키 → "<key>: Extra inputs are not permitted": `user_profile_id`(SDK 타입엔 있음)·`mcp_servers`·`context_management`·`betas`·`speed`·`effort`·`seed`·`response_format`·`instructions`·`input`·`n`·`user`·`logprobs`·`stop`. 순서: `max_tokens: Field required`가 미지 키보다 먼저, `temperature: range: 0..1`도 미지 키보다 먼저, 미지 키 둘이면 본문 순서의 첫 키; `messages[0].bogus` → "messages.0.bogus: Extra inputs are not permitted"; `bogus: null`도 거절. 프록시는 이 집합을 그대로 미러한다(A-37).
 
-### 5.5.6 Responses direct 실측 (2026-08-30) — 측정 완료, **아직 미러 안 함**
+### 5.5.6 Responses direct 실측 (2026-08-30~31) — **미러 완료**, 계기가 표를 고쳤다
 
-Chat과 같은 계기·같은 절차. 이 표면은 다음 커밋의 대상이며, 여기 있는 값이 그 커밋의 기준이다.
-(이 절이 존재하는 이유: 측정은 끝났고 구현은 안 됐다는 상태를 문서가 말하지 않으면, 다음 세션이 같은 콜을 다시 쓴다.)
+이 절의 첫 초안은 코드보다 먼저 쓰였고, 코드로 옮기는 과정에서 **열다섯 군데가 실제 API와 달랐다**.
+아래는 고쳐진 값이며, 근거는 `pnpm e2e:text:parity`(양쪽에 같은 본문을 보내 `{status,type,param,code,message}`를 비교)의
+**ALL PASS 333/333**과 `test/openai-responses-validation-parity.test.mjs`(128행, 그 ALL PASS 실행에서 생성).
+초안이 틀렸던 자리를 남겨 두는 이유는 하나다 — **측정 전의 표는 측정이 아니다.**
 
 **키 집합**: `input`·`instructions`·`max_output_tokens`·`max_tool_calls`·`temperature`·`top_p`·`top_logprobs`·`stream`·
 `stream_options`·`text`·`tools`·`tool_choice`·`parallel_tool_calls`·`reasoning`·`include`·`store`·`background`·
 `previous_response_id`·`conversation`·`truncation`·`metadata`·`user`·`safety_identifier`·`prompt_cache_key`·
 `prompt_cache_retention`·`prompt_cache_options`·`service_tier`·`prompt`·`context_management`·`moderation`·
-`presence_penalty`·`frequency_penalty`. **모르는 키**: `n`·`stop`·`seed`·`logprobs`·`max_tokens` → `unknown_parameter`.
-`messages`는 특별하다 — `unsupported_parameter`, **`param` 없이** "In the Responses API, this parameter has moved to 'input'".
+`presence_penalty`·`frequency_penalty`. **모르는 키** → `unknown_parameter`. `messages`만 예외로 `unsupported_parameter`,
+`param` 없이 "In the Responses API, this parameter has moved to 'input'".
 
-| 요청 | direct 응답 |
-| --- | --- |
-| `model` 없음 / `null` | `missing_required_parameter` `model` / **`invalid_type` `model` "got an object instead"** — Chat과 다르다(Chat은 둘 다 `you must provide a model parameter`) |
-| `reasoning.effort: "max"` | **200** — Chat은 같은 값을 `unsupported_value`로 거절한다. 표면별로 enum이 다르다 |
-| `reasoning.summary: "bogus"` / `reasoning.generate_summary` / `reasoning.bogus` | `invalid_value`(`concise`·`detailed`·`auto`) / `unknown_parameter` `reasoning.generate_summary` / `unknown_parameter` `reasoning.bogus` |
-| `top_logprobs: 1` | `unsupported_parameter` "logprobs are not supported with reasoning models." (`include: ["message.output_text.logprobs"]`도 같은 봉투, param은 `include`) |
-| `presence_penalty` / `frequency_penalty` 값 | `unsupported_parameter` (타입 결함은 `invalid_type` "a decimal") |
-| `previous_response_id: "resp_없음"` | 400 `previous_response_not_found` |
-| `conversation: "conv_없음"` / `prompt: {id:"pmpt_없음"}` | **404** (`param` 없음) |
-| `truncation: "bogus"` / `include: ["bogus.thing"]` | `invalid_value` + 목록 / `invalid_value` `include[0]` + 8개 목록 |
-| `max_tool_calls: 0` / `metadata` 17쌍 | `integer_below_min_value` / `object_above_max_properties` |
-| `input[0].bogus` | `unknown_parameter` `input[0].bogus` — 항목 내부도 엄격 |
-| `service_tier` | Chat과 같은 목록·같은 해석(`fast`→`priority`). **이 필드만 이번 커밋에서 이미 미러**(에코되기 때문) |
-| `prompt_cache_retention: "in_memory"` | 400 `invalid_parameter` — Chat은 같은 문구를 **code 없이** 답한다 |
-| `context_management`·`include`·`store`·`metadata`·`user`·`safety_identifier`·`prompt_cache_*`·`truncation`·`max_tool_calls`·`text`·`parallel_tool_calls`·`instructions` | 전부 200, 요청값이 응답에 에코된다 |
+| 요청 | direct 응답 | 초안이 틀렸던 점 |
+| --- | --- | --- |
+| `model` 없음 / `null` / `''` | `missing_required_parameter` / `invalid_type` **"got an object instead"** / **400 `model_not_found`** `The requested model '' does not exist.` | `''`를 "없음"으로 적었다 |
+| `null`의 의미 | Responses에서 **`model`을 뺀 모든 필드는 null=생략** (truncation·store·user·metadata·instructions·max_output_tokens·temperature 개별 확인) | — |
+| `model: null`의 문구 | "an object" — **Images 표면은 같은 결함을 "null"이라 쓴다**. 한 표면의 표현을 API의 표현으로 일반화하면 Images 테스트 3건이 깨진다 | 일반화할 뻔했다 |
+| `reasoning.effort` 2층 | 스키마 집합 밖 → `invalid_value` (`none`·**`minimal`**·`low`·`medium`·`high`·`xhigh`·`max`) / 안이지만 모델 집합 밖(`minimal`) → `unsupported_value` **모델명을 적는다** (`'minimal' is not supported with the 'gpt-5.6-terra' model`) | 한 층·한 문장으로 적었다 |
+| `reasoning.effort` 타입 | 정수 → `invalid_type` `one of 'minimal', 'low', 'medium', or 'high'` (좁은 목록) / 그 밖 → `one of one of 'none', 'minimal', … or 'max' or integer` | 없었다 |
+| `presence_penalty`·`frequency_penalty` 값 | `unsupported_parameter` 문구에 **code 없음** (Chat은 code 있음) | code가 있다고 적었다 |
+| `prompt_cache_retention` enum 밖 문자열 | `invalid_value` + 목록 (Chat은 **`Invalid prompt_cache_retention argument`**, code 없음) | Chat과 같다고 적었다 |
+| 2개짜리 목록 문장부호 | `'auto' and 'disabled'` — **직렬 쉼표 없음** (3개 이상은 있다) | 3개 이상 규칙을 2개에 적용했다 |
+| `max_output_tokens` 하한 | **16** (1·15 거절, 16 수용). `max_tool_calls`의 하한은 1 | 1이라고 적었다 |
+| `include: ["message.output_text.logprobs"]` | `unsupported_parameter` `param: include` "logprobs are not supported with reasoning models." | 문 하나를 통째로 빠뜨렸고, 프록시는 **수용해서 턴을 돌리고 logprobs 없는 답을 주고 있었다** |
+| logprobs 두 문의 위치 | 필드 자리가 아니라 **모델 능력 검사 단계**(맨 뒤). 뒤 필드의 타입 결함이 이긴다. 둘이 함께 오면 `include`가 이긴다 | 필드 자리라고 적었다 |
+| `previous_response_id`·`prompt`·`conversation` | **단계**다. 모든 스키마 검사가 이기고, 능력 검사를 이긴다. 자기들끼리는 `conversation` → `prompt` → `previous_response_id` | 필드 순서 안에 넣었다(2·3번) |
+| `previous_response_id` + `conversation` | 400 `mutually_exclusive_parameters`, `param` 없음, `Mutually exclusive parameters: ''. Ensure you are only providing one of: 'pre..._id' or 'conversation'.` | 없었다 |
+| 이름 축약 규칙 | 12자는 그대로(`'conversation'`), 20자는 축약(`'pre..._id'`), `include` 멤버(24자+)도 타입 문장에서 축약 — **값 문장에서는 전체** | 임계값을 6자로 두고 있었다 |
+| 모르는 키의 철자 도움 | `Did you mean 'store'?` — 편집거리 2 이하, **본문에 이미 있는 키는 제외**(`modell`은 `model`을 제안하지 않는다), 가까운 순, 동률은 알파벳순. Chat도 같다 | 없었다 |
+| `tool_choice` | 타입 문장이 표면마다 다르고(`one of an object or …` vs `one of one of … or object`) 객체 모양도 다르다(`{type,name}` vs `{type,function:{name}}`) | 공유 함수를 그대로 썼다 |
+| `input[N]` 내부 | 메시지 항목의 미지 멤버는 `unknown_parameter` `input[0].bogus` — `input` 자리에서 보고된다 | 항목 내부 검사가 없었다 |
 
 **보고 순서** (타입 결함, 비교 정렬 31키·124콜·대칭성 3/3·인접쌍 0실패):
 `input` → `previous_response_id` → `prompt` → `moderation` → `include` → `tools` → `tool_choice` → `metadata` → `text` →
 `temperature` → `top_p` → `presence_penalty` → `frequency_penalty` → `parallel_tool_calls` → `stream` → `stream_options` →
 `background` → `max_output_tokens` → `max_tool_calls` → `reasoning` → `user` → `safety_identifier` → `prompt_cache_options` →
 `prompt_cache_key` → `prompt_cache_retention` → `truncation` → `instructions` → `store` → `service_tier` → `top_logprobs` →
-`context_management`.
-**Chat의 순서와 완전히 다르다** — 표면마다 자기 스키마 순서이므로, 한쪽에서 잰 순서를 다른 쪽에 옮겨 쓸 수 없다.
+`context_management`. **Chat의 순서와 완전히 다르다** — 표면마다 자기 스키마 순서이므로 옮겨 쓸 수 없다.
+(`previous_response_id`·`prompt`의 이 자리는 **타입 결함**의 자리다. 조회 실패는 위에 적은 대로 별도 단계다.)
+
+**계기 검증**: 심은 변이 3개 — 철자 도움 제거, 하한을 1로 되돌리기, `conversation`보다 `prompt`를 먼저 조회 — 모두 빨간불.
+오프라인 골든은 ALL PASS 실행의 프록시에서 **생성**했고(손으로 옮겨 적지 않았다), 거리 임계값 변이가 그중 4행을 죽인다.
+
+### 5.5.7 Anthropic Messages 필드 검증·보고 순서 실측 (2026-08-31) — **미러 완료**
+
+`claude-sonnet-5`. 봉투는 `{type:"error", error:{type, message}}` — **`param`도 `code`도 없다**.
+이 절이 생긴 계기는 리뷰 지적 2건이었다: 알려진 필드 여러 개가 아예 검증되지 않았고(`stream: "yes"`가 조용히 버퍼 모드가 됐다),
+필수 필드 누락이 선택 필드의 결함에 밀렸다. 고치려면 순서를 알아야 했고, 순서는 재 봐야 했다.
+
+**보고 순서** (타입 결함으로 종류 고정, 비교 정렬 18키·137콜·**대칭성 51/51**·인접쌍 17/17):
+`model` → `tool_choice` → `tools` → `messages` → `system` → `thinking` → `output_config` → `cache_control` →
+`max_tokens` → `metadata` → `stop_sequences` → `temperature` → `service_tier` → `top_k` → `top_p` → `stream` →
+`container` → `inference_geo` → **모르는 키** → **`container` 거절**.
+알파벳순도, 문서의 파라미터 나열 순서도 아니다. `container` 거절이 미지 키보다 뒤라는 것이 이 순서에서 가장 놀라운 부분이고,
+OpenAI 표면들이 능력 거절을 맨 뒤에 두는 것과 같은 모양이다.
+
+| 요청 | direct 응답 |
+| --- | --- |
+| `model` 없음 / `null`·정수 / `''` / `'   '` | `model: Field required` / `model: Input should be a valid string` / `model: String should have at least 1 character` / **404** (이름으로 취급해 조회한다) |
+| `messages` 없음 / 문자열·null / `[]` | `messages: Field required` / `messages: Input should be a valid array` / `messages: at least one message is required` |
+| `max_tokens` 없음 / 문자열·null / `-1` / `0` | `max_tokens: Field required` / `Input should be a valid integer` / `must be greater than or equal to 0` / **수용** |
+| 항목 `role` 없음 / `"developer"` / **`"system"` 0번** / `"system"` 1번 이후 | `messages.0.role: Field required` / `messages: Unexpected role "developer". Allowed roles are "user" or "assistant"` / `messages.0: use the top-level 'system' parameter …` / **200 수용** |
+| 항목 `content` 없음 / null·정수·객체 / `[]` / `[7]` / `[{}]` | `messages.0.content: Field required` / `messages.0.content: Input should be a valid array`(문자열은 수용) / `messages.0: user messages must have non-empty content` / `messages.0.content.0: Input should be an object` / `messages.0.content.0.type: Field required` |
+| 항목 미지 멤버 | `messages.0.bogus: Extra inputs are not permitted` — `messages` 자리에서 보고된다 |
+| `null`의 의미 | **생략**: `metadata`·`inference_geo`·`stop_sequences`·`cache_control`·`container`. **타입 결함**: 그 밖 전부(`stream`·`system`·`tools`·`tool_choice`·`thinking`·`output_config`·`service_tier`·`top_k`·`top_p`·`temperature`). OpenAI 표면처럼 일률적이지 않다 |
+| `temperature`·`top_p` 범위 | `range: 0..1` (`top_k`는 하한 없음 — `-1` 수용) |
+| `tool_choice` `{}` / `{type:'bogus'}` | `tool_choice.type: Field required` / `tool_choice: Input tag 'bogus' found using 'type' does not match any of the expected tags: 'auto', 'any', 'tool', 'none'` |
+| `system: 7` / 문자열 / `[7]` | `system: Input should be a valid array` (문자열은 **수용**) / 200 / `system.0: Input does not match the expected shape.` |
+| `container` 값 무엇이든 | 미지 키 검사 **뒤에** `container: Container identifier can only be provided when using the code execution tool` |
+
+**아직 미러하지 않은 것 (측정만 됨)** — 다음 작업의 재료다:
+`thinking`은 variant별 스키마다(`thinking.enabled.budget_tokens: Field required`, 하한 1024, `thinking.disabled.display: Extra inputs are not permitted`,
+그리고 이 모델은 `enabled` 자체를 거절하고 `adaptive`+`output_config.effort`를 쓰라고 답한다).
+`output_config`의 direct 멤버는 `format`·`effort` **둘뿐**이고 `output_config.effort`의 문구는
+`Input should be 'low', 'medium', 'high', 'xhigh' or 'max'`이다. **`output_config.task_budget`은 direct가 모르는 키**
+(`Extra inputs are not permitted`)이므로 이 프록시의 확장이다 — 선언된 발산으로 등록해야 한다.
 
 ### 5.5.5-A Anthropic Messages 나머지 행 direct 실측 (2026-08-30)
 

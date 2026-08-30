@@ -167,7 +167,39 @@ const ORDER = [
   ['verbosity before a refused logprobs', { logprobs: true, verbosity: 'bogus' }, { param: 'verbosity', message: "Invalid value: 'bogus'. Supported values are: 'low', 'medium', and 'high'." }],
 ];
 
-for (const [name, fragment, expected] of ORDER) {
+// Every ADJACENT edge of the measured order, derived from one list rather than
+// hand-picked. The old table paired `store` with `stream` and `max_tokens` and
+// `metadata` with `prediction` — but never `store` with `metadata`, and
+// swapping exactly those two adjacent checks changed the reported fault with
+// no test noticing (found by mutation). Keys whose wrong-type value is refused
+// for another reason are absent here on purpose: fault kind changes the order,
+// so a mixed-kind pair tests nothing. Each row sends the LATER key first.
+const WRONG = { __probe__: 'wrong type' };
+const ADJACENT = [
+  ['messages before functions, the adjacent edge', { functions: 'wrong type', messages: 'wrong type' }, { param: 'messages', message: "Invalid type for 'messages': expected an array of objects, but got a string instead." }],
+  ['functions before tools, the adjacent edge', { tools: 'wrong type', functions: 'wrong type' }, { param: 'functions', message: "Invalid type for 'functions': expected an array of function definitions, but got a string instead." }],
+  ['tools before parallel_tool_calls, the adjacent edge', { parallel_tool_calls: WRONG, tools: 'wrong type' }, { param: 'tools', message: "Invalid type for 'tools': expected an array of objects, but got a string instead." }],
+  ['parallel_tool_calls before max_completion_tokens, the adjacent edge', { max_completion_tokens: WRONG, parallel_tool_calls: WRONG }, { param: 'parallel_tool_calls', message: "Invalid type for 'parallel_tool_calls': expected a boolean, but got an object instead." }],
+  ['max_completion_tokens before n, the adjacent edge', { n: WRONG, max_completion_tokens: WRONG }, { param: 'max_completion_tokens', message: "Invalid type for 'max_completion_tokens': expected an integer, but got an object instead." }],
+  ['n before temperature, the adjacent edge', { temperature: WRONG, n: WRONG }, { param: 'n', message: "Invalid type for 'n': expected an integer, but got an object instead." }],
+  ['temperature before top_p, the adjacent edge', { top_p: WRONG, temperature: WRONG }, { param: 'temperature', message: "Invalid type for 'temperature': expected a decimal, but got an object instead." }],
+  ['top_p before presence_penalty, the adjacent edge', { presence_penalty: WRONG, top_p: WRONG }, { param: 'top_p', message: "Invalid type for 'top_p': expected a decimal, but got an object instead." }],
+  ['presence_penalty before frequency_penalty, the adjacent edge', { frequency_penalty: WRONG, presence_penalty: WRONG }, { param: 'presence_penalty', message: "Invalid type for 'presence_penalty': expected a decimal, but got an object instead." }],
+  ['frequency_penalty before logprobs, the adjacent edge', { logprobs: WRONG, frequency_penalty: WRONG }, { param: 'frequency_penalty', message: "Invalid type for 'frequency_penalty': expected a decimal, but got an object instead." }],
+  ['logprobs before top_logprobs, the adjacent edge', { top_logprobs: WRONG, logprobs: WRONG }, { param: 'logprobs', message: "Invalid type for 'logprobs': expected a boolean, but got an object instead." }],
+  ['top_logprobs before user, the adjacent edge', { user: WRONG, top_logprobs: WRONG }, { param: 'top_logprobs', message: "Invalid type for 'top_logprobs': expected an integer, but got an object instead." }],
+  ['user before seed, the adjacent edge', { seed: WRONG, user: WRONG }, { param: 'user', message: "Invalid type for 'user': expected a string, but got an object instead." }],
+  ['seed before safety_identifier, the adjacent edge', { safety_identifier: WRONG, seed: WRONG }, { param: 'seed', message: "Invalid type for 'seed': expected an integer, but got an object instead." }],
+  ['safety_identifier before prompt_cache_key, the adjacent edge', { prompt_cache_key: WRONG, safety_identifier: WRONG }, { param: 'safety_identifier', message: "Invalid type for 'safety_identifier': expected a string, but got an object instead." }],
+  ['prompt_cache_key before prompt_cache_retention, the adjacent edge', { prompt_cache_retention: WRONG, prompt_cache_key: WRONG }, { param: 'prompt_cache_key', message: "Invalid type for 'prompt_cache_key': expected a string, but got an object instead." }],
+  ['prompt_cache_retention before service_tier, the adjacent edge', { service_tier: WRONG, prompt_cache_retention: WRONG }, { param: 'prompt_cache_retention', message: "Invalid type for 'prompt_cache_retention': expected one of 'in_memory' or '24h', but got an object instead." }],
+  ['service_tier before stream, the adjacent edge', { stream: WRONG, service_tier: WRONG }, { param: 'service_tier', message: "Invalid type for 'service_tier': expected one of 'auto', 'default', 'fast', 'flex', or 'priority', but got an object instead." }],
+  ['stream before store, the adjacent edge', { store: WRONG, stream: WRONG }, { param: 'stream', message: "Invalid type for 'stream': expected a boolean, but got an object instead." }],
+  ['store before metadata, the adjacent edge', { metadata: 'wrong type', store: WRONG }, { param: 'store', message: "Invalid type for 'store': expected a boolean, but got an object instead." }],
+  ['metadata before verbosity, the adjacent edge', { verbosity: WRONG, metadata: 'wrong type' }, { param: 'metadata', message: "Invalid type for 'metadata': expected a metadata object, but got a string instead." }],
+];
+
+for (const [name, fragment, expected] of [...ORDER, ...ADJACENT]) {
   test(`chat reports faults in the direct API's order: ${name}`, async () => {
     const { status, payload } = await chat(fragment);
     assert.equal(status, 400, JSON.stringify(payload));

@@ -81,6 +81,73 @@ test('the gate keeps a trailing partial for the flush', () => {
   assert.equal(gate.flush(), 'Z', 'a turn that ended mid-partial still owes the client that text');
 });
 
+test('the gate never commits a match a later delta could beat', () => {
+  // Found by review: `["abc","ab"]` over `Xab` + `cY` committed `ab` on the
+  // stream while the buffered path answered `abc` — the same turn reporting a
+  // different `stop_sequence` depending on how the caller read it.
+  const gate = new StopSequenceGate(['abc', 'ab']);
+  assert.equal(gate.push('Xab'), 'X', 'ab matches, but abc is listed first and still possible');
+  assert.equal(gate.stopped, null);
+  assert.equal(gate.push('cY'), '');
+  assert.equal(gate.stopped, 'abc');
+  assert.deepEqual(truncateAtStopSequence('XabcY', ['abc', 'ab']), { text: 'X', sequence: 'abc' });
+});
+
+test('a shorter sequence that starts earlier still wins as it arrives', () => {
+  // The mirror case: nothing pending beats it, so it commits immediately.
+  const gate = new StopSequenceGate(['abcd', 'c']);
+  assert.equal(gate.push('abc'), '', 'c matched at 2, but abcd could still match at 0 — nothing is safe yet');
+  assert.equal(gate.stopped, null);
+  assert.equal(gate.push('d'), '');
+  assert.equal(gate.stopped, 'abcd');
+  // And when the turn ends before `abcd` completes, the deferred `c` is the
+  // answer after all — the flush is what resolves it.
+  const ended = new StopSequenceGate(['abcd', 'c']);
+  assert.equal(ended.push('abc'), '');
+  assert.equal(ended.flush(), 'ab');
+  assert.equal(ended.stopped, 'c');
+});
+
+test('the stream and the buffer agree on every split of every case', () => {
+  // The property the two paths owe each other. Exhaustive over a small
+  // alphabet: every text of length <= 5 over {a,b,c}, every split into deltas,
+  // against sequence sets chosen for overlap, prefixes and ties.
+  const SEQUENCE_SETS = [['ab'], ['abc', 'ab'], ['ab', 'abc'], ['abcd', 'c'], ['a', 'ab'], ['ab', 'ba'], ['aa', 'a'], ['b', 'ab', 'aab']];
+  const texts = [''];
+  for (let length = 1; length <= 5; length += 1) {
+    for (const text of texts.filter((candidate) => candidate.length === length - 1)) {
+      for (const letter of 'abc') texts.push(text + letter);
+    }
+  }
+  const splits = (text) => {
+    if (text.length === 0) return [[]];
+    const out = [];
+    for (let cut = 1; cut <= text.length; cut += 1) {
+      for (const rest of splits(text.slice(cut))) out.push([text.slice(0, cut), ...rest]);
+    }
+    return out;
+  };
+  let checked = 0;
+  for (const sequences of SEQUENCE_SETS) {
+    for (const text of texts) {
+      const expected = truncateAtStopSequence(text, sequences);
+      for (const deltas of splits(text)) {
+        const gate = new StopSequenceGate(sequences);
+        let streamed = '';
+        for (const delta of deltas) streamed += gate.push(delta);
+        streamed += gate.flush();
+        checked += 1;
+        assert.deepEqual(
+          { text: streamed, sequence: gate.stopped },
+          expected,
+          `${JSON.stringify(sequences)} over ${JSON.stringify(deltas)}`,
+        );
+      }
+    }
+  }
+  assert.ok(checked > 5000, `the enumeration must actually run: ${checked} cases`);
+});
+
 test('a gate with no sequences is a pass-through', () => {
   const gate = new StopSequenceGate([]);
   assert.equal(gate.active, false);
@@ -151,6 +218,63 @@ test('a tool-call turn keeps tool_use as its reason, and its narration is still 
   assert.equal(json.stop_reason, 'tool_use');
   assert.equal(json.stop_sequence, null);
   assert.deepEqual(json.content.filter((block) => block.type === 'text'), [{ type: 'text', text: 'AA' }]);
+});
+
+test('a tool-first turn streams its blocks in production order, not text first', async () => {
+  // The streamed and buffered readings of ONE turn have to agree. A completion
+  // -only result that says its tools came before any text was answered
+  // [text, tool_use] on the wire and [tool_use, text] in the body.
+  const result = {
+    id: 'x', model: 'configured-model', text: 'AAZZBB',
+    toolCalls: [{ id: 'c1', name: 'f', arguments: '{"a":1}' }],
+    toolCallsBeforeText: true,
+    usage: { inputTokens: 20, outputTokens: 4, source: 'provider' }, latencyMs: 1,
+  };
+  const be = {
+    name: 'test', model: 'configured-model',
+    async generate() { return result; },
+    async *stream() { yield { type: 'completed', result }; },
+    async close() {},
+  };
+  const streamed = await messages(be, { stop_sequences: ['ZZ'], stream: true, tools: [{ name: 'f', input_schema: { type: 'object' } }] });
+  const opened = events(streamed.text)
+    .filter((event) => event.type === 'content_block_start')
+    .map((event) => event.data.content_block.type);
+  assert.deepEqual(opened, ['tool_use', 'text'], 'the wire reports the tools first');
+  const buffered = await messages(be, { stop_sequences: ['ZZ'], tools: [{ name: 'f', input_schema: { type: 'object' } }] });
+  assert.deepEqual(buffered.json.content.map((block) => block.type), opened, 'and the body reads the same turn the same way');
+  assert.deepEqual(streamedText(streamed.text), 'AA', 'the narration is still cut at the sequence');
+});
+
+test('no content block ever opens inside another', async () => {
+  // A tool block whose arguments the backend never declares finished stays
+  // open; the text that follows used to open at a new index inside it.
+  const result = {
+    id: 'x', model: 'configured-model', text: 'tail',
+    toolCalls: [{ id: 'c1', name: 'f', arguments: '{"a":1}' }],
+    usage: { inputTokens: 1, outputTokens: 1, source: 'provider' }, latencyMs: 1,
+  };
+  const be = {
+    name: 'test', model: 'configured-model',
+    async generate() { return result; },
+    async *stream() {
+      // No `argumentsDone`, so the block is left open on purpose.
+      yield { type: 'tool_call_delta', index: 0, id: 'c1', name: 'f', argumentsDelta: '{"a":1}' };
+      yield { type: 'completed', result };
+    },
+    async close() {},
+  };
+  const { text } = await messages(be, { stream: true, tools: [{ name: 'f', input_schema: { type: 'object' } }] });
+  const open = new Set();
+  const overlaps = [];
+  for (const event of events(text)) {
+    if (event.type === 'content_block_start') {
+      if (open.size > 0) overlaps.push(`${event.data.index} opened while ${[...open].join(',')} was open`);
+      open.add(event.data.index);
+    }
+    if (event.type === 'content_block_stop') open.delete(event.data.index);
+  }
+  assert.deepEqual(overlaps, []);
 });
 
 // The validation half, measured the same day.

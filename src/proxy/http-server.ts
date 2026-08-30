@@ -233,13 +233,17 @@ async function handleRequest(
       if (normalized.stream) {
         // One `close` listener per turn is wired inside `streamEvents`.
         if (choiceCount > 1) res.setMaxListeners(choiceCount + 10);
+        // The turns of one fan-out share a cancel: the first failure ends them
+        // all, instead of each waiting out its own timeout.
+        const fanOut = new AbortController();
         await writeOpenAiChatStream(
           res,
           await Promise.all(Array.from(
             { length: choiceCount },
-            () => streamEvents(backend, normalized, requestTimeoutMs, res),
+            () => streamEvents(backend, normalized, requestTimeoutMs, res, fanOut.signal),
           )),
           await requestReportingExecutedModel(backend, normalized),
+          () => fanOut.abort(),
         );
       } else {
         const results = await runChoicesWithTimeout(backend, normalized, choiceCount, requestTimeoutMs, res);
@@ -1293,21 +1297,30 @@ function streamEvents(
   request: NormalizedRequest,
   requestTimeoutMs: number,
   res: ServerResponse,
+  fanOut?: AbortSignal,
 ): Promise<AsyncIterable<LocalStreamEvent>> {
-  // The disconnect signal is wired in BOTH modes and lives for the whole
+  // The cancel signal is wired in BOTH modes and lives for the whole
   // iteration. It used to exist only during honor-on prefetch, so a client
   // that left mid-stream kept its backend turn running to the timeout — and on
   // a serialized backend the next client paid for it.
-  const clientGone = new AbortController();
+  //
+  // A fan-out's siblings cancel through the same door: when one choice fails
+  // the others are turns nothing will read, and without this they ran to the
+  // request timeout with the client's error held back behind them.
+  const cancelled = new AbortController();
   const onResponseClose = (): void => {
-    if (!res.writableEnded) clientGone.abort();
+    if (!res.writableEnded) cancelled.abort();
   };
+  const onFanOut = (): void => cancelled.abort();
   res.once('close', onResponseClose);
+  if (fanOut?.aborted) cancelled.abort();
+  else fanOut?.addEventListener('abort', onFanOut, { once: true });
   const release = (): void => {
     res.removeListener('close', onResponseClose);
+    fanOut?.removeEventListener('abort', onFanOut);
   };
   const events = releaseOnFinish(
-    runStreamWithTimeout(backend, request, requestTimeoutMs, clientGone.signal),
+    runStreamWithTimeout(backend, request, requestTimeoutMs, cancelled.signal),
     release,
   );
   if (!honorRequestModel()) {
@@ -1978,10 +1991,11 @@ function applyStreamStopSequence(
   });
   if (gate.stopped) return stopped(gate.stopped);
   // The deltas may have carried nothing at all (a schema or refusal result), so
-  // the result's own text goes through the gate before it is written.
-  const held = gate.flush();
-  const remaining = missingTextTail(streamedText + held, result.text);
-  const emitted = gate.push(`${held}${remaining}`);
+  // the result's own text goes through the gate before it is written. What the
+  // gate is still holding stays inside it — `push` prepends it — and the flush
+  // resolves the turn, which is where a deferred match becomes the answer.
+  const remaining = missingTextTail(streamedText + gate.pending, result.text);
+  const emitted = gate.push(remaining) + gate.flush();
   if (gate.stopped) {
     return {
       ...stopped(gate.stopped),
@@ -1991,7 +2005,7 @@ function applyStreamStopSequence(
         : { ...result, text: streamedText + emitted },
     };
   }
-  return { result, tail: `${emitted}${gate.flush()}` };
+  return { result, tail: emitted };
 }
 
 function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
@@ -2295,6 +2309,7 @@ async function writeOpenAiChatStream(
   res: ServerResponse,
   streams: readonly AsyncIterable<LocalStreamEvent>[],
   request: NormalizedRequest,
+  cancel?: () => void,
 ): Promise<void> {
   writeSseHeaders(res);
   const id = `chatcmpl-${randomUUID()}`;
@@ -2311,7 +2326,7 @@ async function writeOpenAiChatStream(
   const results: LocalCompletionResult[] = [];
   try {
     for (const choice of choices) await choice.start(base);
-    for await (const { index, value: event } of mergeTaggedStreams(streams)) {
+    for await (const { index, value: event } of mergeTaggedStreams(streams, cancel)) {
       const result = await choices[index].push(base, event);
       if (result) {
         base = { ...base, model: result.model };
@@ -2344,6 +2359,7 @@ async function writeOpenAiChatStream(
  */
 async function* mergeTaggedStreams<T>(
   sources: readonly AsyncIterable<T>[],
+  cancel?: () => void,
 ): AsyncIterable<{ index: number; value: T }> {
   const iterators = sources.map((source) => source[Symbol.asyncIterator]());
   const pending = new Map<number, Promise<{ index: number; result: IteratorResult<T> }>>();
@@ -2360,6 +2376,13 @@ async function* mergeTaggedStreams<T>(
       yield { index, value: result.value };
     }
   } finally {
+    // Cancel FIRST, then collect. `iterator.return()` on a generator suspended
+    // inside `next()` is queued behind that call, so awaiting the returns
+    // without cancelling waits for whatever the sibling is waiting for — in
+    // practice the whole request timeout, with the client's error held back
+    // for all of it. Measured: a failed choice took 3003ms to reach the client
+    // on a 3000ms timeout, and the sibling's abort came from its own timer.
+    cancel?.();
     await Promise.allSettled(iterators.map((iterator) => iterator.return?.()));
   }
 }
@@ -2994,6 +3017,10 @@ async function writeAnthropicMessagesStream(
 
     const ensureTextStarted = async (): Promise<void> => {
       if (textStarted && !textBlockClosed) return;
+      // A tool block whose arguments the backend never declared finished is
+      // still open. Opening a text block inside it nests two blocks on a wire
+      // that has no nesting, and a client assembling by index cannot read it.
+      await toolState.closeOpen();
       // Two content blocks are never open at once on this wire, so a tool call
       // stops the text block — and text that resumes afterwards is a NEW block.
       // Continuing to write at the stopped index left an SDK accumulator, which
@@ -3051,9 +3078,19 @@ async function writeAnthropicMessagesStream(
       const result = gated.result;
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
       if (result.toolCalls.length > 0) {
-        await writeText(gated.tail);
-        await closeOpenTextBlock();
-        await toolState.finish(result.toolCalls);
+        // Blocks follow production order, which is what the non-streamed body
+        // reports through `orderedByEmission`. A turn whose tools came before
+        // any text was answered here in the other order — the same turn read
+        // as [text, tool_use] streamed and [tool_use, text] buffered.
+        if (result.toolCallsBeforeText && !streamedText) {
+          await toolState.finish(result.toolCalls);
+          for (const chunk of chunkText(gated.tail)) await writeText(chunk);
+          await closeOpenTextBlock();
+        } else {
+          await writeText(gated.tail);
+          await closeOpenTextBlock();
+          await toolState.finish(result.toolCalls);
+        }
       } else {
         // Flush any final text not already streamed (covers schema/refusal results
         // where no live text_delta was emitted), then close the block. A truly empty
@@ -3137,6 +3174,11 @@ class AnthropicToolUseStreamState {
     // nothing else is open. Two blocks open at once is not this wire's shape,
     // and a client that assembles by index has no way to nest them.
     if (event.argumentsDone) await this.stop(state);
+  }
+
+  /** Closes any block still open, so nothing else can open inside one. */
+  async closeOpen(): Promise<void> {
+    for (const state of this.states.values()) await this.stop(state);
   }
 
   async finish(toolCalls: readonly LocalToolCall[]): Promise<void> {

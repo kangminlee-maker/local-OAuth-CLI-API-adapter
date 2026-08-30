@@ -170,6 +170,49 @@ test('streamed tool calls carry the choice index, not a hard-coded zero', async 
   }
 });
 
+test('a failed streamed turn cancels its siblings instead of waiting out the timeout', async () => {
+  // Measured before the fix: the client's error arrived at exactly
+  // `requestTimeoutMs` (3003ms on a 3000ms timeout) because the merge awaited
+  // `iterator.return()` on a sibling suspended inside `next()`, and that return
+  // queues behind the pending call. The sibling's abort came from its own
+  // timer, not from the failure.
+  const state = { aborted: false, turns: 0 };
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { throw new Error('unused'); },
+    async *stream(_request, signal) {
+      const turn = state.turns++;
+      if (turn === 0) throw new Error('this turn failed');
+      // Blocks until something aborts it — which, without a shared cancel, is
+      // only this turn's own request timer.
+      await new Promise((resolve) => {
+        if (signal?.aborted) { state.aborted = true; resolve(); return; }
+        signal?.addEventListener('abort', () => { state.aborted = true; resolve(); }, { once: true });
+      });
+      throw new Error('aborted');
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    const began = Date.now();
+    const res = await fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'a-model', messages: [{ role: 'user', content: 'ping' }], n: 2, stream: true }),
+    });
+    const text = await res.text();
+    const elapsed = Date.now() - began;
+    assert.equal(res.status, 200, 'the stream had already committed');
+    assert.match(text, /"error"/);
+    assert.ok(state.aborted, 'the surviving turn was cancelled');
+    // The request timeout is 30s; anything near it means the cancel did not
+    // reach the sibling and the timer is what ended the wait.
+    assert.ok(elapsed < 5_000, `the client waited ${elapsed}ms for an error it should have had at once`);
+  } finally {
+    await started.close();
+  }
+});
+
 test('a failed turn on the stream is an in-band error, not a truncated fan-out', async () => {
   const { backend } = countingBackend({ fail: 1 });
   const { status, text } = await post(backend, { n: 2, stream: true });

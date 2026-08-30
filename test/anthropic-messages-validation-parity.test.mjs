@@ -1,0 +1,160 @@
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+
+// The Messages twin of the Chat and Responses parity files. Every row is a
+// DIRECT API observation taken 2026-08-31 against `claude-sonnet-5`, recorded
+// in `docs/conformance-matrix.md` §5.5.7; the bodies are the rows
+// `scripts/e2e-text-surfaces-direct-parity.mjs` sends to both sides, and these
+// envelopes were taken from the proxy on a run where that instrument reported
+// ALL PASS against the live API.
+//
+// This surface's envelope is its own: `{type:"error", error:{type, message}}`
+// with neither `param` nor `code`, and its report order — derived by comparison
+// sort, 18 keys, 137 calls, antisymmetry 51/51 — is nothing like either OpenAI
+// surface's.
+
+const DELETE = Symbol('delete the key');
+const AM = [{ role: 'user', content: 'ping' }];
+
+function backend() {
+  return {
+    name: 'test',
+    model: 'configured-model',
+    // Every row here is a rejection, so reaching the backend is a broken row.
+    async generate() { throw new Error('a rejection case reached the backend'); },
+    async *stream() { throw new Error('a rejection case reached the backend'); },
+    async close() {},
+  };
+}
+
+async function messages(extra) {
+  const started = await startLocalApiProxy({ backend: backend(), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    const body = { model: 'claude-sonnet-5', max_tokens: 16, messages: AM, ...extra };
+    for (const key of Object.keys(body)) if (body[key] === DELETE) delete body[key];
+    const res = await fetch(`${started.url}/v1/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    return { status: res.status, payload: await res.json() };
+  } finally {
+    await started.close();
+  }
+}
+
+// [name, request fragment, the direct API's sentence]
+const REJECTIONS = [
+  // Required presence and type, in this surface's own order.
+  ["model absent", { model: DELETE }, "model: Field required"],
+  ["model null", { model: null }, "model: Input should be a valid string"],
+  ["model as an integer", { model: 7 }, "model: Input should be a valid string"],
+  ["model empty", { model: '' }, "model: String should have at least 1 character"],
+  ["messages absent", { messages: DELETE }, "messages: Field required"],
+  ["messages null", { messages: null }, "messages: Input should be a valid array"],
+  ["messages as a string", { messages: 'x' }, "messages: Input should be a valid array"],
+  ["messages empty", { messages: [] }, "messages: at least one message is required"],
+  ["max_tokens absent", { max_tokens: DELETE }, "max_tokens: Field required"],
+  ["max_tokens null", { max_tokens: null }, "max_tokens: Input should be a valid integer"],
+  ["max_tokens as a string", { max_tokens: 'x' }, "max_tokens: Input should be a valid integer"],
+  ["max_tokens below zero", { max_tokens: -1 }, "max_tokens: must be greater than or equal to 0"],
+  // The item level, reported at the `messages` slot.
+  ["item role missing", { messages: [{ content: 'ping' }] }, "messages.0.role: Field required"],
+  ["item role unknown", { messages: [{ role: 'bogus', content: 'ping' }] }, "messages: Unexpected role \"bogus\". Allowed roles are \"user\" or \"assistant\""],
+  ["item role system at the head", { messages: [{ role: 'system', content: 'ping' }] }, "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position"],
+  ["item role system with empty content", { messages: [{ role: 'system', content: [] }, { role: 'user', content: 'ping' }] }, "messages.0: system content must contain at least one block"],
+  ["item role developer", { messages: [{ role: 'developer', content: 'x' }, { role: 'user', content: 'ping' }] }, "messages: Unexpected role \"developer\". Allowed roles are \"user\" or \"assistant\""],
+  ["item content missing", { messages: [{ role: 'user' }] }, "messages.0.content: Field required"],
+  ["item content null", { messages: [{ role: 'user', content: null }] }, "messages.0.content: Input should be a valid array"],
+  ["item content as an integer", { messages: [{ role: 'user', content: 7 }] }, "messages.0.content: Input should be a valid array"],
+  ["item content as an object", { messages: [{ role: 'user', content: {} }] }, "messages.0.content: Input should be a valid array"],
+  ["item content empty array", { messages: [{ role: 'user', content: [] }] }, "messages.0: user messages must have non-empty content"],
+  ["item content block not an object", { messages: [{ role: 'user', content: [7] }] }, "messages.0.content.0: Input should be an object"],
+  ["item content block without a type", { messages: [{ role: 'user', content: [{}] }] }, "messages.0.content.0.type: Field required"],
+  ["item unknown member", { messages: [{ role: 'user', content: 'ping', bogus: 1 }] }, "messages.0.bogus: Extra inputs are not permitted"],
+  // Known fields, one type fault each — the rows the order sort was run on.
+  ["tool_choice as an integer", { tool_choice: 7 }, "tool_choice: Input should be an object"],
+  ["tool_choice null", { tool_choice: null }, "tool_choice: Input should be an object"],
+  ["tools as a string", { tools: 'x' }, "tools: Input should be a valid array"],
+  ["tools null", { tools: null }, "tools: Input should be a valid array"],
+  ["tools member not an object", { tools: [7] }, "tools.0: Input should be an object"],
+  ["system as an integer", { system: 7 }, "system: Input should be a valid array"],
+  ["system null", { system: null }, "system: Input should be a valid array"],
+  ["system member not an object", { system: [7] }, "system.0: Input does not match the expected shape."],
+  ["thinking as a string", { thinking: 'x' }, "thinking: Input should be an object"],
+  ["thinking null", { thinking: null }, "thinking: Input should be an object"],
+  ["output_config as a string", { output_config: 'x' }, "output_config: Input does not match the expected shape."],
+  ["output_config null", { output_config: null }, "output_config: Input does not match the expected shape."],
+  ["cache_control as a string", { cache_control: 'x' }, "cache_control: Input should be an object"],
+  ["metadata as a string", { metadata: 'x' }, "metadata: Input does not match the expected shape."],
+  ["metadata unknown member", { metadata: { bogus: 'x' } }, "metadata.bogus: Extra inputs are not permitted"],
+  ["metadata user_id as an integer", { metadata: { user_id: 7 } }, "metadata.user_id: Input should be a valid string"],
+  ["stop_sequences as a string", { stop_sequences: 'ZZ' }, "stop_sequences: Input should be a valid array"],
+  ["stop_sequences member not a string", { stop_sequences: [1] }, "stop_sequences.0: Input should be a valid string"],
+  ["temperature as a string", { temperature: 'x' }, "temperature: Input should be a valid number"],
+  ["temperature null", { temperature: null }, "temperature: Input should be a valid number"],
+  ["temperature above its range", { temperature: 2 }, "temperature: range: 0..1"],
+  ["service_tier unknown", { service_tier: 'bogus' }, "service_tier: Input should be 'auto' or 'standard_only'"],
+  ["service_tier null", { service_tier: null }, "service_tier: Input should be 'auto' or 'standard_only'"],
+  ["top_k as a string", { top_k: 'x' }, "top_k: Input should be a valid integer"],
+  ["top_k null", { top_k: null }, "top_k: Input should be a valid integer"],
+  ["top_p as a string", { top_p: 'x' }, "top_p: Input should be a valid number"],
+  ["top_p null", { top_p: null }, "top_p: Input should be a valid number"],
+  ["top_p above its range", { top_p: 1.5 }, "top_p: range: 0..1"],
+  ["stream as a string", { stream: 'yes' }, "stream: Input should be a valid boolean"],
+  ["stream null", { stream: null }, "stream: Input should be a valid boolean"],
+  ["container as an integer", { container: 7 }, "container.ContainerParams: Input does not match the expected shape."],
+  ["container by name", { container: 'container_x' }, "container: Container identifier can only be provided when using the code execution tool"],
+  ["inference_geo as an integer", { inference_geo: 7 }, "inference_geo: Input should be a valid string"],
+  ["inference_geo unknown", { inference_geo: 'bogus-geo' }, "inference_geo: must be one of ['global', 'us']"],
+  ["unknown key", { zzz_unknown: 1 }, "zzz_unknown: Extra inputs are not permitted"],
+  // The derived order, adjacent pair by adjacent pair, each sent with the
+  // LATER key first so a proxy that answered about the first key it read would
+  // fail every one of them.
+  ["order model before tool_choice", { tool_choice: 7, model: 7 }, "model: Input should be a valid string"],
+  ["order tool_choice before tools", { tools: 'x', tool_choice: 7 }, "tool_choice: Input should be an object"],
+  ["order tools before messages", { messages: 'x', tools: 'x' }, "tools: Input should be a valid array"],
+  ["order messages before system", { system: 7, messages: 'x' }, "messages: Input should be a valid array"],
+  ["order system before thinking", { thinking: 'x', system: 7 }, "system: Input should be a valid array"],
+  ["order thinking before output_config", { output_config: 'x', thinking: 'x' }, "thinking: Input should be an object"],
+  ["order output_config before cache_control", { cache_control: 'x', output_config: 'x' }, "output_config: Input does not match the expected shape."],
+  ["order cache_control before max_tokens", { max_tokens: 'x', cache_control: 'x' }, "cache_control: Input should be an object"],
+  ["order max_tokens before metadata", { metadata: 'x', max_tokens: 'x' }, "max_tokens: Input should be a valid integer"],
+  ["order metadata before stop_sequences", { stop_sequences: 'ZZ', metadata: 'x' }, "metadata: Input does not match the expected shape."],
+  ["order stop_sequences before temperature", { temperature: 'x', stop_sequences: 'ZZ' }, "stop_sequences: Input should be a valid array"],
+  ["order temperature before service_tier", { service_tier: 7, temperature: 'x' }, "temperature: Input should be a valid number"],
+  ["order service_tier before top_k", { top_k: 'x', service_tier: 7 }, "service_tier: Input should be 'auto' or 'standard_only'"],
+  ["order top_k before top_p", { top_p: 'x', top_k: 'x' }, "top_k: Input should be a valid integer"],
+  ["order top_p before stream", { stream: 'yes', top_p: 'x' }, "top_p: Input should be a valid number"],
+  ["order stream before container", { container: 7, stream: 'yes' }, "stream: Input should be a valid boolean"],
+  ["order container before inference_geo", { inference_geo: 7, container: 7 }, "container.ContainerParams: Input does not match the expected shape."],
+  // The two phases behind every known field.
+  ["order a known field beats an unknown key", { zzz_unknown: 1, inference_geo: 7 }, "inference_geo: Input should be a valid string"],
+  ["order a missing model beats an unknown key", { model: DELETE, zzz_unknown: 1 }, "model: Field required"],
+  ["order an unknown key beats the container refusal", { container: 'container_x', zzz_unknown: 1 }, "zzz_unknown: Extra inputs are not permitted"],
+  ["order a known field beats the container refusal", { container: 'container_x', inference_geo: 7 }, "inference_geo: Input should be a valid string"],
+  ["order a missing model beats a bad optional field", { model: DELETE, stop_sequences: 'ZZ' }, "model: Field required"],
+  ["order a bad item beats an unknown key", { messages: [{ role: 'user', content: 'ping', bogus: 1 }], zzz_unknown: 1 }, "messages.0.bogus: Extra inputs are not permitted"],
+];
+
+for (const [name, fragment, message] of REJECTIONS) {
+  test(`/v1/messages rejects ${name} as the direct API does`, async () => {
+    const { status, payload } = await messages(fragment);
+    assert.equal(status, 400, JSON.stringify(payload));
+    assert.equal(payload.type, 'error');
+    assert.equal(payload.error.type, 'invalid_request_error');
+    assert.equal(payload.error.message, message);
+    assert.equal(payload.error.param, undefined, 'this envelope carries no param');
+    assert.equal(payload.error.code, undefined, 'and no code');
+  });
+}
+
+test('the rows cover every key this surface knows', () => {
+  const sent = new Set();
+  for (const [, fragment] of REJECTIONS) for (const key of Object.keys(fragment)) sent.add(key);
+  const known = [
+    'model', 'messages', 'max_tokens', 'cache_control', 'container', 'inference_geo',
+    'metadata', 'output_config', 'service_tier', 'stop_sequences', 'stream', 'system',
+    'temperature', 'thinking', 'tool_choice', 'tools', 'top_k', 'top_p',
+  ];
+  assert.deepEqual(known.filter((key) => !sent.has(key)), [], 'these known keys have no row');
+});

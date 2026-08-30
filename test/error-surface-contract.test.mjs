@@ -758,7 +758,8 @@ test('/v1/messages: max_tokens is required, as on the direct API', async () => {
   const body = JSON.parse(text);
   assert.equal(body.type, 'error');
   assert.equal(body.error.type, 'invalid_request_error');
-  assert.match(body.error.message, /max_tokens is required/);
+  // The direct API's own sentence, measured 2026-08-31 — not a paraphrase.
+  assert.equal(body.error.message, 'max_tokens: Field required');
 });
 
 for (const [label, value] of [
@@ -940,7 +941,38 @@ test('/v1/messages: a system role inside messages is rejected, naming the mistak
   assert.equal(status, 400);
   const body = JSON.parse(text);
   assert.equal(body.type, 'error');
-  assert.match(body.error.message, /must be user or assistant/);
+  // Measured: `system` at index 0 is not an unknown role — the direct API
+  // recognizes it and points at the top-level parameter instead. An unknown
+  // role (`developer`) is what gets the "Allowed roles" sentence.
+  assert.equal(
+    body.error.message,
+    "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position",
+  );
+});
+
+test('/v1/messages: a system role past the head is accepted, as on the direct API', async () => {
+  // Measured 2026-08-31: a system message at index 1 returns 200. The proxy
+  // used to refuse the role at every position, which made a body the direct
+  // API runs a 400 here.
+  const { status } = await call(
+    backendThat({}),
+    '/v1/messages',
+    { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }, { role: 'system', content: 'be terse' }] },
+  );
+  assert.equal(status, 200);
+});
+
+test('/v1/messages: an unknown role still gets the "Allowed roles" sentence', async () => {
+  const { status, text } = await call(
+    backendThat({}),
+    '/v1/messages',
+    { model: 'a-model', max_tokens: 16, messages: [{ role: 'developer', content: 'x' }, { role: 'user', content: 'hi' }] },
+  );
+  assert.equal(status, 400);
+  assert.equal(
+    JSON.parse(text).error.message,
+    'messages: Unexpected role "developer". Allowed roles are "user" or "assistant"',
+  );
 });
 
 for (const [label, content] of [['null', null], ['a number', 7]]) {

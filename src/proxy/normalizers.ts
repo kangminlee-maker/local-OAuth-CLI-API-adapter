@@ -986,22 +986,219 @@ function readOpenAiVerbosity(value: unknown): NormalizedVerbosity | undefined {
   throw new ProxyRequestError('verbosity must be one of low, medium, or high.', 400);
 }
 
+
+const ANTHROPIC_ROLES = ['user', 'assistant'] as const;
+const ANTHROPIC_TOOL_CHOICE_TYPES = ['auto', 'any', 'tool', 'none'] as const;
+const ANTHROPIC_SERVICE_TIERS = ['auto', 'standard_only'] as const;
+const ANTHROPIC_INFERENCE_GEOS = ['global', 'us'] as const;
+
+function anthropicFault(message: string): ProxyRequestError {
+  return new ProxyRequestError(message, 400, 'anthropic');
+}
+
+/**
+ * Every known field, in the order the direct Messages API reports it, derived
+ * the same way the OpenAI orders were: a comparison sort over SAME-KIND (type)
+ * faults — 18 keys, 137 calls, antisymmetry 51/51 in both body orders, all 17
+ * adjacent pairs re-verified (2026-08-31, `claude-sonnet-5`). It is not
+ * alphabetical and it is not the documented parameter listing:
+ *
+ *   model → tool_choice → tools → messages → system → thinking → output_config
+ *   → cache_control → max_tokens → metadata → stop_sequences → temperature
+ *   → service_tier → top_k → top_p → stream → container → inference_geo
+ *
+ * Then unknown keys, and only then the `container` refusal — which loses to an
+ * unknown key, so it is a phase of its own rather than a check at container's
+ * slot, exactly as the OpenAI surfaces put capability refusals last.
+ *
+ * `null` is NOT uniformly omission on this surface, unlike the OpenAI ones:
+ * `metadata`, `inference_geo`, `stop_sequences`, `cache_control` and
+ * `container` take it as absence, and every other field answers about its
+ * type. Each of those was measured one at a time.
+ */
+function validateAnthropicMessagesFields(input: Record<string, unknown>): void {
+  const sent = (key: string): boolean => input[key] !== undefined;
+  const set = (key: string): boolean => input[key] !== undefined && input[key] !== null;
+
+  if (!sent('model')) throw anthropicFault('model: Field required');
+  if (typeof input.model !== 'string') throw anthropicFault('model: Input should be a valid string');
+  if (input.model.length === 0) throw anthropicFault('model: String should have at least 1 character');
+  // A whitespace-only name is a NAME to the direct API — it answers 404 model
+  // not found, as it does for any name it does not know. This proxy runs every
+  // name on its configured backend and so cannot mirror that 404; it keeps its
+  // own 400 rather than dispatching a turn for a name that is plainly a slip.
+  if (!input.model.trim()) throw anthropicFault('model: String should have at least 1 character');
+
+  if (sent('tool_choice')) validateAnthropicToolChoice(input.tool_choice);
+  if (sent('tools')) {
+    if (!Array.isArray(input.tools)) throw anthropicFault('tools: Input should be a valid array');
+    input.tools.forEach((tool, index) => {
+      if (!asRecord(tool)) throw anthropicFault(`tools.${index}: Input should be an object`);
+    });
+  }
+
+  if (!sent('messages')) throw anthropicFault('messages: Field required');
+  if (!Array.isArray(input.messages)) throw anthropicFault('messages: Input should be a valid array');
+  if (input.messages.length === 0) throw anthropicFault('messages: at least one message is required');
+  input.messages.forEach((item, index) => validateAnthropicMessageItem(item, index));
+
+  // A string is accepted too; the type sentence names only the array branch.
+  if (sent('system')) {
+    if (typeof input.system !== 'string' && !Array.isArray(input.system)) {
+      throw anthropicFault('system: Input should be a valid array');
+    }
+    if (Array.isArray(input.system)) {
+      input.system.forEach((block, index) => {
+        if (!asRecord(block)) throw anthropicFault(`system.${index}: Input does not match the expected shape.`);
+      });
+    }
+  }
+  if (sent('thinking')) {
+    if (!asRecord(input.thinking)) throw anthropicFault('thinking: Input should be an object');
+    if (asRecord(input.thinking)?.type === undefined) throw anthropicFault('thinking.type: Field required');
+  }
+  if (sent('output_config') && !asRecord(input.output_config)) {
+    throw anthropicFault('output_config: Input does not match the expected shape.');
+  }
+  if (set('cache_control') && !asRecord(input.cache_control)) {
+    throw anthropicFault('cache_control: Input should be an object');
+  }
+
+  if (!sent('max_tokens')) throw anthropicFault('max_tokens: Field required');
+  if (!Number.isInteger(input.max_tokens)) throw anthropicFault('max_tokens: Input should be a valid integer');
+  // 0 is accepted by the direct API, measured; the floor is 0, not 1.
+  if ((input.max_tokens as number) < 0) throw anthropicFault('max_tokens: must be greater than or equal to 0');
+
+  if (set('metadata')) {
+    const metadata = asRecord(input.metadata);
+    if (!metadata) throw anthropicFault('metadata: Input does not match the expected shape.');
+    for (const key of Object.keys(metadata)) {
+      if (key !== 'user_id') throw anthropicFault(`metadata.${key}: Extra inputs are not permitted`);
+    }
+    if (metadata.user_id !== undefined && metadata.user_id !== null && typeof metadata.user_id !== 'string') {
+      throw anthropicFault('metadata.user_id: Input should be a valid string');
+    }
+  }
+  if (set('stop_sequences')) {
+    if (!Array.isArray(input.stop_sequences)) throw anthropicFault('stop_sequences: Input should be a valid array');
+    input.stop_sequences.forEach((member, index) => {
+      if (typeof member !== 'string') throw anthropicFault(`stop_sequences.${index}: Input should be a valid string`);
+    });
+  }
+  for (const field of ['temperature'] as const) {
+    if (!sent(field)) continue;
+    if (typeof input[field] !== 'number' || !Number.isFinite(input[field])) {
+      throw anthropicFault(`${field}: Input should be a valid number`);
+    }
+    if ((input[field] as number) < 0 || (input[field] as number) > 1) throw anthropicFault(`${field}: range: 0..1`);
+  }
+  if (sent('service_tier') && !ANTHROPIC_SERVICE_TIERS.some((tier) => tier === input.service_tier)) {
+    throw anthropicFault(`service_tier: Input should be ${listOfQuoted(ANTHROPIC_SERVICE_TIERS, 'or')}`);
+  }
+  if (sent('top_k') && !Number.isInteger(input.top_k)) throw anthropicFault('top_k: Input should be a valid integer');
+  if (sent('top_p')) {
+    if (typeof input.top_p !== 'number' || !Number.isFinite(input.top_p)) {
+      throw anthropicFault('top_p: Input should be a valid number');
+    }
+    if (input.top_p < 0 || input.top_p > 1) throw anthropicFault('top_p: range: 0..1');
+  }
+  if (sent('stream') && typeof input.stream !== 'boolean') throw anthropicFault('stream: Input should be a valid boolean');
+  if (set('container') && typeof input.container !== 'string' && !asRecord(input.container)) {
+    throw anthropicFault('container.ContainerParams: Input does not match the expected shape.');
+  }
+  if (set('inference_geo')) {
+    if (typeof input.inference_geo !== 'string') throw anthropicFault('inference_geo: Input should be a valid string');
+    if (!ANTHROPIC_INFERENCE_GEOS.some((geo) => geo === input.inference_geo)) {
+      throw anthropicFault("inference_geo: must be one of ['global', 'us']");
+    }
+  }
+
+}
+
+/**
+ * The two phases that follow every known field's validation, in the order they
+ * were measured: an unknown key beats the `container` refusal, and every known
+ * field's fault beats them both — which is why the nested readers
+ * (`readAnthropicThinking`, `readAnthropicEffort`, ...) run before this.
+ */
+function refuseAnthropicUnknownAndContainer(input: Record<string, unknown>): void {
+  rejectUnknownAnthropicKeys(input);
+  // The direct API allows a container only alongside the code execution tool,
+  // which this proxy does not serve, so every value gets that refusal.
+  if (input.container !== undefined && input.container !== null) {
+    throw anthropicFault('container: Container identifier can only be provided when using the code execution tool');
+  }
+}
+
+function validateAnthropicToolChoice(value: unknown): void {
+  const choice = asRecord(value);
+  if (!choice) throw anthropicFault('tool_choice: Input should be an object');
+  if (choice.type === undefined) throw anthropicFault('tool_choice.type: Field required');
+  if (!ANTHROPIC_TOOL_CHOICE_TYPES.some((type) => type === choice.type)) {
+    throw anthropicFault(
+      `tool_choice: Input tag '${String(choice.type)}' found using 'type' does not match any of the expected tags: ${listOfQuoted(ANTHROPIC_TOOL_CHOICE_TYPES, 'or').replace(" or ", ", ")}`,
+    );
+  }
+}
+
+function validateAnthropicMessageItem(item: unknown, index: number): void {
+  const message = asRecord(item);
+  if (!message) throw anthropicFault(`messages.${index}: Input should be an object`);
+  if (message.role === undefined) throw anthropicFault(`messages.${index}.role: Field required`);
+  // `system` is a recognized role with a rule of its own, and only at index 0:
+  // there it is refused with guidance toward the top-level parameter, and
+  // ANYWHERE ELSE it is accepted (measured — a system message at index 1
+  // returns 200). This proxy used to refuse it at every position.
+  if (message.role === 'system') {
+    if (index > 0) return;
+    throw anthropicFault(Array.isArray(message.content) && message.content.length === 0
+      ? 'messages.0: system content must contain at least one block'
+      : "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position");
+  }
+  if (!ANTHROPIC_ROLES.some((role) => role === message.role)) {
+    throw anthropicFault(`messages: Unexpected role "${String(message.role)}". Allowed roles are "user" or "assistant"`);
+  }
+  if (message.content === undefined) throw anthropicFault(`messages.${index}.content: Field required`);
+  // A string is accepted; the type sentence names only the array branch, as
+  // `system`'s does. `null`, a number and an object all get it (measured).
+  if (typeof message.content !== 'string' && !Array.isArray(message.content)) {
+    throw anthropicFault(`messages.${index}.content: Input should be a valid array`);
+  }
+  if (Array.isArray(message.content)) {
+    if (message.content.length === 0 && message.role === 'user') {
+      throw anthropicFault(`messages.${index}: user messages must have non-empty content`);
+    }
+    message.content.forEach((block, at) => {
+      if (!asRecord(block)) throw anthropicFault(`messages.${index}.content.${at}: Input should be an object`);
+      if (asRecord(block)?.type === undefined) {
+        throw anthropicFault(`messages.${index}.content.${at}.type: Field required`);
+      }
+    });
+  }
+  for (const key of Object.keys(message)) {
+    if (!ANTHROPIC_MESSAGE_ITEM_KEYS.has(key)) {
+      throw anthropicFault(`messages.${index}.${key}: Extra inputs are not permitted`);
+    }
+  }
+}
+
 export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequest {
   const input = objectBody(body);
+  // One walk, in the measured order, before any of the body is read: the
+  // checks used to be spread through the normalization below, which reported
+  // an optional field's fault ahead of a missing `model` and let several known
+  // fields through unvalidated (`stream: "yes"` became buffered mode).
+  validateAnthropicMessagesFields(input);
   const messages: NormalizedMessage[] = [];
   const system = flattenAnthropicSystem(input.system);
   if (system) messages.push({ role: 'system', content: system, images: [] });
   messages.push(...readAnthropicMessages(input.messages));
-  // The CONTAINER is not nullable on the direct API — its leaves are. A
-  // present non-object here silently disabled every output control.
-  if (input.output_config !== undefined && !asRecord(input.output_config)) {
-    throw new ProxyRequestError('output_config must be an object.', 400, 'anthropic');
-  }
   const outputConfig = asRecord(input.output_config);
-  const maxTokens = readRequiredMaxTokens(input.max_tokens);
-  rejectInvalidAnthropicSampling(input);
-  const stopSequences = readAnthropicStopSequences(input.stop_sequences);
-  validateAnthropicAcceptedFields(input);
+  const maxTokens = input.max_tokens as number;
+  const stopSequences = Array.isArray(input.stop_sequences) ? (input.stop_sequences as string[]) : [];
+  // `thinking` is read before any `output_config` leaf: measured, a bad
+  // `thinking.type` beats a bad `output_config.effort`.
+  const thinking = readAnthropicThinking(input.thinking, maxTokens);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
   const toolChoice = readAnthropicToolChoice(input.tool_choice);
@@ -1019,14 +1216,10 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
       'anthropic',
     );
   }
-  // Every known field is validated before an unknown key is reported — the
-  // order the direct API reports in (measured with `max_tokens` and
-  // `temperature` faults beside an unknown key).
-  const model = readRequiredModel(input.model, 'anthropic');
+  const model = input.model as string;
   const effort = readAnthropicEffort(outputConfig?.effort);
   const taskBudgetTokens = readAnthropicTaskBudget(outputConfig?.task_budget);
-  const thinking = readAnthropicThinking(input.thinking, maxTokens);
-  rejectUnknownAnthropicKeys(input);
+  refuseAnthropicUnknownAndContainer(input);
   return {
     shape: 'anthropic-messages',
     model,
@@ -1478,42 +1671,18 @@ function readResponsesRole(msg: Record<string, unknown>, index: number): Normali
   );
 }
 
+/**
+ * Reads messages the walk has already validated. It used to validate them a
+ * second time with sentences of its own — two validators for one contract, and
+ * the second one refused `role: "system"` at every position, which the direct
+ * API accepts anywhere but the head.
+ */
 function readAnthropicMessages(value: unknown): NormalizedMessage[] {
-  if (!Array.isArray(value)) {
-    throw new ProxyRequestError('messages must be an array.', 400, 'anthropic');
-  }
-  if (value.length === 0) {
-    throw new ProxyRequestError('messages must contain at least one message.', 400, 'anthropic');
-  }
-  return value.map((item, index) => {
-    const msg = asRecord(item);
-    if (!msg) throw new ProxyRequestError('Each message must be an object.', 400, 'anthropic');
-    const role = msg.role;
-    if (role !== 'user' && role !== 'assistant') {
-      // The direct API's whole role set for messages[]; `system` in particular
-      // is a top-level field there, not a role, and rewriting it to `user`
-      // hid that mistake instead of reporting it.
-      throw new ProxyRequestError(
-        role === undefined || role === null
-          ? `messages.${index}.role is required.`
-          : `messages.${index}.role must be user or assistant.`,
-        400,
-        'anthropic',
-      );
-    }
-    const content = msg.content;
-    if (typeof content !== 'string' && !Array.isArray(content)) {
-      throw new ProxyRequestError(
-        content === undefined || content === null
-          ? `messages.${index}.content is required.`
-          : `messages.${index}.content must be a string or an array of content blocks.`,
-        400,
-        'anthropic',
-      );
-    }
+  return (value as unknown[]).map((item) => {
+    const msg = asRecord(item) as Record<string, unknown>;
     const flattened = flattenAnthropicMessage(msg);
     return {
-      role,
+      role: msg.role as NormalizedMessage['role'],
       content: flattened.text,
       images: flattened.images,
       ...(flattened.toolHistory ? { toolHistory: true } : {}),

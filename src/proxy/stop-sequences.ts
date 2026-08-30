@@ -79,39 +79,71 @@ export class StopSequenceGate {
     if (this.matched) return '';
     const buffer = this.held + delta;
     const match = matchStopSequence(buffer, this.sequences);
-    if (match) {
+    // A match is not enough: a sequence that is still only half-arrived can
+    // beat it once the rest lands. With `["abc","ab"]` and the text `XabcY`,
+    // `ab` matches the moment `Xab` arrives, but the buffered path answers
+    // `abc` — same index, and `abc` is listed first. Committing here would
+    // make the same turn report a different `stop_sequence` depending on
+    // whether the caller streamed it.
+    const pending = pendingWinnerIndex(buffer, this.sequences, match);
+    if (match && pending === -1) {
       this.held = '';
       this.matched = match.sequence;
       return buffer.slice(0, match.index);
     }
-    const hold = partialSuffixLength(buffer, this.sequences);
-    this.held = hold === 0 ? '' : buffer.slice(buffer.length - hold);
-    return buffer.slice(0, buffer.length - hold);
+    const holdFrom = pending === -1 ? buffer.length : pending;
+    this.held = buffer.slice(holdFrom);
+    return buffer.slice(0, holdFrom);
   }
 
-  /** The held-back tail, once the turn has ended without a match. */
+  /** What the gate is still holding back, without resolving anything. */
+  get pending(): string {
+    return this.held;
+  }
+
+  /**
+   * The turn is over, so nothing outstanding can arrive to beat a match any
+   * more: whatever is held resolves now. Without this the deferral above would
+   * turn a real match into no match at all — `["abc","ab"]` over a turn that
+   * ends at `ab` must still report `ab`, as the buffered path does.
+   */
   flush(): string {
     if (this.matched) return '';
-    const rest = this.held;
+    const buffer = this.held;
     this.held = '';
-    return rest;
+    const match = matchStopSequence(buffer, this.sequences);
+    if (!match) return buffer;
+    this.matched = match.sequence;
+    return buffer.slice(0, match.index);
   }
 }
 
 /**
- * How much of the buffer's tail could still turn into a sequence: the longest
- * suffix of `buffer` that is a proper prefix of one of them.
+ * Where the earliest still-possible sequence would start, counting only the
+ * ones that would BEAT `match` — start earlier, or start level and be listed
+ * earlier, which is exactly `matchStopSequence`'s own rule. Returns -1 when
+ * nothing outstanding can change the answer, which is the only moment a match
+ * is safe to commit.
+ *
+ * A half-arrived sequence always runs to the end of the buffer, so only the
+ * buffer's suffixes can be one, and the longest qualifying suffix is the
+ * earliest start.
  */
-function partialSuffixLength(buffer: string, sequences: readonly string[]): number {
-  let longest = 0;
-  for (const sequence of sequences) {
-    const max = Math.min(sequence.length - 1, buffer.length);
-    for (let length = max; length > longest; length -= 1) {
-      if (sequence.startsWith(buffer.slice(buffer.length - length))) {
-        longest = length;
-        break;
-      }
+function pendingWinnerIndex(
+  buffer: string,
+  sequences: readonly string[],
+  match: StopSequenceMatch | null,
+): number {
+  const matchRank = match ? sequences.indexOf(match.sequence) : -1;
+  const longest = Math.max(0, ...sequences.map((sequence) => sequence.length - 1));
+  for (let length = Math.min(longest, buffer.length); length > 0; length -= 1) {
+    const index = buffer.length - length;
+    if (match && index > match.index) continue;
+    const tail = buffer.slice(index);
+    for (const [rank, sequence] of sequences.entries()) {
+      if (sequence.length <= tail.length || !sequence.startsWith(tail)) continue;
+      if (!match || index < match.index || rank < matchRank) return index;
     }
   }
-  return longest;
+  return -1;
 }

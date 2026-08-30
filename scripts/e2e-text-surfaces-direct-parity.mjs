@@ -24,6 +24,10 @@ const args = process.argv.slice(2);
 const generate = args.includes('--generate');
 const only = readArg('--only');
 const DIRECT = 'https://api.openai.com';
+const ANTHROPIC = 'https://api.anthropic.com';
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_MODEL = readArg('--anthropic-model') ?? 'claude-sonnet-5';
+const MESSAGES = '/v1/messages';
 const CHAT = '/v1/chat/completions';
 const MODEL = readArg('--model') ?? 'gpt-5.6-terra';
 
@@ -74,6 +78,33 @@ function envelope(r) {
     : { status: r.status, keys: Object.keys(r.json ?? {}).sort() };
 }
 
+// The Anthropic envelope is its own shape: `{type:'error', error:{type,message}}`
+// with neither `param` nor `code`, so it gets its own reader and its own
+// comparison rather than being forced through the OpenAI one.
+function anthropicEnvelope(r) {
+  return r.json?.error
+    ? { status: r.status, type: r.json.error.type, message: r.json.error.message }
+    : { status: r.status, keys: Object.keys(r.json ?? {}).sort() };
+}
+
+async function anthropicParity(name, body) {
+  const sent = { model: ANTHROPIC_MODEL, max_tokens: 16, messages: [{ role: 'user', content: 'ping' }], ...body };
+  for (const key of Object.keys(sent)) if (sent[key] === DELETE) delete sent[key];
+  const [p, d] = await Promise.all([
+    post(started.url, MESSAGES, sent),
+    post(ANTHROPIC, MESSAGES, sent, { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' }),
+  ]);
+  const pe = anthropicEnvelope(p);
+  const de = anthropicEnvelope(d);
+  const same = JSON.stringify(pe) === JSON.stringify(de);
+  record(`parity ${name}`, same, same
+    ? `→ ${de.status} ${de.message ?? ''}`
+    : `\n   proxy : ${JSON.stringify(pe)}\n   direct: ${JSON.stringify(de)}`);
+  if (d.status === 200 && !generate) {
+    process.stdout.write(`   !! the direct API accepted "${name}" — that case is not a free probe\n`);
+  }
+}
+
 async function parity(name, path, body) {
   const sent = { model: MODEL, ...body };
   for (const key of Object.keys(sent)) if (sent[key] === DELETE) delete sent[key];
@@ -94,6 +125,44 @@ async function parity(name, path, body) {
 
 const DELETE = Symbol('delete the key');
 const M = [{ role: 'user', content: 'ping' }];
+const WRONG = { __probe__: 'wrong type' };
+
+/**
+ * The adjacent edges of a measured report order, generated from ONE list
+ * instead of hand-picked. A hand-picked subset is how `store` and `metadata`
+ * came to sit next to each other in the Chat validator with nothing pinning
+ * the pair: swapping the two checks changed which fault a two-fault body
+ * reported and no row noticed.
+ *
+ * Only keys whose WRONG-TYPE value makes the direct API answer about that key
+ * belong in a list here — the always-refused ones (`stop`, `logit_bias`,
+ * `max_tokens`, ...) answer `unsupported_parameter` whatever you send, and a
+ * mixed-kind pair does not test the order at all. Those keep their own
+ * hand-written rows above, because kind changes the order.
+ *
+ * Each row sends the LATER key first, so a surface that answered about the
+ * first key it read would fail every one of them.
+ */
+function adjacentOrderRows(order, base) {
+  const rows = [];
+  for (let i = 0; i + 1 < order.length; i += 1) {
+    const [[a, aFault], [b, bFault]] = [order[i], order[i + 1]];
+    rows.push([`order ${a} before ${b} (adjacent)`, { ...base, [b]: bFault, [a]: aFault }]);
+  }
+  return rows;
+}
+
+// The Chat order (§5.5.5), restricted to its type-faultable keys: 22 of 33,
+// every adjacent edge of them measured 2026-08-31 (20 by sweep, 2 by hand).
+const CHAT_TYPE_FAULT_ORDER = [
+  ['messages', 'wrong type'], ['functions', 'wrong type'], ['tools', 'wrong type'],
+  ['parallel_tool_calls', WRONG], ['max_completion_tokens', WRONG], ['n', WRONG],
+  ['temperature', WRONG], ['top_p', WRONG], ['presence_penalty', WRONG], ['frequency_penalty', WRONG],
+  ['logprobs', WRONG], ['top_logprobs', WRONG], ['user', WRONG], ['seed', WRONG],
+  ['safety_identifier', WRONG], ['prompt_cache_key', WRONG], ['prompt_cache_retention', WRONG],
+  ['service_tier', WRONG], ['stream', WRONG], ['store', WRONG], ['metadata', 'wrong type'],
+  ['verbosity', WRONG],
+];
 const TOOL = { type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } };
 
 // Each row is one body both sides must answer identically. They are the same
@@ -205,6 +274,7 @@ const chatCases = [
   ['order metadata before a refused temperature', { messages: M, temperature: 0.5, metadata: 'x' }],
   ['order verbosity before a refused logprobs', { messages: M, logprobs: true, verbosity: 'bogus' }],
   ['order reasoning_effort before metadata', { messages: M, reasoning_effort: 'bogus', metadata: 'x' }],
+  ...adjacentOrderRows(CHAT_TYPE_FAULT_ORDER, { messages: M }),
 ];
 
 // The Responses surface. Same rule as the Chat rows: every default case is
@@ -369,6 +439,108 @@ if (!only || only === 'chat') {
 }
 if (!only || only === 'responses') {
   for (const [name, body] of responsesCases) await parity(name, '/v1/responses', body);
+}
+
+// The Anthropic Messages surface. Its report order was derived the same way the
+// OpenAI ones were — a comparison sort over type faults, 18 keys, antisymmetry
+// checked in both body orders — and these rows are the pairs it rests on.
+const AM = [{ role: 'user', content: 'ping' }];
+const messagesCases = [
+  // Required presence and type, in this surface's own order.
+  ['messages model absent', { model: DELETE }],
+  ['messages model null', { model: null }],
+  ['messages model as an integer', { model: 7 }],
+  ['messages model empty', { model: '' }],
+  ['messages messages absent', { messages: DELETE }],
+  ['messages messages null', { messages: null }],
+  ['messages messages as a string', { messages: 'x' }],
+  ['messages messages empty', { messages: [] }],
+  ['messages max_tokens absent', { max_tokens: DELETE }],
+  ['messages max_tokens null', { max_tokens: null }],
+  ['messages max_tokens as a string', { max_tokens: 'x' }],
+  ['messages max_tokens below zero', { max_tokens: -1 }],
+  // The item level, reported at the `messages` slot.
+  ['messages item role missing', { messages: [{ content: 'ping' }] }],
+  ['messages item role unknown', { messages: [{ role: 'bogus', content: 'ping' }] }],
+  ['messages item role system at the head', { messages: [{ role: 'system', content: 'ping' }] }],
+  ['messages item role system with empty content', { messages: [{ role: 'system', content: [] }, { role: 'user', content: 'ping' }] }],
+  ['messages item role developer', { messages: [{ role: 'developer', content: 'x' }, { role: 'user', content: 'ping' }] }],
+  ['messages item content missing', { messages: [{ role: 'user' }] }],
+  ['messages item content null', { messages: [{ role: 'user', content: null }] }],
+  ['messages item content as an integer', { messages: [{ role: 'user', content: 7 }] }],
+  ['messages item content as an object', { messages: [{ role: 'user', content: {} }] }],
+  ['messages item content empty array', { messages: [{ role: 'user', content: [] }] }],
+  ['messages item content block not an object', { messages: [{ role: 'user', content: [7] }] }],
+  ['messages item content block without a type', { messages: [{ role: 'user', content: [{}] }] }],
+  ['messages item unknown member', { messages: [{ role: 'user', content: 'ping', bogus: 1 }] }],
+  // Known fields, one type fault each — the rows the order sort was run on.
+  ['messages tool_choice as an integer', { tool_choice: 7 }],
+  ['messages tool_choice null', { tool_choice: null }],
+  ['messages tools as a string', { tools: 'x' }],
+  ['messages tools null', { tools: null }],
+  ['messages tools member not an object', { tools: [7] }],
+  ['messages system as an integer', { system: 7 }],
+  ['messages system null', { system: null }],
+  ['messages system member not an object', { system: [7] }],
+  ['messages thinking as a string', { thinking: 'x' }],
+  ['messages thinking null', { thinking: null }],
+  ['messages output_config as a string', { output_config: 'x' }],
+  ['messages output_config null', { output_config: null }],
+  ['messages cache_control as a string', { cache_control: 'x' }],
+  ['messages metadata as a string', { metadata: 'x' }],
+  ['messages metadata unknown member', { metadata: { bogus: 'x' } }],
+  ['messages metadata user_id as an integer', { metadata: { user_id: 7 } }],
+  ['messages stop_sequences as a string', { stop_sequences: 'ZZ' }],
+  ['messages stop_sequences member not a string', { stop_sequences: [1] }],
+  ['messages temperature as a string', { temperature: 'x' }],
+  ['messages temperature null', { temperature: null }],
+  ['messages temperature above its range', { temperature: 2 }],
+  ['messages service_tier unknown', { service_tier: 'bogus' }],
+  ['messages service_tier null', { service_tier: null }],
+  ['messages top_k as a string', { top_k: 'x' }],
+  ['messages top_k null', { top_k: null }],
+  ['messages top_p as a string', { top_p: 'x' }],
+  ['messages top_p null', { top_p: null }],
+  ['messages top_p above its range', { top_p: 1.5 }],
+  ['messages stream as a string', { stream: 'yes' }],
+  ['messages stream null', { stream: null }],
+  ['messages container as an integer', { container: 7 }],
+  ['messages container by name', { container: 'container_x' }],
+  ['messages inference_geo as an integer', { inference_geo: 7 }],
+  ['messages inference_geo unknown', { inference_geo: 'bogus-geo' }],
+  ['messages unknown key', { zzz_unknown: 1 }],
+  // The derived order, adjacent pair by adjacent pair, each sent with the
+  // LATER key first so a proxy that answered about the first key it read would
+  // fail every one of them.
+  ['messages order model before tool_choice', { tool_choice: 7, model: 7 }],
+  ['messages order tool_choice before tools', { tools: 'x', tool_choice: 7 }],
+  ['messages order tools before messages', { messages: 'x', tools: 'x' }],
+  ['messages order messages before system', { system: 7, messages: 'x' }],
+  ['messages order system before thinking', { thinking: 'x', system: 7 }],
+  ['messages order thinking before output_config', { output_config: 'x', thinking: 'x' }],
+  ['messages order output_config before cache_control', { cache_control: 'x', output_config: 'x' }],
+  ['messages order cache_control before max_tokens', { max_tokens: 'x', cache_control: 'x' }],
+  ['messages order max_tokens before metadata', { metadata: 'x', max_tokens: 'x' }],
+  ['messages order metadata before stop_sequences', { stop_sequences: 'ZZ', metadata: 'x' }],
+  ['messages order stop_sequences before temperature', { temperature: 'x', stop_sequences: 'ZZ' }],
+  ['messages order temperature before service_tier', { service_tier: 7, temperature: 'x' }],
+  ['messages order service_tier before top_k', { top_k: 'x', service_tier: 7 }],
+  ['messages order top_k before top_p', { top_p: 'x', top_k: 'x' }],
+  ['messages order top_p before stream', { stream: 'yes', top_p: 'x' }],
+  ['messages order stream before container', { container: 7, stream: 'yes' }],
+  ['messages order container before inference_geo', { inference_geo: 7, container: 7 }],
+  // The two phases behind every known field.
+  ['messages order a known field beats an unknown key', { zzz_unknown: 1, inference_geo: 7 }],
+  ['messages order a missing model beats an unknown key', { model: DELETE, zzz_unknown: 1 }],
+  ['messages order an unknown key beats the container refusal', { container: 'container_x', zzz_unknown: 1 }],
+  ['messages order a known field beats the container refusal', { container: 'container_x', inference_geo: 7 }],
+  ['messages order a missing model beats a bad optional field', { model: DELETE, stop_sequences: 'ZZ' }],
+  ['messages order a bad item beats an unknown key', { messages: [{ role: 'user', content: 'ping', bogus: 1 }], zzz_unknown: 1 }],
+];
+
+if (!only || only === 'messages') {
+  if (!ANTHROPIC_KEY) throw new Error('ANTHROPIC_API_KEY is not set; the messages rows need it.');
+  for (const [name, body] of messagesCases) await anthropicParity(name, body);
 }
 
 // The accepted rows: identical bodies on both sides, compared on the fields
