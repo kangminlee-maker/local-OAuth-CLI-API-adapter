@@ -108,6 +108,13 @@ const REJECTIONS = [
   ['a message with no role', { messages: [{ content: 'ping' }] }, { param: 'messages[0].role', code: 'missing_required_parameter', message: "Missing required parameter: 'messages[0].role'." }],
   ['a moderation object with no model', { moderation: {} }, { param: 'moderation.model', code: 'missing_required_parameter', message: "Missing required parameter: 'moderation.model'." }],
 
+  // Ranges and nested unions.
+  ['frequency_penalty above its range', { reasoning_effort: 'none', frequency_penalty: 3 }, { param: 'frequency_penalty', code: 'decimal_above_max_value', message: "Invalid 'frequency_penalty': decimal above maximum value. Expected a value <= 2, but got 3 instead." }],
+  ['presence_penalty below its range', { reasoning_effort: 'none', presence_penalty: -3 }, { param: 'presence_penalty', code: 'decimal_below_min_value', message: "Invalid 'presence_penalty': decimal below minimum value. Expected a value >= -2, but got -3 instead." }],
+  ['a json_schema format with no schema member', { response_format: { type: 'json_schema' } }, { param: 'response_format.json_schema', code: 'missing_required_parameter', message: "Missing required parameter: 'response_format.json_schema'." }],
+  ['a json_schema member with no name', { response_format: { type: 'json_schema', json_schema: {} } }, { param: 'response_format.json_schema.name', code: 'missing_required_parameter', message: "Missing required parameter: 'response_format.json_schema.name'." }],
+  ['an unknown stream_options member', { stream_options: { bogus: 1 } }, { param: 'stream_options.bogus', code: 'unknown_parameter', message: "Unknown parameter: 'stream_options.bogus'." }],
+
   // Values this family refuses although the key is known and well-typed.
   ['prompt_cache_retention in_memory', { prompt_cache_retention: 'in_memory' }, { param: 'prompt_cache_retention', code: null, message: 'This model is compatible only with 24h extended prompt caching' }],
   ['an unknown prompt_cache_options member', { prompt_cache_options: { bogus: 1 } }, { param: 'prompt_cache_options.bogus', code: 'unknown_parameter', message: "Unknown parameter: 'prompt_cache_options.bogus'." }],
@@ -138,6 +145,26 @@ const ORDER = [
   ['n is reported before temperature', { n: 'abc', temperature: 0.5 }, { param: 'n', message: "Invalid type for 'n': expected an integer, but got a string instead." }],
   ['n is reported before stop even as a bound fault', { n: 0, stop: ['ZZ'] }, { param: 'n', message: "Invalid 'n': integer below minimum value. Expected a value >= 1, but got 0 instead." }],
   ['stop is reported before temperature', { stop: ['ZZ'], temperature: 0.5 }, { param: 'stop', message: "Unsupported parameter: 'stop' is not supported with this model." }],
+  // The order is measured, not alphabetical: each of these pairs was sent to
+  // the direct API and the winner recorded (§5.5.5). They are here because a
+  // hand-picked subset let a reordering of two checks pass unnoticed.
+  ['seed before service_tier', { seed: 1.5, service_tier: 'bogus' }, { param: 'seed', message: "Invalid type for 'seed': expected an integer, but got a decimal number instead." }],
+  ['n before metadata', { metadata: { k: 7 }, n: 0 }, { param: 'n', message: "Invalid 'n': integer below minimum value. Expected a value >= 1, but got 0 instead." }],
+  ['max_completion_tokens before logprobs', { logprobs: 'x', max_completion_tokens: 0 }, { param: 'max_completion_tokens', message: "Invalid 'max_completion_tokens': integer below minimum value. Expected a value >= 1, but got 0 instead." }],
+  ['messages before metadata', { messages: [7], metadata: { k: 7 } }, { param: 'messages[0]', message: "Invalid type for 'messages[0]': expected an object, but got an integer instead." }],
+  ['n before moderation', { moderation: {}, n: 0 }, { param: 'n', message: "Invalid 'n': integer below minimum value. Expected a value >= 1, but got 0 instead." }],
+  ['stream before store', { store: 'x', stream: 'y' }, { param: 'stream', message: "Invalid type for 'stream': expected a boolean, but got a string instead." }],
+  ['tools before top_logprobs', { tools: 'x', top_logprobs: -1 }, { param: 'tools', message: "Invalid type for 'tools': expected an array of objects, but got a string instead." }],
+  ['user before verbosity', { user: 7, verbosity: 'bogus' }, { param: 'user', message: "Invalid type for 'user': expected a string, but got an integer instead." }],
+  ['functions before function_call', { function_call: {}, functions: 'x' }, { param: 'functions', message: "Invalid type for 'functions': expected an array of function definitions, but got a string instead." }],
+  ['prompt_cache_options before prompt_cache_key', { prompt_cache_key: 7, prompt_cache_options: 'x' }, { param: 'prompt_cache_options', message: "Invalid type for 'prompt_cache_options': expected an object, but got a string instead." }],
+  ['max_tokens before store', { max_tokens: 32, store: 'x' }, { param: 'max_tokens', message: "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead." }],
+  ['stop before stream_options', { stop: ['ZZ'], stream_options: 'x' }, { param: 'stop', message: "Unsupported parameter: 'stop' is not supported with this model." }],
+  ['stop before verbosity', { stop: ['ZZ'], verbosity: 'bogus' }, { param: 'stop', message: "Unsupported parameter: 'stop' is not supported with this model." }],
+  ['metadata before prediction', { prediction: { type: 'content', content: 'p' }, metadata: 'x' }, { param: 'metadata', message: "Invalid type for 'metadata': expected a metadata object, but got a string instead." }],
+  ['logit_bias before verbosity', { logit_bias: { 1: 1 }, verbosity: 'bogus' }, { param: 'logit_bias', message: "Unsupported parameter: 'logit_bias' is not supported with this model." }],
+  ['metadata before a refused temperature value', { temperature: 0.5, metadata: 'x' }, { param: 'metadata', message: "Invalid type for 'metadata': expected a metadata object, but got a string instead." }],
+  ['verbosity before a refused logprobs', { logprobs: true, verbosity: 'bogus' }, { param: 'verbosity', message: "Invalid value: 'bogus'. Supported values are: 'low', 'medium', and 'high'." }],
 ];
 
 for (const [name, fragment, expected] of ORDER) {
@@ -161,6 +188,26 @@ test('chat accepts the keys the direct API accepts and does not apply', async ()
   assert.equal(status, 200);
 });
 
+// A rejection table proves the far side of a bound; without the near side, a
+// `>` that became a `>=` refuses a valid request and every rejection still
+// passes. These are the exact boundaries.
+for (const [name, fragment] of [
+  ['n at 1', { n: 1 }],
+  ['n at 8', { n: 8 }],
+  ['max_completion_tokens at 1', { max_completion_tokens: 1 }],
+  ['top_logprobs at 0', { reasoning_effort: 'none', logprobs: true, top_logprobs: 0 }],
+  ['top_logprobs at 5', { reasoning_effort: 'none', logprobs: true, top_logprobs: 5 }],
+  ['metadata with exactly 16 properties', { metadata: Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`k${i}`, 'v'])) }],
+  ['a metadata key of exactly 64 characters', { metadata: { ['k'.repeat(64)]: 'v' } }],
+  ['a metadata value of exactly 512 characters', { metadata: { k: 'x'.repeat(512) } }],
+  ['penalties at their bounds', { reasoning_effort: 'none', frequency_penalty: 2, presence_penalty: -2 }],
+]) {
+  test(`chat accepts ${name} — the valid side of the bound`, async () => {
+    const { status, payload } = await chat(fragment);
+    assert.equal(status, 200, JSON.stringify(payload));
+  });
+}
+
 test('chat accepts the penalties and logprobs once the model stops reasoning', async () => {
   const { status } = await chat({ reasoning_effort: 'none', frequency_penalty: 0.5, presence_penalty: 0.5, logprobs: true, top_logprobs: 5 });
   assert.equal(status, 200);
@@ -172,9 +219,10 @@ test('chat accepts a message with no content, and one with null content', async 
 });
 
 // `service_tier` is echoed, so it is the one accepted-and-not-applied key with
-// a visible answer: the direct API returns the tier the caller asked for
-// (`flex` in, `flex` out, measured), and `auto`/absent resolve to `default`.
-for (const [sent, echoed] of [[undefined, 'default'], ['auto', 'default'], ['default', 'default'], ['flex', 'flex'], ['priority', 'priority'], ['fast', 'fast']]) {
+// a visible answer — and the answer is NOT the request: `fast` comes back as
+// `priority`, `auto` and an omitted value as `default` (measured 2026-08-30 on
+// both surfaces).
+for (const [sent, echoed] of [[undefined, 'default'], ['auto', 'default'], ['default', 'default'], ['flex', 'flex'], ['priority', 'priority'], ['fast', 'priority']]) {
   test(`chat echoes service_tier ${sent ?? '(absent)'} as ${echoed}`, async () => {
     const { status, payload } = await chat(sent === undefined ? {} : { service_tier: sent });
     assert.equal(status, 200);
@@ -198,9 +246,72 @@ test('the chat stream reports the same service_tier as the body', async () => {
   }
 });
 
+test('chat runs function tools with a reasoning effort, the one declared divergence', async () => {
+  // `spec/declared-divergences.json` says this proxy accepts a combination the
+  // direct API refuses for the gpt-5.6 family. A declaration nothing exercises
+  // is a claim: this asserts the request reaches the backend, so a cross-field
+  // rejection added later fails here instead of quietly making the
+  // declaration false.
+  const { readFile } = await import('node:fs/promises');
+  const declared = JSON.parse(await readFile(new URL('../spec/declared-divergences.json', import.meta.url), 'utf8'));
+  assert.ok(
+    declared.divergences.some((entry) => entry.claim === 'chat-function-tools-with-reasoning-effort'),
+    'the declaration this test guards is missing; remove the test with it',
+  );
+  let reached = false;
+  const started = await startLocalApiProxy({
+    backend: {
+      name: 'test', model: 'configured-model',
+      async generate() {
+        reached = true;
+        return { id: 'x', model: 'configured-model', text: 'ok', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 };
+      },
+      async close() {},
+    },
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'a-model', messages: [{ role: 'user', content: 'ping' }],
+        reasoning_effort: 'high',
+        tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }],
+      }),
+    });
+    assert.equal(res.status, 200);
+    assert.ok(reached, 'the turn must reach the backend, which is what the divergence claims');
+  } finally {
+    await started.close();
+  }
+});
+
+test('the Python-style rendering of a refused value is Python, not string surgery', async () => {
+  // A caller's apostrophe used to come back as `{'k': 'a'b'}`, which says
+  // something the value does not.
+  const { payload } = await chat({ reasoning_effort: { k: "a'b" } });
+  assert.match(payload.error.message, /\{'k': "a'b"\}/);
+});
+
 // The Responses surface echoes it too, and shares the resolver.
-test('responses echoes the requested service_tier', async () => {
+test('responses echoes the resolved service_tier', async () => {
   const { status, payload } = await chat({ input: 'ping', messages: '__delete__', service_tier: 'flex' }, '/v1/responses');
   assert.equal(status, 200);
   assert.equal(payload.service_tier, 'flex');
+});
+
+test('responses refuses an unknown service_tier instead of echoing it', async () => {
+  // The echo made an unvalidated request value visible in the response; the
+  // direct API answers this body with `invalid_value` (measured 2026-08-30).
+  const { status, payload } = await chat({ input: 'ping', messages: '__delete__', service_tier: 'bogus' }, '/v1/responses');
+  assert.equal(status, 400);
+  assert.equal(payload.error.param, 'service_tier');
+  assert.equal(payload.error.code, 'invalid_value');
+  assert.equal(payload.error.message, "Invalid value: 'bogus'. Supported values are: 'auto', 'default', 'fast', 'flex', and 'priority'.");
+});
+
+test('responses resolves fast to priority, as the direct API does', async () => {
+  const { status, payload } = await chat({ input: 'ping', messages: '__delete__', service_tier: 'fast' }, '/v1/responses');
+  assert.equal(status, 200);
+  assert.equal(payload.service_tier, 'priority');
 });

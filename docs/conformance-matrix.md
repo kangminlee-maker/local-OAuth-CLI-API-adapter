@@ -237,7 +237,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-14 | `temperature` | number **0..1** | (not applied) | sampling | 400 `invalid_request_error` `temperature: range: 0..1`; non-number or **null** → `temperature: Input should be a valid number` (measured 2026-08-30) | mirrored (`rejectInvalidAnthropicSampling`); a valid value is accepted and inert — the Claude CLI has no sampling control, and nothing echoes it | VERIFIED (§5.5.4) |
 | A-15 | `top_p` | number 0..1 | (not applied) | nucleus | `top_p: range: 0..1` / `Input should be a valid number` (measured) | mirrored; accepted and inert | VERIFIED (§5.5.4) |
 | A-16 | `top_k` | integer (negatives accepted by the direct API) | (not applied) | top-K truncation | non-integer → `top_k: Input should be a valid integer` (measured); `-1` accepted | mirrored; accepted and inert | VERIFIED (§5.5.4) |
-| A-17 | `stop_sequences` | array of strings | `[]` | stops output; `stop_reason:"stop_sequence"` **and `stop_sequence` echoes the matched string** | 400 / `invalid_request_error` | **silently ignored** — never read, yet the response emits `stop_sequence: result.stopSequence ?? null` (`http-server.ts:1896`), which can therefore never reflect a client sequence | DOC |
+| A-17 | `stop_sequences` | array of strings | `[]` | stops output; `stop_reason:"stop_sequence"` **and `stop_sequence` echoes the matched string** | 400 / `invalid_request_error` | **realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`) | VERIFIED (P-8, §5.5.5-A) |
 | A-18 | `stream` | boolean | `false` | SSE events | 400 / `invalid_request_error` | supported | VERIFIED-weak (`anthropic.messages.stream`) |
 | A-19 | `tools` | array of `{name, description, input_schema}` + server tools (`web_search`, `bash`, `text_editor`, `computer`, …) | absent | `tool_use` blocks; `stop_reason:"tool_use"` | 400 / `invalid_request_error` | **custom tools only**; server-tool entries UNKNOWN (probe P-35) | VERIFIED-weak (`anthropic.messages.tool_use`) |
 | A-20 | `tools[].input_schema` | JSON Schema object, required | none | argument shape | 400 / `invalid_request_error` | preserved (contract `:311`) | DOC |
@@ -247,15 +247,15 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-24 | `output_config.format` | `{type:"json_schema", schema}` | absent | structured output | 400 / `invalid_request_error` | supported; **rejected together with tools unless `tool_choice:"none"`** (`normalizers.ts:110-125`) — a restriction the provider does not impose | DOC |
 | A-25 | `output_config.task_budget` | `{type:"tokens", total ≥ 20000}` | UNKNOWN | total task token budget | 400 / `invalid_request_error` | validated; forwarding UNKNOWN (contract `:320`) | DOC? |
 | A-26 | `output_format` (top level, deprecated) | object | absent | superseded by `output_config.format` | 400 / `invalid_request_error` | refused as an unknown key (`output_format: Extra inputs are not permitted`) since 7a8bef6 — not in the measured key set | VERIFIED (§5.5.4 key set) |
-| A-27 | `metadata.user_id` | opaque string | absent | abuse detection | 400 / `invalid_request_error` | **silently ignored** | DOC |
-| A-28 | `service_tier` | `auto`\|`standard_only` | `"auto"` | **`usage.service_tier` in the response** ( `"priority"` / `"standard"` ) | 400 / `invalid_request_error` | **silently ignored**; `usage.service_tier` never emitted | DOC |
+| A-27 | `metadata.user_id` | opaque string | absent | abuse detection | 400 / `invalid_request_error` | validated as the direct API validates it — `user_id` only, and a string — then not applied | VERIFIED (§5.5.5-A) |
+| A-28 | `service_tier` | `auto`\|`standard_only` | `"auto"` | **`usage.service_tier` in the response** ( `"priority"` / `"standard"` ) | 400 / `invalid_request_error` | validated (`Input should be 'auto' or 'standard_only'`) and not applied. `usage.service_tier` is **not emitted**, where the direct API always emits it: a local CLI runs in no tier, and the proxy reports the runtime's numbers rather than inventing one | VERIFIED (§5.5.5-A) |
 | A-29 | `speed` | `standard`\|`fast` | UNKNOWN (beta) | latency mode | 400 / `invalid_request_error` `speed: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
-| A-30 | `inference_geo` | string (beta) | UNKNOWN | inference region | 400 / `invalid_request_error` | silently ignored | DOC? |
+| A-30 | `inference_geo` | string (beta) | UNKNOWN | inference region | 400 / `invalid_request_error` | validated (`must be one of ['global', 'us']`) and not applied; `usage.inference_geo` is not emitted, for the same reason as A-28 | VERIFIED (§5.5.5-A) |
 | A-31 | `mcp_servers` | array of MCP server defs (beta) | absent | `mcp_tool_use` blocks | 400 `mcp_servers: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
-| A-32 | `container` | string (code-execution container id) | absent | container reuse | 400 / `invalid_request_error` | silently ignored | DOC? |
+| A-32 | `container` | string (code-execution container id) | absent | container reuse | 400 / `invalid_request_error` | **refused for every value** with the direct API's own sentence — it allows `container` only alongside the code execution tool, which this proxy does not serve | VERIFIED (§5.5.5-A) |
 | A-33 | `context_management` | object (beta) | absent | context editing/compaction | 400 `context_management: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
 | A-34 | `anthropic-version` header | e.g. `2023-06-01`; **required** | none — required | request is rejected without it | **400 / `invalid_request_error`** | **UNKNOWN — the proxy does not appear to require it**; a body missing the header succeeds here and fails there. Probe P-37 | DOC |
-| A-35 | `anthropic-beta` header | array/CSV of beta ids | absent | unlocks beta fields | 400 / `invalid_request_error` on an unknown id | silently ignored | DOC |
+| A-35 | `anthropic-beta` header | array/CSV of beta ids | absent | unlocks beta fields | 400 / `invalid_request_error` on an unknown id | silently ignored. The direct API refuses an unknown beta id at the header (`Unexpected value(s) … for the anthropic-beta header`); the proxy serves no betas, so it neither honours nor refuses one | DOC (measured: direct refuses an unknown id) |
 | A-36 | `x-api-key` / `Authorization` | credential header | none — required | 401 without it | 401 / `authentication_error` | proxy has its own local access gate; **the credential semantics differ by construction** (not applicable) | DOC |
 | A-37 | *(behavioral)* unknown top-level field | — | — | — | 400 `invalid_request_error` `bogus_field: Extra inputs are not permitted`; also `messages.0.bogus`; reported after field validation (measured 2026-08-30) | mirrored (`rejectUnknownAnthropicKeys`) against the measured key set of 18 — `user_profile_id`, `mcp_servers`, `context_management`, `betas` are unknown to the direct API without a beta and unknown here | VERIFIED (§5.5.4) |
 
@@ -518,6 +518,23 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 
 **최상위 키 집합 (같은 날, 각 키에 틀린 타입 `1`을 보내 판별)**: 아는 키 18개 — `model`·`messages`·`max_tokens`·`cache_control`("Input should be an object")·`container`·`inference_geo`·`metadata`·`output_config`·`service_tier`("Input should be 'auto' or 'standard_only'")·`stop_sequences`·`stream`("Input should be a valid boolean")·`system`·`temperature`·`thinking`·`tool_choice`·`tools`·`top_k`·`top_p`. 모르는 키 → "<key>: Extra inputs are not permitted": `user_profile_id`(SDK 타입엔 있음)·`mcp_servers`·`context_management`·`betas`·`speed`·`effort`·`seed`·`response_format`·`instructions`·`input`·`n`·`user`·`logprobs`·`stop`. 순서: `max_tokens: Field required`가 미지 키보다 먼저, `temperature: range: 0..1`도 미지 키보다 먼저, 미지 키 둘이면 본문 순서의 첫 키; `messages[0].bogus` → "messages.0.bogus: Extra inputs are not permitted"; `bogus: null`도 거절. 프록시는 이 집합을 그대로 미러한다(A-37).
 
+### 5.5.5-A Anthropic Messages 나머지 행 direct 실측 (2026-08-30)
+
+`scripts/probe-text-surface-keys.mjs --phase values --only messages`. 봉투는 `{type:"error", error:{type, message}}` — `param`·`code` 없음.
+
+| 요청 | direct 응답 |
+| --- | --- |
+| `stop_sequences: "ZZ"` / `[1]` / `[]` | `stop_sequences: Input should be a valid array` / `stop_sequences.0: Input should be a valid string` / **수용** |
+| `stop_sequences: ["ZZ"]` + `AAZZBB`를 말하게 하는 프롬프트 | 200, `content: [{text:"AA"}]`, `stop_reason: "stop_sequence"`, `stop_sequence: "ZZ"` (P-8) — **시퀀스 앞에서 자른다** |
+| `metadata: {user_id:"…"}` / `{user_id:7}` / `{bogus:"x"}` | 수용 / `metadata.user_id: Input should be a valid string` / `metadata.bogus: Extra inputs are not permitted` |
+| `service_tier: "standard_only"` / `"bogus"` | 수용, 응답 `usage.service_tier: "standard"` / `service_tier: Input should be 'auto' or 'standard_only'` |
+| `inference_geo: "us"` / `"bogus-geo"` | 수용, 응답 `usage.inference_geo: "us"` / `inference_geo: must be one of ['global', 'us']` |
+| `container: "container_x"` | `container: Container identifier can only be provided when using the code execution tool` — **코드 실행 도구 없이는 어떤 값도 거절** |
+| `anthropic-beta: bogus-…` 헤더 | 400 `Unexpected value(s) … for the anthropic-beta header.` |
+
+**direct의 `usage`는 항상 `service_tier`와 `inference_geo`를 싣는다.** 프록시는 싣지 않는다 — 로컬 CLI는 어느 티어·리전에서도 돌지 않으며,
+이 프록시의 규칙은 런타임의 숫자를 보고하는 것이지 지어내는 것이 아니다. 계약의 "Anthropic accepted-and-not-applied keys" 행에 명시.
+
 ### 5.5.5 Chat Completions 옵션 규칙 direct 실측 (2026-08-30)
 
 `scripts/probe-text-surface-keys.mjs`(무료 3단계: `--phase keys`는 키마다 **불가능한 타입**을 보내 known/unknown을 가르고,
@@ -540,9 +557,14 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 | `n: 0` / `64` / `"2"` | `integer_below_min_value` (>= 1) / `integer_above_max_value` (**<= 8**) / `invalid_type` |
 | `max_completion_tokens: 0` | `integer_below_min_value` (>= 1) |
 | `top_logprobs: -1` / `21` / `logprobs` 없이 `1` | `integer_below_min_value` (>= 0) / **code 없음** `Invalid value for 'top_logprobs': must be less than or equal to 5.` / **code 없음** `The 'top_logprobs' parameter is only allowed when 'logprobs' is enabled.` |
+| `frequency_penalty: 3` / `presence_penalty: -3` (effort none) | `decimal_above_max_value` (<= 2) / `decimal_below_min_value` (>= -2) — 범위는 -2..2 |
+| `response_format: {type:'json_schema'}` / `{type:'json_schema', json_schema:{}}` | `missing_required_parameter` `response_format.json_schema` / `response_format.json_schema.name` — 프록시는 스키마 없이 JSON 모드로 돌고 있었다 |
+| `stream_options: {bogus:1}` | `unknown_parameter` `stream_options.bogus` — 중첩 객체도 엄격 |
+| `model: null` (Chat) | `you must provide a model parameter` (없음·빈 문자열과 같은 봉투). **Responses는 다르다**: `invalid_type` `model` "got an object instead" |
+| `model: 7` (Chat) | 400 `We could not parse the JSON body of your request.` — 유효한 JSON인데 파서 오류를 답한다. **미러하지 않는다**(벤더 버그로 보이며, 프록시는 `invalid_type`) |
 | `metadata` 17쌍 / 값 600자 / 키 70자 / 값이 정수 | `object_above_max_properties` / `string_above_max_length`(<= 512) / `property_name_above_max_length`(<= 64, **메시지에서는 키를 `'kkk...kkk'`로 줄이고 `param`에는 통째로 싣는다**) / `invalid_type` |
 | `reasoning_effort` | 이 모델군의 집합은 `none`·`low`·`medium`·`high`·`xhigh`. `max`도 **`minimal`도** 밖이며 셋 다 `unsupported_value` + 지원 목록. 값이 객체면 파이썬 표기로 되비친다(`{'__probe__': 'wrong type'}`) |
-| `service_tier` | 목록은 `auto`·`default`·`fast`·`flex`·`priority`. 밖이면 `invalid_value`, 타입이 틀리면 `invalid_type`(목록 동봉). **요청값이 그대로 에코된다** (`flex` → `flex`) |
+| `service_tier` | 목록은 `auto`·`default`·`fast`·`flex`·`priority`. 밖이면 `invalid_value`, 타입이 틀리면 `invalid_type`(목록 동봉). 에코는 **요청값이 아니라 해석된 값**이다: `fast`·`priority` → **`priority`**, `flex` → `flex`, `auto`·`default`·생략 → `default` (Chat·Responses 동일). Responses도 목록 밖 값을 `invalid_value`로 거절한다 |
 | `verbosity: bogus` | `invalid_value` + `'low', 'medium', and 'high'` |
 | `response_format: {}` / `{type:'bogus'}` | `missing_required_parameter` `response_format.type` / `invalid_value` + `'json_object', 'json_schema', and 'text'` |
 | `tools: [{type:'function'}]` / `function`에 name 없음 | `missing_required_parameter` `tools[0].function` / `tools[0].function.name` |
@@ -558,9 +580,29 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 | `model: 'gpt-does-not-exist'` | **404** `model_not_found` |
 | `metadata`·`store`·`user`·`safety_identifier`·`seed`·`prompt_cache_key`·`prompt_cache_options`·`parallel_tool_calls`·`verbosity` | 전부 200. Chat 응답 키는 `choices,created,id,model,object,service_tier,system_fingerprint,usage`뿐이라 되비칠 자리가 없다(`system_fingerprint`는 `null`) |
 
-**보고 순서** (두 결함을 같이 실어 측정): **필수값의 존재**(`model` → `messages`) → **미지 키** → 나머지 필드의 **키 순서**.
-`model` 없음 + 미지 키 → model. `messages` 없음 + 미지 키 → messages. 미지 키 + `n` 타입/`messages: []`/`stop`/`service_tier` 오류 → 미지 키.
-`n` + `stop` → n. `n` + `temperature` → n. `stop` + `temperature` → stop.
+**보고 순서 — 측정한 것이지 규칙이 아니다.** 첫 초안은 "알파벳 키 순서"라고 적었고 그건 **틀렸다**(독립 10쌍 중 5쌍이 반증).
+확정 절차: 같은 종류(타입 결함)로 고정한 뒤 **비교 정렬**로 전순서를 유도했다 — 27키, 107콜, 두 본문 순서로 보내 같은 답이 나오는지
+**대칭성 6/6** 확인(먼저 쓴 키를 답하는 API였다면 정렬은 입력 순서를 그대로 뱉었을 것), 인접쌍 27개 재검증 0실패.
+
+1. **필수값의 존재**: `model` → `messages` (둘 다 미지 키보다 앞).
+2. **미지 키** (`unknown_parameter`).
+3. **필드** — 유도된 순서(알파벳 아님):
+   `messages` → `functions` → `function_call` → `tools` → `tool_choice` → `parallel_tool_calls` → `max_completion_tokens` → `n` →
+   `temperature`(타입) → `top_p`(타입) → `presence_penalty` → `frequency_penalty` → `logprobs`(타입) → `top_logprobs` → `user` →
+   `seed` → `moderation` → `safety_identifier` → `prompt_cache_options` → `prompt_cache_key` → `prompt_cache_retention` →
+   `response_format` → `service_tier` → `max_tokens` → `reasoning_effort` → `logit_bias` → `stop` → `stream` → `stream_options` →
+   `store` → `metadata` → `prediction` → `verbosity`.
+4. **모델 능력 값 검사**(3 전부보다 뒤): `temperature`/`top_p`의 **값**, 추론 중 `presence_penalty`/`frequency_penalty`/`logprobs`.
+
+**결함의 종류가 순서를 바꾼다**: `stop`(파라미터 거절)은 `temperature: 0.5`(값 거절)를 이기지만 `temperature: 'x'`(타입)에게는 진다.
+그래서 "키마다 하나의 자리"가 아니다. 위 배치는 측정한 쌍 전부를 재현하는 순서이며, 그 이상은 주장하지 않는다 —
+`pnpm e2e:text:parity`가 쌍들을 행으로 싣고 있어 드리프트는 조용히 지나가지 않는다.
+
+측정된 쌍(계기에 전부 실려 있음): model↔미지키, messages↔미지키, 미지키↔{n 타입, `messages: []`, stop, service_tier enum,
+reasoning_effort, n 하한}, n↔stop, n↔temperature(값), stop↔temperature(값), seed↔service_tier, n↔metadata, max_completion_tokens↔logprobs,
+messages↔metadata, n↔moderation, stream↔store, tools↔top_logprobs, user↔verbosity, functions↔function_call,
+prompt_cache_options↔prompt_cache_key, max_tokens↔store, stop↔stream_options, stop↔verbosity, metadata↔prediction,
+logit_bias↔verbosity, metadata↔temperature(값), verbosity↔logprobs(값).
 
 **의도된 발산 1건**: direct는 `gpt-5.6-terra`·`gpt-5.6-sol`의 Chat에서 **함수 도구와 `reasoning_effort`의 조합 자체를 거절한다**
 (`Function tools with reasoning_effort are not supported for <model> in /v1/chat/completions`; `gpt-5.5`는 수용). 프록시의 백엔드는

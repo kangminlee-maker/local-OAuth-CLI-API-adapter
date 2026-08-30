@@ -162,7 +162,14 @@ const chatCases = [
   ['top_logprobs without logprobs', { messages: M, reasoning_effort: 'none', top_logprobs: 1 }],
   ['model absent', { messages: M, model: DELETE }],
   ['model empty', { messages: M, model: '' }],
-  // Report order: each of these is invalid twice.
+  ['frequency_penalty above its range', { messages: M, reasoning_effort: 'none', frequency_penalty: 3 }],
+  ['presence_penalty below its range', { messages: M, reasoning_effort: 'none', presence_penalty: -3 }],
+  ['json_schema format without its member', { messages: M, response_format: { type: 'json_schema' } }],
+  ['json_schema member without a name', { messages: M, response_format: { type: 'json_schema', json_schema: {} } }],
+  ['stream_options unknown member', { messages: M, stream_options: { bogus: 1 } }],
+  ['model null', { messages: M, model: null }],
+  // Report order: each of these is invalid twice. The order is measured, not a
+  // rule — a comparison sort over the same-kind faults plus these pins.
   ['order model beats unknown key', { messages: M, model: DELETE, zzz_unknown: 1 }],
   ['order messages beats unknown key', { messages: DELETE, zzz_unknown: 1 }],
   ['order unknown key beats bad type', { messages: M, zzz_unknown: 1, n: 'abc' }],
@@ -173,10 +180,36 @@ const chatCases = [
   ['order n before temperature', { messages: M, n: 'abc', temperature: 0.5 }],
   ['order n bound before stop', { messages: M, n: 0, stop: ['ZZ'] }],
   ['order stop before temperature', { messages: M, stop: ['ZZ'], temperature: 0.5 }],
+  ['order seed before service_tier', { messages: M, seed: 1.5, service_tier: 'bogus' }],
+  ['order n before metadata', { messages: M, metadata: { k: 7 }, n: 0 }],
+  ['order max_completion_tokens before logprobs', { messages: M, logprobs: 'x', max_completion_tokens: 0 }],
+  ['order messages before metadata', { messages: [7], metadata: { k: 7 } }],
+  ['order n before moderation', { messages: M, moderation: {}, n: 0 }],
+  ['order stream before store', { messages: M, store: 'x', stream: 'y' }],
+  ['order tools before top_logprobs', { messages: M, tools: 'x', top_logprobs: -1 }],
+  ['order user before verbosity', { messages: M, user: 7, verbosity: 'bogus' }],
+  ['order functions before function_call', { messages: M, function_call: {}, functions: 'x' }],
+  ['order prompt_cache_options before prompt_cache_key', { messages: M, prompt_cache_key: 7, prompt_cache_options: 'x' }],
+  ['order max_tokens before store', { messages: M, max_tokens: 32, store: 'x' }],
+  ['order stop before stream_options', { messages: M, stop: ['ZZ'], stream_options: 'x' }],
+  ['order stop before verbosity', { messages: M, stop: ['ZZ'], verbosity: 'bogus' }],
+  ['order metadata before prediction', { messages: M, prediction: { type: 'content', content: 'p' }, metadata: 'x' }],
+  ['order logit_bias before verbosity', { messages: M, logit_bias: { 1: 1 }, verbosity: 'bogus' }],
+  ['order metadata before a refused temperature', { messages: M, temperature: 0.5, metadata: 'x' }],
+  ['order verbosity before a refused logprobs', { messages: M, logprobs: true, verbosity: 'bogus' }],
+  ['order reasoning_effort before metadata', { messages: M, reasoning_effort: 'bogus', metadata: 'x' }],
+];
+
+// The Responses surface, for the one field this work touches there.
+const responsesCases = [
+  ['responses service_tier unknown', { input: 'ping', max_output_tokens: 16, service_tier: 'bogus' }],
 ];
 
 if (!only || only === 'chat') {
   for (const [name, body] of chatCases) await parity(name, CHAT, body);
+}
+if (!only || only === 'responses') {
+  for (const [name, body] of responsesCases) await parity(name, '/v1/responses', body);
 }
 
 // The accepted rows: identical bodies on both sides, compared on the fields
@@ -187,6 +220,8 @@ if (generate && (!only || only === 'chat')) {
     ['echo service_tier flex', { service_tier: 'flex' }],
     ['echo service_tier auto', { service_tier: 'auto' }],
     ['echo service_tier priority', { service_tier: 'priority' }],
+    ['echo service_tier fast', { service_tier: 'fast' }],
+    ['echo service_tier default', { service_tier: 'default' }],
   ];
   for (const [name, extra] of echoCases) {
     const body = { model: MODEL, messages: [{ role: 'user', content: 'Reply with exactly: pong' }], max_completion_tokens: 8, reasoning_effort: 'none', ...extra };

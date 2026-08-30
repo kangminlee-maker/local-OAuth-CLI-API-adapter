@@ -28,11 +28,13 @@ import {
   BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
+import { StopSequenceGate, truncateAtStopSequence } from './stop-sequences.js';
 import { missingToolCallArgumentDelta } from './tool-call-stream.js';
 import { image2QualityToGpt55ReasoningEffort } from './image2-via-gpt55.js';
 import {
   jsonTypeName,
   normalizeAnthropicMessagesRequest,
+  resolvedOpenAiServiceTier,
   normalizeOpenAiChatRequest,
   normalizeOpenAiResponsesRequest,
 } from './normalizers.js';
@@ -273,7 +275,7 @@ async function handleRequest(
         );
       } else {
         const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
-        writeJson(res, 200, anthropicMessagesResponse(result));
+        writeJson(res, 200, anthropicMessagesResponse(applyStopSequences(result, normalized)));
       }
       return;
     }
@@ -1873,16 +1875,16 @@ function mergedChatUsage(results: readonly LocalCompletionResult[]): LocalUsage 
 }
 
 /**
- * The tier the caller asked for, which the direct API echoes back verbatim
- * (`flex` in, `flex` out — measured 2026-08-30). `auto` and an omitted value
- * both resolve to `default`, the tier this proxy actually runs at: there is no
- * priority queue behind a local CLI. Hard-coding `default` for every request
- * reported a tier the caller had not asked for.
+ * The tier the response reports. The direct API does not echo the request
+ * verbatim — `fast` comes back as `priority` — so the resolution lives with
+ * the validator that knows the enum, and the value here is only ever one the
+ * validator has already accepted. Hard-coding `default` for every request
+ * reported a tier the caller had not asked for; echoing the request reported
+ * one the direct API never sends.
  */
 function echoedServiceTier(request: NormalizedRequest): string {
   const raw = request.raw as Record<string, unknown> | null | undefined;
-  const tier = raw && typeof raw === 'object' ? raw.service_tier : undefined;
-  return typeof tier === 'string' && tier !== 'auto' ? tier : 'default';
+  return resolvedOpenAiServiceTier(raw && typeof raw === 'object' ? raw.service_tier : undefined);
 }
 
 function openAiResponsesResponse(
@@ -1930,6 +1932,66 @@ function orderedByEmission(
   return result.toolCallsBeforeText
     ? [...parts.toolCalls, ...parts.text]
     : [...parts.text, ...parts.toolCalls];
+}
+
+/**
+ * `stop_sequences` on a finished turn: the text is cut before the first one and
+ * the turn reports that it stopped there — the direct API's answer, realized in
+ * the response path because no runtime carries the option. A turn that made
+ * tool calls keeps `tool_use` as its reason; only the text is cut.
+ */
+function applyStopSequences(
+  result: LocalCompletionResult,
+  request: NormalizedRequest,
+): LocalCompletionResult {
+  const sequences = request.stopSequences ?? [];
+  if (sequences.length === 0) return result;
+  const { text, sequence } = truncateAtStopSequence(result.text, sequences);
+  if (sequence === null) return result;
+  return {
+    ...result,
+    text,
+    ...(result.toolCalls.length === 0
+      ? { stopReason: 'stop_sequence', stopSequence: sequence, stopDetails: undefined }
+      : {}),
+  };
+}
+
+/**
+ * Reconciles a finished turn with what the stop-sequence gate let through.
+ * Three cases: a sequence matched on the wire (the turn is a `stop_sequence`
+ * stop and nothing more is written), the result's full text contains one the
+ * deltas never carried (the same, computed from the result), or neither (the
+ * held-back tail plus whatever text the deltas missed is written as usual).
+ */
+function applyStreamStopSequence(
+  result: LocalCompletionResult,
+  gate: StopSequenceGate,
+  streamedText: string,
+): { readonly result: LocalCompletionResult; readonly tail: string } {
+  if (!gate.active) return { result, tail: missingTextTail(streamedText, result.text) };
+  const stopped = (sequence: string): { result: LocalCompletionResult; tail: string } => ({
+    result: result.toolCalls.length === 0
+      ? { ...result, text: streamedText, stopReason: 'stop_sequence', stopSequence: sequence, stopDetails: undefined }
+      : { ...result, text: streamedText },
+    tail: '',
+  });
+  if (gate.stopped) return stopped(gate.stopped);
+  // The deltas may have carried nothing at all (a schema or refusal result), so
+  // the result's own text goes through the gate before it is written.
+  const held = gate.flush();
+  const remaining = missingTextTail(streamedText + held, result.text);
+  const emitted = gate.push(`${held}${remaining}`);
+  if (gate.stopped) {
+    return {
+      ...stopped(gate.stopped),
+      tail: emitted,
+      result: result.toolCalls.length === 0
+        ? { ...result, text: streamedText + emitted, stopReason: 'stop_sequence', stopSequence: gate.stopped, stopDetails: undefined }
+        : { ...result, text: streamedText + emitted },
+    };
+  }
+  return { result, tail: `${emitted}${gate.flush()}` };
 }
 
 function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
@@ -2890,6 +2952,12 @@ async function writeAnthropicMessagesStream(
     return allocated;
   };
   const toolState = new AnthropicToolUseStreamState(res, allocateBlockIndex);
+  // `stop_sequences`, realized on the wire: text is written through the gate,
+  // which holds back a tail that could still become a sequence and drops
+  // everything once one arrives. The runtime keeps generating — nothing can
+  // stop it mid-turn and still report the turn's usage — so the stream simply
+  // stops carrying its output.
+  const stopGate = new StopSequenceGate(request.stopSequences ?? []);
 
   try {
     await writeSseEvent(res, 'message_start', {
@@ -2935,16 +3003,21 @@ async function writeAnthropicMessagesStream(
       await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
     };
 
+    const writeText = async (text: string): Promise<void> => {
+      if (!text) return;
+      await ensureTextStarted();
+      streamedText += text;
+      await writeSseEvent(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: textBlockIndex,
+        delta: { type: 'text_delta', text },
+      });
+    };
+
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
-        await ensureTextStarted();
-        streamedText += event.delta;
-        await writeSseEvent(res, 'content_block_delta', {
-          type: 'content_block_delta',
-          index: textBlockIndex,
-          delta: { type: 'text_delta', text: event.delta },
-        });
+        await writeText(stopGate.push(event.delta));
         continue;
       }
       if (event.type === 'tool_call_delta') {
@@ -2956,9 +3029,14 @@ async function writeAnthropicMessagesStream(
       // would need the reasoning TEXT, which the backends do not hand over.
       if (event.type === 'reasoning_item') continue;
 
-      const result = event.result;
+      // The gated text is what the caller received, so the turn is reported
+      // against it: a match makes this a `stop_sequence` stop, and the tail the
+      // runtime produced after it is never written.
+      const gated = applyStreamStopSequence(event.result, stopGate, streamedText);
+      const result = gated.result;
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
       if (result.toolCalls.length > 0) {
+        await writeText(gated.tail);
         await closeOpenTextBlock();
         await toolState.finish(result.toolCalls);
       } else {
@@ -2966,18 +3044,7 @@ async function writeAnthropicMessagesStream(
         // where no live text_delta was emitted), then close the block. A truly empty
         // result opens no content block, matching the non-streaming content:[] mapping
         // — so streaming and non-streaming refusals carry the same content.
-        const tail = missingTextTail(streamedText, result.text);
-        if (tail) {
-          await ensureTextStarted();
-          for (const chunk of chunkText(tail)) {
-            streamedText += chunk;
-            await writeSseEvent(res, 'content_block_delta', {
-              type: 'content_block_delta',
-              index: textBlockIndex,
-              delta: { type: 'text_delta', text: chunk },
-            });
-          }
-        }
+        for (const chunk of chunkText(gated.tail)) await writeText(chunk);
         await closeOpenTextBlock();
       }
 

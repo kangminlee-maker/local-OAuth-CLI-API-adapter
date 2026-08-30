@@ -44,6 +44,7 @@ const OPENAI_CHAT_RESPONSE_FORMATS = ['json_object', 'json_schema', 'text'] as c
 const OPENAI_TOOL_CHOICE_MODES = ['none', 'auto', 'required'] as const;
 const OPENAI_CHAT_ROLES = ['system', 'assistant', 'user', 'function', 'tool', 'developer'] as const;
 const OPENAI_PROMPT_CACHE_OPTION_KEYS: ReadonlySet<string> = new Set(['ttl', 'mode']);
+const OPENAI_STREAM_OPTION_KEYS: ReadonlySet<string> = new Set(['include_usage', 'include_obfuscation']);
 const OPENAI_METADATA_MAX_PROPERTIES = 16;
 const OPENAI_METADATA_MAX_KEY_LENGTH = 64;
 const OPENAI_METADATA_MAX_VALUE_LENGTH = 512;
@@ -53,11 +54,11 @@ const OPENAI_CHAT_MAX_TOP_LOGPROBS = 5;
 
 export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const input = objectBody(body);
-  // The order the direct API reports faults in, measured 2026-08-30 with
-  // two-fault bodies (§5.5.5): the REQUIRED parameters' presence first (`model`
-  // beats an unknown key, and so does a missing `messages`), then unknown keys,
-  // then every other field in key order (`n` before `stop` before
-  // `temperature`).
+  // The order the direct API reports faults in, measured 2026-08-30 (§5.5.5):
+  // the REQUIRED parameters' presence first (`model` beats an unknown key, and
+  // so does a missing `messages`), then unknown keys, then the fields in the
+  // order `validateOpenAiChatFields` walks — which is measured, not
+  // alphabetical, and not one order per key.
   const model = readRequiredOpenAiModel(input.model, 'openai-chat');
   requireOpenAiChatMessages(input.messages);
   rejectUnknownOpenAiKeys(input, OPENAI_CHAT_KEYS);
@@ -88,108 +89,45 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
 }
 
 /**
- * Every Chat Completions field the direct API validates, in the key order it
+ * Every Chat Completions field the direct API validates, in the order it
  * reports them in, with its measured envelopes (§5.5.5, `gpt-5.6-terra`,
  * 2026-08-30). Null is omission for every optional field, as it is there.
  *
+ * The ORDER is measured, not derived from a rule. It is not alphabetical —
+ * `stream` is reported before `store`, `prompt_cache_options` before
+ * `prompt_cache_key` — and it is not one order per key either: `stop` beats
+ * `temperature: 0.5` but loses to `temperature: 'x'`, because the value the
+ * model family refuses is checked in a later pass than the type. The sequence
+ * below is the one that reproduces every measured pair: a comparison sort over
+ * 27 same-kind faults (107 calls, antisymmetry-checked in both body orders,
+ * every adjacent pair re-verified), the refusals placed against the pairs that
+ * pin them, and the model-capability VALUE checks last. Nothing beyond those
+ * pairs is claimed; `pnpm e2e:text:parity` carries them as rows so a drift
+ * fails loudly rather than quietly.
+ *
  * What is refused is as measured as what is accepted. `stop`, `max_tokens`,
  * `logit_bias` and `prediction` are refused by the direct API on this model
- * family whatever their value, so they are refused with its envelope instead
- * of being realized; `frequency_penalty`, `presence_penalty` and `logprobs`
- * are refused only while the model reasons and are accepted — and not applied,
- * as the contract says — when `reasoning_effort` is `none`.
+ * family whatever their value; `frequency_penalty`, `presence_penalty` and
+ * `logprobs` are refused only while the model reasons and are accepted — and
+ * not applied, as the contract says — when `reasoning_effort` is `none`.
  */
 function validateOpenAiChatFields(
   input: Record<string, unknown>,
 ): { messages: NormalizedMessage[]; reasoningEffort: NormalizedReasoningEffort | undefined } {
   const present = (key: string): boolean => input[key] !== undefined && input[key] !== null;
   // A plain read, not the validated one: `reasoning_effort` reports its own
-  // fault at its own position, and the three fields below are checked before
-  // it. An absent effort means the model reasons.
+  // fault at its own position, and the fields whose acceptance depends on it
+  // are checked before it. An absent effort means the model reasons.
   const reasons = input.reasoning_effort !== 'none';
 
-  if (present('frequency_penalty')) {
-    if (typeof input.frequency_penalty !== 'number') throw invalidType('frequency_penalty', 'a decimal', input.frequency_penalty);
-    if (reasons) throw unsupportedParameter('frequency_penalty');
-  }
-  if (present('function_call')) readOpenAiLegacyFunctionCall(input.function_call);
+  const messages = readOpenAiMessages(input.messages);
   if (present('functions')) {
     if (!Array.isArray(input.functions)) throw invalidType('functions', 'an array of function definitions', input.functions);
     input.functions.forEach((fn, index) => {
       if (typeof asRecord(fn)?.name !== 'string') throw missingRequiredParameter(`functions[${index}].name`);
     });
   }
-  if (present('logit_bias')) throw unsupportedParameter('logit_bias');
-  if (present('logprobs')) {
-    if (typeof input.logprobs !== 'boolean') throw invalidType('logprobs', 'a boolean', input.logprobs);
-    if (input.logprobs && reasons) throw unsupportedParameter('logprobs');
-  }
-  if (present('max_completion_tokens')) {
-    if (!Number.isInteger(input.max_completion_tokens)) throw invalidType('max_completion_tokens', 'an integer', input.max_completion_tokens);
-    if ((input.max_completion_tokens as number) < 1) throw integerBelowMin('max_completion_tokens', input.max_completion_tokens as number, 1);
-  }
-  if (present('max_tokens')) {
-    throw unsupportedParameter('max_tokens', "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.");
-  }
-  const messages = readOpenAiMessages(input.messages);
-  if (present('metadata')) validateOpenAiMetadata(input.metadata);
-  if (present('moderation')) {
-    // Validated as the direct API validates it, then not applied: the local
-    // runtimes moderate nothing, so the response carries no `moderation`
-    // object (the contract's Chat row says so).
-    const moderation = asRecord(input.moderation);
-    if (!moderation) throw invalidType('moderation', 'an object', input.moderation);
-    if (typeof moderation.model !== 'string') throw missingRequiredParameter('moderation.model');
-  }
-  if (present('n')) {
-    if (!Number.isInteger(input.n)) throw invalidType('n', 'an integer', input.n);
-    const n = input.n as number;
-    if (n < 1) throw integerBelowMin('n', n, 1);
-    if (n > OPENAI_CHAT_MAX_CHOICES) throw integerAboveMax('n', n, OPENAI_CHAT_MAX_CHOICES);
-  }
-  if (present('parallel_tool_calls') && typeof input.parallel_tool_calls !== 'boolean') {
-    throw invalidType('parallel_tool_calls', 'a boolean', input.parallel_tool_calls);
-  }
-  if (present('prediction')) throw unsupportedParameter('prediction');
-  if (present('presence_penalty')) {
-    if (typeof input.presence_penalty !== 'number') throw invalidType('presence_penalty', 'a decimal', input.presence_penalty);
-    if (reasons) throw unsupportedParameter('presence_penalty');
-  }
-  if (present('prompt_cache_key') && typeof input.prompt_cache_key !== 'string') {
-    throw invalidType('prompt_cache_key', 'a string', input.prompt_cache_key);
-  }
-  if (present('prompt_cache_options')) {
-    const options = asRecord(input.prompt_cache_options);
-    if (!options) throw invalidType('prompt_cache_options', 'an object', input.prompt_cache_options);
-    for (const key of Object.keys(options)) {
-      if (!OPENAI_PROMPT_CACHE_OPTION_KEYS.has(key)) throw unknownParameter(`prompt_cache_options.${key}`);
-    }
-  }
-  if (present('prompt_cache_retention')) {
-    const retention = input.prompt_cache_retention;
-    if (retention !== 'in_memory' && retention !== '24h') {
-      throw invalidType('prompt_cache_retention', "one of 'in_memory' or '24h'", retention);
-    }
-    if (retention === 'in_memory') {
-      // Not an enum fault: the value is valid and this model family refuses it.
-      throw new ProxyRequestError('This model is compatible only with 24h extended prompt caching', 400, 'openai', 'invalid_request_error', 'prompt_cache_retention');
-    }
-  }
-  const reasoningEffort = readOpenAiChatReasoningEffort(input.reasoning_effort);
-  if (present('response_format')) validateOpenAiChatResponseFormat(input.response_format);
-  if (present('safety_identifier') && typeof input.safety_identifier !== 'string') {
-    throw invalidType('safety_identifier', 'a string', input.safety_identifier);
-  }
-  if (present('seed') && !Number.isInteger(input.seed)) throw invalidType('seed', 'an integer', input.seed);
-  if (present('service_tier')) readOpenAiServiceTier(input.service_tier);
-  if (present('stop')) throw unsupportedParameter('stop');
-  if (present('store') && typeof input.store !== 'boolean') throw invalidType('store', 'a boolean', input.store);
-  if (present('stream') && typeof input.stream !== 'boolean') throw invalidType('stream', 'a boolean', input.stream);
-  if (present('stream_options') && !asRecord(input.stream_options)) {
-    throw invalidType('stream_options', 'an object', input.stream_options);
-  }
-  rejectUnsupportedOpenAiSampling(input, 'openai-chat', 'temperature');
-  if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice);
+  if (present('function_call')) readOpenAiLegacyFunctionCall(input.function_call);
   if (present('tools')) {
     if (!Array.isArray(input.tools)) throw invalidType('tools', 'an array of objects', input.tools);
     input.tools.forEach((tool, index) => {
@@ -197,6 +135,36 @@ function validateOpenAiChatFields(
       if (!fn) throw missingRequiredParameter(`tools[${index}].function`);
       if (typeof fn.name !== 'string') throw missingRequiredParameter(`tools[${index}].function.name`);
     });
+  }
+  if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice);
+  if (present('parallel_tool_calls') && typeof input.parallel_tool_calls !== 'boolean') {
+    throw invalidType('parallel_tool_calls', 'a boolean', input.parallel_tool_calls);
+  }
+  if (present('max_completion_tokens')) {
+    if (!Number.isInteger(input.max_completion_tokens)) throw invalidType('max_completion_tokens', 'an integer', input.max_completion_tokens);
+    if ((input.max_completion_tokens as number) < 1) throw integerBelowMin('max_completion_tokens', input.max_completion_tokens as number, 1);
+  }
+  if (present('n')) {
+    if (!Number.isInteger(input.n)) throw invalidType('n', 'an integer', input.n);
+    const n = input.n as number;
+    if (n < 1) throw integerBelowMin('n', n, 1);
+    if (n > OPENAI_CHAT_MAX_CHOICES) throw integerAboveMax('n', n, OPENAI_CHAT_MAX_CHOICES);
+  }
+  if (present('temperature') && typeof input.temperature !== 'number') {
+    throw invalidType('temperature', 'a decimal', input.temperature);
+  }
+  if (present('top_p') && typeof input.top_p !== 'number') {
+    throw invalidType('top_p', 'a decimal', input.top_p);
+  }
+  for (const key of ['presence_penalty', 'frequency_penalty'] as const) {
+    if (!present(key)) continue;
+    if (typeof input[key] !== 'number') throw invalidType(key, 'a decimal', input[key]);
+    const value = input[key] as number;
+    if (value < -2) throw decimalBelowMin(key, value, -2);
+    if (value > 2) throw decimalAboveMax(key, value, 2);
+  }
+  if (present('logprobs') && typeof input.logprobs !== 'boolean') {
+    throw invalidType('logprobs', 'a boolean', input.logprobs);
   }
   if (present('top_logprobs')) {
     if (!Number.isInteger(input.top_logprobs)) throw invalidType('top_logprobs', 'an integer', input.top_logprobs);
@@ -210,9 +178,70 @@ function validateOpenAiChatFields(
       throw new ProxyRequestError("The 'top_logprobs' parameter is only allowed when 'logprobs' is enabled.", 400, 'openai', 'invalid_request_error', 'top_logprobs');
     }
   }
-  rejectUnsupportedOpenAiSampling(input, 'openai-chat', 'top_p');
   if (present('user') && typeof input.user !== 'string') throw invalidType('user', 'a string', input.user);
+  if (present('seed') && !Number.isInteger(input.seed)) throw invalidType('seed', 'an integer', input.seed);
+  if (present('moderation')) {
+    // Validated as the direct API validates it, then not applied: the local
+    // runtimes moderate nothing, so the response carries no `moderation`
+    // object (the contract's Chat row says so).
+    const moderation = asRecord(input.moderation);
+    if (!moderation) throw invalidType('moderation', 'an object', input.moderation);
+    if (typeof moderation.model !== 'string') throw missingRequiredParameter('moderation.model');
+  }
+  if (present('safety_identifier') && typeof input.safety_identifier !== 'string') {
+    throw invalidType('safety_identifier', 'a string', input.safety_identifier);
+  }
+  if (present('prompt_cache_options')) {
+    const options = asRecord(input.prompt_cache_options);
+    if (!options) throw invalidType('prompt_cache_options', 'an object', input.prompt_cache_options);
+    for (const key of Object.keys(options)) {
+      if (!OPENAI_PROMPT_CACHE_OPTION_KEYS.has(key)) throw unknownParameter(`prompt_cache_options.${key}`);
+    }
+  }
+  if (present('prompt_cache_key') && typeof input.prompt_cache_key !== 'string') {
+    throw invalidType('prompt_cache_key', 'a string', input.prompt_cache_key);
+  }
+  if (present('prompt_cache_retention')) {
+    const retention = input.prompt_cache_retention;
+    if (retention !== 'in_memory' && retention !== '24h') {
+      throw invalidType('prompt_cache_retention', "one of 'in_memory' or '24h'", retention);
+    }
+    if (retention === 'in_memory') {
+      // Not an enum fault: the value is valid and this model family refuses it.
+      throw new ProxyRequestError('This model is compatible only with 24h extended prompt caching', 400, 'openai', 'invalid_request_error', 'prompt_cache_retention');
+    }
+  }
+  if (present('response_format')) validateOpenAiChatResponseFormat(input.response_format);
+  if (present('service_tier')) readOpenAiServiceTier(input.service_tier);
+  if (present('max_tokens')) {
+    throw unsupportedParameter('max_tokens', "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.");
+  }
+  const reasoningEffort = readOpenAiChatReasoningEffort(input.reasoning_effort);
+  if (present('logit_bias')) throw unsupportedParameter('logit_bias');
+  if (present('stop')) throw unsupportedParameter('stop');
+  if (present('stream') && typeof input.stream !== 'boolean') throw invalidType('stream', 'a boolean', input.stream);
+  if (present('stream_options')) {
+    const options = asRecord(input.stream_options);
+    if (!options) throw invalidType('stream_options', 'an object', input.stream_options);
+    for (const key of Object.keys(options)) {
+      if (!OPENAI_STREAM_OPTION_KEYS.has(key)) throw unknownParameter(`stream_options.${key}`);
+    }
+  }
+  if (present('store') && typeof input.store !== 'boolean') throw invalidType('store', 'a boolean', input.store);
+  if (present('metadata')) validateOpenAiMetadata(input.metadata);
+  if (present('prediction')) throw unsupportedParameter('prediction');
   if (present('verbosity')) readOpenAiChatVerbosity(input.verbosity);
+
+  // The model-capability VALUE checks, measured to run after every field
+  // check above: `stop` (refused outright) is reported before
+  // `temperature: 0.5`, while `temperature: 'x'` is reported before `stop`.
+  rejectUnsupportedOpenAiSampling(input, 'openai-chat', 'temperature');
+  rejectUnsupportedOpenAiSampling(input, 'openai-chat', 'top_p');
+  if (reasons) {
+    if (present('presence_penalty')) throw unsupportedParameter('presence_penalty');
+    if (present('frequency_penalty')) throw unsupportedParameter('frequency_penalty');
+    if (input.logprobs === true) throw unsupportedParameter('logprobs');
+  }
   return { messages, reasoningEffort };
 }
 
@@ -258,6 +287,14 @@ function validateOpenAiChatResponseFormat(value: unknown): void {
   if (!OPENAI_CHAT_RESPONSE_FORMATS.some((candidate) => candidate === format.type)) {
     throw invalidValue('response_format.type', String(format.type), OPENAI_CHAT_RESPONSE_FORMATS);
   }
+  // `json_schema` carries the schema and its name, both required (measured):
+  // the proxy used to accept `{type:"json_schema"}` alone and run the turn in
+  // JSON mode with no schema at all — structured output the caller asked for
+  // and never got.
+  if (format.type !== 'json_schema') return;
+  const jsonSchema = asRecord(format.json_schema);
+  if (!jsonSchema) throw missingRequiredParameter('response_format.json_schema');
+  if (typeof jsonSchema.name !== 'string') throw missingRequiredParameter('response_format.json_schema.name');
 }
 
 function invalidType(field: string, expected: string, value: unknown): ProxyRequestError {
@@ -293,6 +330,20 @@ function integerBelowMin(field: string, value: number, min: number): ProxyReques
   return new ProxyRequestError(
     `Invalid '${field}': integer below minimum value. Expected a value >= ${min}, but got ${value} instead.`,
     400, 'openai', 'invalid_request_error', field, 'integer_below_min_value',
+  );
+}
+
+function decimalBelowMin(field: string, value: number, min: number): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid '${field}': decimal below minimum value. Expected a value >= ${min}, but got ${value} instead.`,
+    400, 'openai', 'invalid_request_error', field, 'decimal_below_min_value',
+  );
+}
+
+function decimalAboveMax(field: string, value: number, max: number): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid '${field}': decimal above maximum value. Expected a value <= ${max}, but got ${value} instead.`,
+    400, 'openai', 'invalid_request_error', field, 'decimal_above_max_value',
   );
 }
 
@@ -363,21 +414,41 @@ function readOpenAiChatReasoningEffort(value: unknown): NormalizedReasoningEffor
   );
 }
 
-// The direct API prints a rejected non-string value Python-style in this one
-// message — `{'__probe__': 'wrong type'}`, quotes and spacing included, which
-// is what a client sees. Fitted to that measurement; only the shapes that can
-// reach an enum field are rendered.
+/**
+ * The direct API prints a rejected non-string value Python-style in this one
+ * message — `{'__probe__': 'wrong type'}`, quotes and spacing included, which
+ * is what a client sees. Python's own `repr` rules are followed rather than
+ * guessed at from the single observation: a string containing an apostrophe is
+ * quoted with double quotes instead of escaping it, a string containing both
+ * kinds escapes the apostrophe, and backslashes and control characters are
+ * escaped. Without that, a caller's `{"k": "a'b"}` came back as `{'k': 'a'b'}`
+ * — a message that says something the value does not.
+ */
 function jsonValueForMessage(value: unknown): string {
   if (value === null) return 'None';
   if (value === true) return 'True';
   if (value === false) return 'False';
-  if (typeof value === 'string') return `'${value}'`;
+  if (typeof value === 'string') return pythonReprString(value);
   if (typeof value === 'number') return String(value);
   if (Array.isArray(value)) return `[${value.map(jsonValueForMessage).join(', ')}]`;
   if (typeof value === 'object') {
-    return `{${Object.entries(value as Record<string, unknown>).map(([key, member]) => `'${key}': ${jsonValueForMessage(member)}`).join(', ')}}`;
+    return `{${Object.entries(value as Record<string, unknown>).map(([key, member]) => `${pythonReprString(key)}: ${jsonValueForMessage(member)}`).join(', ')}}`;
   }
   return String(value);
+}
+
+function pythonReprString(value: string): string {
+  const escaped = value
+    .replace(/\\/g, '\\\\')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, (char) => `\\x${char.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  // Python prefers single quotes and switches to double quotes rather than
+  // escaping an apostrophe — unless the string carries both.
+  if (escaped.includes("'") && !escaped.includes('"')) return `"${escaped}"`;
+  return `'${escaped.replace(/'/g, "\\'")}'`;
 }
 
 function readOpenAiChatVerbosity(value: unknown): NormalizedVerbosity | undefined {
@@ -385,6 +456,19 @@ function readOpenAiChatVerbosity(value: unknown): NormalizedVerbosity | undefine
   if (value === 'low' || value === 'medium' || value === 'high') return value;
   if (typeof value !== 'string') throw invalidType('verbosity', `one of ${listOfQuoted(OPENAI_CHAT_VERBOSITIES, 'or')}`, value);
   throw invalidValue('verbosity', value, OPENAI_CHAT_VERBOSITIES);
+}
+
+/**
+ * The tier the response reports, which is not always the tier the caller sent:
+ * `fast` and `priority` both come back as `priority`, and `auto`, `default`
+ * and an omitted value all come back as `default` (measured 2026-08-30 on both
+ * surfaces). Echoing the request verbatim reported a tier the direct API never
+ * reports.
+ */
+export function resolvedOpenAiServiceTier(value: unknown): string {
+  if (value === 'fast' || value === 'priority') return 'priority';
+  if (value === 'flex') return 'flex';
+  return 'default';
 }
 
 function readOpenAiServiceTier(value: unknown): void {
@@ -411,6 +495,11 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const format = asRecord(text?.format);
   const reasoning = asRecord(input.reasoning);
   rejectUnsupportedOpenAiSampling(input, 'openai-responses');
+  // The one Responses field this commit touches: its value is echoed, so it
+  // cannot go unvalidated — an unknown tier is `invalid_value` there too,
+  // with the same list (measured 2026-08-30). The rest of this surface's
+  // schema is still the pre-existing lenient one.
+  if (input.service_tier !== undefined && input.service_tier !== null) readOpenAiServiceTier(input.service_tier);
   return {
     shape: 'openai-responses',
     model: readRequiredModel(input.model, 'openai'),
@@ -536,6 +625,8 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const outputConfig = asRecord(input.output_config);
   const maxTokens = readRequiredMaxTokens(input.max_tokens);
   rejectInvalidAnthropicSampling(input);
+  const stopSequences = readAnthropicStopSequences(input.stop_sequences);
+  validateAnthropicAcceptedFields(input);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
   const toolChoice = readAnthropicToolChoice(input.tool_choice);
@@ -571,6 +662,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     thinking,
     stream: input.stream === true,
     streamOptions: readStreamOptions(undefined),
+    ...(stopSequences.length > 0 ? { stopSequences } : {}),
     jsonMode: outputFormat !== undefined,
     jsonSchema: outputFormat,
     tools,
@@ -615,6 +707,64 @@ function rejectUnknownAnthropicKeys(input: Record<string, unknown>): void {
         }
       }
     });
+  }
+}
+
+/**
+ * `stop_sequences` as the direct API takes them (measured 2026-08-30): an
+ * array of strings, empty allowed. A non-array is `Input should be a valid
+ * array`, a non-string member names its own index. Unlike every other key on
+ * this surface these are REALIZED — see `stop-sequences.ts`.
+ */
+function readAnthropicStopSequences(value: unknown): readonly string[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new ProxyRequestError('stop_sequences: Input should be a valid array', 400, 'anthropic');
+  }
+  value.forEach((member, index) => {
+    if (typeof member !== 'string') {
+      throw new ProxyRequestError(`stop_sequences.${index}: Input should be a valid string`, 400, 'anthropic');
+    }
+  });
+  return value as string[];
+}
+
+/**
+ * The keys the direct Messages API accepts, validated as it validates them and
+ * then NOT applied — no local runtime has a tier, a region or a code-execution
+ * container. Measured 2026-08-30; the sentences are the direct API's own.
+ *
+ * `container` is the one that is always refused: the direct API allows it only
+ * alongside the code execution tool, which this proxy does not serve, so every
+ * value gets the refusal the direct API gives for a container without it.
+ */
+function validateAnthropicAcceptedFields(input: Record<string, unknown>): void {
+  if (input.metadata !== undefined && input.metadata !== null) {
+    const metadata = asRecord(input.metadata);
+    if (!metadata) {
+      throw new ProxyRequestError('metadata: Input should be a valid dictionary', 400, 'anthropic');
+    }
+    for (const key of Object.keys(metadata)) {
+      if (key !== 'user_id') {
+        throw new ProxyRequestError(`metadata.${key}: Extra inputs are not permitted`, 400, 'anthropic');
+      }
+    }
+    if (metadata.user_id !== undefined && metadata.user_id !== null && typeof metadata.user_id !== 'string') {
+      throw new ProxyRequestError('metadata.user_id: Input should be a valid string', 400, 'anthropic');
+    }
+  }
+  if (input.service_tier !== undefined && input.service_tier !== 'auto' && input.service_tier !== 'standard_only') {
+    throw new ProxyRequestError("service_tier: Input should be 'auto' or 'standard_only'", 400, 'anthropic');
+  }
+  if (input.inference_geo !== undefined && input.inference_geo !== 'global' && input.inference_geo !== 'us') {
+    throw new ProxyRequestError("inference_geo: must be one of ['global', 'us']", 400, 'anthropic');
+  }
+  if (input.container !== undefined && input.container !== null) {
+    throw new ProxyRequestError(
+      'container: Container identifier can only be provided when using the code execution tool',
+      400,
+      'anthropic',
+    );
   }
 }
 

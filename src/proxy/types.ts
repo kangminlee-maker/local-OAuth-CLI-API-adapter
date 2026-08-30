@@ -98,6 +98,12 @@ export interface NormalizedRequest {
    * API's n independent samples are.
    */
   readonly choices?: number;
+  /**
+   * Anthropic `stop_sequences`. No runtime carries them, so they are realized
+   * on the response path (`stop-sequences.ts`): the text is cut before the
+   * first one and the turn reports `stop_sequence`.
+   */
+  readonly stopSequences?: readonly string[];
   readonly raw: unknown;
 }
 
