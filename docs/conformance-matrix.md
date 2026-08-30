@@ -532,6 +532,10 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 | `container: "container_x"` | `container: Container identifier can only be provided when using the code execution tool` — **코드 실행 도구 없이는 어떤 값도 거절** |
 | `anthropic-beta: bogus-…` 헤더 | 400 `Unexpected value(s) … for the anthropic-beta header.` |
 
+**프록시 라이브 검증 (2026-08-30, 실제 claude 런타임)**: 같은 프롬프트·같은 `stop_sequences: ["ZZ"]`를 프록시에 보내
+버퍼 경로와 스트림 경로 모두 `content: [{text:"AA"}]`, `stop_reason: "stop_sequence"`, `stop_sequence: "ZZ"` — P-8의 direct 응답과 필드 단위로 일치.
+스텁 백엔드는 게이트를 증명하고, 이 실행은 배선을 증명한다.
+
 **direct의 `usage`는 항상 `service_tier`와 `inference_geo`를 싣는다.** 프록시는 싣지 않는다 — 로컬 CLI는 어느 티어·리전에서도 돌지 않으며,
 이 프록시의 규칙은 런타임의 숫자를 보고하는 것이지 지어내는 것이 아니다. 계약의 "Anthropic accepted-and-not-applied keys" 행에 명시.
 

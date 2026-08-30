@@ -195,7 +195,15 @@
     <p class="lead">이 문서는 로컬 OAuth CLI를 OpenAI·Anthropic 호환 API 표면과 native local CLI chat 표면으로 노출하는 설치형 프록시의 현재 구현 경계, 검증 기준, 남은 최적화 지점을 한눈에 정리합니다.</p>
 
     <div class="band">
-      <p><strong>버전</strong> 0.2.1 · <strong>단계</strong> 최신 코드 기준 벤치마크 재측정 (2026-06-22) · <strong>상태</strong> <span class="ok">Direct + Proxy 완료 (paired)</span></p>
+      <p><strong>버전</strong> 0.3.0 · <strong>단계</strong> 옵션 규칙을 direct 실측으로 미러링 (2026-08-30) · <strong>상태</strong> <span class="ok">이미지 표면 종결 · Chat 표면 종결 · Messages 잔여행 종결 · Responses 미착수</span></p>
+      <p><strong>지금 어디까지 왔나 (2026-08-30):</strong> <code>pnpm test</code> 990/990. 계기 둘이 라이브 direct와 필드 단위로 비교합니다 —
+      <code>pnpm e2e:images:parity</code> 73/73, <code>pnpm e2e:text:parity</code> 97/97. 이번 단계에서 확정한 것: 기본 이미지 전송기가
+      <strong>요청한 캔버스를 지킨다</strong>(백엔드가 1254&times;1254를 돌려줘도 1024&times;1024로), Chat 본문이 <strong>direct의 스키마</strong>로
+      검증된다(키 집합 34개·미지 키 거절·경계·enum·중첩 필수값), Chat <code>n</code>이 <strong>n개의 백엔드 턴</strong>으로 실현된다,
+      Anthropic <code>stop_sequences</code>가 <strong>출력 경로에서 실현</strong>된다(시퀀스 앞에서 자르고 <code>stop_sequence</code>로 보고).
+      <strong>보고 순서는 비교 정렬로 유도했습니다</strong> — 첫 초안의 "알파벳 키 순서"는 틀렸고(독립 10쌍 중 5쌍 반증), 27키·107콜·대칭성 검사로
+      실제 순서를 얻었습니다. 원자료는 <code>docs/conformance-matrix.md</code> §5.5.1~§5.5.5-A, 이어서 작업할 순서는
+      <code>docs/handoff-2026-08-30.md</code> §4입니다.</p>
       <p><strong>현재 측정 현황:</strong> Direct·Proxy 모두 같은 견고한 표본으로 재측정을 마쳤습니다 — 속도 <code>provider-parity</code> n=10, semantic <code>quality-realistic</code> ×3, 이미지 <code>image-realistic</code> n=3 (OpenAI <code>gpt-5.5</code> + Anthropic <code>claude-opus-4-8</code>). 핵심 결과: <code>proxy-codex</code> 속도 P/D 77~150%로 이전(200~272%) 대비 대폭 개선, <code>proxy-claude</code> tool 케이스는 direct보다 빠름(75~92%). 아래 "벤치마크 재측정 현황"이 현재 기준 paired 표이고, 이전(2026-06-04~06) 스냅샷은 git 이력에 있습니다.</p>
       <p><strong>최근 반영(커밋 33ee3dc~49bd9c2, MAP 미반영분 정리):</strong> Anthropic <code>output_config</code> + thinking parity(claude 런타임), client <code>json_schema</code> name/strict 보존(codex 런타임), 스트리밍 refusal/stop-metadata 정합, <code>--extra-arg</code> 대시 값 허용. 계약 회귀 게이트 <code>contract-smoke</code> 21/21, <code>verify:runtime-boundary</code> 통과.</p>
       <p><strong>리뷰 캠페인 현황(2026-08-20, PR #5 머지 완료):</strong> 5라운드·리뷰어 9명으로 <strong>실결함 34건</strong>을 수정했고 테스트는 645→697로 늘었습니다. 각 수정은 변경 전 재현과 변경 후 뮤테이션 검증(수정을 되돌리면 새 테스트가 빨간불)을 거쳤습니다. 라운드별 수확: ①②브랜치 차분·격리 스위치 7건 ③벤치 판정·전송 9건 ④런타임·벤치 적대적 15건 ⑤이미지·수명주기·직전수정 역공격 15건. 특히 <strong>요청 하나로 프록시 프로세스가 종료</strong>되던 가용성 결함(네이티브 채팅 스트림이 헤더 전송 후 예외 → 오류 작성기의 <code>writeHead</code>가 <code>ERR_HTTP_HEADERS_SENT</code> → 미처리 rejection), <strong>연결 끊긴 클라이언트가 세션을 영구 정지</strong>시키던 drain 대기, <strong>flat 이미지 후처리가 단위 오류로 아무것도 평탄화하지 않던</strong> 문제(채널 합계를 색으로 사용), 그리고 <strong>직전 라운드 수정 자체의 회귀 3건</strong>(완료된 턴을 후속 오류 프레임이 폐기, <code>response.incomplete</code>를 500으로 만들어 생성 토큰 전량 폐기, 알린 <code>call_id</code>를 item id로 되돌림)이 이 캠페인의 대표 수확입니다. 캠페인이 남긴 미처리 14건은 2026-08-20~21에 <strong>모두 닫았습니다</strong>(벤치 판정 5·전송/표면 5·격리 4 — 아래 "벤치 게이트 전환"·"툴 스트림과 완료 본문"·"자식 격리와 수명주기", 테스트 697→722). 함께 발견된 기존 결함 2건도 고쳤습니다: 실 스모크와 설치본 E2E가 백엔드 식별자(<code>codex-app-server</code>)를 모델로 보내 전부 실패하던 문제(기본 모델을 실제 slug로).</p>
