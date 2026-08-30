@@ -82,6 +82,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     // client reads `message.function_call`.
     tools: readOpenAiTools(input.tools),
     toolChoice: readOpenAiToolChoice(input.tool_choice),
+    ...(typeof input.n === 'number' && input.n !== 1 ? { choices: input.n } : {}),
     raw: body,
   };
 }
@@ -425,6 +426,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     jsonSchemaStrict: format?.type === 'json_schema' ? readOptionalBoolean(format.strict) : undefined,
     tools: readOpenAiTools(input.tools),
     toolChoice: readOpenAiToolChoice(input.tool_choice),
+    ...(typeof input.n === 'number' && input.n !== 1 ? { choices: input.n } : {}),
     raw: body,
   };
 }

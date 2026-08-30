@@ -225,15 +225,23 @@ async function handleRequest(
       errorShape = 'openai-chat';
       const normalized = normalizeOpenAiChatRequest(body);
       rejectDeferredFeatures(normalized);
+      // `n` is realized as n backend turns — the runtimes have no slot for it,
+      // and n independent samples is exactly what n turns are.
+      const choiceCount = normalized.choices ?? 1;
       if (normalized.stream) {
+        // One `close` listener per turn is wired inside `streamEvents`.
+        if (choiceCount > 1) res.setMaxListeners(choiceCount + 10);
         await writeOpenAiChatStream(
           res,
-          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await Promise.all(Array.from(
+            { length: choiceCount },
+            () => streamEvents(backend, normalized, requestTimeoutMs, res),
+          )),
           await requestReportingExecutedModel(backend, normalized),
         );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
-        writeJson(res, 200, openAiChatResponse(result, normalized));
+        const results = await runChoicesWithTimeout(backend, normalized, choiceCount, requestTimeoutMs, res);
+        writeJson(res, 200, openAiChatResponse(results, normalized));
       }
       return;
     }
@@ -1175,6 +1183,36 @@ function turnAbort(res: ServerResponse, requestTimeoutMs: number): { signal: Abo
   };
 }
 
+/**
+ * Chat `n`, realized: n independent turns, run together, one per `choices[]`
+ * entry. A turn that fails cancels its siblings — they are already-lost work,
+ * and on a serialized backend they would hold the queue for a caller that has
+ * its error already.
+ */
+async function runChoicesWithTimeout(
+  backend: LocalCliBackend,
+  request: NormalizedRequest,
+  count: number,
+  requestTimeoutMs: number,
+  res: ServerResponse,
+): Promise<LocalCompletionResult[]> {
+  const abort = turnAbort(res, requestTimeoutMs);
+  const fanOut = new AbortController();
+  const onAbort = (): void => fanOut.abort();
+  abort.signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.all(Array.from({ length: count }, () => backend
+      .generate(request, fanOut.signal)
+      .catch((err: unknown) => {
+        fanOut.abort();
+        throw err;
+      })));
+  } finally {
+    abort.signal.removeEventListener('abort', onAbort);
+    abort.release();
+  }
+}
+
 async function runWithTimeout(
   backend: LocalCliBackend,
   request: NormalizedRequest,
@@ -1762,40 +1800,75 @@ function imageStreamEventType(
     : `${prefix}.completed`;
 }
 
-function openAiChatResponse(result: LocalCompletionResult, request: NormalizedRequest): unknown {
-  const hasToolCalls = result.toolCalls.length > 0;
+function openAiChatResponse(
+  results: readonly LocalCompletionResult[],
+  request: NormalizedRequest,
+): unknown {
+  const [first] = results;
   return {
-    id: `chatcmpl-${result.id}`,
+    id: `chatcmpl-${first.id}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: result.model,
-    choices: [
-      {
-        index: 0,
-        message: hasToolCalls ? {
-          role: 'assistant',
-          // Narration that accompanied the tool call, as the provider returns
-          // it; `null` only when the turn really said nothing.
-          content: result.text ? result.text : null,
-          tool_calls: result.toolCalls.map(openAiToolCall),
-          refusal: null,
-          annotations: [],
-        } : {
-          role: 'assistant',
-          content: result.text,
-          refusal: null,
-          annotations: [],
-        },
-        // `length` is how the chat surface says "stopped at the cap"; the
-        // Anthropic surface already passes `max_tokens` through as a stop reason.
-        finish_reason: hasToolCalls
-          ? 'tool_calls'
-          : result.stopReason === 'max_tokens' ? 'length' : 'stop',
-      },
-    ],
-    usage: openAiChatUsage(result.usage),
+    model: first.model,
+    choices: results.map((result, index) => openAiChatChoice(result, index)),
+    usage: openAiChatUsage(mergedChatUsage(results)),
     service_tier: echoedServiceTier(request),
     system_fingerprint: null,
+  };
+}
+
+function openAiChatChoice(result: LocalCompletionResult, index: number): unknown {
+  const hasToolCalls = result.toolCalls.length > 0;
+  return {
+    index,
+    message: hasToolCalls ? {
+      role: 'assistant',
+      // Narration that accompanied the tool call, as the provider returns
+      // it; `null` only when the turn really said nothing.
+      content: result.text ? result.text : null,
+      tool_calls: result.toolCalls.map(openAiToolCall),
+      refusal: null,
+      annotations: [],
+    } : {
+      role: 'assistant',
+      content: result.text,
+      refusal: null,
+      annotations: [],
+    },
+    // `length` is how the chat surface says "stopped at the cap"; the
+    // Anthropic surface already passes `max_tokens` through as a stop reason.
+    finish_reason: hasToolCalls
+      ? 'tool_calls'
+      : result.stopReason === 'max_tokens' ? 'length' : 'stop',
+  };
+}
+
+/**
+ * One usage for a fan-out, shaped as the direct API shapes it: the PROMPT is
+ * counted once and the completions are summed (measured on `n: 2` —
+ * `prompt_tokens` unchanged, `completion_tokens` doubled). This proxy really
+ * does send the prompt once per turn, so the number under-reports what the
+ * backend consumed; the contract's `n` row says so. Reporting it n times would
+ * hand a client a number no direct response can produce.
+ */
+function mergedChatUsage(results: readonly LocalCompletionResult[]): LocalUsage {
+  const [first, ...rest] = results;
+  if (rest.length === 0) return first.usage;
+  let outputTokens = first.usage.outputTokens;
+  let reasoningOutputTokens = first.usage.reasoningOutputTokens;
+  for (const result of rest) {
+    outputTokens += result.usage.outputTokens;
+    if (result.usage.reasoningOutputTokens !== undefined) {
+      reasoningOutputTokens = (reasoningOutputTokens ?? 0) + result.usage.reasoningOutputTokens;
+    }
+  }
+  return {
+    ...first.usage,
+    outputTokens,
+    ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(first.usage.totalTokens !== undefined
+      ? { totalTokens: first.usage.inputTokens + outputTokens }
+      : {}),
   };
 }
 
@@ -2133,9 +2206,17 @@ function cachedInputTokens(usage: LocalUsage): number {
     ?? (usage.cacheCreationInputTokens ?? 0) + (usage.cacheReadInputTokens ?? 0);
 }
 
+/**
+ * The Chat stream, with `n` realized: one backend turn per choice, merged as
+ * their events arrive and written with each choice's own `index`. Every chunk
+ * carries exactly one choice, which is how the direct API streams a fan-out
+ * (measured 2026-08-30 on `n: 2`: the two choices' role, content and stop
+ * chunks interleave, one choice per chunk). With one choice this is the stream
+ * it has always been.
+ */
 async function writeOpenAiChatStream(
   res: ServerResponse,
-  events: AsyncIterable<LocalStreamEvent>,
+  streams: readonly AsyncIterable<LocalStreamEvent>[],
   request: NormalizedRequest,
 ): Promise<void> {
   writeSseHeaders(res);
@@ -2149,82 +2230,24 @@ async function writeOpenAiChatStream(
     service_tier: echoedServiceTier(request),
     system_fingerprint: null,
   };
-  let streamedText = '';
-  let assistantStarted = false;
-  const toolState = new OpenAiChatToolStreamState(
-    res,
-    request.streamOptions,
-    () => assistantStarted,
-    () => {
-      assistantStarted = true;
-    },
-  );
+  const choices = streams.map((_, index) => new OpenAiChatChoiceStream(res, request, index));
+  const results: LocalCompletionResult[] = [];
   try {
-    const ensureTextStarted = async (): Promise<void> => {
-      if (assistantStarted) return;
-      assistantStarted = true;
-      await writeSseData(res, openAiChatStreamChunk(
-        base,
-        [{ index: 0, delta: { role: 'assistant', content: '', refusal: null }, finish_reason: null }],
-        request.streamOptions,
-      ));
-    };
-    if (!hasToolDecisionSchema(request)) {
-      await ensureTextStarted();
-    } else {
-      await toolState.prestart(base, predictableOpenAiChatToolStart(request));
+    for (const choice of choices) await choice.start(base);
+    for await (const { index, value: event } of mergeTaggedStreams(streams)) {
+      const result = await choices[index].push(base, event);
+      if (result) {
+        base = { ...base, model: result.model };
+        results.push(result);
+      }
     }
-    for await (const event of events) {
-      if (event.type === 'text_delta') {
-        if (!event.delta) continue;
-        await ensureTextStarted();
-        streamedText += event.delta;
-        await writeSseData(res, openAiChatStreamChunk(
-          base,
-          [{ index: 0, delta: { content: event.delta }, finish_reason: null }],
-          request.streamOptions,
-        ));
-        continue;
-      }
-      if (event.type === 'tool_call_delta') {
-        await toolState.write(base, event);
-        continue;
-      }
-      // The chat surface has no reasoning item: its shape reports reasoning
-      // only as a token count in `usage`.
-      if (event.type === 'reasoning_item') continue;
-      const result = event.result;
-      base = { ...base, model: result.model };
-      if (result.toolCalls.length > 0) {
-        await toolState.finish(base, result.toolCalls);
-        await writeSseData(res, openAiChatStreamChunk(
-          base,
-          [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-          request.streamOptions,
-        ));
-      } else {
-        await ensureTextStarted();
-        for (const chunk of chunkText(missingTextTail(streamedText, result.text))) {
-          await writeSseData(res, openAiChatStreamChunk(
-            base,
-            [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-            request.streamOptions,
-          ));
-        }
-        await writeSseData(res, openAiChatStreamChunk(
-          base,
-          [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          request.streamOptions,
-        ));
-      }
-      if (request.streamOptions.includeUsage) {
-        await writeSseData(res, {
-          ...base,
-          choices: [],
-          usage: openAiChatUsage(result.usage),
-          ...(request.streamOptions.includeObfuscation ? { obfuscation: randomObfuscation() } : {}),
-        });
-      }
+    if (request.streamOptions.includeUsage && results.length > 0) {
+      await writeSseData(res, {
+        ...base,
+        choices: [],
+        usage: openAiChatUsage(mergedChatUsage(results)),
+        ...(request.streamOptions.includeObfuscation ? { obfuscation: randomObfuscation() } : {}),
+      });
     }
     res.write('data: [DONE]\n\n');
   } catch (err) {
@@ -2232,6 +2255,120 @@ async function writeOpenAiChatStream(
     res.write('data: [DONE]\n\n');
   } finally {
     res.end();
+  }
+}
+
+/**
+ * Interleaves n event streams, tagging each event with the stream it came
+ * from. One stream's failure propagates — a fan-out that answers a client with
+ * three of its four choices and no error would be worse than the error — and
+ * the `finally` closes the siblings, so a rejected turn does not leave the
+ * others generating for nobody.
+ */
+async function* mergeTaggedStreams<T>(
+  sources: readonly AsyncIterable<T>[],
+): AsyncIterable<{ index: number; value: T }> {
+  const iterators = sources.map((source) => source[Symbol.asyncIterator]());
+  const pending = new Map<number, Promise<{ index: number; result: IteratorResult<T> }>>();
+  const pull = (index: number): void => {
+    pending.set(index, iterators[index].next().then((result) => ({ index, result })));
+  };
+  iterators.forEach((_, index) => pull(index));
+  try {
+    while (pending.size > 0) {
+      const { index, result } = await Promise.race(pending.values());
+      pending.delete(index);
+      if (result.done) continue;
+      pull(index);
+      yield { index, value: result.value };
+    }
+  } finally {
+    await Promise.allSettled(iterators.map((iterator) => iterator.return?.()));
+  }
+}
+
+/**
+ * One choice of a Chat stream: its own assistant-start, its own streamed text,
+ * its own tool-call state. With `n > 1` these run side by side, and nothing
+ * about a choice may leak into another — a shared `assistantStarted` would
+ * silently drop the second choice's opening chunk.
+ */
+class OpenAiChatChoiceStream {
+  private assistantStarted = false;
+  private streamedText = '';
+  private readonly toolState: OpenAiChatToolStreamState;
+
+  constructor(
+    private readonly res: ServerResponse,
+    private readonly request: NormalizedRequest,
+    private readonly choiceIndex: number,
+  ) {
+    this.toolState = new OpenAiChatToolStreamState(
+      res,
+      request.streamOptions,
+      choiceIndex,
+      () => this.assistantStarted,
+      () => {
+        this.assistantStarted = true;
+      },
+    );
+  }
+
+  async start(base: Record<string, unknown>): Promise<void> {
+    if (!hasToolDecisionSchema(this.request)) {
+      await this.ensureTextStarted(base);
+      return;
+    }
+    await this.toolState.prestart(base, predictableOpenAiChatToolStart(this.request));
+  }
+
+  /** Returns this choice's result once its turn has finished. */
+  async push(
+    base: Record<string, unknown>,
+    event: LocalStreamEvent,
+  ): Promise<LocalCompletionResult | null> {
+    if (event.type === 'text_delta') {
+      if (!event.delta) return null;
+      await this.ensureTextStarted(base);
+      this.streamedText += event.delta;
+      await this.write(base, { delta: { content: event.delta }, finish_reason: null });
+      return null;
+    }
+    if (event.type === 'tool_call_delta') {
+      await this.toolState.write(base, event);
+      return null;
+    }
+    // The chat surface has no reasoning item: its shape reports reasoning
+    // only as a token count in `usage`.
+    if (event.type === 'reasoning_item') return null;
+    const result = event.result;
+    // The closing chunks report the model that actually ran.
+    const finalBase = { ...base, model: result.model };
+    if (result.toolCalls.length > 0) {
+      await this.toolState.finish(finalBase, result.toolCalls);
+      await this.write(finalBase, { delta: {}, finish_reason: 'tool_calls' });
+    } else {
+      await this.ensureTextStarted(finalBase);
+      for (const chunk of chunkText(missingTextTail(this.streamedText, result.text))) {
+        await this.write(finalBase, { delta: { content: chunk }, finish_reason: null });
+      }
+      await this.write(finalBase, { delta: {}, finish_reason: 'stop' });
+    }
+    return result;
+  }
+
+  private async ensureTextStarted(base: Record<string, unknown>): Promise<void> {
+    if (this.assistantStarted) return;
+    this.assistantStarted = true;
+    await this.write(base, { delta: { role: 'assistant', content: '', refusal: null }, finish_reason: null });
+  }
+
+  private async write(base: Record<string, unknown>, choice: Record<string, unknown>): Promise<void> {
+    await writeSseData(this.res, openAiChatStreamChunk(
+      base,
+      [{ index: this.choiceIndex, ...choice }],
+      this.request.streamOptions,
+    ));
   }
 }
 
@@ -2255,6 +2392,9 @@ class OpenAiChatToolStreamState {
   constructor(
     private readonly res: ServerResponse,
     private readonly streamOptions: NormalizedRequest['streamOptions'],
+    // The CHOICE this state belongs to. The `index` inside `tool_calls` is the
+    // tool's position; this one is the choice's, and with `n > 1` they differ.
+    private readonly choiceIndex: number,
     private readonly hasAssistantStarted: () => boolean,
     private readonly markAssistantStarted: () => void,
   ) {}
@@ -2302,7 +2442,7 @@ class OpenAiChatToolStreamState {
       base,
       [
         {
-          index: 0,
+          index: this.choiceIndex,
           delta: {
             ...(includeAssistantStart ? { role: 'assistant', content: null, refusal: null } : {}),
             tool_calls: [
@@ -2337,7 +2477,7 @@ class OpenAiChatToolStreamState {
       base,
       [
         {
-          index: 0,
+          index: this.choiceIndex,
           delta: {
             tool_calls: [
               {

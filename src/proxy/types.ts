@@ -91,6 +91,13 @@ export interface NormalizedRequest {
   readonly jsonSchemaStrict?: boolean;
   readonly tools: readonly NormalizedTool[];
   readonly toolChoice: NormalizedToolChoice;
+  /**
+   * Chat `n`: how many completions the caller asked for, when they asked for
+   * more than one. The runtimes have no such slot, so it is realized as that
+   * many backend turns — one per `choices[]` entry, which is what the direct
+   * API's n independent samples are.
+   */
+  readonly choices?: number;
   readonly raw: unknown;
 }
 
