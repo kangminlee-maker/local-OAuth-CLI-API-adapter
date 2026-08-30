@@ -10,6 +10,12 @@ const systemPromptIndex = args.indexOf('--system-prompt');
 const jsonSchema = readJsonSchemaArg();
 const isToolArgumentsOnlySchema = Boolean(jsonSchema?.properties?.city)
   && !jsonSchema?.properties?.toolCalls;
+// A stand-in for `--json-schema` has to answer the schema it was GIVEN, or it
+// cannot tell a proxy that passes the right schema from one that passes any
+// schema at all. It used to emit the tool-decision shape for every schema,
+// which is why an OpenAI `response_format` reaching the native channel looked
+// like a regression instead of the fix.
+const isToolDecisionSchema = Boolean(jsonSchema?.properties?.toolCalls);
 
 if (
   systemPromptIndex === -1
@@ -235,7 +241,8 @@ if (isPersistent) {
   rl.on('close', () => process.exit(0));
 } else if (hasSchema) {
   if (isToolArgumentsOnlySchema) emitToolArgumentsOnly();
-  else emitStructured();
+  else if (isToolDecisionSchema) emitStructured();
+  else emitJsonObject();
 } else {
   emitText('OK');
 }

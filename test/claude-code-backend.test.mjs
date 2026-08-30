@@ -89,7 +89,11 @@ test('ClaudeCodeBackend parses structured tool decisions from persistent schema 
   }
 });
 
-test('ClaudeCodeBackend uses persistent JSON mode without losing exact JSON output', async () => {
+test('ClaudeCodeBackend sends an OpenAI json_schema through the native channel', async () => {
+  // This used to run on the persistent child, whose argv is fixed at spawn, so
+  // `--json-schema` never went with it: the only thing asking for the shape was
+  // a sentence in the prompt. The schema is a promise, so the turn takes the
+  // path that can carry it.
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
@@ -267,6 +271,47 @@ function toolRequest() {
     raw: {},
   };
 }
+
+test('every schema-bearing turn is spawned with --json-schema, on every surface', async () => {
+  // Measured against the real runtime 2026-08-31: with the caller's schema on
+  // the native channel, 0 of 12 hard turns violated it; with the schema left in
+  // the prompt — which is what the OpenAI shapes used to get, because only the
+  // Anthropic shape forced the flag-carrying path — 6 of 12 came back as valid
+  // JSON with keys the model invented (`comparison`, `summary`, `content`)
+  // instead of the caller's. A schema is a promise; the prompt is a request.
+  const base = {
+    model: 'claude-code-cli',
+    messages: [{ role: 'user', content: 'hi' }],
+    stream: false,
+    streamOptions: { includeUsage: false, includeObfuscation: false },
+    jsonMode: false,
+    tools: [],
+    toolChoice: { type: 'auto' },
+    raw: {},
+  };
+  const schema = { type: 'object', properties: { adapter: { type: 'string' } }, required: ['adapter'] };
+  const weather = { name: 'get_weather', description: 'w', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } };
+
+  for (const [label, request] of [
+    ['an OpenAI response_format schema', { ...base, shape: 'openai-chat', jsonMode: true, jsonSchema: schema }],
+    ['a Responses text.format schema', { ...base, shape: 'openai-responses', jsonMode: true, jsonSchema: schema }],
+    ['an Anthropic output_config schema', { ...base, shape: 'anthropic-messages', jsonMode: true, jsonSchema: schema }],
+    ['a forced tool', { ...base, shape: 'openai-chat', tools: [weather], toolChoice: { type: 'tool', name: 'get_weather' } }],
+  ]) {
+    const argv = await spawnedArgv(request, 'claude-code-cli');
+    const at = argv.indexOf('--json-schema');
+    assert.notEqual(at, -1, `${label} must carry the native channel: ${argv.join(' ')}`);
+    assert.ok(argv[at + 1]?.startsWith('{'), `${label} must carry a schema, got ${argv[at + 1]}`);
+    // The flag is spawn-time only (claude 2.1.251 has no per-turn form in
+    // stream-json input), so the turn cannot be reusing the persistent child.
+    assert.ok(argv.includes('--no-session-persistence'), `${label} must run one-shot`);
+  }
+
+  // And a turn with no schema still reuses the persistent child — the cost is
+  // paid where the promise exists, not everywhere.
+  const plain = await spawnedArgv({ ...base, shape: 'openai-chat' }, 'claude-code-cli');
+  assert.equal(plain.indexOf('--json-schema'), -1, `a schemaless turn must not carry the flag: ${plain.join(' ')}`);
+});
 
 async function spawnedArgv(request, model, options = {}) {
   const backend = new ClaudeCodeBackend({

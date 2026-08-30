@@ -584,6 +584,34 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 **계기 검증**: 심은 변이 3개 — 철자 도움 제거, 하한을 1로 되돌리기, `conversation`보다 `prompt`를 먼저 조회 — 모두 빨간불.
 오프라인 골든은 ALL PASS 실행의 프록시에서 **생성**했고(손으로 옮겨 적지 않았다), 거리 임계값 변이가 그중 4행을 죽인다.
 
+### 5.5.8 claude 네이티브 스키마 채널 — 라이브 위반율 (2026-08-31)
+
+**측정 대상**: 상시(persistent) claude 세션 경로에서 caller의 출력 스키마가 실제로 지켜지는가.
+`claude --json-schema`(2.1.251)는 **spawn 시점 플래그**이고 stream-json 입력에 턴별 형태가 없다 —
+상시 자식의 argv는 spawn에 고정되므로, 상시 경로로 간 요청에는 이 플래그가 **절대 붙지 않는다**.
+그런 턴을 붙들고 있던 것은 프롬프트 한 줄(`Schema JSON only.` / `Valid JSON only. No Markdown.`)뿐이었다.
+
+**계기**: 프록시에 같은 본문을 N회 보내 응답이 caller 스키마를 만족하는지 판정. 쉬운 케이스는 계기가 되지 못한다 —
+첫 시도(`tool_choice: required` + "서울 날씨?")는 **양쪽 빌드 다 0/6**이었고, 그건 채널이 아니라 질문의 쉬움을 잰 것이다.
+산문을 유도하는 케이스로 바꾼 뒤에야 갈렸다.
+
+| 케이스 (각 3회) | 네이티브 채널 | 프롬프트만 (변이) |
+| --- | --- | --- |
+| `json_schema` + "비교하고 이유를 설명하라" | 0/3 | **3/3 위반** |
+| `json_schema` + "마크다운 제목·불릿으로 요약하라" | 0/3 | **3/3 위반** |
+| `tool_choice: required` + 도구가 필요 없는 질문 | 0/3 | 0/3 |
+| 도구 결과 뒤의 연속 턴 | 0/3 | 0/3 |
+| **합계** | **0/12** | **6/12** |
+
+위반의 형태가 말해 주는 것: 모델은 **유효한 JSON을 냈지만 자기가 지어낸 키**를 썼다 —
+`{comparison, preference}`, `{comparison, key_differences, preference}`, `{summary}`, `{content}`,
+`{response, requested_format, delivered_format, conflict, topic}`. caller가 요구한 `{city, verdict}`는 한 번도 나오지 않았다.
+도구 판정 스키마가 양쪽 다 0인 이유는 프롬프트가 그 형태를 예시까지 적어 두기 때문이며, 그래도 채널로 보낸다 —
+같은 약속을 두 가지 방법으로 지킬 이유가 없다.
+
+**대가**: 스키마를 실은 턴은 상시 세션을 잃고 매번 새 CLI를 띄운다. 약속이 있는 곳에서만 치르는 값이고,
+스키마 없는 턴은 그대로 자식을 재사용한다. 회귀는 `test/claude-code-backend.test.mjs`의 argv 단언이 잡는다.
+
 ### 5.5.7 Anthropic Messages 필드 검증·보고 순서 실측 (2026-08-31) — **미러 완료**
 
 `claude-sonnet-5`. 봉투는 `{type:"error", error:{type, message}}` — **`param`도 `code`도 없다**.

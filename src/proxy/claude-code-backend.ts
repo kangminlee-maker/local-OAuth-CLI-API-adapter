@@ -726,15 +726,27 @@ function claudeTuningArgs(request: NormalizedRequest, model?: string): string[] 
   return args;
 }
 
-// Per-request flags must be on the spawned argv, so a request that contributes any
-// of them runs one-shot rather than reusing the persistent process (whose argv is
-// fixed at spawn). The schema case is scoped to the Anthropic shape, where
-// `jsonSchema` comes from `output_config.format` and must reach `claude
-// --json-schema`; OpenAI-shape `response_format` keeps its persistent path. Tuning
-// flags only force one-shot when they actually contribute (gated-out flags do not).
+/**
+ * Per-request flags must be on the spawned argv, so a request that contributes
+ * any of them runs one-shot rather than reusing the persistent process (whose
+ * argv is fixed at spawn).
+ *
+ * The schema case used to be scoped to the Anthropic shape. Everything else
+ * with a schema — an OpenAI `response_format: json_schema`, and every turn
+ * carrying tools, which is most of them — kept the persistent path, where
+ * `--json-schema` is never passed. What constrained those turns was a sentence
+ * in the prompt ("Schema JSON only.") and nothing else, with `parseBackendOutput`
+ * left to salvage whatever came back. That is asking, not requiring, and this
+ * proxy's rule is that an option is a promise: if the runtime has a channel for
+ * it, the request goes through the channel.
+ *
+ * `claude --json-schema` (2.1.251) is a spawn-time flag with no per-turn form in
+ * stream-json input, so honouring it costs those turns the persistent session.
+ * That is the price of the promise, and it is paid where the schema exists —
+ * a turn with no schema still reuses the child.
+ */
 function requiresOneShotClaudeArgs(request: NormalizedRequest, model?: string): boolean {
-  const needsSchema = request.shape === 'anthropic-messages' && request.jsonSchema !== undefined;
-  return needsSchema || claudeTuningArgs(request, model).length > 0;
+  return outputSchemaFor(request) !== null || claudeTuningArgs(request, model).length > 0;
 }
 
 function readClaudeStopReason(message: JsonObject): string | undefined {
