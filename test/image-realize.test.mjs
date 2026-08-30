@@ -137,6 +137,22 @@ test('realizeRequestedSize: another canvas is covered to the requested size, in 
   assert.ok(q70.equals(reference), 'the 70 encode is the reference encode');
 });
 
+test('realizeRequestedSize: a WebP canvas comes back WebP, a PNG with alpha keeps its alpha', async () => {
+  // The codec it came back in, not a codec of ours: re-encoding WebP as PNG
+  // would change the bytes' type under a client that asked for WebP.
+  const source = await solid(8, 8, { r: 10, g: 200, b: 30, alpha: 1 });
+  const webp = { b64Json: b64(await sharp(source).webp().toBuffer()) };
+  const outWebp = await realizeRequestedSize(request({ size: '32x16', outputFormat: 'webp' }), webp);
+  const mw = await meta(outWebp);
+  assert.equal(mw.format, 'webp');
+  assert.equal(`${mw.width}x${mw.height}`, '32x16');
+
+  const transparent = { b64Json: b64(await solid(8, 8, { r: 0, g: 0, b: 255, alpha: 0 })) };
+  const outPng = await realizeRequestedSize(request({ size: '32x16' }), transparent);
+  assert.equal((await meta(outPng)).format, 'png');
+  assert.equal((await pixel(outPng, 5, 5))[3], 0, 'the alpha the backend returned survives the resize');
+});
+
 test('realizeRequestedSize: bytes the codec cannot read come back untouched, not as a failure', async () => {
   const image = { b64Json: Buffer.from('garbage after a billed turn').toString('base64') };
   assert.equal(await realizeRequestedSize(request({ size: '32x16' }), image), image);

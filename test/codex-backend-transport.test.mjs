@@ -6,6 +6,9 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
 import sharp from 'sharp';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js';
 import { resetCodexModelCatalogCache } from '../dist/proxy/codex-model-catalog.js';
 
@@ -1032,6 +1035,85 @@ test('a returned canvas that is not the requested size is brought to it (streame
   const completed = events.filter((event) => event.type === 'completed');
   assert.equal(completed.length, 1);
   assert.equal(await dims(completed[0].image.b64Json), '32x16');
+});
+
+test('every image of every turn is corrected, in turn order (n > 1)', async () => {
+  // The fan-out runs one backend turn per requested image; a correction that
+  // only reached the first turn's images would leave the rest at whatever
+  // canvas the backend chose, which is the defect this whole path exists for.
+  const codexHome = await createCodexHome();
+  const returned = [await solidPng(8, 8, { r: 255, g: 0, b: 0, alpha: 1 }), await solidPng(16, 4, { r: 0, g: 0, b: 255, alpha: 1 })];
+  let call = 0;
+  globalThis.fetch = async () => new Response(imageSse(returned[call++ % returned.length]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), n: 2, size: '32x16' });
+  assert.equal(result.images.length, 2);
+  for (const [index, image] of result.images.entries()) {
+    assert.equal(await dims(image.b64Json), '32x16', `image ${index}`);
+  }
+  // Turn order is the response order: the red turn's image is first.
+  const colour = async (b64) => {
+    const { data } = await sharp(Buffer.from(b64, 'base64')).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    return [data[0], data[1], data[2]];
+  };
+  assert.deepEqual(await colour(result.images[0].b64Json), [255, 0, 0]);
+  assert.deepEqual(await colour(result.images[1].b64Json), [0, 0, 255]);
+});
+
+test('the streamed completed frame reports the size its bytes actually have', async () => {
+  // Through the HTTP surface, because the promise is what the CLIENT reads:
+  // the event's `size` and the bytes beside it have to be the same canvas.
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const started = await startLocalApiProxy({
+    backend: { name: 'unused', model: 'x', async generate() { throw new Error('unused'); }, async close() {} },
+    imageGenerationClient: new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' }),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    // The proxy's own fetch stub must not intercept the client's request.
+    const res = await originalFetch(`${started.url}/v1/images/generations`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a green leaf icon', size: '32x16', stream: true }),
+    });
+    assert.equal(res.status, 200);
+    const wire = await res.text();
+    const frames = [...wire.matchAll(/^event: (\S+)\ndata: (.+)$/gm)].map(([, type, data]) => ({ type, data: JSON.parse(data) }));
+    assert.equal(frames.length, 1, wire);
+    assert.equal(frames[0].type, 'image_generation.completed');
+    assert.equal(frames[0].data.size, '32x16');
+    assert.equal(await dims(frames[0].data.b64_json), '32x16', 'the frame reports the canvas its own bytes carry');
+  } finally {
+    await started.close();
+  }
+});
+
+// A codec that cannot load is answered before the first backend turn — which
+// cannot be shown in-process, because this process has a working sharp. The
+// child runs the same two requests under a resolve hook that makes
+// `import('sharp')` fail, and the control arm (no hook) is what proves the
+// probe's fetch counter can move at all.
+test('a codec that cannot load is a 500 before any backend turn, buffered and streamed', async () => {
+  const execFileAsync = promisify(execFile);
+  const probe = resolve(here, 'fixtures/image-codec-failure-probe.mjs');
+  const run = async (args) => JSON.parse((await execFileAsync(process.execPath, args, { cwd: resolve(here, '..') })).stdout);
+
+  const failed = await run(['--import', './test/fixtures/register-fail-sharp.mjs', probe]);
+  for (const arm of ['buffered', 'streamed']) {
+    assert.equal(failed[arm].name, 'ProxyRequestError', arm);
+    assert.equal(failed[arm].statusCode, 500, arm);
+    assert.equal(failed[arm].type, 'server_error', arm);
+    assert.equal(failed[arm].param, null, arm);
+    assert.match(failed[arm].message, /sharp/, arm);
+  }
+  assert.equal(failed.fetchCallsAfterBuffered, 0, 'the buffered path did not start a turn');
+  assert.equal(failed.fetchCalls, 0, 'neither path started a turn');
+
+  const control = await run([probe]);
+  assert.equal(control.fetchCalls, 2, 'with a loadable codec both paths do reach the backend — the counter is not stuck at 0');
+  assert.notEqual(control.buffered.statusCode, 500);
 });
 
 test('a returned canvas already at the requested size is passed through byte for byte', async () => {
