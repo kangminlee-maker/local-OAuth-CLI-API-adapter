@@ -1098,3 +1098,118 @@ for (const [label, messages] of TOOL_HISTORY_SHAPES) {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// A tool-calling turn's narration, on a backend that streams none of it.
+//
+// Measured against the installed claude CLI (2.1.251, 2026-08-31) on the native
+// `--json-schema` channel every tool-calling turn now takes: the content_block
+// deltas carry the model's PROSE, and the wrapper object arrives only in the
+// final `result` message as `structured_output`. The extractor reading those
+// deltas as JSON finds neither a `text` property nor a tool call, so the turn
+// streams NOTHING and the whole answer is first known at `completed`.
+//
+//   STREAMED TEXT     : "서울의 날씨를 확인해드리겠습니다."
+//   RESULT.structured : {"status":"tool_calls","text":"서울의 날씨를 …",
+//                        "toolCalls":[{"id":"call_1", …}]}
+//
+// So `result.text` is non-empty while nothing was streamed — the case the
+// `missingTextTail` reconciliation exists for. Assert it on all three surfaces
+// at once: the stream and the buffered body describe ONE turn.
+
+function narratedToolCallBackend() {
+  const result = {
+    id: 'x',
+    model: 'configured-model',
+    text: '서울의 날씨를 확인해드리겠습니다.',
+    toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+    usage: { inputTokens: 20, outputTokens: 8, source: 'provider' },
+    latencyMs: 1,
+  };
+  return {
+    name: 'test',
+    model: 'configured-model',
+    async generate() { return result; },
+    async *stream() { yield { type: 'completed', result }; },
+    async close() {},
+  };
+}
+
+async function narratedToolSurfaces() {
+  const backend = narratedToolCallBackend();
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  const post = (path, body, headers = {}) => realFetch(`${server.url}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer local', ...headers },
+    body: JSON.stringify(body),
+  });
+  const chatTools = [{ type: 'function', function: { name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true } }];
+  const responsesTools = [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }];
+  const messagesTools = [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }];
+  const anthropicHeaders = { 'x-api-key': 'local', 'anthropic-version': '2023-06-01' };
+  try {
+    const chatBuffered = await (await post('/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'w' }], tools: chatTools })).json();
+    const chatStream = sseEvents(await (await post('/v1/chat/completions', { model: 'm', stream: true, messages: [{ role: 'user', content: 'w' }], tools: chatTools })).text());
+    const responsesBuffered = await (await post('/v1/responses', { model: 'm', input: 'w', tools: responsesTools })).json();
+    const responsesStream = sseEvents(await (await post('/v1/responses', { model: 'm', stream: true, input: 'w', tools: responsesTools })).text());
+    const messagesBuffered = await (await post('/v1/messages', { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }], tools: messagesTools }, anthropicHeaders)).json();
+    const messagesWire = await (await post('/v1/messages', { model: 'm', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'w' }], tools: messagesTools }, anthropicHeaders)).text();
+    const messagesStream = [...messagesWire.matchAll(/^event: (\S+)\ndata: (.+)$/gm)].map(([, type, data]) => ({ type, data: JSON.parse(data) }));
+    return {
+      chat: {
+        buffered: chatBuffered.choices?.[0]?.message?.content ?? '',
+        streamed: chatStream.map((chunk) => chunk.choices?.[0]?.delta?.content ?? '').join(''),
+        finishReason: chatStream.map((chunk) => chunk.choices?.[0]?.finish_reason).filter(Boolean),
+        streamedCalls: chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? [])
+          .map((call) => call.function?.arguments).filter((value) => typeof value === 'string').join(''),
+      },
+      responses: {
+        buffered: responsesBuffered.output ?? [],
+        streamed: responsesStream.find((event) => event.type === 'response.completed')?.response?.output ?? [],
+        deltas: responsesStream.filter((event) => event.type === 'response.output_text.delta').map((event) => event.delta).join(''),
+      },
+      messages: {
+        buffered: messagesBuffered.content ?? [],
+        streamedBlocks: messagesStream.filter((event) => event.type === 'content_block_start').map((event) => event.data.content_block),
+        deltas: messagesStream.filter((event) => event.type === 'content_block_delta' && event.data.delta.type === 'text_delta')
+          .map((event) => event.data.delta.text).join(''),
+      },
+    };
+  } finally {
+    await server.close();
+  }
+}
+
+const NARRATION = '서울의 날씨를 확인해드리겠습니다.';
+
+test('chat streams the narration a tool-calling turn carried', async () => {
+  const surfaces = await narratedToolSurfaces();
+  assert.equal(surfaces.chat.buffered, NARRATION, 'the buffered body is the reference');
+  assert.equal(surfaces.chat.streamed, NARRATION, 'the stream must carry the same content the body reports');
+  assert.deepEqual(surfaces.chat.finishReason, ['tool_calls'], 'and it is still a tool-call turn');
+  assert.equal(surfaces.chat.streamedCalls, '{"city":"Seoul"}', 'the call still reaches the client once');
+});
+
+test('responses streams the message item a tool-calling turn carried', async () => {
+  const surfaces = await narratedToolSurfaces();
+  assert.deepEqual(
+    surfaces.responses.buffered.map((item) => item.type),
+    ['message', 'function_call'],
+    'the buffered body is the reference',
+  );
+  assert.deepEqual(
+    surfaces.responses.streamed.map((item) => item.type),
+    ['message', 'function_call'],
+    'the completed output must name the same items, at the same positions',
+  );
+  assert.equal(surfaces.responses.deltas, NARRATION, 'and the deltas must carry the text the item reports');
+  const message = surfaces.responses.streamed.find((item) => item.type === 'message');
+  assert.equal(message?.content?.[0]?.text, NARRATION);
+});
+
+test('messages streams the text block a tool-calling turn carried', async () => {
+  const surfaces = await narratedToolSurfaces();
+  assert.deepEqual(surfaces.messages.buffered.map((block) => block.type), ['text', 'tool_use']);
+  assert.deepEqual(surfaces.messages.streamedBlocks.map((block) => block.type), ['text', 'tool_use']);
+  assert.equal(surfaces.messages.deltas, NARRATION);
+});

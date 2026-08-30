@@ -234,3 +234,72 @@ test('honour-on: streaming chunks report the executed model, not the request ech
   assert.ok(!text.includes('gpt-5.6-sol'), `chunks must not echo the request model: ${text}`);
   assert.ok(!text.includes('configured-not-this'), `chunks must not fall back to the configured model: ${text}`);
 });
+
+// A fan-out's shared cancel lives on the writer, and honour-on can fail before
+// the writer exists: `streamEvents` prefetches each turn's first event, so a
+// turn that throws before that event rejects while its siblings are already
+// running. Measured before the fix, with `n: 3` and the first turn throwing:
+// the client was answered in 13ms, turns 1 and 2 were still suspended, and the
+// abort signal had fired zero times — two backend turns generating for nobody
+// until their own request timeouts.
+test('honour-on: a fan-out turn that fails to start cancels its siblings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'fan-out-prefetch-'));
+  trees.push(root);
+  await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  const settings = JSON.parse(await readFile(join(repoRoot, 'settings.json'), 'utf8'));
+  await writeFile(
+    join(root, 'settings.json'),
+    `${JSON.stringify({ ...settings, modelSelection: { honorRequestModel: true } }, null, 2)}\n`,
+  );
+  const scriptPath = join(root, 'fan-out.mjs');
+  await writeFile(scriptPath, `
+    import { startLocalApiProxy } from ${JSON.stringify(join(root, 'dist/proxy/http-server.js'))};
+
+    const state = { turns: 0, aborts: 0, suspended: [] };
+    const live = new Set();
+    const backend = {
+      name: 'live', model: 'live-model',
+      async generate() { throw new Error('unused'); },
+      async *stream(request, signal) {
+        const turn = state.turns++;
+        signal?.addEventListener('abort', () => { state.aborts += 1; }, { once: true });
+        live.add(turn);
+        try {
+          if (turn === 0) throw new Error('this turn failed');
+          yield { type: 'text_delta', delta: 'hello' };
+          // Long enough that only a cancel — never this turn's own timer — can
+          // end it inside the test's lifetime.
+          await new Promise((resolveP, rejectP) => {
+            const timer = setTimeout(resolveP, 20000);
+            signal?.addEventListener('abort', () => { clearTimeout(timer); rejectP(new Error('aborted')); }, { once: true });
+          });
+          yield { type: 'completed', result: { id: 'x', model: 'live-model', text: 'hello', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 } };
+        } finally {
+          live.delete(turn);
+        }
+      },
+      async close() {},
+    };
+
+    const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30000 });
+    const began = Date.now();
+    const res = await fetch(started.url + '/v1/chat/completions', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'live-model', stream: true, n: 3, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const text = await res.text();
+    const answeredMs = Date.now() - began;
+    await new Promise((r) => setTimeout(r, 250));
+    state.suspended = [...live];
+    await started.close();
+    process.stdout.write(JSON.stringify({ status: res.status, answeredMs, text, state }));
+    process.exit(0);
+  `);
+  const { stdout } = await execFileAsync(process.execPath, [scriptPath], { cwd: root });
+  const result = JSON.parse(stdout);
+  assert.equal(result.status, 500, `the failure must reach the client: ${result.text}`);
+  assert.ok(result.answeredMs < 5_000, `the client waited ${result.answeredMs}ms for an error it should have had at once`);
+  assert.equal(result.state.turns, 3, 'all three turns did start');
+  assert.equal(result.state.aborts, 2, 'both surviving turns must be cancelled');
+  assert.deepEqual(result.state.suspended, [], 'and no turn may be left generating for nobody');
+});

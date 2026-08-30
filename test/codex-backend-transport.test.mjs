@@ -1043,8 +1043,16 @@ test('every image of every turn is corrected, in turn order (n > 1)', async () =
   // canvas the backend chose, which is the defect this whole path exists for.
   const codexHome = await createCodexHome();
   const returned = [await solidPng(8, 8, { r: 255, g: 0, b: 0, alpha: 1 }), await solidPng(16, 4, { r: 0, g: 0, b: 255, alpha: 1 })];
-  let call = 0;
-  globalThis.fetch = async () => new Response(imageSse(returned[call++ % returned.length]), { status: 200 });
+  // Keyed by the TURN, read out of the prompt, not by the order the two
+  // concurrent turns happen to reach fetch: an arrival-order stub decides the
+  // colour of turn 0 by a coin flip, and this assertion then passed or failed
+  // on the scheduler rather than on the transport.
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.stringify(JSON.parse(init.body).input);
+    const turn = body.includes('Generate image 1 of 2') ? 0 : 1;
+    assert.match(body, /Generate image [12] of 2/, 'the turn must be identifiable from its own request');
+    return new Response(imageSse(returned[turn]), { status: 200 });
+  };
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
   const result = await backend.generate({ ...imageRequest(), n: 2, size: '32x16' });
   assert.equal(result.images.length, 2);

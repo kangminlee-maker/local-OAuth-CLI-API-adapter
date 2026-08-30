@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { before, test } from 'node:test';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
+import { MAX_ERROR_MESSAGE_CHARS } from '../dist/proxy/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fakeClaude = resolve(here, 'fixtures/fake-claude.cjs');
@@ -1162,7 +1163,7 @@ test('an oversized runtime diagnostic is bounded before it reaches the client', 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 500, `client message must be bounded to 500, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `client message must ride the shared ceiling, got ${err.message.length}`);
         assert.match(err.message, /error_during_execution/);
         return true;
       },
@@ -1221,7 +1222,7 @@ test('an oversized subtype cannot bypass the client-message bound', async () => 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 500, `bound must cover the whole message, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `bound must cover the whole message, got ${err.message.length}`);
         return true;
       },
     );
@@ -1342,7 +1343,7 @@ test('the bound applies to the composed message, not to each half', async () => 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 500, `composed message must be bounded, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `composed message must be bounded, got ${err.message.length}`);
         return true;
       },
     );
@@ -1461,7 +1462,7 @@ test('honorRequestModel off: a refusal message is bounded even though nothing ma
       ),
       (err) => {
         assert.equal(err.statusCode, undefined, 'honour-off keeps this a server-side failure');
-        assert.ok(err.message.length <= 500, `refusal message must be bounded, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `refusal message must be bounded, got ${err.message.length}`);
         return true;
       },
     );
@@ -1962,4 +1963,55 @@ test('honorRequestModel off: the one-shot argv is unchanged', async () => {
     'claude-opus-4-8',
   );
   assert.ok(argv.some((arg) => arg.includes('Say OK')), `argv: ${argv.join(' ')}`);
+});
+
+// The ceiling is one constant, and this is the half that proves it: a
+// diagnostic BETWEEN the operator log's 500 and the client ceiling must arrive
+// whole. A second, tighter bound inside this backend clipped these at 500 while
+// the HTTP layer's own comment claimed both were the same — so raising
+// MAX_ERROR_MESSAGE_CHARS silently did nothing for claude-runtime messages.
+test('a runtime diagnostic under the client ceiling is not clipped by the operator log bound', async () => {
+  const length = MAX_ERROR_MESSAGE_CHARS - 100;
+  assert.ok(length > 500, 'this case only exists while the two bounds differ');
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const previousChars = process.env.CLAUDE_TEST_DETAIL_CHARS;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'sized_detail';
+    process.env.CLAUDE_TEST_DETAIL_CHARS = String(length);
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.equal(err.message.length, length, 'a diagnostic that fits the ceiling must arrive whole');
+        assert.ok(!err.message.includes('...[truncated]'), `it must not be truncated: ${err.message.slice(-30)}`);
+        return true;
+      },
+    );
+    // And the other side: over the ceiling, it is bounded AT the ceiling — not
+    // at some smaller number of a producer's own choosing.
+    process.env.CLAUDE_TEST_DETAIL_CHARS = String(MAX_ERROR_MESSAGE_CHARS + 500);
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.equal(err.message.length, MAX_ERROR_MESSAGE_CHARS);
+        assert.ok(err.message.endsWith('...[truncated]'), `expected the marker: ${err.message.slice(-30)}`);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+    if (previousChars === undefined) delete process.env.CLAUDE_TEST_DETAIL_CHARS;
+    else process.env.CLAUDE_TEST_DETAIL_CHARS = previousChars;
+  }
 });

@@ -224,7 +224,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-1 | `model` | string, required | none | the model; echoed in `model` | 400 / `invalid_request_error` (Anthropic envelope has **no `param`/`code`**) | supported; required non-empty string; 404 `not_found_error` when honouring is on (contract `:301`, `:405` ff.) | VERIFIED-weak (`anthropic.messages.text` vs `anthropic-api`; **the archive shows this case both passing and failing across runs**) |
 | A-2 | `max_tokens` | integer, **required** | none | caps output; `stop_reason:"max_tokens"` | 400 / `invalid_request_error` | supported and required; **`0` accepted** on the claim that the direct API accepts it (contract `:316`) — an unverified claim about the provider | DOC? |
 | A-3 | `messages` | array, `minItems: 1`, required | none | the conversation | 400 / `invalid_request_error` | supported | VERIFIED-weak (same caveat as A-1) |
-| A-4 | `messages[].role` | `user`\|`assistant` only | none | turn attribution | 400 / `invalid_request_error` | supported; anything else (esp. `system`) 400 in the Anthropic envelope (contract `:303`) | DOC |
+| A-4 | `messages[].role` | `user`\|`assistant`, plus `system` past index 0 | none | turn attribution | 400 / `invalid_request_error` | supported; `system` at index 0 is 400 with guidance toward the top-level parameter and elsewhere is accepted, and only its POSITION is exempt — the rest of the item's schema still applies at `messages.<i>` (§5.5.7). Anything else 400 in the Anthropic envelope | VERIFIED |
 | A-5 | `messages[].content` | string \| block array | none | the turn | 400 / `invalid_request_error` | supported | VERIFIED-weak |
 | A-6 | `content[].type:"text"` | `{text, cache_control?, citations?}` | — | text input | 400 / `invalid_request_error` | supported | VERIFIED-weak |
 | A-7 | `content[].type:"image"` | `source`: `{type:"base64", media_type, data}` \| `{type:"url", url}` \| `{type:"file", file_id}` | — | vision input | 400 / `invalid_request_error` | base64 + url supported; **`file` rejected pre-execution** (contract `:307`) — the provider accepts it via the Files API, so this is a real capability gap surfaced as a 400 | VERIFIED-weak for base64/url (`anthropic.messages.image.schema_exact`) |
@@ -581,6 +581,12 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 잘려 나갔다. 상한은 성장을 막는 장치이지 목표가 아니므로 1024로 올렸고,
 값은 `MAX_ERROR_MESSAGE_CHARS` 한 곳에 있으며 테스트 픽스처도 그 상수에서 파생한다.
 
+**후속(2026-08-31, 3라운드 리뷰)**: "한 곳"이 두 군데서 깨져 있었다. ① `error.param`은 상한을 타지 않아서
+1,000만 자 미지 키가 `message.len 1024` 옆에 `param.len 10,000,000`으로 나갔다 — `param`도 caller의 바이트다
+(`metadata.<key>`, 항목 경로, 키 이름 자체). ② claude 백엔드가 **자기 상한 500**으로 클라이언트 진단을 다시
+잘랐고, 그래서 1024로 올린 것이 그 경로에서는 아무 효과가 없었다. 상수는 `types.ts`로 옮겨 HTTP 표면과
+백엔드가 같은 것을 읽고, 500은 **운영자 로그 한 줄**에만 남는다.
+
 **계기 검증**: 심은 변이 3개 — 철자 도움 제거, 하한을 1로 되돌리기, `conversation`보다 `prompt`를 먼저 조회 — 모두 빨간불.
 오프라인 골든은 ALL PASS 실행의 프록시에서 **생성**했고(손으로 옮겨 적지 않았다), 거리 임계값 변이가 그중 4행을 죽인다.
 
@@ -631,6 +637,7 @@ OpenAI 표면들이 능력 거절을 맨 뒤에 두는 것과 같은 모양이�
 | `messages` 없음 / 문자열·null / `[]` | `messages: Field required` / `messages: Input should be a valid array` / `messages: at least one message is required` |
 | `max_tokens` 없음 / 문자열·null / `-1` / `0` | `max_tokens: Field required` / `Input should be a valid integer` / `must be greater than or equal to 0` / **수용** |
 | 항목 `role` 없음 / `"developer"` / **`"system"` 0번** / `"system"` 1번 이후 | `messages.0.role: Field required` / `messages: Unexpected role "developer". Allowed roles are "user" or "assistant"` / `messages.0: use the top-level 'system' parameter …` / **200 수용** |
+| **`"system"` 1번 이후의 나머지 스키마** (2026-08-31 3라운드 추가 측정) | 위치만 면제이고 항목 스키마는 그대로 적용된다: content 없음 → `messages.1.content: Field required`, `content: null`·정수 → `messages.1.content: Input should be a valid array`, 블록에 type 없음 → `messages.1.content.0.type: Field required`, 미지 멤버 → `messages.1.bogus: Extra inputs are not permitted`(뒤 필드의 타입 결함을 이긴다). 프록시는 조기 `return`으로 앞의 셋을 **200**으로 답하고 미지 멤버를 **미지 키 단계**에서 보고하고 있었다 |
 | 항목 `content` 없음 / null·정수·객체 / `[]` / `[7]` / `[{}]` | `messages.0.content: Field required` / `messages.0.content: Input should be a valid array`(문자열은 수용) / `messages.0: user messages must have non-empty content` / `messages.0.content.0: Input should be an object` / `messages.0.content.0.type: Field required` |
 | 항목 미지 멤버 | `messages.0.bogus: Extra inputs are not permitted` — `messages` 자리에서 보고된다 |
 | `null`의 의미 | **생략**: `metadata`·`inference_geo`·`stop_sequences`·`cache_control`·`container`. **타입 결함**: 그 밖 전부(`stream`·`system`·`tools`·`tool_choice`·`thinking`·`output_config`·`service_tier`·`top_k`·`top_p`·`temperature`). OpenAI 표면처럼 일률적이지 않다 |

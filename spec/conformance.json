@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "31cd0c0571fcdfbe962ebb23dae2255b0bc13ec87a5f2611f8a2134dced13277",
+    "matrixDigest": "36028e206c3c681d91ffd03a9c2153e1def6ad87da422a9c5ed0a93174429e89",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -2679,16 +2679,16 @@
       "matrixLine": 227,
       "field": "`messages[].role`",
       "vendor": {
-        "valueSpace": "`user`|`assistant` only",
+        "valueSpace": "`user`|`assistant`, plus `system` past index 0",
         "defaultWhenOmitted": "none",
         "observableEffect": "turn attribution",
         "invalidValue": "400 / `invalid_request_error`"
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported; anything else (esp. `system`) 400 in the Anthropic envelope (contract `:303`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "supported; `system` at index 0 is 400 with guidance toward the top-level parameter and elsewhere is accepted, and only its POSITION is exempt — the rest of the item's schema still applies at `messages.<i>` (§5.5.7). Anything else 400 in the Anthropic envelope",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED",
       "liveParityRow": true
     },
     {

@@ -336,6 +336,20 @@ export const BACKEND_IDENTIFIERS: readonly string[] = [
   'claude-code-cli',
 ];
 
+// The ceiling on every client-visible diagnostic. It lives beside the error
+// type rather than inside one surface, because its producers are on both sides
+// of the HTTP boundary: a model name a client chose, a backend runtime's own
+// words, an upstream's prose. One constant rather than one per producer —
+// bounding at each source has already been missed once, and a second, tighter
+// bound in a backend made raising this one silently do nothing there.
+//
+// The ceiling bounds GROWTH; it is not a target. It has to clear the longest
+// sentence the surfaces this proxy mirrors actually emit, or it turns a
+// faithful message into a divergence — which is what 500 did to the Responses
+// item-type union (713 characters, measured 2026-08-31, and the parity row
+// `responses input item type unknown` is what catches a regression here).
+export const MAX_ERROR_MESSAGE_CHARS = 1024;
+
 export class ProxyRequestError extends Error {
   constructor(
     message: string,

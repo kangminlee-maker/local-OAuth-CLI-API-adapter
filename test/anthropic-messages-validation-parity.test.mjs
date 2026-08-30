@@ -63,6 +63,17 @@ const REJECTIONS = [
   ["item role system at the head", { messages: [{ role: 'system', content: 'ping' }] }, "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position"],
   ["item role system with empty content", { messages: [{ role: 'system', content: [] }, { role: 'user', content: 'ping' }] }, "messages.0: system content must contain at least one block"],
   ["item role developer", { messages: [{ role: 'developer', content: 'x' }, { role: 'user', content: 'ping' }] }, "messages: Unexpected role \"developer\". Allowed roles are \"user\" or \"assistant\""],
+  // A system item past the head is ACCEPTED, so the rest of its schema decides
+  // the answer — measured 2026-08-31, the same sentences a user item gets, at
+  // the same position. The proxy used to return early and answer all four 200.
+  ["item system past the head without content", { messages: [{ role: 'user', content: 'a' }, { role: 'system' }] }, "messages.1.content: Field required"],
+  ["item system past the head content null", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: null }] }, "messages.1.content: Input should be a valid array"],
+  ["item system past the head content as an integer", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 7 }] }, "messages.1.content: Input should be a valid array"],
+  ["item system past the head content block without a type", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [{ text: 'x' }] }] }, "messages.1.content.0.type: Field required"],
+  // The phase, not just the sentence: the item's unknown member is reported at
+  // the `messages` position (4), beating `temperature`'s type fault (12).
+  ["item system past the head unknown member", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 'x', bogus: 1 }], temperature: 'x' }, "messages.1.bogus: Extra inputs are not permitted"],
+  ["item user unknown member beats a later field", { messages: [{ role: 'user', content: 'a', bogus: 1 }], temperature: 'x' }, "messages.0.bogus: Extra inputs are not permitted"],
   ["item content missing", { messages: [{ role: 'user' }] }, "messages.0.content: Field required"],
   ["item content null", { messages: [{ role: 'user', content: null }] }, "messages.0.content: Input should be a valid array"],
   ["item content as an integer", { messages: [{ role: 'user', content: 7 }] }, "messages.0.content: Input should be a valid array"],

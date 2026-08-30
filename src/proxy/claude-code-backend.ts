@@ -21,7 +21,7 @@ import type {
   LocalUsage,
   NormalizedRequest,
 } from './types.js';
-import { unsupportedModelError } from './types.js';
+import { MAX_ERROR_MESSAGE_CHARS, unsupportedModelError } from './types.js';
 import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface ClaudeCodeBackendOptions {
@@ -1072,13 +1072,14 @@ function claudeProcessFailure(
 }
 
 /**
- * A client-visible diagnostic, bounded but not escaped. HTTP JSON and SSE JSON
+ * A client-visible diagnostic, bounded to the ceiling every client-visible
+ * diagnostic takes, and not escaped. HTTP JSON and SSE JSON
  * already encode control characters safely, so escaping them here would make a
  * legitimate multi-line runtime message arrive as escape notation. Truncation
  * walks code points so a boundary cannot split an astral character.
  */
 function boundedText(message: string): string {
-  const budget = MAX_LOG_LINE_CHARS - TRUNCATION_MARKER.length;
+  const budget = MAX_ERROR_MESSAGE_CHARS - TRUNCATION_MARKER.length;
   let out = '';
   for (const ch of message) {
     if (out.length + ch.length > budget) return `${out}${TRUNCATION_MARKER}`;
@@ -1115,8 +1116,11 @@ const CLAUDE_REFUSAL_DIAGNOSTIC = new RegExp(
 // C0, DEL and C1, plus the two Unicode line separators.
 const NON_PRINTING = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const TRUNCATION_MARKER = '...[truncated]';
-// Long enough for the CLI's refusal sentence and a model name; short enough that
-// a hostile value cannot flood an operator's log from one request.
+// The OPERATOR's log line only. Long enough for the CLI's refusal sentence and
+// a model name; short enough that a hostile value cannot flood a log from one
+// request. Client-visible diagnostics take `MAX_ERROR_MESSAGE_CHARS` instead —
+// they are the same channel every other error takes, and a second bound here
+// made raising that one silently do nothing for claude-runtime messages.
 const MAX_LOG_LINE_CHARS = 500;
 // A terminating child gets this long to exit before it is killed outright.
 const CHILD_SHUTDOWN_GRACE_MS = 2_000;

@@ -1164,13 +1164,21 @@ function validateAnthropicMessageItem(item: unknown, index: number): void {
   // there it is refused with guidance toward the top-level parameter, and
   // ANYWHERE ELSE it is accepted (measured — a system message at index 1
   // returns 200). This proxy used to refuse it at every position.
-  if (message.role === 'system') {
-    if (index > 0) return;
+  const system = message.role === 'system';
+  if (system && index === 0) {
     throw anthropicFault(Array.isArray(message.content) && message.content.length === 0
       ? 'messages.0: system content must contain at least one block'
       : "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position");
   }
-  if (!ANTHROPIC_ROLES.some((role) => role === message.role)) {
+  // Only the ROLE check is skipped past index 0; the rest of the item's schema
+  // still applies, with the same sentences at the same position (measured
+  // 2026-08-31: `messages.1.content: Field required`, `messages.1.content:
+  // Input should be a valid array`, `messages.1.content.0.type: Field
+  // required`, and `messages.1.bogus: Extra inputs are not permitted` beating a
+  // later field's type fault). Returning here instead answered those four with
+  // a 200, and reported the item's unknown member from the unknown-keys phase
+  // — after every known field rather than at the `messages` position.
+  if (!system && !ANTHROPIC_ROLES.some((role) => role === message.role)) {
     throw anthropicFault(`messages: Unexpected role "${String(message.role)}". Allowed roles are "user" or "assistant"`);
   }
   if (message.content === undefined) throw anthropicFault(`messages.${index}.content: Field required`);
@@ -1609,18 +1617,25 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
       'input',
     );
   }
-  return value.map((item, index) => {
+  return value.flatMap((item, index) => {
     const msg = asRecord(item);
     if (!msg) {
       throw new ProxyRequestError(`input[${index}] must be an object.`, 400);
     }
     const content = flattenResponsesMessage(msg);
-    return {
+    // An item this runtime cannot replay carries nothing a turn can be built
+    // from. It used to fall through to stringifying the ITEM, which put
+    // `{"id":"rs_…","type":"reasoning","summary":[]}` in front of the model as
+    // a USER message — and feeding `output` back as `input` is the documented
+    // way to hold a conversation on a surface that stores none, so the proxy
+    // was corrupting its own round trip.
+    if (content === null) return [];
+    return [{
       role: readResponsesRole(msg, index),
       content: content.text,
       images: content.images,
       ...(content.toolHistory ? { toolHistory: true } : {}),
-    };
+    }];
   });
 }
 
@@ -1840,7 +1855,15 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
   };
 }
 
-function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedContent {
+/**
+ * One input item as a turn, or `null` for an item that is not one.
+ *
+ * A message item always carries `content` — `validateOpenAiResponsesInputItem`
+ * requires it — so an item without one is a typed item of some other kind: a
+ * reasoning item, a hosted-tool call this runtime never made. Those replay as
+ * nothing rather than as their own JSON.
+ */
+function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedContent | null {
   if (msg.type === 'function_call_output') {
     const output = flattenOpenAiContent(msg.output);
     return {
@@ -1865,7 +1888,8 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
       toolHistory: true,
     };
   }
-  return flattenOpenAiContent(msg.content ?? msg);
+  if (msg.content === undefined) return null;
+  return flattenOpenAiContent(msg.content);
 }
 
 function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedContent {

@@ -25,7 +25,7 @@ import type {
 } from './types.js';
 import { honorRequestModel } from '../settings.js';
 import {
-  BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
+  BACKEND_IDENTIFIERS, MAX_ERROR_MESSAGE_CHARS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { StopSequenceGate, truncateAtStopSequence } from './stop-sequences.js';
@@ -238,10 +238,11 @@ async function handleRequest(
         const fanOut = new AbortController();
         await writeOpenAiChatStream(
           res,
-          await Promise.all(Array.from(
-            { length: choiceCount },
+          await startFanOutStreams(
+            choiceCount,
             () => streamEvents(backend, normalized, requestTimeoutMs, res, fanOut.signal),
-          )),
+            () => fanOut.abort(),
+          ),
           await requestReportingExecutedModel(backend, normalized),
           () => fanOut.abort(),
         );
@@ -1253,23 +1254,42 @@ export async function withFirstEventSettled(
 ): Promise<AsyncIterable<LocalStreamEvent>> {
   const iterator = events[Symbol.asyncIterator]();
   const first = await iterator.next();
+  let delivered = false;
+  let closed = false;
+  // The wrapper drives the backend iterator by hand, so closing early — a
+  // client disconnect after the first event, or a fan-out sibling abandoned
+  // when another turn failed to start — would otherwise never reach the source
+  // generator's own cleanup, leaving its timeout, CLI process, or backend lock
+  // alive. It is written as an explicit iterator rather than a generator
+  // because `return()` on a generator that was never started skips its body:
+  // an abandoned turn nothing ever read is exactly that case.
+  const close = async (): Promise<IteratorResult<LocalStreamEvent>> => {
+    if (!closed) {
+      closed = true;
+      await iterator.return?.();
+    }
+    return { done: true, value: undefined };
+  };
   return {
-    async *[Symbol.asyncIterator]() {
-      try {
-        if (first.done) return;
-        yield first.value;
-        while (true) {
-          const next = await iterator.next();
-          if (next.done) return;
-          yield next.value;
-        }
-      } finally {
-        // The wrapper drives the backend iterator by hand, so closing early —
-        // a client disconnect after the first event — would otherwise never
-        // reach the source generator's own cleanup, leaving its timeout, CLI
-        // process, or backend lock alive.
-        await iterator.return?.();
-      }
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<LocalStreamEvent>> {
+          if (closed) return { done: true, value: undefined };
+          if (!delivered) {
+            delivered = true;
+            if (!first.done) return { done: false, value: first.value };
+            return await close();
+          }
+          try {
+            const next = await iterator.next();
+            return next.done ? await close() : next;
+          } catch (err) {
+            await close();
+            throw err;
+          }
+        },
+        return: close,
+      };
     },
   };
 }
@@ -1290,6 +1310,35 @@ async function requestReportingExecutedModel(
   const resolved = await backend.resolvedModel?.(request).catch(() => null) ?? null;
   if (!resolved || resolved === request.model) return request;
   return { ...request, model: resolved };
+}
+
+/**
+ * A fan-out's turns, with the whole fan-out cancelled if any of them fails to
+ * start.
+ *
+ * With honouring on, `streamEvents` prefetches each turn's first event, so a
+ * turn that fails before that event rejects HERE — before the writer that owns
+ * the shared cancel exists, which is the only place the siblings were being
+ * cancelled from. Measured before this: `n: 3` with the first turn throwing
+ * answered the client in 13ms and left turns 1 and 2 suspended with zero abort
+ * signals fired, generating until their own request timeouts.
+ */
+async function startFanOutStreams(
+  count: number,
+  start: () => Promise<AsyncIterable<LocalStreamEvent>>,
+  cancel: () => void,
+): Promise<AsyncIterable<LocalStreamEvent>[]> {
+  const settled = await Promise.allSettled(
+    Array.from({ length: count }, () => start()),
+  );
+  const started = settled.filter((entry) => entry.status === 'fulfilled');
+  if (started.length === settled.length) return started.map((entry) => entry.value);
+  cancel();
+  // Cancel first, then collect: an iterator suspended inside `next()` queues a
+  // `return()` behind that call, which is the same trap `mergeTaggedStreams`
+  // documents in its own `finally`.
+  await Promise.allSettled(started.map((entry) => entry.value[Symbol.asyncIterator]().return?.()));
+  throw (settled.find((entry) => entry.status === 'rejected') as PromiseRejectedResult).reason;
 }
 
 function streamEvents(
@@ -2445,6 +2494,19 @@ class OpenAiChatChoiceStream {
     // The closing chunks report the model that actually ran.
     const finalBase = { ...base, model: result.model };
     if (result.toolCalls.length > 0) {
+      // The narration that came with the call is part of the turn, and the
+      // buffered body reports it — a stream that drops it makes the two
+      // describe different turns. Nothing streams it live: a backend running a
+      // tool extractor emits no `text_delta` at all, so the wrapper's prose is
+      // first known here.
+      const tail = missingTextTail(this.streamedText, result.text);
+      if (tail) {
+        await this.ensureTextStarted(finalBase);
+        for (const chunk of chunkText(tail)) {
+          this.streamedText += chunk;
+          await this.write(finalBase, { delta: { content: chunk }, finish_reason: null });
+        }
+      }
       await this.toolState.finish(finalBase, result.toolCalls);
       await this.write(finalBase, { delta: {}, finish_reason: 'tool_calls' });
     } else {
@@ -2722,12 +2784,30 @@ async function writeOpenAiResponsesStream(
 
       const result = event.result;
       if (result.toolCalls.length > 0) {
-        for (const { outputIndex, item } of await toolState.finish(result.toolCalls)) {
-          finalItems.set(outputIndex, item);
-        }
-        // Narration streamed before the call belongs in the completed output
-        // too, or the stream's own summary contradicts the deltas it sent.
-        if (streamedText) {
+        const finishTools = async (): Promise<void> => {
+          for (const { outputIndex, item } of await toolState.finish(result.toolCalls)) {
+            finalItems.set(outputIndex, item);
+          }
+        };
+        // Narration belongs in the completed output too, or the stream's own
+        // summary contradicts the deltas it sent — and nothing streams it live
+        // when a tool extractor is active, so the tail the result carries is
+        // the only place the prose appears at all.
+        const finishMessage = async (): Promise<void> => {
+          const tail = missingTextTail(streamedText, result.text);
+          if (!streamedText && !tail) return;
+          await ensureTextStarted();
+          for (const chunk of chunkText(tail)) {
+            streamedText += chunk;
+            await writeResponseEvent('response.output_text.delta', {
+              type: 'response.output_text.delta',
+              item_id: itemId,
+              output_index: messageOutputIndex,
+              content_index: 0,
+              delta: chunk,
+              logprobs: [],
+            });
+          }
           const messageItem = openAiResponseMessageItem(itemId, streamedText);
           await writeResponseEvent('response.output_text.done', {
             type: 'response.output_text.done',
@@ -2750,6 +2830,17 @@ async function writeOpenAiResponsesStream(
             output_index: messageOutputIndex,
             item: messageItem,
           });
+        };
+        // Output positions follow production order, which is the same knob the
+        // buffered body reads through `orderedByEmission`. Text already
+        // streamed has its position, so only a turn that streamed none of it
+        // can still put the call first.
+        if (result.toolCallsBeforeText && !streamedText) {
+          await finishTools();
+          await finishMessage();
+        } else {
+          await finishMessage();
+          await finishTools();
         }
       } else {
         await ensureTextStarted();
@@ -3291,7 +3382,7 @@ function streamErrorPayload(err: unknown): unknown {
       error: {
         message: boundedErrorMessage(err.message),
         type: err.type,
-        param: err.param,
+        param: boundedErrorParam(err.param),
         code: err.code,
       },
     };
@@ -3302,7 +3393,7 @@ function streamErrorPayload(err: unknown): unknown {
       error: {
         message: boundedErrorMessage(providerError.message),
         type: providerError.type,
-        param: providerError.param,
+        param: boundedErrorParam(providerError.param),
         code: providerError.code,
       },
     };
@@ -3436,19 +3527,18 @@ function isAddressInfo(value: string | AddressInfo | null): value is AddressInfo
   return Boolean(value) && typeof value === 'object';
 }
 
-// Every client-visible error message passes through here, so this is where the
-// documented ceiling belongs: one place rather than one per producer. A model
-// name a client chose, a runtime diagnostic, an upstream's prose — each reaches a
-// response through some branch below, and bounding at each source has already
-// been missed once.
-//
-// The ceiling bounds GROWTH; it is not a target. It has to clear the longest
-// sentence the surfaces this proxy mirrors actually emit, or it turns a
-// faithful message into a divergence — which is what 500 did to the Responses
-// item-type union (713 characters, measured 2026-08-31, and the parity row
-// `responses input item type unknown` is what catches a regression here).
-export const MAX_ERROR_MESSAGE_CHARS = 1024;
 const ERROR_TRUNCATION_MARKER = '...[truncated]';
+
+/**
+ * The same ceiling for `param`. It is client-visible and caller-supplied too —
+ * an unknown key's own name and `metadata.<key>` both put the caller's bytes
+ * there, and a provider error's `param` is prose this proxy did not write.
+ * Measured before this: an unknown key of 10,000,000 characters answered 400
+ * with `message.len 1024` beside `param.len 10,000,000`.
+ */
+function boundedErrorParam(param: string | null): string | null {
+  return param === null ? null : boundedErrorMessage(param);
+}
 
 function boundedErrorMessage(message: string): string {
   // A message that already fits is returned untouched. Reserving the marker
@@ -3526,7 +3616,7 @@ function writeError(
       error: {
         message: boundedErrorMessage(err.message),
         type: err.type,
-        param: err.param,
+        param: boundedErrorParam(err.param),
         code: err.code,
       },
     });
@@ -3562,7 +3652,7 @@ function writeError(
       error: {
         message: boundedErrorMessage(providerError.message),
         type: providerError.type,
-        param: providerErrorParamForShape(providerError.param, shape),
+        param: boundedErrorParam(providerErrorParamForShape(providerError.param, shape)),
         code: providerError.code,
       },
     });

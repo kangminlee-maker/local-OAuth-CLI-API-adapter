@@ -309,3 +309,112 @@ test('the rows cover every key this surface knows', () => {
   assert.ok(known.length >= 33, `the key set must actually load: ${known.length}`);
   assert.deepEqual(known.filter((key) => !sent.has(key)), [], 'these known keys have no row');
 });
+
+// The round trip the surface is built around: a client with nowhere to store
+// state replays the previous turn's `output` as the next turn's `input`. The
+// rejection row named "input item round trip" only proves such a body is
+// ACCEPTED — it asserts the `temperature` envelope and nothing about what the
+// model is then asked. What the backend receives is the promise.
+test('replayed output reaches the model as the turn it was, not as its own JSON', async () => {
+  let seen = null;
+  const started = await startLocalApiProxy({
+    backend: {
+      name: 'test', model: 'configured-model',
+      async generate(request) {
+        seen = request;
+        return { id: 'x', model: 'configured-model', text: 'pong', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 };
+      },
+      async *stream() { throw new Error('unused'); },
+      async close() {},
+    },
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  const send = async (input) => {
+    seen = null;
+    const res = await fetch(`${started.url}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.6-terra', input, max_output_tokens: 16 }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 200, JSON.stringify(body));
+    return seen.messages.map((message) => ({ role: message.role, content: message.content }));
+  };
+  try {
+    const conversation = [{ role: 'user', content: 'ping' }, ASSISTANT_ITEM(), { role: 'user', content: 'again' }];
+    const expected = [
+      { role: 'user', content: 'ping' },
+      { role: 'assistant', content: 'OK' },
+      { role: 'user', content: 'again' },
+    ];
+    assert.deepEqual(await send(conversation), expected);
+    // A reasoning item is in `output` on every reasoning model, and this proxy
+    // emits one of its own. It replays as NOTHING: no backend takes a reasoning
+    // summary, and it used to be stringified into a `user` turn — the model was
+    // told `{"id":"rs_…","type":"reasoning","summary":[]}` in the user's voice.
+    const withReasoning = [{ id: 'rs_abc', type: 'reasoning', summary: [] }, ...conversation];
+    assert.deepEqual(await send(withReasoning), expected, 'a reasoning item must not become a turn');
+    // Same for a hosted-tool call this runtime never made.
+    const withHostedCall = [{ id: 'ws_abc', type: 'web_search_call', status: 'completed' }, ...conversation];
+    assert.deepEqual(await send(withHostedCall), expected, 'a hosted-tool call must not become a turn');
+    // And the items that DO carry a turn still do.
+    const withToolHistory = [
+      { role: 'user', content: 'ping' },
+      { type: 'function_call', call_id: 'call_1', name: 'f', arguments: '{"a":1}' },
+      { type: 'function_call_output', call_id: 'call_1', output: 'done' },
+    ];
+    const replayed = await send(withToolHistory);
+    assert.equal(replayed.length, 3);
+    assert.match(replayed[1].content, /name: f/);
+    assert.match(replayed[2].content, /done/);
+  } finally {
+    await started.close();
+  }
+});
+
+// The unknown-key suggester's length pre-filter is a COST promise: it changes
+// no message, because `|len(a) - len(b)| <= distance` holds for unit-cost
+// Levenshtein, so the keys it drops were never going to be within 2 anyway.
+// Nothing about the output can catch its removal — measured, deleting the one
+// `.filter(...)` line leaves the whole offline suite green while a 1M-char
+// unknown key goes from ~2ms to ~1000ms of synchronous work, blocking the
+// whole server for it.
+//
+// So this asserts the cost. The baseline is the SAME request size rejected at
+// the same phase with no suggestion work, which cancels the ~1MB JSON parse
+// and leaves only the suggester: measured 2ms with the filter, 960ms without.
+test('a huge unknown key costs no more than parsing it', async () => {
+  const started = await startLocalApiProxy({ backend: backend(), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  const huge = 'z'.repeat(1_000_000);
+  const base = { model: 'gpt-5.6-terra', input: 'ping', max_output_tokens: 16 };
+  const timed = async (body) => {
+    const began = process.hrtime.bigint();
+    const res = await fetch(`${started.url}/v1/responses`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const payload = await res.json();
+    assert.equal(res.status, 400, JSON.stringify(payload).slice(0, 200));
+    return Number(process.hrtime.bigint() - began) / 1e6;
+  };
+  try {
+    // A body of the same size whose rejection runs no suggester: the 1M chars
+    // sit in a known key's VALUE, and `temperature` is what is reported.
+    const withoutSuggestions = { ...base, prompt_cache_key: huge, temperature: 0.5 };
+    const withSuggestions = { ...base, [huge]: 1 };
+    await timed(withSuggestions);
+    let smallestDelta = Infinity;
+    // The smallest of five rounds: this runs beside the rest of the suite, so a
+    // scheduling hiccup must not decide it — and the gap being guarded is three
+    // orders of magnitude wide, so the smallest sample is still decisive.
+    for (let round = 0; round < 5; round += 1) {
+      const baseline = await timed(withoutSuggestions);
+      const probe = await timed(withSuggestions);
+      smallestDelta = Math.min(smallestDelta, probe - baseline);
+    }
+    assert.ok(
+      smallestDelta < 400,
+      `suggesting for a 1M-char key cost ${smallestDelta.toFixed(0)}ms over parsing it — the length pre-filter is gone`,
+    );
+  } finally {
+    await started.close();
+  }
+});

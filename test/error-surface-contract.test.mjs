@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import http from 'node:http';
-import { MAX_ERROR_MESSAGE_CHARS, startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { MAX_ERROR_MESSAGE_CHARS } from '../dist/proxy/types.js';
 import { unsupportedModelError } from '../dist/proxy/types.js';
 import { LocalCliChatError } from '../dist/chat/types.js';
 
@@ -2129,4 +2130,36 @@ test('an oversized native error message is bounded like every other surface', as
   } finally {
     await started.close();
   }
+});
+
+// `param` is the other half of the client-visible envelope, and it is caller
+// text: an unknown key's own name, `metadata.<key>`, an item path. Bounding
+// only `message` left it as large as the client cared to make the request —
+// measured before this, a 10,000,000-character unknown key answered 400 with
+// `message.len 1024` beside `param.len 10,000,000`.
+for (const [path, body, where] of [
+  ['/v1/chat/completions', { ...CHAT, [OVERSIZED]: 1 }, 'buffered'],
+  ['/v1/responses', { model: 'm', input: 'hi', [OVERSIZED]: 1 }, 'buffered'],
+  // The Anthropic envelope carries no `param` at all, so the caller's key can
+  // only reach a client there through `message`, which is already bounded.
+]) {
+  test(`${path}: an oversized parameter name does not become an oversized param (${where})`, async () => {
+    const { text } = await call(backendThat({}), path, body);
+    const error = JSON.parse(text).error;
+    assert.ok(error.param, `expected a param naming the key: ${text.slice(0, 200)}`);
+    assert.ok(
+      error.param.length <= MAX_ERROR_MESSAGE_CHARS,
+      `param must ride the same ceiling as message, got ${error.param.length}`,
+    );
+    assert.ok(error.param.endsWith('...[truncated]'), `expected the marker: ${error.param.slice(-20)}`);
+    assert.ok(error.message.length <= MAX_ERROR_MESSAGE_CHARS);
+  });
+}
+
+test('a param that already fits is delivered untouched', async () => {
+  // The other side of the bound, which an unconditional truncation would break:
+  // every real param is short, so this is the case that must never change.
+  const { text } = await call(backendThat({}), '/v1/responses', { model: 'm', input: 'hi', zzz_unknown: 1 });
+  const error = JSON.parse(text).error;
+  assert.equal(error.param, 'zzz_unknown');
 });

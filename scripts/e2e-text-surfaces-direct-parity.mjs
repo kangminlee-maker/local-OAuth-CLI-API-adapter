@@ -512,6 +512,14 @@ const messagesCases = [
   ['messages item role system at the head', { messages: [{ role: 'system', content: 'ping' }] }],
   ['messages item role system with empty content', { messages: [{ role: 'system', content: [] }, { role: 'user', content: 'ping' }] }],
   ['messages item role developer', { messages: [{ role: 'developer', content: 'x' }, { role: 'user', content: 'ping' }] }],
+  // A system item past the head is ACCEPTED, so its own schema is what decides
+  // the answer — the item's content and members, at the `messages` position.
+  ['messages item system past the head without content', { messages: [{ role: 'user', content: 'a' }, { role: 'system' }] }],
+  ['messages item system past the head content null', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: null }] }],
+  ['messages item system past the head content as an integer', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 7 }] }],
+  ['messages item system past the head content block without a type', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [{ text: 'x' }] }] }],
+  ['messages item system past the head unknown member', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 'x', bogus: 1 }], temperature: 'x' }],
+  ['messages item user unknown member beats a later field', { messages: [{ role: 'user', content: 'a', bogus: 1 }], temperature: 'x' }],
   ['messages item content missing', { messages: [{ role: 'user' }] }],
   ['messages item content null', { messages: [{ role: 'user', content: null }] }],
   ['messages item content as an integer', { messages: [{ role: 'user', content: 7 }] }],
