@@ -1,4 +1,14 @@
 {
   "note": "Divergences from the vendor that the proxy makes on purpose. Each is data, not an exception in code: it carries the surface it applies to, the exact behavior, and why. A divergence that stops being true fails the same check that a new one does — a stale exemption hides a fixed defect and lets the next regression through. Seed of the manifest described in docs/conformance-suite-design.md §2.",
-  "divergences": []
+  "divergences": [
+    {
+      "id": "chat-function-tools-with-reasoning-effort",
+      "surface": "/v1/chat/completions",
+      "behavior": "The proxy accepts function tools together with a reasoning effort other than 'none' and runs them. The direct API refuses that combination for the gpt-5.6 family with 400 invalid_request_error, param 'reasoning_effort', message \"Function tools with reasoning_effort are not supported for <model> in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\"",
+      "why": "Measured 2026-08-30: gpt-5.6-terra and gpt-5.6-sol refuse it, gpt-5.5 accepts it, so the refusal is one model family's limitation on OpenAI's own chat endpoint. The Codex backend behind this proxy runs the combination, and the option rules refuse only what cannot be realized — refusing a request the backend executes would be the violation, not the parity.",
+      "measuredAt": "2026-08-30",
+      "evidence": "docs/conformance-matrix.md §5.5.5",
+      "claim": "chat-function-tools-with-reasoning-effort"
+    }
+  ]
 }

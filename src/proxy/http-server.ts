@@ -31,6 +31,7 @@ import { hasToolDecisionSchema } from './backend-contract.js';
 import { missingToolCallArgumentDelta } from './tool-call-stream.js';
 import { image2QualityToGpt55ReasoningEffort } from './image2-via-gpt55.js';
 import {
+  jsonTypeName,
   normalizeAnthropicMessagesRequest,
   normalizeOpenAiChatRequest,
   normalizeOpenAiResponsesRequest,
@@ -232,7 +233,7 @@ async function handleRequest(
         );
       } else {
         const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
-        writeJson(res, 200, openAiChatResponse(result));
+        writeJson(res, 200, openAiChatResponse(result, normalized));
       }
       return;
     }
@@ -652,15 +653,6 @@ function unknownImageParameter(name: string): ProxyRequestError {
 // The direct API's wording for a wrong JSON type — "got null / an integer / a
 // decimal number / a boolean / an object / an array instead" — each measured
 // on `model` (2026-08-30).
-function jsonTypeName(value: unknown): string {
-  if (value === null) return 'null';
-  if (Array.isArray(value)) return 'an array';
-  if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a decimal number';
-  if (typeof value === 'boolean') return 'a boolean';
-  if (typeof value === 'object') return 'an object';
-  return `a ${typeof value}`;
-}
-
 function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void {
   // Only compression BELOW 100 needs a lossy format — 100 is "no compression",
   // which PNG can express. The guard rejected every defined value, including the
@@ -1770,7 +1762,7 @@ function imageStreamEventType(
     : `${prefix}.completed`;
 }
 
-function openAiChatResponse(result: LocalCompletionResult): unknown {
+function openAiChatResponse(result: LocalCompletionResult, request: NormalizedRequest): unknown {
   const hasToolCalls = result.toolCalls.length > 0;
   return {
     id: `chatcmpl-${result.id}`,
@@ -1802,9 +1794,22 @@ function openAiChatResponse(result: LocalCompletionResult): unknown {
       },
     ],
     usage: openAiChatUsage(result.usage),
-    service_tier: 'default',
+    service_tier: echoedServiceTier(request),
     system_fingerprint: null,
   };
+}
+
+/**
+ * The tier the caller asked for, which the direct API echoes back verbatim
+ * (`flex` in, `flex` out — measured 2026-08-30). `auto` and an omitted value
+ * both resolve to `default`, the tier this proxy actually runs at: there is no
+ * priority queue behind a local CLI. Hard-coding `default` for every request
+ * reported a tier the caller had not asked for.
+ */
+function echoedServiceTier(request: NormalizedRequest): string {
+  const raw = request.raw as Record<string, unknown> | null | undefined;
+  const tier = raw && typeof raw === 'object' ? raw.service_tier : undefined;
+  return typeof tier === 'string' && tier !== 'auto' ? tier : 'default';
 }
 
 function openAiResponsesResponse(
@@ -1999,7 +2004,7 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     prompt_cache_retention: '24h',
     reasoning: responseReasoning(raw.reasoning),
     safety_identifier: typeof raw.safety_identifier === 'string' ? raw.safety_identifier : null,
-    service_tier: 'default',
+    service_tier: echoedServiceTier(options.request),
     store: raw.store === false ? false : true,
     // Sampling is echoed at the direct API's defaults, which are the only
     // values a request can still carry here: the normalizer rejects any other
@@ -2141,7 +2146,7 @@ async function writeOpenAiChatStream(
     object: 'chat.completion.chunk',
     created,
     model: request.model,
-    service_tier: 'default',
+    service_tier: echoedServiceTier(request),
     system_fingerprint: null,
   };
   let streamedText = '';

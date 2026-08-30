@@ -794,12 +794,18 @@ for (const [path, body] of [
 ]) {
   test(`${path}: an empty messages array is rejected`, async () => {
     // `minItems: 1` on both direct APIs. An empty conversation was reaching the
-    // runtime as a turn with nothing in it.
+    // runtime as a turn with nothing in it. The OpenAI surface answers with the
+    // direct API's own envelope, measured 2026-08-30.
     const { status, text } = await call(backendThat({}), path, body);
     assert.equal(status, 400);
     const payload = JSON.parse(text);
-    const message = payload.error.message;
-    assert.match(message, /at least one message/);
+    if (path === '/v1/chat/completions') {
+      assert.equal(payload.error.code, 'empty_array');
+      assert.equal(payload.error.param, 'messages');
+      assert.equal(payload.error.message, "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.");
+    } else {
+      assert.match(payload.error.message, /at least one message/);
+    }
   });
 }
 
@@ -852,7 +858,7 @@ test('a message with no role is rejected as missing, not defaulted', async () =>
   assert.equal(body.error.param, 'messages[0].role');
 });
 
-for (const [label, content] of [['null', null], ['a number', 42], ['a bare object', { type: 'text', text: 'x' }]]) {
+for (const [label, content] of [['a number', 42], ['a bare object', { type: 'text', text: 'x' }]]) {
   test(`chat content ${label} is rejected, as on the direct API`, async () => {
     const { status, text } = await call(
       backendThat({}),
@@ -860,19 +866,32 @@ for (const [label, content] of [['null', null], ['a number', 42], ['a bare objec
       { model: 'a-model', messages: [{ role: 'user', content }] },
     );
     assert.equal(status, 400, `content=${JSON.stringify(content)} must be a string or array`);
-    assert.equal(JSON.parse(text).error.param, 'messages[0].content');
+    const payload = JSON.parse(text);
+    assert.equal(payload.error.param, 'messages[0].content');
+    assert.equal(payload.error.code, 'invalid_type');
+    assert.equal(payload.error.message, `Invalid type for 'messages[0].content': expected one of a string or array of objects, but got ${label === 'a number' ? 'an integer' : 'an object'} instead.`);
   });
 }
 
-test('a user message with no content is rejected as missing', async () => {
-  const { status, text } = await call(
-    backendThat({}),
-    '/v1/chat/completions',
-    { model: 'a-model', messages: [{ role: 'user' }] },
-  );
-  assert.equal(status, 400);
-  assert.equal(JSON.parse(text).error.code, 'missing_required_parameter');
-});
+// Measured 2026-08-30, and it overturned this file's earlier premise: the
+// direct Chat API accepts a message with no `content` and one with
+// `content: null`, on any role — `{"role":"user"}` beside a `temperature: 0.5`
+// tripwire is answered about the temperature, so the message passed validation.
+// Requiring content here made the proxy refuse bodies the direct API runs.
+for (const [label, message] of [
+  ['absent', { role: 'user' }],
+  ['null', { role: 'user', content: null }],
+  ['absent on an assistant turn with no tool calls', { role: 'assistant' }],
+]) {
+  test(`a message whose content is ${label} is accepted, as on the direct API`, async () => {
+    const { status } = await call(
+      backendThat({}),
+      '/v1/chat/completions',
+      { model: 'a-model', messages: [{ role: 'user', content: 'hi' }, message] },
+    );
+    assert.equal(status, 200);
+  });
+}
 
 test('an assistant tool-call turn needs no content, as on the direct API', async () => {
   // "Required unless tool_calls or function_call is specified" — a client
@@ -891,15 +910,6 @@ test('an assistant tool-call turn needs no content, as on the direct API', async
     },
   );
   assert.equal(status, 200);
-});
-
-test('an assistant message with neither content nor tool calls is rejected', async () => {
-  const { status } = await call(
-    backendThat({}),
-    '/v1/chat/completions',
-    { model: 'a-model', messages: [{ role: 'assistant' }] },
-  );
-  assert.equal(status, 400);
 });
 
 test('the deprecated function role is accepted and treated as a tool result', async () => {
@@ -1266,21 +1276,24 @@ test('an assistant with the singular deprecated function_call needs no content e
   assert.equal(status, 200);
 });
 
-test('chat accepts nested reasoning.effort as the alternate spelling', async () => {
-  // The contract names both `reasoning_effort` and `reasoning.effort` on chat;
-  // only the top-level spelling was tested there.
-  let seen;
+test('chat refuses the Responses-shaped spellings, as the direct API does', async () => {
+  // `reasoning` and `text` used to be accepted here as alternate sources for
+  // `reasoning_effort`/`verbosity` — a body the direct Chat API answers with
+  // `unknown_parameter` (measured 2026-08-30) succeeded against the proxy.
   const backend = {
     name: 'test', model: 'configured-model',
-    async generate(request) { seen = request.reasoningEffort; return ok(); },
-    async *stream() {},
+    async generate() { throw new Error('the request must not reach the backend'); },
+    async *stream() { throw new Error('the request must not reach the backend'); },
     async close() {},
   };
-  const { status } = await call(backend, '/v1/chat/completions', {
-    ...CHAT, reasoning: { effort: 'high' },
-  });
-  assert.equal(status, 200);
-  assert.equal(seen, 'high', 'the nested spelling must reach the backend');
+  for (const [key, value] of [['reasoning', { effort: 'high' }], ['text', { verbosity: 'low' }]]) {
+    const { status, text } = await call(backend, '/v1/chat/completions', { ...CHAT, [key]: value });
+    assert.equal(status, 400, key);
+    const payload = JSON.parse(text);
+    assert.equal(payload.error.code, 'unknown_parameter', key);
+    assert.equal(payload.error.param, key);
+    assert.equal(payload.error.message, `Unknown parameter: '${key}'.`);
+  }
 });
 
 test('/v1/responses: a non-streaming tool call is reported as a function_call output item', async () => {

@@ -10,11 +10,30 @@ import {
 test('OpenAI chat normalizer preserves request reasoning_effort', () => {
   const request = normalizeOpenAiChatRequest({
     model: 'codex-app-server',
-    reasoning_effort: 'minimal',
+    reasoning_effort: 'xhigh',
     messages: [{ role: 'user', content: 'Say OK' }],
   });
 
-  assert.equal(request.reasoningEffort, 'minimal');
+  assert.equal(request.reasoningEffort, 'xhigh');
+});
+
+test('OpenAI chat normalizer refuses the efforts this model family refuses', () => {
+  // `minimal` and `max` are outside the set the direct API lists for this
+  // family, and it answers both with the same `unsupported_value` (measured
+  // 2026-08-30) — not with the enum error the proxy used to raise.
+  for (const effort of ['minimal', 'max']) {
+    assert.throws(
+      () => normalizeOpenAiChatRequest({
+        model: 'codex-app-server',
+        reasoning_effort: effort,
+        messages: [{ role: 'user', content: 'Say OK' }],
+      }),
+      (err) => err.code === 'unsupported_value'
+        && err.param === 'reasoning_effort'
+        && err.message === `Unsupported value: 'reasoning_effort' does not support '${effort}' with this model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'.`,
+      effort,
+    );
+  }
 });
 
 test('OpenAI responses normalizer preserves request reasoning.effort', () => {
@@ -59,7 +78,7 @@ test('OpenAI normalizer rejects invalid reasoning effort', () => {
       reasoning_effort: 'tiny',
       messages: [{ role: 'user', content: 'Say OK' }],
     }),
-    /reasoning effort must be one of/,
+    /Unsupported value: 'reasoning_effort' does not support 'tiny'/,
   );
 });
 

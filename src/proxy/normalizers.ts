@@ -21,28 +21,382 @@ interface NormalizedContent {
   readonly toolHistory?: boolean;
 }
 
+// The top-level keys the direct Chat Completions API knows, measured
+// 2026-08-30 on `gpt-5.6-terra` by sending each with a value of a type it
+// cannot take (§5.5.5): a known key answers about its own type or value, an
+// unknown one is `unknown_parameter`. `audio`, `modalities` and
+// `web_search_options` are unknown there and unknown here; so are the
+// Responses-shaped `reasoning` and `text`, which used to be accepted as
+// alternate sources for `reasoning_effort`/`verbosity` — a body the direct API
+// refuses must not succeed here.
+const OPENAI_CHAT_KEYS: ReadonlySet<string> = new Set([
+  'model', 'messages', 'frequency_penalty', 'function_call', 'functions', 'logit_bias', 'logprobs',
+  'max_completion_tokens', 'max_tokens', 'metadata', 'moderation', 'n', 'parallel_tool_calls',
+  'prediction', 'presence_penalty', 'prompt_cache_key', 'prompt_cache_options',
+  'prompt_cache_retention', 'reasoning_effort', 'response_format', 'safety_identifier', 'seed',
+  'service_tier', 'stop', 'store', 'stream', 'stream_options', 'temperature', 'tool_choice',
+  'tools', 'top_logprobs', 'top_p', 'user', 'verbosity',
+]);
+const OPENAI_SERVICE_TIERS = ['auto', 'default', 'fast', 'flex', 'priority'] as const;
+const OPENAI_CHAT_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh'] as const;
+const OPENAI_CHAT_VERBOSITIES = ['low', 'medium', 'high'] as const;
+const OPENAI_CHAT_RESPONSE_FORMATS = ['json_object', 'json_schema', 'text'] as const;
+const OPENAI_TOOL_CHOICE_MODES = ['none', 'auto', 'required'] as const;
+const OPENAI_CHAT_ROLES = ['system', 'assistant', 'user', 'function', 'tool', 'developer'] as const;
+const OPENAI_PROMPT_CACHE_OPTION_KEYS: ReadonlySet<string> = new Set(['ttl', 'mode']);
+const OPENAI_METADATA_MAX_PROPERTIES = 16;
+const OPENAI_METADATA_MAX_KEY_LENGTH = 64;
+const OPENAI_METADATA_MAX_VALUE_LENGTH = 512;
+// Measured, not assumed: `n: 64` answers "Expected a value <= 8".
+const OPENAI_CHAT_MAX_CHOICES = 8;
+const OPENAI_CHAT_MAX_TOP_LOGPROBS = 5;
+
 export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const input = objectBody(body);
-  const messages = readOpenAiMessages(input.messages);
-  const tools = readOpenAiTools(input.tools);
-  rejectUnsupportedOpenAiSampling(input, 'openai-chat');
+  // The order the direct API reports faults in, measured 2026-08-30 with
+  // two-fault bodies (§5.5.5): the REQUIRED parameters' presence first (`model`
+  // beats an unknown key, and so does a missing `messages`), then unknown keys,
+  // then every other field in key order (`n` before `stop` before
+  // `temperature`).
+  const model = readRequiredOpenAiModel(input.model, 'openai-chat');
+  requireOpenAiChatMessages(input.messages);
+  rejectUnknownOpenAiKeys(input, OPENAI_CHAT_KEYS);
+  const { messages, reasoningEffort } = validateOpenAiChatFields(input);
   return {
     shape: 'openai-chat',
-    model: readRequiredModel(input.model, 'openai'),
+    model,
     messages,
-    maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
-    reasoningEffort: readOpenAiReasoningEffort(input.reasoning_effort ?? asRecord(input.reasoning)?.effort),
-    verbosity: readOpenAiVerbosity(input.verbosity ?? asRecord(input.text)?.verbosity),
+    maxTokens: readOptionalNumber(input.max_completion_tokens),
+    reasoningEffort,
+    verbosity: readOpenAiChatVerbosity(input.verbosity),
     stream: input.stream === true,
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: isOpenAiJsonMode(input.response_format),
     jsonSchema: readOpenAiJsonSchema(input.response_format),
     jsonSchemaName: readOpenAiJsonSchemaName(input.response_format),
     jsonSchemaStrict: readOpenAiJsonSchemaStrict(input.response_format),
-    tools,
+    // The deprecated `functions`/`function_call` pair is VALIDATED as the
+    // direct API validates it and then not applied — the same standing as
+    // before this change, now with the direct envelopes. Carrying it into
+    // `tools` would run the tools but answer in the modern shape, and a legacy
+    // client reads `message.function_call`.
+    tools: readOpenAiTools(input.tools),
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
   };
+}
+
+/**
+ * Every Chat Completions field the direct API validates, in the key order it
+ * reports them in, with its measured envelopes (§5.5.5, `gpt-5.6-terra`,
+ * 2026-08-30). Null is omission for every optional field, as it is there.
+ *
+ * What is refused is as measured as what is accepted. `stop`, `max_tokens`,
+ * `logit_bias` and `prediction` are refused by the direct API on this model
+ * family whatever their value, so they are refused with its envelope instead
+ * of being realized; `frequency_penalty`, `presence_penalty` and `logprobs`
+ * are refused only while the model reasons and are accepted — and not applied,
+ * as the contract says — when `reasoning_effort` is `none`.
+ */
+function validateOpenAiChatFields(
+  input: Record<string, unknown>,
+): { messages: NormalizedMessage[]; reasoningEffort: NormalizedReasoningEffort | undefined } {
+  const present = (key: string): boolean => input[key] !== undefined && input[key] !== null;
+  // A plain read, not the validated one: `reasoning_effort` reports its own
+  // fault at its own position, and the three fields below are checked before
+  // it. An absent effort means the model reasons.
+  const reasons = input.reasoning_effort !== 'none';
+
+  if (present('frequency_penalty')) {
+    if (typeof input.frequency_penalty !== 'number') throw invalidType('frequency_penalty', 'a decimal', input.frequency_penalty);
+    if (reasons) throw unsupportedParameter('frequency_penalty');
+  }
+  if (present('function_call')) readOpenAiLegacyFunctionCall(input.function_call);
+  if (present('functions')) {
+    if (!Array.isArray(input.functions)) throw invalidType('functions', 'an array of function definitions', input.functions);
+    input.functions.forEach((fn, index) => {
+      if (typeof asRecord(fn)?.name !== 'string') throw missingRequiredParameter(`functions[${index}].name`);
+    });
+  }
+  if (present('logit_bias')) throw unsupportedParameter('logit_bias');
+  if (present('logprobs')) {
+    if (typeof input.logprobs !== 'boolean') throw invalidType('logprobs', 'a boolean', input.logprobs);
+    if (input.logprobs && reasons) throw unsupportedParameter('logprobs');
+  }
+  if (present('max_completion_tokens')) {
+    if (!Number.isInteger(input.max_completion_tokens)) throw invalidType('max_completion_tokens', 'an integer', input.max_completion_tokens);
+    if ((input.max_completion_tokens as number) < 1) throw integerBelowMin('max_completion_tokens', input.max_completion_tokens as number, 1);
+  }
+  if (present('max_tokens')) {
+    throw unsupportedParameter('max_tokens', "Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.");
+  }
+  const messages = readOpenAiMessages(input.messages);
+  if (present('metadata')) validateOpenAiMetadata(input.metadata);
+  if (present('moderation')) {
+    // Validated as the direct API validates it, then not applied: the local
+    // runtimes moderate nothing, so the response carries no `moderation`
+    // object (the contract's Chat row says so).
+    const moderation = asRecord(input.moderation);
+    if (!moderation) throw invalidType('moderation', 'an object', input.moderation);
+    if (typeof moderation.model !== 'string') throw missingRequiredParameter('moderation.model');
+  }
+  if (present('n')) {
+    if (!Number.isInteger(input.n)) throw invalidType('n', 'an integer', input.n);
+    const n = input.n as number;
+    if (n < 1) throw integerBelowMin('n', n, 1);
+    if (n > OPENAI_CHAT_MAX_CHOICES) throw integerAboveMax('n', n, OPENAI_CHAT_MAX_CHOICES);
+  }
+  if (present('parallel_tool_calls') && typeof input.parallel_tool_calls !== 'boolean') {
+    throw invalidType('parallel_tool_calls', 'a boolean', input.parallel_tool_calls);
+  }
+  if (present('prediction')) throw unsupportedParameter('prediction');
+  if (present('presence_penalty')) {
+    if (typeof input.presence_penalty !== 'number') throw invalidType('presence_penalty', 'a decimal', input.presence_penalty);
+    if (reasons) throw unsupportedParameter('presence_penalty');
+  }
+  if (present('prompt_cache_key') && typeof input.prompt_cache_key !== 'string') {
+    throw invalidType('prompt_cache_key', 'a string', input.prompt_cache_key);
+  }
+  if (present('prompt_cache_options')) {
+    const options = asRecord(input.prompt_cache_options);
+    if (!options) throw invalidType('prompt_cache_options', 'an object', input.prompt_cache_options);
+    for (const key of Object.keys(options)) {
+      if (!OPENAI_PROMPT_CACHE_OPTION_KEYS.has(key)) throw unknownParameter(`prompt_cache_options.${key}`);
+    }
+  }
+  if (present('prompt_cache_retention')) {
+    const retention = input.prompt_cache_retention;
+    if (retention !== 'in_memory' && retention !== '24h') {
+      throw invalidType('prompt_cache_retention', "one of 'in_memory' or '24h'", retention);
+    }
+    if (retention === 'in_memory') {
+      // Not an enum fault: the value is valid and this model family refuses it.
+      throw new ProxyRequestError('This model is compatible only with 24h extended prompt caching', 400, 'openai', 'invalid_request_error', 'prompt_cache_retention');
+    }
+  }
+  const reasoningEffort = readOpenAiChatReasoningEffort(input.reasoning_effort);
+  if (present('response_format')) validateOpenAiChatResponseFormat(input.response_format);
+  if (present('safety_identifier') && typeof input.safety_identifier !== 'string') {
+    throw invalidType('safety_identifier', 'a string', input.safety_identifier);
+  }
+  if (present('seed') && !Number.isInteger(input.seed)) throw invalidType('seed', 'an integer', input.seed);
+  if (present('service_tier')) readOpenAiServiceTier(input.service_tier);
+  if (present('stop')) throw unsupportedParameter('stop');
+  if (present('store') && typeof input.store !== 'boolean') throw invalidType('store', 'a boolean', input.store);
+  if (present('stream') && typeof input.stream !== 'boolean') throw invalidType('stream', 'a boolean', input.stream);
+  if (present('stream_options') && !asRecord(input.stream_options)) {
+    throw invalidType('stream_options', 'an object', input.stream_options);
+  }
+  rejectUnsupportedOpenAiSampling(input, 'openai-chat', 'temperature');
+  if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice);
+  if (present('tools')) {
+    if (!Array.isArray(input.tools)) throw invalidType('tools', 'an array of objects', input.tools);
+    input.tools.forEach((tool, index) => {
+      const fn = asRecord(asRecord(tool)?.function);
+      if (!fn) throw missingRequiredParameter(`tools[${index}].function`);
+      if (typeof fn.name !== 'string') throw missingRequiredParameter(`tools[${index}].function.name`);
+    });
+  }
+  if (present('top_logprobs')) {
+    if (!Number.isInteger(input.top_logprobs)) throw invalidType('top_logprobs', 'an integer', input.top_logprobs);
+    const top = input.top_logprobs as number;
+    if (top < 0) throw integerBelowMin('top_logprobs', top, 0);
+    if (top > OPENAI_CHAT_MAX_TOP_LOGPROBS) {
+      // The one bound the direct API reports with no code (measured).
+      throw new ProxyRequestError(`Invalid value for 'top_logprobs': must be less than or equal to ${OPENAI_CHAT_MAX_TOP_LOGPROBS}.`, 400, 'openai', 'invalid_request_error', 'top_logprobs');
+    }
+    if (input.logprobs !== true) {
+      throw new ProxyRequestError("The 'top_logprobs' parameter is only allowed when 'logprobs' is enabled.", 400, 'openai', 'invalid_request_error', 'top_logprobs');
+    }
+  }
+  rejectUnsupportedOpenAiSampling(input, 'openai-chat', 'top_p');
+  if (present('user') && typeof input.user !== 'string') throw invalidType('user', 'a string', input.user);
+  if (present('verbosity')) readOpenAiChatVerbosity(input.verbosity);
+  return { messages, reasoningEffort };
+}
+
+function validateOpenAiMetadata(value: unknown): void {
+  const metadata = asRecord(value);
+  if (!metadata) throw invalidType('metadata', 'a metadata object', value);
+  const keys = Object.keys(metadata);
+  if (keys.length > OPENAI_METADATA_MAX_PROPERTIES) {
+    throw new ProxyRequestError(
+      `Invalid 'metadata': too many properties. Expected an object with at most ${OPENAI_METADATA_MAX_PROPERTIES} properties, but got an object with ${keys.length} properties instead.`,
+      400, 'openai', 'invalid_request_error', 'metadata', 'object_above_max_properties',
+    );
+  }
+  for (const key of keys) {
+    if (key.length > OPENAI_METADATA_MAX_KEY_LENGTH) {
+      throw new ProxyRequestError(
+        `Invalid property name in 'metadata': '${elideLongName(key)}' is too long. Expected a string with maximum length ${OPENAI_METADATA_MAX_KEY_LENGTH}, but got a string with length ${key.length} instead.`,
+        400, 'openai', 'invalid_request_error', `metadata.${key}`, 'property_name_above_max_length',
+      );
+    }
+    const entry = metadata[key];
+    if (typeof entry !== 'string') throw invalidType(`metadata.${key}`, 'a string', entry);
+    if (entry.length > OPENAI_METADATA_MAX_VALUE_LENGTH) {
+      throw new ProxyRequestError(
+        `Invalid 'metadata.${key}': string too long. Expected a string with maximum length ${OPENAI_METADATA_MAX_VALUE_LENGTH}, but got a string with length ${entry.length} instead.`,
+        400, 'openai', 'invalid_request_error', `metadata.${key}`, 'string_above_max_length',
+      );
+    }
+  }
+}
+
+// The direct API shortens an over-long property NAME in its message while the
+// `param` carries it whole (measured on a 70-character key: `'kkk...kkk'`).
+// Fitted to that one observation; the parity instrument re-checks it.
+function elideLongName(name: string): string {
+  return name.length > 6 ? `${name.slice(0, 3)}...${name.slice(-3)}` : name;
+}
+
+function validateOpenAiChatResponseFormat(value: unknown): void {
+  const format = asRecord(value);
+  if (!format) throw invalidType('response_format', 'an object', value);
+  if (format.type === undefined || format.type === null) throw missingRequiredParameter('response_format.type');
+  if (!OPENAI_CHAT_RESPONSE_FORMATS.some((candidate) => candidate === format.type)) {
+    throw invalidValue('response_format.type', String(format.type), OPENAI_CHAT_RESPONSE_FORMATS);
+  }
+}
+
+function invalidType(field: string, expected: string, value: unknown): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid type for '${field}': expected ${expected}, but got ${jsonTypeName(value)} instead.`,
+    400, 'openai', 'invalid_request_error', field, 'invalid_type',
+  );
+}
+
+function invalidValue(field: string, value: string, supported: readonly string[]): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid value: '${value}'. Supported values are: ${listOfQuoted(supported, 'and')}.`,
+    400, 'openai', 'invalid_request_error', field, 'invalid_value',
+  );
+}
+
+function unsupportedParameter(field: string, message?: string): ProxyRequestError {
+  return new ProxyRequestError(
+    message ?? `Unsupported parameter: '${field}' is not supported with this model.`,
+    400, 'openai', 'invalid_request_error', field, 'unsupported_parameter',
+  );
+}
+
+function unknownParameter(field: string): ProxyRequestError {
+  return new ProxyRequestError(`Unknown parameter: '${field}'.`, 400, 'openai', 'invalid_request_error', field, 'unknown_parameter');
+}
+
+function missingRequiredParameter(field: string): ProxyRequestError {
+  return new ProxyRequestError(`Missing required parameter: '${field}'.`, 400, 'openai', 'invalid_request_error', field, 'missing_required_parameter');
+}
+
+function integerBelowMin(field: string, value: number, min: number): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid '${field}': integer below minimum value. Expected a value >= ${min}, but got ${value} instead.`,
+    400, 'openai', 'invalid_request_error', field, 'integer_below_min_value',
+  );
+}
+
+function integerAboveMax(field: string, value: number, max: number): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid '${field}': integer above maximum value. Expected a value <= ${max}, but got ${value} instead.`,
+    400, 'openai', 'invalid_request_error', field, 'integer_above_max_value',
+  );
+}
+
+/** "'a', 'b', or 'c'" — the direct API's own list punctuation. */
+function listOfQuoted(values: readonly string[], conjunction: 'or' | 'and'): string {
+  const quoted = values.map((value) => `'${value}'`);
+  if (quoted.length <= 1) return quoted.join('');
+  return `${quoted.slice(0, -1).join(', ')}, ${conjunction} ${quoted[quoted.length - 1]}`;
+}
+
+/** The direct API's own type words for its "got X instead" messages. */
+export function jsonTypeName(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a decimal number';
+  if (typeof value === 'boolean') return 'a boolean';
+  if (typeof value === 'object') return 'an object';
+  return `a ${typeof value}`;
+}
+
+// Strict top-level schema, as the direct OpenAI surfaces have (P-5, §5.5.5):
+// an unknown key is `unknown_parameter`, reported after the required
+// parameters' presence and before every other field's validation.
+function rejectUnknownOpenAiKeys(input: Record<string, unknown>, known: ReadonlySet<string>): void {
+  for (const key of Object.keys(input)) {
+    if (!known.has(key)) throw unknownParameter(key);
+  }
+}
+
+function readRequiredOpenAiModel(value: unknown, shape: 'openai-chat' | 'openai-responses'): string {
+  // Two surfaces, two sentences (measured): Chat answers with neither `param`
+  // nor `code`, Responses names the parameter. An empty string is the same
+  // fault as an absent one on Chat, also measured.
+  const missing = (): never => {
+    if (shape === 'openai-chat') {
+      throw new ProxyRequestError('you must provide a model parameter', 400, 'openai', 'invalid_request_error', null, null);
+    }
+    throw missingRequiredParameter('model');
+  };
+  if (value === undefined || value === null) missing();
+  if (typeof value !== 'string') throw invalidType('model', 'a string', value);
+  if (!value.trim()) missing();
+  return value as string;
+}
+
+function requireOpenAiChatMessages(value: unknown): void {
+  if (value === undefined || value === null) throw missingRequiredParameter('messages');
+}
+
+function readOpenAiChatReasoningEffort(value: unknown): NormalizedReasoningEffort | undefined {
+  if (value === undefined || value === null) return undefined;
+  const effort = OPENAI_CHAT_REASONING_EFFORTS.find((candidate) => candidate === value);
+  if (effort) return effort;
+  // Any non-member — a string outside the set or another type entirely — gets
+  // the same `unsupported_value` with the supported list. `minimal` and `max`
+  // are outside it on this family, both measured.
+  const shown = typeof value === 'string' ? `'${value}'` : jsonValueForMessage(value);
+  throw new ProxyRequestError(
+    `Unsupported value: 'reasoning_effort' does not support ${shown} with this model. Supported values are: ${listOfQuoted(OPENAI_CHAT_REASONING_EFFORTS, 'and')}.`,
+    400, 'openai', 'invalid_request_error', 'reasoning_effort', 'unsupported_value',
+  );
+}
+
+// The direct API prints a rejected non-string value Python-style in this one
+// message — `{'__probe__': 'wrong type'}`, quotes and spacing included, which
+// is what a client sees. Fitted to that measurement; only the shapes that can
+// reach an enum field are rendered.
+function jsonValueForMessage(value: unknown): string {
+  if (value === null) return 'None';
+  if (value === true) return 'True';
+  if (value === false) return 'False';
+  if (typeof value === 'string') return `'${value}'`;
+  if (typeof value === 'number') return String(value);
+  if (Array.isArray(value)) return `[${value.map(jsonValueForMessage).join(', ')}]`;
+  if (typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>).map(([key, member]) => `'${key}': ${jsonValueForMessage(member)}`).join(', ')}}`;
+  }
+  return String(value);
+}
+
+function readOpenAiChatVerbosity(value: unknown): NormalizedVerbosity | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (value === 'low' || value === 'medium' || value === 'high') return value;
+  if (typeof value !== 'string') throw invalidType('verbosity', `one of ${listOfQuoted(OPENAI_CHAT_VERBOSITIES, 'or')}`, value);
+  throw invalidValue('verbosity', value, OPENAI_CHAT_VERBOSITIES);
+}
+
+function readOpenAiServiceTier(value: unknown): void {
+  if (typeof value !== 'string') throw invalidType('service_tier', `one of ${listOfQuoted(OPENAI_SERVICE_TIERS, 'or')}`, value);
+  if (!OPENAI_SERVICE_TIERS.some((tier) => tier === value)) throw invalidValue('service_tier', value, OPENAI_SERVICE_TIERS);
+}
+
+function readOpenAiLegacyFunctionCall(value: unknown): NormalizedToolChoice {
+  if (value === undefined || value === null || value === 'auto') return { type: 'auto' };
+  if (value === 'none') return { type: 'none' };
+  const call = asRecord(value);
+  if (!call || typeof call.name !== 'string') throw missingRequiredParameter('function_call.name');
+  return { type: 'tool', name: call.name };
 }
 
 export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedRequest {
@@ -88,8 +442,20 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
 function rejectUnsupportedOpenAiSampling(
   input: Record<string, unknown>,
   shape: 'openai-chat' | 'openai-responses',
+  only?: 'temperature' | 'top_p',
+): void {
+  if (only !== 'top_p') rejectUnsupportedOpenAiTemperature(input, shape);
+  if (only !== 'temperature') rejectUnsupportedOpenAiTopP(input, shape);
+}
+
+function rejectUnsupportedOpenAiTemperature(
+  input: Record<string, unknown>,
+  shape: 'openai-chat' | 'openai-responses',
 ): void {
   const temperature = input.temperature;
+  if (temperature !== undefined && temperature !== null && typeof temperature !== 'number') {
+    throw invalidType('temperature', 'a decimal', temperature);
+  }
   if (temperature !== undefined && temperature !== null && temperature !== 1) {
     if (shape === 'openai-chat') {
       throw new ProxyRequestError(
@@ -109,7 +475,16 @@ function rejectUnsupportedOpenAiSampling(
       'temperature',
     );
   }
+}
+
+function rejectUnsupportedOpenAiTopP(
+  input: Record<string, unknown>,
+  shape: 'openai-chat' | 'openai-responses',
+): void {
   const topP = input.top_p;
+  if (topP !== undefined && topP !== null && typeof topP !== 'number') {
+    throw invalidType('top_p', 'a decimal', topP);
+  }
   // Chat accepts the default `top_p: 1`; Responses rejects the parameter even
   // at its default. Both measured, neither guessed.
   if (topP !== undefined && topP !== null && (shape === 'openai-responses' || topP !== 1)) {
@@ -418,17 +793,17 @@ function objectBody(body: unknown): Record<string, unknown> {
 }
 
 function readOpenAiMessages(value: unknown): NormalizedMessage[] {
-  if (!Array.isArray(value)) {
-    throw new ProxyRequestError('messages must be an array.', 400);
-  }
-  // `minItems: 1` on the direct API. An empty conversation was reaching the
-  // runtime as a turn with nothing in it.
+  if (!Array.isArray(value)) throw invalidType('messages', 'an array of objects', value);
+  // `minItems: 1` on the direct API, with its own code (measured 2026-08-30).
   if (value.length === 0) {
-    throw new ProxyRequestError('messages must contain at least one message.', 400);
+    throw new ProxyRequestError(
+      "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+      400, 'openai', 'invalid_request_error', 'messages', 'empty_array',
+    );
   }
   return value.map((item, index) => {
     const msg = asRecord(item);
-    if (!msg) throw new ProxyRequestError('Each message must be an object.', 400);
+    if (!msg) throw invalidType(`messages[${index}]`, 'an object', item);
     const role = readOpenAiChatRole(msg.role, index);
     requireOpenAiChatContent(msg, index);
     const content = flattenOpenAiMessage(msg, role);
@@ -462,45 +837,25 @@ function readOpenAiChatRole(value: unknown, index: number): NormalizedMessage['r
     return value;
   }
   if (value === 'function') return 'tool';
-  const missing = value === undefined || value === null;
-  throw new ProxyRequestError(
-    missing
-      ? `messages[${index}].role is required.`
-      : `messages[${index}].role must be one of system, developer, user, assistant, tool or function.`,
-    400,
-    'openai',
-    'invalid_request_error',
-    `messages[${index}].role`,
-    missing ? 'missing_required_parameter' : null,
-  );
+  if (value === undefined || value === null) throw missingRequiredParameter(`messages[${index}].role`);
+  // The direct API's own list, in its own order (measured 2026-08-30).
+  if (typeof value !== 'string') throw invalidType(`messages[${index}].role`, `one of ${listOfQuoted(OPENAI_CHAT_ROLES, 'or')}`, value);
+  throw invalidValue(`messages[${index}].role`, value, OPENAI_CHAT_ROLES);
 }
 
 /**
- * `content` as the direct API accepts it: a string or an array of parts.
- * An assistant message may omit it (or send null) when it carries `tool_calls`
- * or the deprecated `function_call` instead — the message the client is
- * replaying is the model's own tool-call turn, which has no text. A deprecated
- * `function` message's content is nullable there too.
+ * `content` as the direct API accepts it: a string or an array of parts, on
+ * any role — and ABSENT or `null` on any role too, measured 2026-08-30
+ * (`{"role":"user"}` and `{"role":"user","content":null}` both pass its
+ * validation). The proxy used to require it except on an assistant turn
+ * carrying `tool_calls`, so a body the direct API runs was a 400 here. A
+ * defined value of another type keeps the direct envelope.
  */
 function requireOpenAiChatContent(msg: Record<string, unknown>, index: number): void {
   const content = msg.content;
+  if (content === undefined || content === null) return;
   if (typeof content === 'string' || Array.isArray(content)) return;
-  const absent = content === undefined || content === null;
-  if (absent && msg.role === 'assistant') {
-    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return;
-    if (asRecord(msg.function_call)) return;
-  }
-  if (content === null && msg.role === 'function') return;
-  throw new ProxyRequestError(
-    absent
-      ? `messages[${index}].content is required.`
-      : `messages[${index}].content must be a string or an array of content parts.`,
-    400,
-    'openai',
-    'invalid_request_error',
-    `messages[${index}].content`,
-    absent ? 'missing_required_parameter' : null,
-  );
+  throw invalidType(`messages[${index}].content`, 'one of a string or array of objects', content);
 }
 
 function readResponsesInput(value: unknown): NormalizedMessage[] {
@@ -938,15 +1293,24 @@ function readAnthropicTools(value: unknown): NormalizedTool[] {
   });
 }
 
+// The forms the direct API takes, with its measured envelopes for the rest
+// (2026-08-30): a string outside the three modes is `invalid_value` with the
+// list, a non-string non-object is `invalid_type`, and an object is required
+// to carry `function` and then `function.name` — whatever its `type` says.
+// The proxy used to read everything else as `auto`.
 function readOpenAiToolChoice(value: unknown): NormalizedToolChoice {
+  if (value === undefined || value === null || value === 'auto') return { type: 'auto' };
   if (value === 'none') return { type: 'none' };
   if (value === 'required') return { type: 'required' };
+  if (typeof value === 'string') throw invalidValue('tool_choice', value, OPENAI_TOOL_CHOICE_MODES);
   const choice = asRecord(value);
-  const fn = asRecord(choice?.function);
-  if (choice?.type === 'function' && typeof fn?.name === 'string') {
-    return { type: 'tool', name: fn.name };
+  if (!choice) {
+    throw invalidType('tool_choice', `one of one of ${listOfQuoted(OPENAI_TOOL_CHOICE_MODES, 'or')} or object`, value);
   }
-  return { type: 'auto' };
+  const fn = asRecord(choice.function);
+  if (!fn) throw missingRequiredParameter('tool_choice.function');
+  if (typeof fn.name !== 'string') throw missingRequiredParameter('tool_choice.function.name');
+  return { type: 'tool', name: fn.name };
 }
 
 function readStreamOptions(value: unknown) {

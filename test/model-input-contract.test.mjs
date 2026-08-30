@@ -42,6 +42,12 @@ for (const [path, base, provider] of SURFACES) {
     if (provider === 'anthropic') {
       assert.equal(payload.type, 'error');
       assert.equal(payload.error.type, 'invalid_request_error');
+    } else if (path === '/v1/chat/completions') {
+      // Chat answers an absent model with neither `param` nor `code`
+      // (measured 2026-08-30); Responses names the parameter.
+      assert.equal(payload.error.type, 'invalid_request_error');
+      assert.equal(payload.error.param, null);
+      assert.equal(payload.error.message, 'you must provide a model parameter');
     } else {
       assert.equal(payload.error.type, 'invalid_request_error');
       assert.equal(payload.error.param, 'model');
