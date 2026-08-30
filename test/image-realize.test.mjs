@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import sharp from 'sharp';
-import { realizeImageOptions } from '../dist/proxy/image-realize.js';
+import { realizeImageOptions, realizeRequestedSize } from '../dist/proxy/image-realize.js';
 
 // The app-server image transport has no tool declaration to carry the Images
 // API options, so the ones with a meaning on bytes are applied to the bytes.
@@ -80,4 +80,45 @@ test('a mask with a size resizes the composite to the requested canvas', async (
   const m = await meta(out);
   assert.equal(`${m.width}x${m.height}`, '16x16');
   assert.deepEqual((await pixel(out, 8, 8)).slice(0, 3), [0, 0, 255], 'a fully transparent mask means the whole canvas is generated');
+});
+
+// `realizeRequestedSize` is the one realization the DEFAULT transport runs:
+// it corrects a canvas the backend returned at another size and touches
+// nothing else.
+test('realizeRequestedSize: no concrete size — bytes untouched, undecoded', async () => {
+  const image = { b64Json: Buffer.from('not an image at all').toString('base64') };
+  assert.equal(await realizeRequestedSize(request({}), image), image);
+  assert.equal(await realizeRequestedSize(request({ size: 'auto' }), image), image);
+});
+
+test('realizeRequestedSize: a canvas at the requested size is the same object', async () => {
+  const image = { b64Json: b64(await solid(32, 16, { r: 1, g: 2, b: 3, alpha: 1 })) };
+  assert.equal(await realizeRequestedSize(request({ size: '32x16' }), image), image);
+});
+
+test('realizeRequestedSize: another canvas is covered to the requested size, in the codec it came back in', async () => {
+  const png = { b64Json: b64(await solid(8, 8, { r: 1, g: 2, b: 3, alpha: 1 })), revisedPrompt: 'kept' };
+  const out = await realizeRequestedSize(request({ size: '32x16' }), png);
+  const m = await meta(out);
+  assert.equal(`${m.width}x${m.height}`, '32x16');
+  assert.equal(m.format, 'png');
+  assert.equal(out.revisedPrompt, 'kept');
+
+  const jpegBytes = await sharp(Buffer.from(png.b64Json, 'base64')).jpeg().toBuffer();
+  const asJpeg = await realizeRequestedSize(request({ size: '32x16', outputFormat: 'jpeg', outputCompression: 70 }), { b64Json: b64(jpegBytes) });
+  const j = await meta(asJpeg);
+  assert.equal(`${j.width}x${j.height}`, '32x16');
+  assert.equal(j.format, 'jpeg');
+});
+
+test('realizeRequestedSize: bytes the codec cannot read come back untouched, not as a failure', async () => {
+  const image = { b64Json: Buffer.from('garbage after a billed turn').toString('base64') };
+  assert.equal(await realizeRequestedSize(request({ size: '32x16' }), image), image);
+});
+
+test('prepareRequestedSize: nothing to prepare without a concrete size; the codec loads for one', async () => {
+  const { prepareRequestedSize } = await import('../dist/proxy/image-realize.js');
+  await prepareRequestedSize(request({}));
+  await prepareRequestedSize(request({ size: 'auto' }));
+  await prepareRequestedSize(request({ size: '32x16' }));
 });

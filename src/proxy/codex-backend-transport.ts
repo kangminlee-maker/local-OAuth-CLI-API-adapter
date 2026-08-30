@@ -14,6 +14,7 @@ import {
   image2ViaGpt55PromptFromRequest,
 } from './image2-via-gpt55.js';
 import { postprocessFlatGraphicImageIfNeeded } from './flat-image-postprocess.js';
+import { prepareRequestedSize, realizeRequestedSize } from './image-realize.js';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
@@ -861,6 +862,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     signal?: AbortSignal,
   ): Promise<OpenAiImageGenerationResult> {
     const startedAt = Date.now();
+    await prepareRequestedSize(request);
     // Siblings of a failed turn are already-lost work: the caller has its
     // error, and every one still running is a full billed image generation
     // whose result nothing will read. Cancel them with the first failure.
@@ -884,7 +886,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     let usage: LocalUsage | undefined;
     const images: OpenAiGeneratedImage[] = [];
     for (const result of results) {
-      images.push(...result.images);
+      for (const image of result.images) images.push(await realizeRequestedSize(request, image));
       usage = mergeUsage(usage, result.usage);
     }
     return {
@@ -903,6 +905,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     request: OpenAiImageGenerationRequest,
     signal?: AbortSignal,
   ): AsyncIterable<OpenAiImageGenerationStreamEvent> {
+    await prepareRequestedSize(request);
     for (let index = 0; index < request.n; index += 1) {
       for (let attempt = 0; attempt <= IMAGE_NO_RESULT_RETRY_DELAYS_MS.length; attempt += 1) {
         const state = new CodexBackendImageState(request, Date.now());
@@ -914,7 +917,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
             for (const local of state.push(event)) {
               yield {
                 ...local,
-                image: postprocessFlatGraphicImageIfNeeded(request, local.image),
+                image: postprocessFlatGraphicImageIfNeeded(request, await realizeRequestedSize(request, local.image)),
                 partialImageIndex: index,
               };
             }

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
+import sharp from 'sharp';
 import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js';
 import { resetCodexModelCatalogCache } from '../dist/proxy/codex-model-catalog.js';
 
@@ -983,6 +984,72 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
   assert.equal(result.outputFormat, 'jpeg');
   assert.equal(result.usage.inputTokens, 31);
   assert.equal(result.usage.source, 'provider');
+});
+
+// The backend has a `size` slot and does not always honour it (a 256×256
+// source edited at `1024x1024` came back 1254×1254, measured 2026-08-29). The
+// direct API returns the requested canvas; so does this transport, on the
+// bytes, on both the buffered and the streamed path.
+function imageSse(b64, { id = 'resp_size', model = 'gpt-5.5' } = {}) {
+  return sse([
+    { type: 'response.created', response: { id, model } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'in_progress' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: b64 } },
+    { type: 'response.completed', response: { id, model, output: [{ type: 'image_generation_call', id: 'ig_1', status: 'completed', result: b64 }] } },
+  ]);
+}
+async function solidPng(width, height, background = { r: 10, g: 20, b: 30, alpha: 1 }) {
+  return (await sharp({ create: { width, height, channels: 4, background } }).png().toBuffer()).toString('base64');
+}
+const dims = async (b64) => {
+  const m = await sharp(Buffer.from(b64, 'base64')).metadata();
+  return `${m.width}x${m.height}`;
+};
+
+test('a returned canvas that is not the requested size is brought to it (buffered)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(imageSse(returned), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), size: '32x16' });
+  assert.equal(JSON.parse(calls[0].init.body).tools[0].size, '32x16', 'the slot is still sent; the bytes are corrected, not the request');
+  assert.equal(result.images.length, 1);
+  assert.equal(await dims(result.images[0].b64Json), '32x16');
+  assert.equal(result.size, '32x16');
+});
+
+test('a returned canvas that is not the requested size is brought to it (streamed)', async () => {
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const events = [];
+  for await (const event of backend.stream({ ...imageRequest(), size: '32x16', stream: true })) events.push(event);
+  const completed = events.filter((event) => event.type === 'completed');
+  assert.equal(completed.length, 1);
+  assert.equal(await dims(completed[0].image.b64Json), '32x16');
+});
+
+test('a returned canvas already at the requested size is passed through byte for byte', async () => {
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(32, 16);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), size: '32x16' });
+  assert.equal(result.images[0].b64Json, returned);
+});
+
+test('a request with size auto takes whatever canvas the backend returns', async () => {
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), size: 'auto' });
+  assert.equal(result.images[0].b64Json, returned);
 });
 
 test('CodexBackendTransport includes reference images for backend image edits', async () => {
