@@ -63,8 +63,8 @@ async function proxy(args: readonly string[]): Promise<number> {
   // A privacy switch must never fail open: an unparsable value is an error, not
   // "off", and asking for it on a runtime that cannot honour it is a mistake
   // worth reporting rather than a flag consumed by nothing.
-  const isolateUserSettings = parseBooleanFlag(options.isolateUserSettings, '--isolate-user-settings');
-  if (runtimeName !== 'claude' && isolateUserSettings) {
+  const isolateFlag = parseOptionalBooleanFlag(options.isolateUserSettings, '--isolate-user-settings');
+  if (runtimeName !== 'claude' && isolateFlag === true) {
     throw new Error('--isolate-user-settings can only be selected with --runtime claude.');
   }
   // Extra args are appended last and win, so these would start a proxy that
@@ -75,9 +75,21 @@ async function proxy(args: readonly string[]): Promise<number> {
   const conflicting = (options.extraArg ?? []).find(
     (arg) => settingsOverrideFlags.some((flag) => arg === flag || arg.startsWith(`${flag}=`)),
   );
-  if (isolateUserSettings && conflicting) {
+  if (isolateFlag === true && conflicting) {
     throw new Error(`--isolate-user-settings conflicts with --extra-arg ${conflicting}: the extra arg would override the isolation.`);
   }
+  // Claude isolates by default. An API request is a stranger's question, and the
+  // CLI answers it by first reading the operator's global CLAUDE.md, hooks, env
+  // and permissions — measured at 25,673 characters on one machine, carrying
+  // answer-style directives and an `effort` setting, injected into every call.
+  // Loading it was never something a caller asked for, and a prose line asking
+  // the model to ignore it is not isolation; the setting source is.
+  //
+  // Supplying `--setting-sources` or `--settings` yourself is an explicit choice
+  // to configure them, so it opts out rather than colliding with a default the
+  // operator never typed. Asking for isolation AND overriding it is still an
+  // error, above.
+  const isolateUserSettings = isolateFlag ?? !conflicting;
   const cwd = options.cwd ?? process.cwd();
   const backend: LocalCliBackend = runtimeName === 'claude'
     ? new ClaudeCodeBackend({
@@ -147,7 +159,7 @@ async function proxy(args: readonly string[]): Promise<number> {
   // Stated for both values: the default runs operator hooks per API turn, and a
   // mistyped flag would otherwise leave that on with nothing contradicting it.
   if (runtimeName === 'claude') {
-    process.stdout.write(`  userSettings: ${isolateUserSettings ? 'isolated (no setting sources)' : 'loaded (user source: CLAUDE.md, hooks, env, permissions)'}\n`);
+    process.stdout.write(`  userSettings: ${isolateUserSettings ? 'isolated (no setting sources) [default]' : `loaded (user source: CLAUDE.md, hooks, env, permissions) [${conflicting ? `--extra-arg ${conflicting}` : '--isolate-user-settings false'}]`}\n`);
   }
   process.stdout.write(`  baseUrl: ${started.url}/v1\n`);
   process.stdout.write(`  openai: OPENAI_BASE_URL=${started.url}/v1\n`);
@@ -227,7 +239,13 @@ function asExtraArgs(value: string | string[] | undefined): string[] {
 
 /** Bare flag or an explicit `true`/`false`; anything else is a usage error. */
 function parseBooleanFlag(value: string | undefined, flag: string): boolean {
-  if (value === undefined) return false;
+  return parseOptionalBooleanFlag(value, flag) ?? false;
+}
+
+// Absent and explicitly-false are different answers when the default is true:
+// one means "the operator said nothing", the other "the operator said no".
+function parseOptionalBooleanFlag(value: string | undefined, flag: string): boolean | undefined {
+  if (value === undefined) return undefined;
   if (value === 'true') return true;
   if (value === 'false') return false;
   throw new Error(`${flag} takes no value or true/false, got: ${value}`);
@@ -338,8 +356,9 @@ function createCodexImageGenerationClient(options: {
   readonly timeoutMs: number;
 }): OpenAiImageGenerationClient {
   // Images are out of scope for `modelSelection.honorRequestModel`: an Images API
-  // `model` is a route selector (`image-2`, `dall-e-2`, `gpt-image-*`), not a
-  // Codex slug, and the Codex model for an image turn comes from
+  // `model` is one of the direct API's image model names (`gpt-image-2` and
+  // its siblings), validated as such and routed here regardless — not a
+  // Codex slug — and the Codex model for an image turn comes from
   // `codexProxy.imageModel`. The image paths do not consult request models today;
   // pinning the flag off keeps that true if they ever come to share more code.
   if (options.transport === 'codex-backend') {
@@ -387,7 +406,7 @@ Options:
   --codex-transport <transport>      Codex text/tool transport: app-server or codex-backend. Default: settings.json (${codexProxyTransport()}).
   --codex-image-transport <transport>
                                      Codex Images transport: app-server or codex-backend. Default: settings.json (${codexProxyImageTransport()}).
-  --image-model <model>              Codex model for image-2 via gpt-5.5 route. Default: settings.json (${codexProxyImageModel()}).
+  --image-model <model>              Codex model that runs Images API turns (every image model name routes here). Default: settings.json (${codexProxyImageModel()}).
   --auth-key <key>                   Require this key on every request via Authorization: Bearer <key> or x-api-key. Env: LOCAL_OAUTH_PROXY_KEY. Default: open (no gate).
 
 Examples:

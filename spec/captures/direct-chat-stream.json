@@ -1,0 +1,13 @@
+{
+  "claimEvidence": "direct-chat-stream",
+  "originRun": "1152429f-790c-4520-933a-dc8751760061",
+  "originFile": "0001-P-11.json",
+  "originRoot": "artifacts/direct-api-captures",
+  "promotedAt": "2026-08-29T05:38:54.686Z",
+  "url": "https://api.openai.com/v1/chat/completions",
+  "status": 200,
+  "kind": "sse",
+  "streamSha256": "bb76425a8e14808b793c6df23bb4707f6cbc16e305359b2ca967cd834fe6944a",
+  "streamBytes": 873,
+  "stream": "data: {\"id\":\"chatcmpl-EI641q9iLECfmezx9sQaWT2B9Ahoy\",\"object\":\"chat.completion.chunk\",\"created\":1787981921,\"model\":\"gpt-5.6-terra\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"refusal\":null},\"finish_reason\":null}],\"obfuscation\":\"4spT9coiPC\"}\n\ndata: {\"id\":\"chatcmpl-EI641q9iLECfmezx9sQaWT2B9Ahoy\",\"object\":\"chat.completion.chunk\",\"created\":1787981921,\"model\":\"gpt-5.6-terra\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"},\"finish_reason\":null}],\"obfuscation\":\"YvWrFjpu\"}\n\ndata: {\"id\":\"chatcmpl-EI641q9iLECfmezx9sQaWT2B9Ahoy\",\"object\":\"chat.completion.chunk\",\"created\":1787981921,\"model\":\"gpt-5.6-terra\",\"service_tier\":\"default\",\"system_fingerprint\":null,\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"obfuscation\":\"sPrBtK\"}\n\ndata: [DONE]\n\n"
+}

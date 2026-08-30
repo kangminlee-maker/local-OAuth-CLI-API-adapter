@@ -29,7 +29,7 @@ Confirmed from `docs/api-interface-contract.md:10-18` (Supported surfaces table)
 Two more scope notes the packet did not state:
 
 - `POST /v1/messages/count_tokens` is a documented Anthropic surface that clients (including the Anthropic SDKs' token-counting helpers) call. The contract does not claim it, and the proxy does not serve it, so a client hitting it gets `404 Unknown endpoint` (`:405` ff., "Method and path dispatch"). Out of matrix scope; flagged as a known client-visible gap.
-- The proxy serves a **proxy-only** surface not on either provider: `GET /v1/images/generated/{id}` (`http-server.ts:1314`), the target of `response_format: "url"`. It has no provider counterpart and cannot diverge; noted for completeness.
+- The proxy used to serve a **proxy-only** surface, `GET /v1/images/generated/{id}`, the target of `response_format: "url"`. Removed 2026-08-29: every live image model refuses `response_format`, so the surface was unreachable (row I-14).
 
 ### 0.1 What "our verification authority" actually is today
 
@@ -95,8 +95,8 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | 10 | `messages[].audio` | `{id}`, assistant input | absent | replays prior audio turn | UNKNOWN | **silently ignored** | DOC? |
 | 11 | `modalities` | array of `text`\|`audio` | `["text"]` | adds `message.audio` to the response | UNKNOWN | **silently ignored** — `["text","audio"]` yields a text-only body with no error | DOC |
 | 12 | `audio` | `{voice, format}`; required when `modalities` includes `audio` | absent | audio bytes in `message.audio.data` | 400 / `invalid_request_error` / `audio` / — | **silently ignored** | DOC |
-| 13 | `temperature` | number 0-2 | `1` (see instrument caveat) | sampling spread | 400 / `invalid_request_error` / `temperature` / `unsupported_value` on reasoning models that fix it at 1 | parsed into `NormalizedRequest.temperature` (`normalizers.ts:30`) but **`codex-backend` does not forward it** (contract `:405` ff., "Codex backend sampling hints") → effectively ignored on the default transport | DOC |
-| 14 | `top_p` | number 0-1 | `1` (caveat) | nucleus cutoff | 400 / `invalid_request_error` / `top_p` / — | **silently ignored** — not read anywhere | DOC |
+| 13 | `temperature` | number 0-2 | `1` (see instrument caveat) | sampling spread | 400 / `invalid_request_error` / `temperature` / `unsupported_value` on reasoning models that fix it at 1 | **rejected unless `1`** (null = omission): 400 `unsupported_value`, message `Unsupported value: 'temperature' does not support 0.5 with this model. Only the default (1) value is supported.` — the direct envelope, mirrored (`normalizers.ts` `rejectUnsupportedOpenAiSampling`). Nothing behind the surface applies it | VERIFIED (direct `gpt-5.6-terra` 2026-08-29: 0.5 → 400 `unsupported_value`, 1 → 200) |
+| 14 | `top_p` | number 0-1 | `1` (caveat) | nucleus cutoff | 400 / `invalid_request_error` / `top_p` / `unsupported_parameter` | **rejected unless `1`** (null = omission): 400 `unsupported_parameter`, `Unsupported parameter: 'top_p' is not supported with this model.` | VERIFIED (direct 2026-08-29: 0.5 → 400 `unsupported_parameter`, 1 → 200) |
 | 15 | `n` | integer ≥1 | `1` (caveat) | `choices` array length | 400 / `invalid_request_error` / `n` / — (and `n>1` unsupported on some models) | **silently ignored** — `n:5` returns exactly one choice, no error. `choices` is hard-coded to a single element (`http-server.ts:1795-1820`) | DOC |
 | 16 | `stop` | string \| array (≤4) \| null | `null` | truncates output at the sequence; `finish_reason:"stop"` | 400 / `invalid_request_error` / `stop` / — | **silently ignored** | DOC |
 | 17 | `max_tokens` | integer (deprecated) | model max | caps output; `finish_reason:"length"` | 400 / `invalid_request_error` / `max_tokens` / `unsupported_parameter` on o-series | parsed (`normalizers.ts:29`, `max_tokens ?? max_completion_tokens`) but **not forwarded by `codex-backend`** | DOC |
@@ -151,8 +151,8 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | R-7 | `instructions` | string | `null` | system-level steering; echoed in `instructions` | UNKNOWN | supported; prepended as a `system` message (`normalizers.ts:48-51`) | DOC |
 | R-8 | `max_output_tokens` | integer | `null` (model max) | caps output; `status:"incomplete"` + `incomplete_details.reason:"max_output_tokens"` | 400 / `invalid_request_error` / `max_output_tokens` / — | parsed but **not forwarded by `codex-backend`**; echoed in the body. **`incomplete_details` is hard `null` (`http-server.ts:2004`) and `status` never becomes `incomplete`** → a capped turn is reported `completed` | DOC |
 | R-9 | `max_tool_calls` | integer | `null` | caps built-in tool calls | UNKNOWN | **silently ignored**; echoed as hard `null` (`http-server.ts:2007`) | DOC |
-| R-10 | `temperature` | number 0-2 | `1` (caveat; confirmed by the doc's SSE transcript showing `"temperature":1.0`) | sampling | 400 / `invalid_request_error` / `temperature` / — | parsed, not forwarded; echoed as `request.temperature ?? 1` (`http-server.ts:2021`) | DOC |
-| R-11 | `top_p` | number 0-1 | `1` (doc SSE transcript shows `"top_p":1.0`) | nucleus | 400 / `invalid_request_error` / `top_p` / — | **divergent, client-visible**: ignored, and echoed as **`0.98`** when omitted (`http-server.ts:2025` `numberOrDefault(raw.top_p, 0.98)`) where the provider echoes `1` | DOC |
+| R-10 | `temperature` | number 0-2 | `1` (caveat; confirmed by the doc's SSE transcript showing `"temperature":1.0`) | sampling | 400 / `invalid_request_error` / `temperature` / — | **rejected unless `1`** (null = omission): 400 `param: temperature`, `code: null`, `Unsupported parameter: 'temperature' is not supported with this model.`; echoed as the constant `1` | VERIFIED (direct `gpt-5.6-terra` 2026-08-29: 0.5 → 400 code null, 1 → 200) |
+| R-11 | `top_p` | number 0-1 | `1` (doc SSE transcript shows `"top_p":1.0`) | nucleus | 400 / `invalid_request_error` / `top_p` / — | **rejected whenever present**, `1` included: 400 `param: top_p`, `code: null`, `Unsupported parameter: 'top_p' is not supported with this model.`; echoed as the constant `1` (was `0.98`) | VERIFIED (direct 2026-08-29: 0.5 → 400, **1 → 400 too** — the Responses surface refuses the parameter, not the value) |
 | R-12 | `top_logprobs` | integer 0-20 | `null` (doc) | logprobs on output text | 400 / `invalid_request_error` / `top_logprobs` / — | ignored; echoed as **`0`** (`http-server.ts:2024`) where the provider echoes `null` | DOC |
 | R-13 | `stream` | boolean | `false` | named SSE events | 400 / `invalid_request_error` / `stream` / — | supported | VERIFIED (`openai.responses.stream`) |
 | R-14 | `stream_options.include_obfuscation` | boolean | `true` | `obfuscation` on delta events | UNKNOWN | parsed via the shared reader (`normalizers.ts:64`) | DOC |
@@ -186,32 +186,32 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 
 ---
 
-## 3. OpenAI Images — `/v1/images/generations`, `/edits`, `/variations`
+## 3. OpenAI Images — `/v1/images/generations`, `/edits` (`/variations` is gone — 404 on both, 2026-08-29)
 
-20 rows. `G`/`E`/`V` = applicability to generations / edits / variations per the provider spec.
+20 rows. `G`/`E`/`V` = applicability to generations / edits / variations per the provider spec as it stood before 2026-08-29; the `V` column is historical — the direct API answers a bare 404 on `/v1/images/variations` (measured 2026-08-29), and so does the proxy.
 
 | # | Field | G/E/V | Type & values | Provider default | Observable effect | Invalid-value error | This proxy | Ev |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| I-1 | `model` | G E V | string | **`dall-e-2`** (doc: the only model for which the `url` default and 1000-char prompt cap apply) | picks the generator; changes which other fields are legal | 400 / `invalid_request_error` / `model` / `model_not_found` | supported; defaults to `dall-e-2`; `image-2` is the local route (contract `:242`) | VERIFIED (`openai.images.direct_generation.gpt_image.schema_exact`) |
-| I-2 | `prompt` | G E, ignored on V | string; ≤32000 chars GPT-image, ≤1000 `dall-e-2`, ≤4000 `dall-e-3` | required on G/E | the image | 400 / `invalid_request_error` / `prompt` / — | supported; cap enforced as **32000 UTF-16 code units** (contract `:243`) — the provider's caps are model-dependent and character-based, so `dall-e-2` prompts of 1001-32000 chars are accepted here and rejected there | VERIFIED for the missing-prompt error (`openai.images.error_missing_prompt.schema_exact`) |
-| I-3 | `image` / `image[]` / `images` | — E V | binary (multipart) | required on E/V | the source image | 400 / `invalid_request_error` / `image` / — | supported; **JSON image references also accepted on edits** (a proxy extension); variations require multipart (contract `:245`) | VERIFIED (`openai.images.direct_edit.gpt_image.schema_exact`, `…error_variation_json…`) |
-| I-4 | `mask` | — E — | binary PNG, <4MB, same dims as `image` | absent | edit region | 400 / `invalid_request_error` / `mask` / — | accepted as an image input (contract `:246`) | DOC |
-| I-5 | `n` | G E V | integer 1-10 (`dall-e-3`: only 1) | `1` | `data` array length | 400 / `invalid_request_error` / `n` / — | supported 1-10 (`http-server.ts:556`) — **does not enforce the `dall-e-3` n=1 rule** | VERIFIED (`…b64_json_n3_parallel…`) |
-| I-6 | `size` | G E V | model-dependent: `1024x1024`\|`1024x1536`\|`1536x1024`\|`auto` (GPT-image); `256x256`\|`512x512`\|`1024x1024` (`dall-e-2`); `1024x1792`\|`1792x1024` (`dall-e-3`) | `auto` on GPT-image; `1024x1024` on dall-e | output dimensions; echoed | 400 / `invalid_request_error` / `size` / — | **divergent**: accepts `auto` or **any** `WIDTHxHEIGHT` with positive ints (`http-server.ts:938-950`) — a free-form grammar the provider rejects | DOC |
-| I-7 | `quality` | G E V | `standard`\|`hd`\|`low`\|`medium`\|`high`\|`auto` | `auto` | fidelity, cost, latency; echoed | 400 / `invalid_request_error` / `quality` / — | supported, full enum (`http-server.ts:563`) — **not model-gated** (`hd` on a GPT-image model is accepted here, rejected there) | VERIFIED (`…generation_api_fields…`) |
-| I-8 | `style` | G — — | `vivid`\|`natural` (dall-e-3 only) | `vivid` | aesthetic | 400 / `invalid_request_error` / `style` / — | supported on generations, 400 elsewhere (`http-server.ts:660`) | DOC |
-| I-9 | `background` | G E V | `transparent`\|`opaque`\|`auto` (GPT-image only) | `auto` | alpha channel; echoed | 400 / `invalid_request_error` / `background` / — | supported; `transparent` rejected for `image-2` and with `jpeg` (`http-server.ts:647-658`) | VERIFIED (`…background_transparent_unsupported…`) |
-| I-10 | `output_format` | G E V | `png`\|`jpeg`\|`webp` (GPT-image only) | `png` | encoding; echoed | 400 / `invalid_request_error` / `output_format` / — | supported | VERIFIED (`…generation_api_fields…`) |
-| I-11 | `output_compression` | G E V | integer 0-100; **provider: only with `webp`/`jpeg`** | `100` | file size | 400 / `invalid_request_error` / `output_compression` / — | supported; **PNG + `100` explicitly allowed** (contract `:250`), and `null` treated as omission — the provider documents the param as webp/jpeg-only, so the PNG carve-out is an unverified reading | VERIFIED for the error case (`…error_invalid_output_compression…`) |
-| I-12 | `moderation` | G E V | `low`\|`auto` (GPT-image only) | `auto` | filter strictness | 400 / `invalid_request_error` / `moderation` / — | supported (`http-server.ts:567`) | DOC |
-| I-13 | `input_fidelity` | — E — | `high`\|`low` (gpt-image-1/1.5, **not** `-mini`) | `low` | face/style preservation | 400 / `invalid_request_error` / `input_fidelity` / — | supported on edits; 400 `invalid_input_fidelity_model` for `image-2` (`http-server.ts:636-645`) | VERIFIED (`…input_fidelity_disabled…`) |
-| I-14 | `response_format` | G E V | `url`\|`b64_json`; **dall-e only** — GPT-image models reject it | **`url`** (dall-e-2/3) | `data[].url` vs `data[].b64_json` | 400 / `invalid_request_error` / `response_format` / `unknown_parameter` on GPT-image | **divergent default**: proxy defaults to **`b64_json`** (contract `:255`) where the provider defaults to `url`; correctly 400s it for `gpt-image-*` (`http-server.ts:588-593`) | VERIFIED for the rejection (`…proxy_gpt_image_response_format_unsupported…`, `…direct_image2_unsupported…`) |
-| I-15 | `stream` | G E — | boolean (GPT-image only) | `false` | SSE partial/completed image events | 400 / `invalid_request_error` / `stream` / — | supported | VERIFIED (`…generation_stream…`) |
-| I-16 | `partial_images` | G E — | integer 0-3 | `0`… (doc's rendered scalar is `1`; **the documented default is not distinguishable** — UNKNOWN) | number of `image_generation.partial_image` events | 400 / `invalid_request_error` / `partial_images` / — | **only 0/null/omitted**; >0 → 400 `partial_images is not supported by this local image proxy` (`http-server.ts:823-833`) | DOC? |
+| I-1 | `model` | G E V | string | **none — required** (2026-08-29: absent → 400 `missing_required_parameter`; null/number → 400 `invalid_type`) | picks the generator; changes which other fields are legal | 400 / `image_generation_user_error` / `model` / `invalid_value` `The model 'X' does not exist.` — for `dall-e-2`, `dall-e-3`, `image-2`, `''`, anything not in the live list | required; live list `gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`, `gpt-image-2-2026-04-21`, `chatgpt-image-latest` (`OPENAI_IMAGE_MODELS`, `http-server.ts`); every name runs on the local backend; the former `image-2` is refused like any other unknown name | VERIFIED (direct 2026-08-29, §5.5.2) |
+| I-2 | `prompt` | G E | string; ≤32000 chars | required | the image | absent → `missing_required_parameter`; null/number → `invalid_type`; `''` → `empty_string`; whitespace-only **accepted** (all measured 2026-08-30) | mirrored (`imagePrompt`); cap enforced as 32000 UTF-16 code units | VERIFIED (§5.5.3) |
+| I-3 | `images` (JSON) / `image`, `image[]` (multipart) | — E — | JSON: array of objects; multipart: file parts | required on E | the source image | JSON `image`/`image[]` → 400 `invalid_value` "Unknown parameter: 'image'. For application/json on /v1/images/edits, use 'images' (array)."; non-array `images` → 400 `invalid_type`; string member → 400 `invalid_type` param `images[0]`; absent → 400 `missing_required_parameter` (all measured 2026-08-29) | mirrored: JSON takes `images` only with those envelopes, multipart takes `image`/`image[]` (`imageInputsForOperation`) | VERIFIED (direct 2026-08-29, §5.5.2) |
+| I-4 | `mask` | — E — | binary PNG, <4MB, same dims as `image` | absent | edit region | 400 / `invalid_request_error` / `mask` / — | sent as the tool's `input_image_mask` (`codexBackendImageGenerationTool`); the slot accepts a data URL and an https URL, and 500s on `{}` (never sent empty) | VERIFIED (tool-slot probe 2026-08-29: `slot_input_image_mask`, `slot_mask_https_url`, `slot_mask_empty_object`) |
+| I-5 | `n` | G E | integer 1-10 | `1` (null = omission) | `data` array length | below/above → `integer_below_min_value` / `integer_above_max_value` naming bound and value; decimal/string/boolean → `invalid_type` naming the type (measured) | mirrored (`imageInteger`); multipart digit strings still parse | VERIFIED (§5.5.3) |
+| I-6 | `size` | G E | `auto` or `WIDTHxHEIGHT`, both divisible by 16 | `auto` | output dimensions | `image_generation_user_error` / `size` / `invalid_value`: `Expected WIDTHxHEIGHT, for example '1824x1024'.` for `bogus`/`0x0`; `Width and height must both be divisible by 16.` for `9x9` (measured) | mirrored (`optionalImageSize`) | VERIFIED (§5.5.3) |
+| I-7 | `quality` | G E | `low`\|`medium`\|`high`\|`auto` (**no `standard`/`hd`** on any live model) | `auto` | fidelity, cost, latency; echoed | string outside the set → `invalid_value` `Supported values are: 'low', 'medium', 'high', and 'auto'.`; non-string → `invalid_type` `expected one of … or 'auto', but got an integer instead` (measured) | mirrored (`imageEnum`); the dall-e aliases are refused | VERIFIED (§5.5.3) |
+| I-8 | `style` | G — — | `vivid`\|`natural` (dall-e-3 only, and dall-e-3 is gone) | — | aesthetic | 400 / `invalid_request_error` / `style` / `unknown_parameter` (measured on gpt-image-2) | rejected whenever present, the same envelope (`rejectUnknownOpenAiImageParameters`) | VERIFIED (direct 2026-08-29, §5.5.2) |
+| I-9 | `background` | G E V | `transparent`\|`opaque`\|`auto` (GPT-image only) | `auto` | alpha channel; echoed | 400 / `invalid_request_error` / `background` / — | sent on the tool; `transparent` with `jpeg` rejected locally (`validateOpenAiImageRequest`); `transparent` itself is refused by the backend image model (`gpt-image-2-codex`, `image_generation_user_error` / `invalid_value`) and that refusal is forwarded, streamed or not — **a capability gap**: the direct Responses image tool on `gpt-5.6-terra` accepts `transparent` and generates (measured 2026-08-30, 200); `opaque`/`auto` accepted | VERIFIED (`…background_transparent_unsupported…`; tool-slot probe 2026-08-29: `slot_background`, `slot_background_opaque`, `slot_background_auto`) |
+| I-10 | `output_format` | G E | `png`\|`webp`\|`jpeg` | `png` | encoding; echoed | `invalid_value` listing the three in that order (measured) | mirrored | VERIFIED (§5.5.3) |
+| I-11 | `output_compression` | G E | integer 0-100 | `100` (null = omission) | file size | range/type envelopes as `n` (measured: 101, -1, 1.5, "50") | mirrored; PNG + `<100` additionally `invalid_png_output_compression` (proxy rule, direct validation passed `50` with no format) | VERIFIED (§5.5.3) |
+| I-12 | `moderation` | G E | `auto`\|`low` | `auto` | filter strictness | `invalid_value` `Supported values are: 'auto' and 'low'.` (measured) | mirrored; sent on the tool | VERIFIED (§5.5.3 + tool-slot probe) |
+| I-13 | `input_fidelity` | — E — | `high`\|`low` (gpt-image-1/1.5, **not** `-mini`) | `low` | face/style preservation | on a generation: 400 `unknown_parameter` (measured on gpt-image-2); on `gpt-image-1-mini`: 400 `unknown_parameter` (measured) | generation → `unknown_parameter`; edit → sent on the tool, and the backend image model (`gpt-image-2-codex`) refuses it with `invalid_input_fidelity_model`, forwarded | VERIFIED (direct 2026-08-29 + tool-slot probe) |
+| I-14 | `response_format` | G E V | — | — | — | 400 / `invalid_request_error` / `response_format` / `unknown_parameter` on every live model, **null included** (measured on gpt-image-2, chatgpt-image-latest, gpt-image-2-2026-04-21) | rejected whenever present; the `url` format and the `GET /v1/images/generated/{id}` store are removed (2026-08-29) | VERIFIED (direct 2026-08-29, §5.5.2) |
+| I-15 | `stream` | G E | boolean (null = omission) | `false` | SSE completed image events | non-boolean → `invalid_type` `expected a boolean, but got a string instead` (measured) | mirrored in JSON; multipart `true`/`false` strings parse | VERIFIED (§5.5.3) |
+| I-16 | `partial_images` | G E | integer 0-3 (null = omission) | `0` | partial events | range/type envelopes as `n` (measured: 4, -1) | mirrored for the envelope; 1-3 then refused as `unsupported_value` (proxy limitation) | VERIFIED (§5.5.3) |
 | I-17 | `user` | G E V | string | absent | abuse signal | UNKNOWN | accepted (contract `:254`) | DOC? |
-| I-18 | `x_proxy_image_route` | G E V | object: `visual_class`, `geometry_mode`, `output_format`, `output_compression` | n/a | route-specific generation constraints | 400 / `invalid_request_error` / `x_proxy_image_route.*` / — | **proxy-only extension** (`http-server.ts:880-934`). Sending it to the direct API is expected to 400 as an unknown parameter | CODE |
-| I-19 | *(behavioral)* body encoding | G E V | JSON on G; multipart on E/V per provider | — | — | 400 on wrong encoding | proxy accepts **JSON on edits** too, and requires multipart only for variations (contract `:245`) | VERIFIED for the variation-JSON rejection (`…error_variation_json…`) |
-| I-20 | *(behavioral)* unknown top-level field | G E V | — | — | — | expected 400 `unknown_parameter` | unknown fields other than `response_format` are silently ignored | DOC? |
+| I-18 | `x_proxy_image_route` | G E | object: `visual_class`, `geometry_mode`, `output_format`, `output_compression` | n/a | route-specific generation constraints | **direct: 400 `unknown_parameter`** (measured 2026-08-30) | **proxy-only extension, kept by decision** — the one key accepted here that the direct API refuses | VERIFIED (§5.5.3) |
+| I-19 | *(behavioral)* body encoding | G E — | JSON or multipart on both (the direct API takes JSON `images` on edits, measured) | — | — | 400 on wrong encoding | JSON and multipart on both operations; variations gone | VERIFIED (direct 2026-08-29) |
+| I-20 | *(behavioral)* unknown top-level field | G E | — | — | — | 400 `unknown_parameter` naming the key; on a generation `mask`, `images`, `input_fidelity` count as unknown (measured) | mirrored, JSON and multipart, `x_proxy_image_route` excepted | VERIFIED (§5.5.3) |
 
 ---
 
@@ -234,9 +234,9 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-11 | `content[].type:"thinking"` / `"redacted_thinking"` | `{thinking, signature}` | — | required to replay a thinking turn; **signature is verified server-side** | 400 / `invalid_request_error` on a bad signature | **UNKNOWN — not in the contract's block table.** A client replaying a thinking turn is unhandled | DOC |
 | A-12 | `cache_control` (on any block) | `{type:"ephemeral", ttl?}` | absent | `usage.cache_creation_input_tokens` / `cache_read_input_tokens` | 400 / `invalid_request_error` | **accepted and ignored**, documented as such (contract `:405` ff., "Prompt caching") | DOC |
 | A-13 | `system` | string \| block array | absent | system steering | 400 / `invalid_request_error` | supported; flattened (`normalizers.ts:99-100`) | DOC |
-| A-14 | `temperature` | number **0..1** (note: not 0..2) | `1` (doc example shows `1`; **stated default UNKNOWN**) | sampling | 400 / `invalid_request_error` | parsed; forwarding to the Claude CLI is not asserted anywhere | DOC? |
-| A-15 | `top_p` | number 0..1 | UNKNOWN | nucleus | 400 / `invalid_request_error` | **silently ignored** — not read (`rg` finds no `top_p` in `normalizers.ts`) | DOC? |
-| A-16 | `top_k` | integer | UNKNOWN | top-K truncation | 400 / `invalid_request_error` | **silently ignored** | DOC? |
+| A-14 | `temperature` | number **0..1** | (not applied) | sampling | 400 `invalid_request_error` `temperature: range: 0..1`; non-number or **null** → `temperature: Input should be a valid number` (measured 2026-08-30) | mirrored (`rejectInvalidAnthropicSampling`); a valid value is accepted and inert — the Claude CLI has no sampling control, and nothing echoes it | VERIFIED (§5.5.4) |
+| A-15 | `top_p` | number 0..1 | (not applied) | nucleus | `top_p: range: 0..1` / `Input should be a valid number` (measured) | mirrored; accepted and inert | VERIFIED (§5.5.4) |
+| A-16 | `top_k` | integer (negatives accepted by the direct API) | (not applied) | top-K truncation | non-integer → `top_k: Input should be a valid integer` (measured); `-1` accepted | mirrored; accepted and inert | VERIFIED (§5.5.4) |
 | A-17 | `stop_sequences` | array of strings | `[]` | stops output; `stop_reason:"stop_sequence"` **and `stop_sequence` echoes the matched string** | 400 / `invalid_request_error` | **silently ignored** — never read, yet the response emits `stop_sequence: result.stopSequence ?? null` (`http-server.ts:1896`), which can therefore never reflect a client sequence | DOC |
 | A-18 | `stream` | boolean | `false` | SSE events | 400 / `invalid_request_error` | supported | VERIFIED-weak (`anthropic.messages.stream`) |
 | A-19 | `tools` | array of `{name, description, input_schema}` + server tools (`web_search`, `bash`, `text_editor`, `computer`, …) | absent | `tool_use` blocks; `stop_reason:"tool_use"` | 400 / `invalid_request_error` | **custom tools only**; server-tool entries UNKNOWN (probe P-35) | VERIFIED-weak (`anthropic.messages.tool_use`) |
@@ -246,18 +246,18 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-23 | `output_config.effort` | `low`\|`medium`\|`high`\|`xhigh`\|`max` | UNKNOWN | reasoning/effort spend | 400 / `invalid_request_error` | supported; **accepted-and-ignored on models that gate it (Haiku)** — documented (contract `:318`) | DOC? |
 | A-24 | `output_config.format` | `{type:"json_schema", schema}` | absent | structured output | 400 / `invalid_request_error` | supported; **rejected together with tools unless `tool_choice:"none"`** (`normalizers.ts:110-125`) — a restriction the provider does not impose | DOC |
 | A-25 | `output_config.task_budget` | `{type:"tokens", total ≥ 20000}` | UNKNOWN | total task token budget | 400 / `invalid_request_error` | validated; forwarding UNKNOWN (contract `:320`) | DOC? |
-| A-26 | `output_format` (top level, deprecated) | object | absent | superseded by `output_config.format` | 400 / `invalid_request_error` | **silently ignored** | DOC |
+| A-26 | `output_format` (top level, deprecated) | object | absent | superseded by `output_config.format` | 400 / `invalid_request_error` | refused as an unknown key (`output_format: Extra inputs are not permitted`) since 7a8bef6 — not in the measured key set | VERIFIED (§5.5.4 key set) |
 | A-27 | `metadata.user_id` | opaque string | absent | abuse detection | 400 / `invalid_request_error` | **silently ignored** | DOC |
 | A-28 | `service_tier` | `auto`\|`standard_only` | `"auto"` | **`usage.service_tier` in the response** ( `"priority"` / `"standard"` ) | 400 / `invalid_request_error` | **silently ignored**; `usage.service_tier` never emitted | DOC |
-| A-29 | `speed` | `standard`\|`fast` | UNKNOWN (beta) | latency mode | 400 / `invalid_request_error` | silently ignored | DOC? |
+| A-29 | `speed` | `standard`\|`fast` | UNKNOWN (beta) | latency mode | 400 / `invalid_request_error` `speed: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
 | A-30 | `inference_geo` | string (beta) | UNKNOWN | inference region | 400 / `invalid_request_error` | silently ignored | DOC? |
-| A-31 | `mcp_servers` | array of MCP server defs (beta) | absent | `mcp_tool_use` blocks | 400 / `invalid_request_error` | silently ignored | DOC |
+| A-31 | `mcp_servers` | array of MCP server defs (beta) | absent | `mcp_tool_use` blocks | 400 `mcp_servers: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
 | A-32 | `container` | string (code-execution container id) | absent | container reuse | 400 / `invalid_request_error` | silently ignored | DOC? |
-| A-33 | `context_management` | object (beta) | absent | context editing/compaction | 400 / `invalid_request_error` | silently ignored | DOC? |
+| A-33 | `context_management` | object (beta) | absent | context editing/compaction | 400 `context_management: Extra inputs are not permitted` (measured without a beta header) | refused as an unknown key, as measured | VERIFIED (§5.5.4) |
 | A-34 | `anthropic-version` header | e.g. `2023-06-01`; **required** | none — required | request is rejected without it | **400 / `invalid_request_error`** | **UNKNOWN — the proxy does not appear to require it**; a body missing the header succeeds here and fails there. Probe P-37 | DOC |
 | A-35 | `anthropic-beta` header | array/CSV of beta ids | absent | unlocks beta fields | 400 / `invalid_request_error` on an unknown id | silently ignored | DOC |
 | A-36 | `x-api-key` / `Authorization` | credential header | none — required | 401 without it | 401 / `authentication_error` | proxy has its own local access gate; **the credential semantics differ by construction** (not applicable) | DOC |
-| A-37 | *(behavioral)* unknown top-level field | — | — | — | Anthropic's schema is strict — expected **400 `invalid_request_error`** ("Extra inputs are not permitted") | **silently ignored** — the widest single divergence class on this surface | DOC? |
+| A-37 | *(behavioral)* unknown top-level field | — | — | — | 400 `invalid_request_error` `bogus_field: Extra inputs are not permitted`; also `messages.0.bogus`; reported after field validation (measured 2026-08-30) | mirrored (`rejectUnknownAnthropicKeys`) against the measured key set of 18 — `user_profile_id`, `mcp_servers`, `context_management`, `betas` are unknown to the direct API without a beta and unknown here | VERIFIED (§5.5.4) |
 
 ---
 
@@ -306,7 +306,7 @@ POST /v1/chat/completions
 
 `output[]` items: `reasoning` (with `summary[]`), `message` (with `content[].type:"output_text"` + `annotations`), `function_call` (`call_id`, `name`, `arguments`), built-in tool-call items.
 
-**The doc's own `response.completed` transcript is the reference for the echoed defaults** and shows: `temperature: 1.0`, `top_p: 1.0`, `store: true`, `truncation: "disabled"`, `parallel_tool_calls: true`, `tool_choice: "auto"`, `reasoning: {effort: null, summary: null}`, `metadata: {}`, `user: null`, `max_output_tokens: null`. Our echo differs on `top_p` (0.98), `top_logprobs` (0 vs null), `prompt_cache_retention` ("24h" always), and adds `billing`, `moderation`, `max_tool_calls`, `frequency_penalty`, `presence_penalty` keys.
+**The doc's own `response.completed` transcript is the reference for the echoed defaults** and shows: `temperature: 1.0`, `top_p: 1.0`, `store: true`, `truncation: "disabled"`, `parallel_tool_calls: true`, `tool_choice: "auto"`, `reasoning: {effort: null, summary: null}`, `metadata: {}`, `user: null`, `max_output_tokens: null`. Our echo matches on `temperature` (1) and `top_p` (1, constants since 2026-08-29 — the `0.98` of earlier revisions is gone with row R-11), differs on `top_logprobs` (0 vs null) and `prompt_cache_retention` ("24h" always), and adds `billing`, `moderation`, `max_tool_calls`, `frequency_penalty`, `presence_penalty` keys.
 
 **Streaming — event sequence** (named SSE; every payload carries `sequence_number`, monotonically increasing from 0):
 
@@ -404,6 +404,119 @@ POST /v1/messages   (headers: anthropic-version: 2023-06-01)
 
 ---
 
+## 5.5 Tier A 실측 (2026-08-29) — DOC → VERIFIED
+
+12회 호출, 실패 0. 모델 `gpt-5.6-terra` / `claude-sonnet-5`. 원본 캡처는
+`artifacts/direct-api-captures/a5eee9af-fcf4-450c-a0b0-4b16cdfcefbf/`에 요청 본문·상태·응답 헤더·응답 바이트(스트림은 파싱 이전
+와이어)로 남아 있고, 아래 값은 전부 그 바이트에서 읽은 것이다. 검출기는 실행 전에 **답이 반대인 입력**으로
+6/6 자가 검사를 통과했다 — 기대와 일치하는 관찰일수록 계기를 먼저 의심해야 하기 때문이다.
+
+| 프로브 | 관찰된 사실 | 증거 등급 |
+| --- | --- | --- |
+| P-1 | `/v1/responses` 최소 요청의 응답 키 집합에 `background`·`billing`·`moderation`·`prompt_cache_key`·`prompt_cache_retention`·`max_tool_calls`·`frequency_penalty`·`presence_penalty`가 포함된다 | VERIFIED |
+| **P-2** | **`/v1/responses` 스트림은 `[DONE]`으로 끝나지 않는다.** 이벤트 9종(`response.created` → `response.completed`), `sequence_number`는 **0**에서 시작, `obfuscation` 필드가 기본으로 존재 | VERIFIED |
+| P-3 | `/v1/chat/completions` 최소 응답의 키는 `choices,created,id,model,object,service_tier,system_fingerprint,usage`. `service_tier: "default"`, `system_fingerprint: null`. choice 키는 `finish_reason,index,message` — `logprobs`·`annotations`·`refusal`은 없다 | VERIFIED |
+| **P-4** | **`/v1/messages` 스트림도 `[DONE]`이 없다.** `message_start`→`content_block_start`→`ping`→`content_block_delta`→`content_block_stop`→`message_delta`→`message_stop`, `ping` 이벤트가 실제로 온다. `message_start.usage.input_tokens`가 존재 | VERIFIED |
+| P-5 | 미지의 최상위 필드: OpenAI 두 표면 모두 400 + `{type: invalid_request_error, param, code: unknown_parameter}`. **Anthropic은 400이지만 `param`도 `code`도 없다** — `{type, message}`뿐 | VERIFIED |
+| P-6 | `anthropic-version` 헤더 누락 → 400 `invalid_request_error`, 메시지 `anthropic-version: header is required` | VERIFIED |
+| P-7 | Chat `n: 2` 수용, `choices` 길이 2 | VERIFIED |
+| P-8 | Anthropic `stop_sequences` 적중 시 `stop_reason: "stop_sequence"`, `stop_sequence: "ZZ"`로 에코 | VERIFIED |
+| **P-9** | **Chat `stop`은 `gpt-5.6-terra`에서 미지원** — 400 `{code: unsupported_parameter, param: stop}`. 모델군별 호출 규약이며 벤치 row 정의에 반영해야 한다 | VERIFIED |
+| P-10 | `/v1/responses`의 `stream_options.include_usage`는 400 `unknown_parameter` — Responses에는 없는 파라미터다 | VERIFIED |
+
+### 이 실측이 즉시 드러낸 프록시 발산
+
+**프록시의 `/v1/responses`가 `data: [DONE]`을 보낸다. direct는 보내지 않는다.** 이벤트 9종은 이름과
+순서까지 일치하므로 차이는 종결자 하나뿐이다. 기존 스트림 단언이 종결자를 **양쪽 다** 보지 않았기 때문에
+지금까지 드러나지 않았다. 근거는 두 캡처의 원본 바이트다 — direct는 위 run, 프록시는
+`artifacts/api-captures/`의 같은 표면 교환.
+
+Chat 표면에서는 `[DONE]`이 맞다(direct도 보낸다). Responses에서만 다르다.
+
+### 5.5.1 Codex 백엔드 `image_generation` 도구 슬롯 실측 (2026-08-29)
+
+`pnpm probe:codex-image-tool-slots` (`scripts/probe-codex-image-tool-slots.mjs`). 텍스트 전용 요청에
+도구 선언만 실어 보내므로 이미지는 생성되지 않는다. 대조군이 먼저다 — 가짜 키와 가짜 enum이 **거절**되지
+않으면 수용은 아무것도 증명하지 못한다. 결과 파일은 `artifacts/codex-backend-image-probe/codex-image-tool-slots.*.json`.
+
+| 변형 | 관찰된 사실 | 등급 |
+| --- | --- | --- |
+| `control_bogus_field` | `tools[0].bogus_field_xyz` → 400 `unknown_parameter`. **선언은 엄격 검증된다** | VERIFIED |
+| `control_bogus_enum_*` | `background`·`moderation`·`input_fidelity`의 enum 밖 값 → 400 `invalid_value`, 허용 값 목록이 메시지에 온다(`transparent/opaque/auto`, `auto/low`, `high/low`) | VERIFIED |
+| `control_bogus_mask_shape` | `input_image_mask: "string"` → 400 `invalid_type` (object 기대) | VERIFIED |
+| `slot_background` | `transparent` → 400 `image_generation_user_error` / `invalid_value` "Transparent background is not supported for this model." — 우리 `image-2` 거절 봉투(`http-server.ts:647`)의 출처 | VERIFIED |
+| `slot_background_opaque`, `_auto` | 200 | VERIFIED |
+| `slot_moderation` | `low` → 200 | VERIFIED |
+| `slot_input_fidelity` | `high` → 400 `image_generation_user_error` / `invalid_input_fidelity_model` "The model 'gpt-image-2-codex' does not support the 'input_fidelity' parameter." — 백엔드 이미지 모델 이름이 여기서 드러난다 | VERIFIED |
+| `slot_input_image_mask` | data URL → 200; `slot_mask_https_url` https URL → 200(스키마 수용, 실제 fetch는 미검증); `slot_mask_empty_object` `{}` → **500** `server_error` | VERIFIED |
+| `slot_edit_combo` | `action: edit` + `opaque` + `moderation: low` + 마스크 + size/quality/output_format 동시 → 200 | VERIFIED |
+| `body_temperature_*`, `body_top_p_0_5` | 요청 본문의 `temperature`(0.5, 1 모두)·`top_p` → 400 `{"detail": "Unsupported parameter: temperature"}`. 프록시는 보내지 않았고 `/v1/responses` 응답이 호출자 값을 그대로 에코했다 — 적용된 적 없는 값의 에코. 같은 날 direct API(`gpt-5.6-terra`) 실측: Chat은 `temperature` 0.5 → 400 `unsupported_value`("Only the default (1) value is supported"), 1 → 200, `top_p` 0.5 → 400 `unsupported_parameter`, 1 → 200; Responses는 `temperature` 0.5 → 400(code null), 1 → 200, `top_p`는 **1이어도** 400(code null). 프록시는 이 봉투를 표면별로 그대로 미러링하고 에코는 상수 1로 고정했다(행 13·14·R-10·R-11) | VERIFIED |
+
+### 5.5.2 Images 모델 네임스페이스 direct 실측 (2026-08-29)
+
+`GET /v1/models`의 이미지 모델: `chatgpt-image-latest`, `gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`,
+`gpt-image-2-2026-04-21`. **`dall-e-2`·`dall-e-3`는 없다.** 아래는 전부 생성 없이 거절된 호출(`n: 0` 등으로 검증 단계에서 멈춤).
+
+| 요청 | direct 응답 | 등급 |
+| --- | --- | --- |
+| `model` 생략 | 400 `invalid_request_error` / `model` / `missing_required_parameter` | VERIFIED |
+| `model: null` / `123` | 400 `invalid_type` "expected a string, but got null / an integer instead" | VERIFIED |
+| `model: "dall-e-2"`, `"dall-e-3"`, `"image-2"`, `"foo-model"`, `""` | 400 `image_generation_user_error` / `model` / `invalid_value` "The model 'X' does not exist." | VERIFIED |
+| `gpt-image-2` + `response_format` (`url`, `null` 모두), `chatgpt-image-latest`·`gpt-image-2-2026-04-21` + `response_format` | 400 `unknown_parameter` | VERIFIED |
+| `gpt-image-2` generations + `input_fidelity`, `gpt-image-1-mini` + `input_fidelity` | 400 `unknown_parameter` | VERIFIED |
+| `gpt-image-2` + `style: vivid` | 400 `unknown_parameter` | VERIFIED |
+| `gpt-image-2` + `user` | 수용(다음 검증인 `n`에서 거절됨) | VERIFIED |
+| edits JSON `image` / `image[]` | 400 `invalid_value` "Unknown parameter: 'image'. For application/json on /v1/images/edits, use 'images' (array)." | VERIFIED |
+| edits JSON `images: {}` / `images: ["str"]` / `images` 생략 | 400 `invalid_type` (param `images` / `images[0]`) / `missing_required_parameter` | VERIFIED |
+| edits JSON `images: [{image_url}]` + `mask: {image_url}` + `input_fidelity` | 수용(`n`에서 거절됨) | VERIFIED |
+| `POST`/`GET /v1/images/variations` (어느 모델이든) | **404**, 본문 없음, `x-content-type-options: nosniff` — `/v1/images/foo`·`/v1/nope`도 동일 | VERIFIED |
+
+프록시는 이 표를 그대로 미러한다(행 I-1·I-3·I-8·I-13·I-14·I-19). 미측정: `model`이 boolean/object/array일 때의 정확한 문구(같은 패턴으로 추정), `images: null`.
+
+### 5.5.3 Images 검증 봉투 direct 실측 (2026-08-30)
+
+E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 전부 `gpt-image-2`, 무효값이라 생성 없음 — 단 공백 프롬프트 `"   "`는 **수용되어 생성**됐다(1회 과금). 프록시는 아래를 그대로 미러한다(행 I-2·I-5·I-6·I-7·I-10·I-11·I-12·I-15·I-16·I-18·I-20).
+
+| 요청 | direct 응답 |
+| --- | --- |
+| `n: 0` / `11` | `integer_below_min_value` "Invalid 'n': integer below minimum value. Expected a value >= 1, but got 0 instead." / `integer_above_max_value` "… <= 10, but got 11 instead." |
+| `n: 1.5` / `"2"` / `true` | `invalid_type` "Invalid type for 'n': expected an integer, but got a decimal number / a string / a boolean instead." |
+| `output_compression: 101` / `-1` / `1.5` / `"50"` | 같은 패턴(`>= 0`, `<= 100`) |
+| `partial_images: 4` / `-1` | 같은 패턴(`>= 0`, `<= 3`) |
+| `quality: "ultra"` / `""` | `invalid_value` "Invalid value: 'ultra'. Supported values are: 'low', 'medium', 'high', and 'auto'." — `standard`/`hd`는 목록에 없다 |
+| `quality: 1` | `invalid_type` "Invalid type for 'quality': expected one of 'low', 'medium', 'high', or 'auto', but got an integer instead." |
+| `output_format: "gif"` / `moderation: "bogus"` / `background: "bogus"` | `invalid_value` — 목록은 각각 `'png', 'webp', and 'jpeg'` / `'auto' and 'low'` / `'transparent', 'opaque', and 'auto'` |
+| `size: "bogus"` / `"0x0"` | `image_generation_user_error` / `size` / `invalid_value` "Invalid size 'bogus'. Expected WIDTHxHEIGHT, for example '1824x1024'." |
+| `size: "9x9"` | 같은 봉투, "Width and height must both be divisible by 16." |
+| `prompt` 생략 / `null` / `123` / `""` / `"   "` | `missing_required_parameter` / `invalid_type` (null, an integer) / `empty_string` / **수용(생성)** |
+| `stream: "yes"` | `invalid_type` "expected a boolean, but got a string instead" |
+| `bogus_field: 1`, generations의 `mask`·`images`·`x_proxy_image_route` | `unknown_parameter` naming the key |
+| `user: 123` | 수용(다음 검증에서 거절) |
+| edits `images: []` / `null` / `mask: null` | `empty_array` / `invalid_type` "got null instead" / `mask` null은 생략 |
+| null: `n`·`output_compression`·`partial_images`·`quality`·`size`·`stream` | 전부 생략으로 취급(다음 필드의 오류가 보고됨) |
+| 순서 (두 결함을 한 본문에) | model → 미지 키 → prompt → images → n → 나머지(`output_compression`·`quality` 등, 상호 순서 미측정) |
+
+추가 실측 (2026-08-30 오후): `model`이 `1.5`/`true`/`{}`/`[]` → `invalid_type` "got a decimal number / a boolean / an object / an array instead"; `quality`가 `true`/`{}`/`[]` → 같은 패턴("expected one of … or 'auto', but got …"); `size: 123` → `invalid_type` "expected a string, but got an integer instead"; JSON `n: "abc"` → "got a string instead".
+**multipart edits** (실제 폼, `n=0` 또는 `output_compression=101` tripwire): `style`·`bogus_field`·`response_format` → `unknown_parameter`; 파트 이름 `images` → `invalid_value` "Unknown parameter: 'images'. For multipart/form-data use 'image' or 'image[]'."; `n=abc`·`n=2.5`·`output_compression=abc` → `invalid_type` "expected an integer, but got a string value that could not be converted into an integer."; `quality=ultra`·`quality=`(빈 값) → JSON과 같은 `invalid_value`; 순서: `quality`가 `output_compression`보다 먼저, `size`는 `output_compression` 뒤, `mask` 파일은 `size` 검사를 막지 않음.
+미측정: multipart `stream=yes`(검증 단계에서 `output_compression`보다 뒤라 tripwire로는 판정 불가 — 프록시는 `invalid_type`으로 거절), `output_compression < 100` + PNG의 최종 판정(검증 단계는 통과).
+
+### 5.5.4 Anthropic Messages 샘플링 필드 direct 실측 (2026-08-30)
+
+`claude-sonnet-5`, `max_tokens: 1`. 봉투는 전부 `{"type":"error","error":{"type":"invalid_request_error","message":…},"request_id":…}` — `param`·`code` 없음(P-5와 일치).
+
+| 요청 | direct 응답 |
+| --- | --- |
+| `temperature: 1.5` / `-0.1` | 400 "temperature: range: 0..1" |
+| `temperature: "abc"` / **`null`** | 400 "temperature: Input should be a valid number" — Anthropic에서 null은 생략이 아니다 |
+| `top_p: 1.5` | 400 "top_p: range: 0..1" |
+| `top_k: 1.5` | 400 "top_k: Input should be a valid integer" |
+| `top_k: -1` | **수용**(1토큰 생성) |
+| `bogus_field: 1` | 400 "bogus_field: Extra inputs are not permitted" |
+
+프록시는 세 필드를 같은 문구로 검증하고 유효값은 수용하되 적용하지 않는다(claude CLI에 샘플링 노브 없음, 응답에 에코 필드 없음).
+
+**최상위 키 집합 (같은 날, 각 키에 틀린 타입 `1`을 보내 판별)**: 아는 키 18개 — `model`·`messages`·`max_tokens`·`cache_control`("Input should be an object")·`container`·`inference_geo`·`metadata`·`output_config`·`service_tier`("Input should be 'auto' or 'standard_only'")·`stop_sequences`·`stream`("Input should be a valid boolean")·`system`·`temperature`·`thinking`·`tool_choice`·`tools`·`top_k`·`top_p`. 모르는 키 → "<key>: Extra inputs are not permitted": `user_profile_id`(SDK 타입엔 있음)·`mcp_servers`·`context_management`·`betas`·`speed`·`effort`·`seed`·`response_format`·`instructions`·`input`·`n`·`user`·`logprobs`·`stop`. 순서: `max_tokens: Field required`가 미지 키보다 먼저, `temperature: range: 0..1`도 미지 키보다 먼저, 미지 키 둘이면 본문 순서의 첫 키; `messages[0].bogus` → "messages.0.bogus: Extra inputs are not permitted"; `bogus: null`도 거절. 프록시는 이 집합을 그대로 미러한다(A-37).
+
 ## 6. Probe plan — converting DOC into VERIFIED
 
 **Ranking.** risk = P(our proxy diverges) × client visibility. Tier A = a divergence a normal SDK client would hit on an ordinary request. Tier B = a divergence a client hits when it uses the feature. Tier C = completeness.
@@ -428,7 +541,7 @@ Standing rules for every probe: minimal token spend (`max_tokens`/`max_completio
 | P-14 | B | Chat, model omitted; then `""`; then `"   "` | status/type/param/code per case | row 1 | 3 |
 | P-15 | B | Responses **with `model` omitted** | whether the provider really requires it | R-1 | 1 |
 | P-16 | B | `POST /v1/images/generations` `{"model":"gpt-image-1","prompt":"a red dot","size":"1024x1024","quality":"low"}` | Exact key set + **`usage` sub-shape** (settles the contract's Responses-shaped image usage) | I-1, I-7, §5.3 | 1 |
-| P-17 | B | Images generations with `"model":"dall-e-2","prompt":"a red dot"`, `response_format` omitted | whether `data[0]` carries `url` (provider default) — settles our `b64_json` default | I-14 | 1 |
+| P-17 | B | ~~Images generations with `dall-e-2`, `response_format` omitted~~ — settled 2026-08-29 without a generation: `dall-e-2` does not exist and `response_format` is refused on every live model (§5.5.2) | — | I-14 | 0 |
 | P-18 | B | Images generations, `"size":"777x333"` on gpt-image | status/type/param/code — settles our free-form `WIDTHxHEIGHT` grammar | I-6 | 1 |
 | P-19 | B | Chat `tool_choice:"banana"`; Responses same | 400 vs silent `auto` fallback | row 31, R-19 | 2 |
 | P-20 | B | Chat with a tool + `"parallel_tool_calls":false` on a prompt that would call twice | `tool_calls` length; echo | row 32 | 1 |

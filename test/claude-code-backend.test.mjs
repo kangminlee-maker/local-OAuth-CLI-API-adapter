@@ -325,8 +325,17 @@ function settingSourcesIn(argv) {
 }
 
 for (const [pathName, request] of [['one-shot', ONE_SHOT], ['persistent', PERSISTENT]]) {
-  test(`default (${pathName} child): the user setting source loads`, async () => {
+  // Flipped 2026-08-29. The default used to load the operator's user source into
+  // every API turn — 25,673 characters of one machine's CLAUDE.md, hooks, env and
+  // permissions on a stranger's question, carrying answer-style directives and an
+  // `effort` value. An API caller never asked for any of it.
+  test(`default (${pathName} child): no setting source loads`, async () => {
     const argv = await spawnedArgv(request, 'claude-opus-4-8');
+    assert.equal(settingSourcesIn(argv), '');
+  });
+
+  test(`isolateUserSettings false (${pathName} child): the operator can still ask for their settings`, async () => {
+    const argv = await spawnedArgv(request, 'claude-opus-4-8', { isolateUserSettings: false });
     assert.equal(settingSourcesIn(argv), 'user');
   });
 

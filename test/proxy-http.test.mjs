@@ -168,7 +168,7 @@ afterEach(async () => {
   started = undefined;
 });
 
-test('image-2 quality maps to gpt-5.5 reasoning effort', () => {
+test('Images quality maps to gpt-5.5 reasoning effort', () => {
   assert.equal(openAiImageQualityReasoningEffort(undefined), 'high');
   assert.equal(openAiImageQualityReasoningEffort('high'), 'high');
   assert.equal(openAiImageQualityReasoningEffort('medium'), 'medium');
@@ -260,8 +260,10 @@ test('default streaming Images API proxy reports unsupported without direct Open
     });
     const text = await res.text();
 
-    assert.equal(res.status, 200);
-    assert.match(text, /event: error/);
+    // Nothing was streamed before the refusal, so it is the HTTP status — the
+    // stream commits on the backend's first event, not before it.
+    assert.equal(res.status, 501);
+    assert.match(res.headers.get('content-type'), /application\/json/);
     assert.match(text, /"type":"unsupported_feature"/);
     assert.match(text, /Direct OpenAI API fallback is disabled/);
   } finally {
@@ -269,7 +271,7 @@ test('default streaming Images API proxy reports unsupported without direct Open
   }
 });
 
-test('POST /v1/images/generations accepts image-2 through the local image2_via_gpt55 route', async () => {
+test('POST /v1/images/generations accepts gpt-image-2 through the local image2_via_gpt55 route', async () => {
   const res = await fetch(`${started.url}/v1/images/generations`, {
     method: 'POST',
     headers: {
@@ -277,33 +279,15 @@ test('POST /v1/images/generations accepts image-2 through the local image2_via_g
       'content-type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'image-2',
+      model: 'gpt-image-2',
       prompt: 'A small red square.',
-      response_format: 'b64_json',
     }),
   });
   const body = await res.json();
 
   assert.equal(res.status, 200);
-  assert.equal(seenImageGenerationRequests[0].model, 'image-2');
-  assert.equal(seenImageGenerationRequests[0].responseFormat, 'b64_json');
+  assert.equal(seenImageGenerationRequests[0].model, 'gpt-image-2');
   assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:A small red square.').toString('base64'));
-});
-
-test('POST /v1/images/generations reports image-2 transparent background as a disabled model value', async () => {
-  const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
-    prompt: 'A transparent sticker.',
-    background: 'transparent',
-    output_format: 'png',
-  });
-  const body = await res.json();
-
-  assert.equal(res.status, 400);
-  assert.equal(body.error.type, 'image_generation_user_error');
-  assert.equal(body.error.param, 'tools');
-  assert.equal(body.error.code, 'invalid_value');
-  assert.match(body.error.message, /Transparent background is not supported/);
 });
 
 test('POST /v1/images/generations rejects response_format for GPT image models', async () => {
@@ -509,7 +493,7 @@ test('POST /v1/images/generations maps GPT image requests to the image generatio
 
 test('POST /v1/images/generations accepts proxy image route hints', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'Create a simple flat circular badge.',
     x_proxy_image_route: {
       visual_class: 'badge_or_emblem',
@@ -534,7 +518,7 @@ test('POST /v1/images/generations accepts proxy image route hints', async () => 
 
 test('POST /v1/images/generations keeps standard output_format ahead of proxy route output_format', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'Create a simple flat icon.',
     output_format: 'png',
     x_proxy_image_route: {
@@ -551,7 +535,7 @@ test('POST /v1/images/generations keeps standard output_format ahead of proxy ro
 
 test('POST /v1/images/generations rejects invalid proxy image route hints', async () => {
   const res = await postJson('/v1/images/generations', {
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'Create a simple flat icon.',
     x_proxy_image_route: {
       visual_class: 'flat_icon',
@@ -562,32 +546,6 @@ test('POST /v1/images/generations rejects invalid proxy image route hints', asyn
   assert.equal(res.status, 400);
   assert.match(body.error.message, /x_proxy_image_route\.visual_class/);
   assert.equal(seenImageGenerationRequests.length, 0);
-});
-
-test('POST /v1/images/generations supports URL response format with local image URLs', async () => {
-  const res = await postJson('/v1/images/generations', {
-    model: 'dall-e-2',
-    prompt: 'A small red square.',
-    response_format: 'url',
-  });
-  const body = await res.json();
-
-  assert.equal(res.status, 200);
-  assert.equal(seenImageGenerationRequests[0].responseFormat, 'url');
-  assert.equal(body.output_format, undefined);
-  assert.equal(body.quality, undefined);
-  assert.equal(body.size, undefined);
-  assert.equal(body.background, undefined);
-  assert.equal(body.data[0].b64_json, undefined);
-  assert.match(body.data[0].url, /^http:\/\/127\.0\.0\.1:\d+\/v1\/images\/generated\//);
-
-  const imageRes = await fetch(body.data[0].url);
-  assert.equal(imageRes.status, 200);
-  assert.equal(imageRes.headers.get('content-type'), 'image/png');
-  assert.equal(
-    Buffer.from(await imageRes.arrayBuffer()).toString('utf8'),
-    'fake-image-1:A small red square.',
-  );
 });
 
 test('POST /v1/images/generations streams completed image events without partial output', async () => {
@@ -634,8 +592,10 @@ test('POST /v1/images/generations stream preserves provider error fields', async
   });
   const text = await res.text();
 
-  assert.equal(res.status, 200);
-  assert.match(text, /event: error/);
+  // The provider refused before any event, so the client gets its status and
+  // envelope as JSON, not a committed 200 carrying an error frame.
+  assert.equal(res.status, 429);
+  assert.match(res.headers.get('content-type'), /application\/json/);
   assert.match(text, /"type":"insufficient_quota"/);
   assert.match(text, /"code":"insufficient_quota"/);
   assert.match(text, /"message":"Image quota exceeded\."/);
@@ -664,22 +624,6 @@ test('POST /v1/images/edits accepts JSON image references', async () => {
   assert.equal(seenImageGenerationRequests[0].outputCompression, 55);
   assert.equal(seenImageGenerationRequests[0].moderation, 'auto');
   assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Make the square green.').toString('base64'));
-});
-
-test('POST /v1/images/edits reports image-2 input_fidelity as an API-disabled field', async () => {
-  const res = await postJson('/v1/images/edits', {
-    model: 'image-2',
-    prompt: 'Make the square green.',
-    images: [{ image_url: pngDataUrl }],
-    input_fidelity: 'high',
-    response_format: 'b64_json',
-  });
-  const body = await res.json();
-
-  assert.equal(res.status, 400);
-  assert.equal(body.error.type, 'image_generation_user_error');
-  assert.equal(body.error.param, 'tools');
-  assert.equal(body.error.code, 'invalid_input_fidelity_model');
 });
 
 test('POST /v1/images/edits accepts multipart image array fields and string options', async () => {
@@ -711,58 +655,6 @@ test('POST /v1/images/edits accepts multipart image array fields and string opti
   assert.equal(seenImageGenerationRequests[0].proxyRoute.visualClass, 'reference_or_edit');
   assert.doesNotMatch(text, /image_edit\.partial_image/);
   assert.match(text, /event: image_edit\.completed/);
-});
-
-test('POST /v1/images/variations accepts multipart image uploads', async () => {
-  const form = new FormData();
-  form.set('model', 'dall-e-2');
-  form.set('image', new Blob([Buffer.from('fake-png')], { type: 'image/png' }), 'source.png');
-  form.set('response_format', 'b64_json');
-  const res = await fetch(`${started.url}/v1/images/variations`, {
-    method: 'POST',
-    headers: { authorization: 'Bearer local' },
-    body: form,
-  });
-  const body = await res.json();
-
-  assert.equal(res.status, 200);
-  assert.equal(seenImageGenerationRequests[0].operation, 'variation');
-  assert.equal(seenImageGenerationRequests[0].prompt, 'Create a variation of the provided image.');
-  assert.equal(seenImageGenerationRequests[0].images.length, 1);
-  assert.equal(seenImageGenerationRequests[0].images[0].source.type, 'base64');
-  assert.equal(seenImageGenerationRequests[0].images[0].source.mediaType, 'image/png');
-  assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Create a variation of the provided image.').toString('base64'));
-});
-
-test('POST /v1/images/variations accepts image-2 multipart uploads through image2_via_gpt55', async () => {
-  const form = new FormData();
-  form.set('model', 'image-2');
-  form.set('image', new Blob([Buffer.from('fake-png')], { type: 'image/png' }), 'source.png');
-  form.set('response_format', 'b64_json');
-  const res = await fetch(`${started.url}/v1/images/variations`, {
-    method: 'POST',
-    headers: { authorization: 'Bearer local' },
-    body: form,
-  });
-  const body = await res.json();
-
-  assert.equal(res.status, 200);
-  assert.equal(seenImageGenerationRequests[0].operation, 'variation');
-  assert.equal(seenImageGenerationRequests[0].model, 'image-2');
-  assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:Create a variation of the provided image.').toString('base64'));
-});
-
-test('POST /v1/images/variations rejects JSON image input to match the Images API form-data shape', async () => {
-  const res = await postJson('/v1/images/variations', {
-    model: 'dall-e-2',
-    image: pngDataUrl,
-    response_format: 'b64_json',
-  });
-  const body = await res.json();
-
-  assert.equal(res.status, 400);
-  assert.equal(body.error.type, 'invalid_request_error');
-  assert.match(body.error.message, /multipart\/form-data/);
 });
 
 test('POST /v1/images/generations rejects output compression without jpeg or webp output', async () => {
@@ -1687,5 +1579,122 @@ test('auth-key gate: open proxy without a key allows unauthenticated requests', 
     assert.equal(res.status, 200);
   } finally {
     await proxy.close();
+  }
+});
+
+test('/v1/responses echoes sampling at the direct defaults, not the caller\'s value', async () => {
+  // The echo used to repeat `request.temperature` — a value no backend applied
+  // — and `top_p: 0.98` where the provider echoes `1`.
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    input: 'Say OK',
+    temperature: 1,
+  });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.temperature, 1);
+  assert.equal(body.top_p, 1);
+});
+
+test('/v1/chat/completions rejects a non-default temperature in the direct envelope', async () => {
+  const res = await postJson('/v1/chat/completions', {
+    model: 'fake-local-model',
+    messages: [{ role: 'user', content: 'Say OK' }],
+    temperature: 0.5,
+  });
+  const body = await res.json();
+  assert.equal(res.status, 400);
+  assert.equal(body.error.type, 'invalid_request_error');
+  assert.equal(body.error.param, 'temperature');
+  assert.equal(body.error.code, 'unsupported_value');
+  assert.match(body.error.message, /Only the default \(1\) value is supported/);
+});
+
+test('/v1/responses rejects top_p at any value, code null as on the direct surface', async () => {
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model',
+    input: 'Say OK',
+    top_p: 1,
+  });
+  const body = await res.json();
+  assert.equal(res.status, 400);
+  assert.equal(body.error.param, 'top_p');
+  assert.equal(body.error.code, null);
+  assert.equal(body.error.message, "Unsupported parameter: 'top_p' is not supported with this model.");
+});
+
+// Anthropic sampling fields are validated as the direct API validates them
+// (measured 2026-08-30) and then not applied — the Claude CLI has no sampling
+// control, and no response field echoes them.
+for (const [label, body, message] of [
+  ['temperature above the range', { temperature: 1.5 }, 'temperature: range: 0..1'],
+  ['temperature below the range', { temperature: -0.1 }, 'temperature: range: 0..1'],
+  ['temperature that is not a number', { temperature: 'abc' }, 'temperature: Input should be a valid number'],
+  ['temperature null (not omission on this surface)', { temperature: null }, 'temperature: Input should be a valid number'],
+  ['top_p above the range', { top_p: 1.5 }, 'top_p: range: 0..1'],
+  ['top_k that is not an integer', { top_k: 1.5 }, 'top_k: Input should be a valid integer'],
+]) {
+  test(`/v1/messages: ${label} is refused in the direct envelope`, async () => {
+    const res = await postJson('/v1/messages', {
+      model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }], ...body,
+    });
+    const payload = await res.json();
+    assert.equal(res.status, 400);
+    assert.equal(payload.type, 'error');
+    assert.equal(payload.error.type, 'invalid_request_error');
+    assert.equal(payload.error.message, message);
+  });
+}
+
+test('/v1/messages: valid sampling values are accepted and the turn runs', async () => {
+  const res = await postJson('/v1/messages', {
+    model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }],
+    temperature: 0.5, top_p: 0.9, top_k: -1,
+  });
+  assert.equal(res.status, 200, await res.text());
+});
+
+// The direct Messages API's schema is strict (measured 2026-08-30): a key it
+// does not know is refused by name — at the top level, on a message item, a
+// present null included — after every known field's own validation.
+test('/v1/messages: an unknown top-level key is refused by name, after field validation', async () => {
+  const base = { model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }] };
+  for (const [body, message] of [
+    [{ ...base, bogus_field: 1 }, 'bogus_field: Extra inputs are not permitted'],
+    [{ ...base, bogus: null }, 'bogus: Extra inputs are not permitted'],
+    [{ ...base, zzz: 1, aaa: 1 }, 'zzz: Extra inputs are not permitted'],
+    [{ ...base, bogus: 1, temperature: 1.5 }, 'temperature: range: 0..1'],
+    [{ ...base, messages: [{ role: 'user', content: 'hi', bogus: 1 }] }, 'messages.0.bogus: Extra inputs are not permitted'],
+  ]) {
+    const res = await postJson('/v1/messages', body);
+    const payload = await res.json();
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.equal(payload.error.message, message);
+  }
+});
+
+test('/v1/messages: known keys this proxy does not apply are still accepted', async () => {
+  const res = await postJson('/v1/messages', {
+    model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }],
+    metadata: { user_id: 'u1' }, service_tier: 'auto', stop_sequences: ['ZZ'], inference_geo: 'us', container: null,
+  });
+  assert.equal(res.status, 200, await res.text());
+});
+
+test('/v1/messages: a known field fault is reported before an unknown key, whichever field', async () => {
+  // The direct API validates every known field before it complains about an
+  // extra key (measured with max_tokens and temperature); the proxy used to
+  // check the extra key before output_config, thinking and model.
+  const base = { model: 'fake-local-model', max_tokens: 16, messages: [{ role: 'user', content: 'Say OK' }] };
+  for (const [body, fragment] of [
+    [{ ...base, output_config: { effort: 'bogus' }, zzz: 1 }, /effort/],
+    [{ ...base, thinking: { type: 'sideways' }, zzz: 1 }, /thinking/],
+    [{ ...base, model: '', zzz: 1 }, /model/],
+  ]) {
+    const res = await postJson('/v1/messages', body);
+    const payload = await res.json();
+    assert.equal(res.status, 400);
+    assert.match(payload.error.message, fragment, JSON.stringify(payload));
+    assert.doesNotMatch(payload.error.message, /Extra inputs/);
   }
 });

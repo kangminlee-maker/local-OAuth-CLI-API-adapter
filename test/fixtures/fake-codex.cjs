@@ -205,7 +205,11 @@ function emitImageTurn(threadId, turnId, options = {}) {
         id: `image_${turnId}`,
         status: 'completed',
         revisedPrompt,
-        result: Buffer.from('fake-codex-image-result'.repeat(80)).toString('base64'),
+        // A real 4x4 opaque red PNG when a test asks for one (the image
+        // realization step decodes the bytes); otherwise recognisable text.
+        result: process.env.FAKE_CODEX_IMAGE_PNG === '1'
+          ? 'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEklEQVQImWP4z8DwHxkzkC4AADxAH+HdRw9wAAAAAElFTkSuQmCC'
+          : Buffer.from('fake-codex-image-result'.repeat(80)).toString('base64'),
       },
     },
   });

@@ -544,7 +544,11 @@ test('CodexAppServerBackend can collect imageGeneration items for image-2 proxy 
     const result = await backend.generate(imageRequest());
 
     assert.equal(result.images.length, 1);
-    assert.match(Buffer.from(result.images[0].b64Json, 'base64').toString('utf8'), /fake-codex-image-result/);
+    // The fixture asks for webp: the realization step re-encoded the fake's
+    // PNG into the requested format (RIFF....WEBP) at the requested size.
+    const bytes = Buffer.from(result.images[0].b64Json, 'base64');
+    assert.equal(bytes.subarray(0, 4).toString('ascii'), 'RIFF');
+    assert.equal(bytes.subarray(8, 12).toString('ascii'), 'WEBP');
     assert.equal(result.images[0].revisedPrompt, 'fake revised image prompt');
     assert.equal(result.quality, 'medium');
     assert.equal(result.size, '1024x1536');
@@ -611,7 +615,7 @@ test('CodexAppServerBackend streams imageGeneration completed events', async () 
     assert.equal(events.length, 1);
     assert.equal(events[0].type, 'completed');
     assert.equal(events[0].quality, 'medium');
-    assert.match(Buffer.from(events[0].image.b64Json, 'base64').toString('utf8'), /fake-codex-image-result/);
+    assert.equal(Buffer.from(events[0].image.b64Json, 'base64').subarray(8, 12).toString('ascii'), 'WEBP');
   } finally {
     await backend.close();
   }
@@ -628,7 +632,7 @@ async function createCodexHome() {
 function imageRequest() {
   return {
     operation: 'generation',
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'A simple flat red square centered on a white background. No text.',
     n: 1,
     images: [],
@@ -638,7 +642,6 @@ function imageRequest() {
     outputCompression: 80,
     background: 'opaque',
     moderation: 'low',
-    responseFormat: 'b64_json',
     stream: false,
     partialImages: 0,
     raw: {},
@@ -710,6 +713,9 @@ function restoreProviderEnv(snapshot) {
 }
 
 function setProviderEnv() {
+  // The image realization step decodes what the fake app-server returns, so
+  // the fake returns a real (4x4) PNG for every test here.
+  process.env.FAKE_CODEX_IMAGE_PNG = '1';
   for (const name of providerEnvNames()) {
     process.env[name] = name === 'FAKE_ASSERT_NO_DIRECT_PROVIDER_ENV' ? '1' : `${name}_secret`;
   }
@@ -765,6 +771,59 @@ test('a request whose client already left never starts a turn', async () => {
     });
     const payload = JSON.parse(debug.text);
     assert.equal(payload.turnCount, 1, 'the aborted request must never have started a turn');
+  } finally {
+    await backend.close();
+  }
+});
+
+// The transport has no tool declaration to carry Images API options; the
+// ones with a meaning on bytes are realized on the returned image, and the
+// two the backend image model refuses are answered with its envelope.
+test('CodexAppServerBackend realizes output_format and size on the returned bytes', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  setProviderEnv();
+  const backend = new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, model: 'gpt-5.5', imageGeneration: true });
+  try {
+    const result = await backend.generate({ ...imageRequest(), size: '16x8', outputFormat: 'jpeg', outputCompression: 70 });
+    const bytes = Buffer.from(result.images[0].b64Json, 'base64');
+    assert.equal(bytes.subarray(0, 3).toString('hex'), 'ffd8ff', 'JPEG magic');
+    const { default: sharp } = await import('sharp');
+    const m = await sharp(bytes).metadata();
+    assert.equal(`${m.width}x${m.height}`, '16x8');
+    assert.equal(result.outputFormat, 'jpeg');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexAppServerBackend answers transparent and input_fidelity as the backend image model does', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  setProviderEnv();
+  const backend = new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, model: 'gpt-5.5', imageGeneration: true });
+  try {
+    await assert.rejects(backend.generate({ ...imageRequest(), background: 'transparent' }), (err) => err.code === 'invalid_value' && err.type === 'image_generation_user_error' && err.param === 'tools');
+    await assert.rejects(backend.generate({ ...imageRequest(), operation: 'edit', images: [{ source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' }, raw: {} }], inputFidelity: 'high' }), (err) => err.code === 'invalid_input_fidelity_model');
+  } finally {
+    await backend.close();
+  }
+});
+
+test('CodexAppServerBackend refuses an unusable mask before the turn, as the caller\'s 400', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  setProviderEnv();
+  const backend = new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, model: 'gpt-5.5', imageGeneration: true });
+  const source = { source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEklEQVQImWP4z8DwHxkzkC4AADxAH+HdRw9wAAAAAElFTkSuQmCC' }, raw: {} };
+  try {
+    // Garbage bytes in a valid reference shape: decodable is checked up front.
+    await assert.rejects(
+      backend.generate({ ...imageRequest(), operation: 'edit', images: [source], mask: { source: { type: 'base64', mediaType: 'image/png', data: Buffer.from('not a png').toString('base64') }, raw: {} } }),
+      (err) => err.statusCode === 400 && err.param === 'mask' && /not a decodable image/.test(err.message),
+    );
+    // A remote URL the proxy will not fetch: also before the turn.
+    await assert.rejects(
+      backend.generate({ ...imageRequest(), operation: 'edit', images: [source], mask: { source: { type: 'url', url: 'https://example.com/mask.png' }, raw: {} } }),
+      (err) => err.statusCode === 400 && err.param === 'mask' && /remote image URL/.test(err.message),
+    );
   } finally {
     await backend.close();
   }

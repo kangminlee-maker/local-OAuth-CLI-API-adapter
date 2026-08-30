@@ -138,8 +138,14 @@ async function validateExtractedPackage(packageDir) {
   if (packageJson.scripts?.postinstall !== 'node postinstall.mjs') {
     throw new Error('Package postinstall must print the LLM install guide.');
   }
-  if (packageJson.dependencies && Object.keys(packageJson.dependencies).length > 0) {
-    throw new Error('Installable adapter package must not declare runtime dependencies.');
+  // The adapter runs on the platform's Node and the operator's CLIs; a runtime
+  // dependency has to earn its place by name. `sharp` (prebuilt libvips
+  // binaries, no network, no build step) realizes Images API options on the
+  // bytes for the transport that has no tool declaration to send them on.
+  const allowedRuntimeDependencies = new Set(['sharp']);
+  const unexpected = Object.keys(packageJson.dependencies ?? {}).filter((name) => !allowedRuntimeDependencies.has(name));
+  if (unexpected.length > 0) {
+    throw new Error(`Installable adapter package must not declare runtime dependencies beyond ${[...allowedRuntimeDependencies].join(', ')}: ${unexpected.join(', ')}`);
   }
 
   for await (const filePath of walk(packageDir)) {

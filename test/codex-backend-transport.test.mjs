@@ -879,8 +879,8 @@ test('an id-less completed call never overwrites a different streamed call', asy
 
 test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
   // The contract exempts `/v1/images/*` from the switch: the request `model` is
-  // an Images route selector (`image-2`), not a Codex slug. Honouring it would
-  // send `image-2` where a Codex model belongs. The exemption currently holds by
+  // an Images model name (`gpt-image-2`), not a Codex slug. Honouring it would
+  // send `gpt-image-2` where a Codex model belongs. The exemption currently holds by
   // construction — the image path never consults the setting — which is exactly
   // the kind of fact that a later edit can undo silently.
   const codexHome = await createCodexHome();
@@ -901,10 +901,10 @@ test('Images requests ignore honorRequestModel: the configured image model runs'
   const backend = new CodexBackendTransport({
     codexHome, timeoutMs: 30_000, model: 'gpt-5.5', honorRequestModel: true,
   });
-  await backend.generate({ ...imageRequest(), model: 'image-2' });
+  await backend.generate({ ...imageRequest(), model: 'gpt-image-2' });
   const body = JSON.parse(calls[0].init.body);
   assert.equal(body.model, 'gpt-5.5', 'the configured Codex model runs, not the Images route selector');
-  assert.notEqual(body.model, 'image-2');
+  assert.notEqual(body.model, 'gpt-image-2');
 });
 
 test('CodexBackendTransport maps Images API requests to backend image_generation tool results', async () => {
@@ -952,6 +952,8 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
     ...imageRequest(),
     outputFormat: 'jpeg',
     outputCompression: 80,
+    background: 'opaque',
+    moderation: 'low',
   });
   const body = JSON.parse(calls[0].init.body);
 
@@ -964,11 +966,14 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
     quality: 'medium',
     output_format: 'jpeg',
     output_compression: 80,
+    background: 'opaque',
+    moderation: 'low',
   }]);
+  assert.doesNotMatch(body.input[0].content[0].text, /opaque|moderation/i);
   assert.deepEqual(body.tool_choice, { type: 'image_generation' });
   assert.equal(body.reasoning.effort, 'medium');
   assert.match(body.instructions, /Use the image_generation tool/);
-  assert.match(body.input[0].content[0].text, /Original Images API prompt:/);
+  assert.doesNotMatch(body.input[0].content[0].text, /translation constraints/, 'no route hint, no translation block');
   assert.match(body.input[0].content[0].text, /green leaf icon/);
   assert.equal(result.images.length, 1);
   assert.equal(result.images[0].b64Json, image);
@@ -1019,8 +1024,46 @@ test('CodexBackendTransport includes reference images for backend image edits', 
   assert.equal(body.tools[0].action, 'edit');
   assert.equal(body.input[0].content[1].type, 'input_image');
   assert.match(body.input[0].content[1].image_url, /^data:image\/png;base64,/);
-  assert.match(body.input[0].content[0].text, /This is an edit request/);
+  assert.match(body.input[0].content[0].text, /Make the leaf blue while keeping the composition\./, 'the caller prompt goes through verbatim');
   assert.match(body.input[0].content[0].text, /Attached images 1-1/);
+});
+
+test('CodexBackendTransport sends the edit mask and input_fidelity on the tool, not as prose', async () => {
+  // The mask has a slot on the backend tool (`input_image_mask`, probed live
+  // 2026-08-29). It used to be appended to the input images and the model told
+  // in prose that the last picture was a mask; the tool never knew.
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(sse([
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: { type: 'image_generation_call', id: 'ig_mask', status: 'completed', result: tinyPngBase64() },
+      },
+      { type: 'response.completed', response: { id: 'resp_image_mask', model: 'gpt-5.5' } },
+    ]), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const source = { source: { type: 'base64', mediaType: 'image/png', data: tinyPngBase64() }, raw: {} };
+
+  await backend.generate({
+    ...imageRequest(),
+    model: 'gpt-image-1',
+    operation: 'edit',
+    prompt: 'Make the leaf blue.',
+    images: [source],
+    mask: { source: { type: 'base64', mediaType: 'image/png', data: 'bWFzaw==' }, raw: {} },
+    inputFidelity: 'high',
+  });
+  const body = JSON.parse(calls[0].init.body);
+
+  assert.deepEqual(body.tools[0].input_image_mask, { image_url: 'data:image/png;base64,bWFzaw==' });
+  assert.equal(body.tools[0].input_fidelity, 'high');
+  const images = body.input[0].content.filter((part) => part.type === 'input_image');
+  assert.equal(images.length, 1, 'the mask is no longer attached as an input image');
+  assert.doesNotMatch(body.input[0].content[0].text, /mask|fidelity/i);
 });
 
 test('CodexBackendTransport retries backend image completions that contain no image result', async () => {
@@ -1504,13 +1547,12 @@ function toolRequest() {
 function imageRequest() {
   return {
     operation: 'generation',
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'Create a simple green leaf icon on a white background. No text.',
     n: 1,
     images: [],
     size: '1024x1024',
     quality: 'medium',
-    responseFormat: 'b64_json',
     stream: false,
     partialImages: 0,
     raw: {},
@@ -1521,6 +1563,11 @@ function tinyPngBase64() {
   return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 }
 
+// The two tool turns below carry `toolHistory: true` because that is what the
+// normalizer sets when it flattens them — this fixture simulates its output, so
+// it has to match it. Dropping the flag makes the transport read these as
+// ordinary prose, which is the correct behaviour for text a CALLER wrote and the
+// wrong behaviour for a turn this proxy flattened itself.
 function chatToolResultRequest() {
   return {
     ...textRequest(),
@@ -1536,6 +1583,7 @@ function chatToolResultRequest() {
           'arguments: {"city":"Seoul"}',
         ].join('\n'),
         images: [],
+        toolHistory: true,
       },
       {
         role: 'tool',
@@ -1545,6 +1593,7 @@ function chatToolResultRequest() {
           '{"city":"Seoul","temperature_c":23,"condition":"clear"}',
         ].join('\n'),
         images: [],
+        toolHistory: true,
       },
     ],
     tools: [{
@@ -1561,3 +1610,34 @@ function chatToolResultRequest() {
     toolChoice: { type: 'auto' },
   };
 }
+
+// Verbosity is a length-governing field, and the adapter used to fill it in with
+// `'medium'` whenever the caller left it out — not from settings, not from the
+// operator, but from a constructor default in this file. The direct API sends
+// the field only when the caller does, so the proxy was authoring a parameter
+// nobody set: the same class as injecting prose, one layer down. Captured on the
+// wire, all four cases.
+test('text.verbosity is sent only when someone actually asked for it', async () => {
+  const codexHome = await createCodexHome();
+  let sent = null;
+  globalThis.fetch = async (_url, init) => {
+    sent = JSON.parse(init.body);
+    return new Response(sse([{ type: 'response.completed', response: { id: 'r', model: 'gpt-5.5' } }]), { status: 200 });
+  };
+
+  const base = textRequest();
+
+  const silent = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await silent.generate(base);
+  assert.equal(sent.text, undefined, 'nobody asked, so no text object at all — not even an empty one');
+
+  await silent.generate({ ...base, verbosity: 'high' });
+  assert.deepEqual(sent.text, { verbosity: 'high' }, "the caller's value is what goes on the wire");
+
+  const configured = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, verbosity: 'low' });
+  await configured.generate(base);
+  assert.deepEqual(sent.text, { verbosity: 'low' }, 'an operator who sets one explicitly still gets it');
+
+  await silent.generate({ ...base, jsonMode: true });
+  assert.deepEqual(sent.text, { format: { type: 'json_object' } }, 'json mode still carries its format, with no verbosity added');
+});

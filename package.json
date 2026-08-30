@@ -1,6 +1,6 @@
 {
   "name": "local-oauth-cli-api-adapter",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Local OpenAI/Anthropic-compatible API proxy backed by logged-in Codex CLI or Claude Code OAuth sessions — chat completions, responses, messages, and images without provider API keys.",
   "keywords": [
     "openai",
@@ -48,6 +48,8 @@
     "catalog:runtime": "node scripts/update-runtime-capability-catalog.mjs",
     "smoke:runtime-capabilities": "node scripts/smoke-runtime-capabilities.mjs",
     "probe:codex-backend-image": "node scripts/probe-codex-backend-image.mjs",
+    "probe:codex-image-tool-slots": "node scripts/probe-codex-image-tool-slots.mjs",
+    "e2e:images:parity": "node scripts/e2e-images-direct-parity.mjs",
     "verify:runtime-boundary": "node scripts/verify-runtime-boundary.mjs",
     "prepack": "pnpm build && pnpm verify:runtime-boundary",
     "postinstall": "node postinstall.mjs",
@@ -63,7 +65,9 @@
     "smoke:real:claude:multimodal": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model opus --only multimodal",
     "bench:api": "pnpm build && node scripts/api-comparison-benchmark.mjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "sharp": "^0.35.4"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.20.6",

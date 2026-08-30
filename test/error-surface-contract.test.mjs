@@ -446,7 +446,7 @@ test('the access gate rejects /v1/messages in the Anthropic envelope', async () 
 });
 
 test('the access gate rejects an images route too', async () => {
-  const { status, body } = await unauthorized('/v1/images/generations', { model: 'image-2', prompt: 'hi' });
+  const { status, body } = await unauthorized('/v1/images/generations', { model: 'gpt-image-2', prompt: 'hi' });
   assert.equal(status, 401);
   assert.equal(body.error.type, 'invalid_request_error');
 });
@@ -663,13 +663,21 @@ test('a comma-containing key is not satisfied by one of its fragments', async ()
   assert.equal(await withRawKeyHeaders({ 'x-api-key': 'a' }, 'a,b'), 401);
 });
 
-test('/v1/responses: a successful stream ends with completed then [DONE]', async () => {
+// Renamed and inverted on 2026-08-29. This asserted a `[DONE]` terminator the
+// vendor does not send: a capture of `gpt-5.6-terra` on the real
+// `/v1/responses` ends at `response.completed` with nothing after it, while our
+// nine event names and their order match exactly. The expectation was written
+// without any observation of the vendor and pinned a divergence in place — the
+// existing stream-shape assertion never looked at the terminator on either
+// side, so nothing else could catch it. Evidence:
+// `spec/captures/direct-responses-stream.json`.
+test('/v1/responses: a successful stream ends at completed, with no [DONE]', async () => {
   const { status, text } = await call(usageBackend(), '/v1/responses', {
     model: 'a-model', input: 'hi', stream: true,
   });
   assert.equal(status, 200);
   const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
-  assert.equal(frames.at(-1), 'data: [DONE]');
+  assert.notEqual(frames.at(-1), 'data: [DONE]', 'the Responses surface has no [DONE]; that is the Chat convention');
   const events = text.split('\n').filter((l) => l.startsWith('event: ')).map((l) => l.slice(7).trim());
   assert.ok(events.includes('response.created'), `expected response.created: ${events.join(',')}`);
   assert.equal(events.at(-1), 'response.completed', `the last event must be completion: ${events.join(',')}`);
@@ -690,8 +698,11 @@ test('an unknown path is a 404 whatever method it arrives with', async () => {
     for (const method of ['GET', 'POST', 'DELETE', 'PUT']) {
       const res = await fetch(`${started.url}/v1/nope`, { method });
       assert.equal(res.status, 404, `${method} /v1/nope must be a 404`);
-      const body = await res.json();
-      assert.match(body.error.message, /Unknown endpoint/);
+      // As the direct API answers an unknown path (measured 2026-08-29): no
+      // body, no content-type, `x-content-type-options: nosniff`.
+      assert.equal(await res.text(), '', 'a bare 404, no JSON envelope');
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+      assert.equal(res.headers.get('content-type'), null);
     }
   } finally {
     await started.close();

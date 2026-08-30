@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import { captureSummary, recordExchange, startCaptureRun } from './lib/capture-recorder.mjs';
 import fs from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { deflateSync } from 'node:zlib';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 import {
@@ -34,7 +37,6 @@ const imageGenerationCaseNames = {
   generationB64: 'openai.images.generation.image2_via_gpt55.b64_json.schema_exact',
   generationB64N3Parallel: 'openai.images.generation.image2_via_gpt55.b64_json_n3_parallel.schema_exact',
   generationApiFields: 'openai.images.generation_api_fields.image2_via_gpt55.schema_exact',
-  generationUrl: 'openai.images.generation_url.image2_via_gpt55.schema_exact',
   generationStream: 'openai.images.generation_stream.image2_via_gpt55.schema_exact',
   generationStreamPaired: 'openai.images.generation_stream_paired.image2_via_gpt55.latency_compare',
   generationPhotorealProduct: 'openai.images.generation_photoreal_product.image2_via_gpt55.schema_exact',
@@ -47,7 +49,6 @@ const imageGenerationCaseNames = {
   editPreserveComposition: 'openai.images.edit_preserve_composition.image2_via_gpt55.schema_exact',
   editMultiImage: 'openai.images.edit_multi_image.image2_via_gpt55.schema_exact',
   editMultipartStream: 'openai.images.edit_multipart_stream.image2_via_gpt55.schema_exact',
-  variation: 'openai.images.variation.image2_via_gpt55.schema_exact',
   proxyGptImageResponseFormatUnsupported: 'openai.images.proxy_gpt_image_response_format_unsupported.schema_exact',
   directImagesGeneration: 'openai.images.direct_generation.gpt_image.schema_exact',
   directImagesEdit: 'openai.images.direct_edit.gpt_image.schema_exact',
@@ -238,6 +239,23 @@ const claudeIsolateUserSettings = strictBooleanOption(
   '--claude-isolate-user-settings',
 );
 const outputPath = options.output;
+// Migration step 1: from here on every run keeps the exchanges it made. Nothing
+// reads them yet — the conformance suite that will is not built — but a run
+// whose evidence was discarded cannot be re-asked later, and this suite has
+// been discarding it since it was written.
+const benchmarkRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const captureDir = options.captureDir ?? (options.noCapture === 'true' ? null : resolve(benchmarkRepoRoot, 'artifacts/api-captures'));
+const captureRun = startCaptureRun({
+  dir: captureDir,
+  meta: {
+    suites: options.suites ?? options.suite ?? null,
+    targets: options.targets ?? options.target ?? null,
+    openAiModel,
+    codexModel: options.codexBackendModel ?? options.codexModel ?? null,
+    claudeCliModel: options.claudeCliModel ?? 'opus',
+  },
+});
+if (captureRun) process.stdout.write(`api capture run: ${captureRun.runDir}\n`);
 const baselinePath = options.baseline;
 const regressionTargets = options.regressionTargets ?? 'proxy';
 const latencyRegressionPct = numberOption(options.latencyRegressionPct, 30);
@@ -508,6 +526,7 @@ const verdictFailures = benchmarkFailureReasons({
 });
 const summary = {
   ...summaryBase,
+  captures: captureSummary(),
   ...(baselineLoadError ? { baselineError: baselineLoadError } : {}),
   ...(imageAttemptDiagnostics.length > 0 ? { imageAttemptDiagnostics } : {}),
   ...(regressionGate ? { regressionGate } : {}),
@@ -1025,6 +1044,9 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     });
 
     await benchmarkCase(target, imageGenerationCaseNames.directImagesImage2Unsupported, repeats, async () => {
+      // The proxy's FORMER route name, sent to the direct API on purpose: the
+      // case pins that the vendor refuses it ("does not exist"). A live name
+      // here would run a billed generation and then fail the assertion.
       return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
         model: 'image-2',
         prompt: 'A simple flat red square centered on a white background. No text.',
@@ -1063,7 +1085,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
         })
       : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
           prompt,
-          response_format: 'b64_json',
         }, {
           prompt,
           requirements: ['solid red square', 'white background', 'no text'],
@@ -1087,7 +1108,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       : await proxyImagesMultiSample(`${baseUrl}/v1/images/generations`, {
           prompt,
           n: 3,
-          response_format: 'b64_json',
         }, judge);
   });
 
@@ -1113,7 +1133,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
         })
       : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
           prompt,
-          response_format: 'b64_json',
           ...imageOptions,
           user: 'api-benchmark-user',
         }, {
@@ -1122,20 +1141,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
           kind: 'generation',
         });
   });
-
-  if (!isApi) {
-    await benchmarkCase(target, imageGenerationCaseNames.generationUrl, repeats, async () => {
-      const prompt = 'A simple flat red square centered on a white background. No text.';
-      return await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
-        prompt,
-        response_format: 'url',
-      }, {
-        prompt,
-        requirements: ['solid red square', 'white background', 'no text'],
-        kind: 'generation',
-      });
-    });
-  }
 
   await benchmarkCase(target, imageGenerationCaseNames.generationStream, repeats, async () => {
     return await openAiImageGenerationStreamSample(baseUrl, isApi);
@@ -1161,7 +1166,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
         })
       : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
           prompt,
-          response_format: 'b64_json',
           ...imageOptions,
         }, judge);
   });
@@ -1187,7 +1191,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
         })
       : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
           prompt,
-          response_format: 'b64_json',
           ...imageOptions,
         }, judge);
   });
@@ -1212,7 +1215,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
         })
       : await proxyImagesSample(`${baseUrl}/v1/images/generations`, {
           prompt,
-          response_format: 'b64_json',
           ...imageOptions,
         }, judge);
   });
@@ -1254,7 +1256,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
           prompt,
           images: referenceImages.map((image_url) => ({ image_url })),
-          response_format: 'b64_json',
           ...imageOptions,
         }, judge);
   });
@@ -1296,7 +1297,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
           prompt,
           images: referenceImages.map((image_url) => ({ image_url })),
-          response_format: 'b64_json',
           ...imageOptions,
         }, judge);
   });
@@ -1341,7 +1341,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
           prompt,
           images: referenceImages.map((image_url) => ({ image_url })),
-          response_format: 'b64_json',
           ...imageOptions,
         }, judge);
   });
@@ -1366,7 +1365,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
           prompt,
           images: [{ image_url: fixtureDataUrl('red_square') }],
-          response_format: 'b64_json',
         }, {
           prompt,
           requirements: ['green square', 'same simple square composition', 'no text'],
@@ -1396,7 +1394,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
           prompt,
           images: [{ image_url: fixtureDataUrl('red_square_on_white') }],
-          response_format: 'b64_json',
           ...imageOptions,
         }, judge);
   });
@@ -1422,7 +1419,6 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       : await proxyImagesSample(`${baseUrl}/v1/images/edits`, {
           prompt,
           images: images.map((image_url) => ({ image_url })),
-          response_format: 'b64_json',
         }, {
           prompt,
           requirements: ['purple square', 'white background', 'no text', 'uses red and blue references'],
@@ -1434,7 +1430,7 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     await benchmarkCase(target, imageGenerationCaseNames.editMultipartStream, repeats, async () => {
       const prompt = 'Edit this image so the red square becomes green. No text.';
       const response = await postSseMultipart(`${baseUrl}/v1/images/edits`, {
-        model: 'image-2',
+        model: 'gpt-image-2',
         prompt,
         stream: 'true',
         size: '1024x1024',
@@ -1451,38 +1447,9 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     });
   }
 
-  await benchmarkCase(target, imageGenerationCaseNames.variation, repeats, async () => {
-    const prompt = 'Create a clean visual variation of the provided image. No text.';
-    return isApi
-      ? await directResponsesImageSample(baseUrl, prompt, {
-          action: 'edit',
-          images: [fixtureDataUrl('red_square')],
-          judge: {
-            prompt,
-            requirements: ['red visual variation', 'simple square-like composition', 'no text'],
-            kind: 'variation baseline through responses edit',
-          },
-        })
-      : await proxyImagesMultipartSample(`${baseUrl}/v1/images/variations`, {
-          model: 'image-2',
-          response_format: 'b64_json',
-          size: '1024x1024',
-        }, [{
-          name: 'image',
-          filename: 'red-square.png',
-          contentType: 'image/png',
-          data: fixtureImageBytes('red_square'),
-        }], {
-          prompt,
-          requirements: ['red visual variation', 'simple square-like composition', 'no text'],
-          kind: 'variation',
-        });
-  });
-
   await benchmarkCase(target, imageGenerationCaseNames.errorMissingPrompt, repeats, async () => {
     return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
-      model: isApi ? openAiImageApiModel : 'image-2',
-      response_format: 'b64_json',
+      model: isApi ? openAiImageApiModel : 'gpt-image-2',
     }, openAiHeaders(isApi), {
       status: 400,
       type: 'invalid_request_error',
@@ -1491,7 +1458,7 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
 
   await benchmarkCase(target, imageGenerationCaseNames.errorInvalidOutputCompression, repeats, async () => {
     return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
-      model: isApi ? openAiImageApiModel : 'image-2',
+      model: isApi ? openAiImageApiModel : 'gpt-image-2',
       prompt: 'A simple flat red square centered on a white background. No text.',
       output_format: 'png',
       output_compression: 80,
@@ -1503,41 +1470,18 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
     });
   });
 
-  await benchmarkCase(target, imageGenerationCaseNames.backgroundTransparentUnsupported, repeats, async () => {
+  // Proxy-only since 2026-08-30: the direct Responses image tool on
+  // gpt-5.6-terra ACCEPTS `background: transparent` and generates (measured —
+  // a paired run returned 200 and billed an image), while the Codex backend's
+  // image model refuses it. The refusal the proxy forwards is a documented
+  // capability gap of the backend, not a parity row.
+  if (!isApi) await benchmarkCase(target, imageGenerationCaseNames.backgroundTransparentUnsupported, repeats, async () => {
     const prompt = 'A clean app icon style illustration of a yellow rain boot with a small blue puddle, centered, transparent background, no text.';
-    if (isApi) {
-      return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/responses`, {
-        model: openAiModel,
-        input: image2ViaGpt55Prompt({
-          action: 'generate',
-          prompt,
-          size: '1024x1024',
-          quality: 'medium',
-          outputFormat: 'png',
-          background: 'transparent',
-        }),
-        reasoning: { effort: openAiImageQualityReasoningEffort('medium') },
-        tools: [{
-          type: 'image_generation',
-          action: 'generate',
-          size: '1024x1024',
-          quality: 'medium',
-          output_format: 'png',
-          background: 'transparent',
-        }],
-      }, openAiHeaders(true), {
-        status: 400,
-        type: 'image_generation_user_error',
-        param: 'tools',
-        code: 'invalid_value',
-      });
-    }
     return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/generations`, {
-      model: 'image-2',
+      model: 'gpt-image-2',
       prompt,
       background: 'transparent',
       output_format: 'png',
-      response_format: 'b64_json',
     }, openAiHeaders(false), {
       status: 400,
       type: 'image_generation_user_error',
@@ -1569,11 +1513,10 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
       });
     }
     return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/edits`, {
-      model: 'image-2',
+      model: 'gpt-image-2',
       prompt,
       images: [{ image_url: fixtureDataUrl('red_square') }],
       input_fidelity: 'high',
-      response_format: 'b64_json',
     }, openAiHeaders(false), {
       status: 400,
       type: 'image_generation_user_error',
@@ -1584,20 +1527,23 @@ async function benchmarkOpenAiImageGenerationCompatible(target, baseUrl, isApi) 
 
   await benchmarkCase(target, imageGenerationCaseNames.errorVariationJson, repeats, async () => {
     return await postJsonExpectOpenAiErrorShape(`${baseUrl}/v1/images/variations`, {
-      model: isApi ? 'dall-e-2' : 'image-2',
+      model: isApi ? 'dall-e-2' : 'gpt-image-2',
       image: fixtureDataUrl('red_square'),
       response_format: 'b64_json',
     }, openAiHeaders(isApi), {
-      status: isApi ? 404 : 400,
-      type: isApi ? undefined : 'invalid_request_error',
-      allowEmptyBody: isApi,
+      // Gone on both: the direct API removed the endpoint with dall-e-2, and
+      // since 2026-08-30 the proxy answers an unknown path the same way it
+      // does — a bare 404, no body.
+      status: 404,
+      type: undefined,
+      allowEmptyBody: true,
     });
   });
 }
 
 async function proxyImagesSample(url, body, judgeSpec) {
   const response = await postJson(url, {
-    model: 'image-2',
+    model: 'gpt-image-2',
     n: 1,
     size: '1024x1024',
     quality: 'low',
@@ -1610,7 +1556,7 @@ async function proxyImagesSample(url, body, judgeSpec) {
 
 async function proxyImagesMultiSample(url, body, judgeSpec) {
   const response = await postJson(url, {
-    model: 'image-2',
+    model: 'gpt-image-2',
     n: 1,
     size: '1024x1024',
     quality: 'low',
@@ -1697,18 +1643,10 @@ async function imagesApiMultiSampleSummary(response, responseApi, judgeSpec) {
 
 async function directResponsesImageSample(baseUrl, prompt, options) {
   const imageOptions = options.imageOptions ?? {};
-  const translatedPrompt = image2ViaGpt55Prompt({
-    action: options.action,
-    prompt,
-    size: imageOptions.size ?? '1024x1024',
-    quality: imageOptions.quality ?? 'low',
-    outputFormat: imageOptions.output_format ?? 'png',
-    outputCompression: imageOptions.output_compression,
-    background: imageOptions.background,
-    moderation: imageOptions.moderation,
-    inputFidelity: imageOptions.input_fidelity,
-    imageCount: options.images?.length ?? 0,
-  });
+  // The proxy's translation is now identity without a route hint, and the
+  // direct arm never sends one; calling it keeps the two arms on the same
+  // prompt by construction rather than by assertion.
+  const translatedPrompt = image2ViaGpt55Prompt({ prompt });
   const response = await postJson(`${baseUrl}/v1/responses`, {
     model: openAiModel,
     input: responsesImageInput(translatedPrompt, options.images ?? []),
@@ -1862,13 +1800,7 @@ async function openAiImageGenerationStreamSample(baseUrl, isApi) {
   const response = isApi
     ? await postSse(`${baseUrl}/v1/responses`, {
         model: openAiModel,
-        input: image2ViaGpt55Prompt({
-          action: 'generate',
-          prompt,
-          size: '1024x1024',
-          quality: 'low',
-          outputFormat: 'png',
-        }),
+        input: image2ViaGpt55Prompt({ prompt }),
         reasoning: { effort: openAiImageQualityReasoningEffort('low') },
         stream: true,
         tools: [{
@@ -1880,13 +1812,12 @@ async function openAiImageGenerationStreamSample(baseUrl, isApi) {
         }],
       }, openAiHeaders(true), () => '', imageStreamCollector)
     : await postSse(`${baseUrl}/v1/images/generations`, {
-        model: 'image-2',
+        model: 'gpt-image-2',
         prompt,
         stream: true,
         size: '1024x1024',
         quality: 'low',
         output_format: 'png',
-        response_format: 'b64_json',
       }, openAiHeaders(false), () => '', imageStreamCollector);
   assertImageStreamShape(response.events, isApi ? 'responses' : 'images-generation');
   return imageStreamSummary(response, isApi ? 'responses' : 'images');
@@ -2240,13 +2171,28 @@ async function benchmarkQualityCase(target, caseName, count, fn) {
 
 async function postJson(url, body, headers) {
   const startedAt = performance.now();
+  const requestBody = JSON.stringify(stripUndefined(body));
   const res = await guardedProxyFetch(url, () => fetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify(stripUndefined(body)),
+    body: requestBody,
     signal: AbortSignal.timeout(timeoutMs),
   }));
   const text = await res.text();
+  // Recorded before the status check, so the body of a 4xx survives — that body
+  // is the whole evidence for an error-parity row.
+  recordExchange({
+    kind: 'json',
+    label: captureLabelFor(url),
+    url,
+    requestHeaders: headers,
+    requestBody,
+    status: res.status,
+    statusText: res.statusText,
+    responseHeaders: res.headers,
+    responseBody: text,
+    durationMs: elapsed(startedAt),
+  });
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -2255,6 +2201,17 @@ async function postJson(url, body, headers) {
   }
   if (!res.ok) throw new Error(`${url} ${res.status}: ${truncate(text)}`);
   return { body: parsed, totalMs: elapsed(startedAt) };
+}
+
+// A stable, filesystem-safe name for the exchange: the path says which surface
+// answered, which is what a reader looks for months later.
+function captureLabelFor(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.hostname}${parsed.pathname}`;
+  } catch {
+    return String(url);
+  }
 }
 
 async function postMultipart(url, fields, files, headers) {
@@ -2267,6 +2224,20 @@ async function postMultipart(url, fields, files, headers) {
     signal: AbortSignal.timeout(timeoutMs),
   }));
   const text = await res.text();
+  recordExchange({
+    kind: 'multipart',
+    label: captureLabelFor(url),
+    url,
+    requestHeaders: headers,
+    // The parts, not the encoded body: a multipart payload carries binary
+    // fixtures whose bytes are already on disk under test/fixtures.
+    requestBody: JSON.stringify({ fields, files: files.map((file) => ({ name: file.name, filename: file.filename, bytes: file.data?.length ?? null })) }),
+    status: res.status,
+    statusText: res.statusText,
+    responseHeaders: res.headers,
+    responseBody: text,
+    durationMs: elapsed(startedAt),
+  });
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -2390,6 +2361,11 @@ async function postSseRequest(url, request, collectText, collectToolArgument = (
     if (!res.body) throw new Error(`${url} did not return a readable stream`);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
+    // The wire as it arrived, before any event parsing. The terminator and the
+    // chunk boundaries exist only here — the parsed event list cannot say
+    // whether `[DONE]` was sent, which is the single highest-risk unverified
+    // cell in the conformance matrix.
+    let rawStream = '';
     let buffer = '';
     let firstDataMs = null;
     let firstTextMs = null;
@@ -2434,7 +2410,9 @@ async function postSseRequest(url, request, collectText, collectToolArgument = (
     while (true) {
       const read = await reader.read();
       if (read.done) break;
-      buffer += decoder.decode(read.value, { stream: true });
+      const decoded = decoder.decode(read.value, { stream: true });
+      rawStream += decoded;
+      buffer += decoded;
       let index;
       while ((index = buffer.indexOf('\n\n')) !== -1) {
         const frame = buffer.slice(0, index);
@@ -2445,6 +2423,18 @@ async function postSseRequest(url, request, collectText, collectToolArgument = (
     buffer += decoder.decode();
     const finalFrame = buffer.trim();
     if (finalFrame) processFrame(finalFrame);
+    recordExchange({
+      kind: 'sse',
+      label: captureLabelFor(url),
+      url,
+      requestHeaders: request.headers,
+      requestBody: request.body,
+      status: res.status,
+      statusText: res.statusText,
+      responseHeaders: res.headers,
+      streamBytes: rawStream,
+      durationMs: elapsed(startedAt),
+    });
     return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, firstToolArgumentMs, chunks, text, toolArguments, done, events };
   });
 }
@@ -3216,7 +3206,7 @@ function qualityTasks() {
         'Cover generation, edit, variation, URL response, and streaming image generation.',
         'Include a vision judge requirement for image quality.',
         'State that proxy Images API requests must not call direct provider APIs; provider egress from a proxy target scores 0.',
-        'State that image-2 through the proxy is the formal image2_via_gpt55 route and must not call direct provider APIs.',
+        'State that gpt-image-2 through the proxy is the formal image2_via_gpt55 route and must not call direct provider APIs.',
         'Mention direct Images API positive and negative baseline rows.',
         'Do not claim variations are supported by GPT Image models.',
       ].join(' '),

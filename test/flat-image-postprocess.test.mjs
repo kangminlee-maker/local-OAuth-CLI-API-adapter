@@ -109,7 +109,7 @@ function vignetteBackgroundPngBase64() {
 function flatReferenceRequest() {
   return {
     operation: 'generation',
-    model: 'image-2',
+    model: 'gpt-image-2',
     prompt: 'Use the attached reference image to create a flat vector icon. No text.',
     n: 1,
     images: [{
@@ -119,7 +119,6 @@ function flatReferenceRequest() {
     size: '1024x1024',
     quality: 'medium',
     outputFormat: 'png',
-    responseFormat: 'b64_json',
     stream: false,
     partialImages: 0,
     raw: {},

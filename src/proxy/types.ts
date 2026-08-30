@@ -24,6 +24,16 @@ export interface NormalizedMessage {
   readonly role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
   readonly content: string;
   readonly images: readonly NormalizedImage[];
+  /**
+   * Set only when the normalizer itself flattened a tool turn into this text.
+   * Downstream readers turn tool history back into their transport's native
+   * items, and they used to decide by looking for the marker in the text — which
+   * a caller can write. A user message beginning `[tool result]` became a
+   * `function_call_output` with an empty body: the text was dropped and a tool
+   * result the caller never sent was invented. Provenance is a field, not a
+   * prefix.
+   */
+  readonly toolHistory?: boolean;
 }
 
 export type NormalizedImageDetail = 'low' | 'high' | 'auto' | 'original';
@@ -63,7 +73,6 @@ export interface NormalizedRequest {
   readonly model: string;
   readonly messages: readonly NormalizedMessage[];
   readonly maxTokens?: number;
-  readonly temperature?: number;
   readonly reasoningEffort?: NormalizedReasoningEffort;
   readonly verbosity?: NormalizedVerbosity;
   // Anthropic `output_config.effort`, routed to `claude --effort` (claude runtime).
@@ -142,7 +151,7 @@ export interface LocalCompletionResult {
 }
 
 export interface OpenAiImageGenerationRequest {
-  readonly operation: 'generation' | 'edit' | 'variation';
+  readonly operation: 'generation' | 'edit';
   readonly model: string;
   readonly prompt: string;
   readonly n: number;
@@ -155,9 +164,7 @@ export interface OpenAiImageGenerationRequest {
   readonly outputCompression?: number;
   readonly moderation?: string;
   readonly inputFidelity?: string;
-  readonly style?: string;
   readonly user?: string;
-  readonly responseFormat: 'b64_json' | 'url';
   readonly stream: boolean;
   readonly partialImages: number;
   readonly proxyRoute?: OpenAiImageProxyRoute;
@@ -291,23 +298,10 @@ export interface LocalCliBackend {
   close(): Promise<void>;
 }
 
-/**
- * The generated-image store's public surface. The implementation lives with the
- * HTTP server; this names only what the server needs, so a test can inject the
- * same class built with smaller budgets — eviction and pinning are behaviour
- * that HTTP-level tests cannot exercise against the production 128 MiB.
- */
-export interface GeneratedImageStoreLike {
-  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string;
-  get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null;
-  clear(): void;
-}
-
 export interface ProxyServerOptions {
   readonly backend: LocalCliBackend;
   readonly imageGenerationClient?: OpenAiImageGenerationClient;
   readonly chatSessionManager?: LocalCliChatSessionManager;
-  readonly generatedImageStore?: GeneratedImageStoreLike;
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;

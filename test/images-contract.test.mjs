@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import http from 'node:http';
 import net from 'node:net';
-import { startLocalApiProxy, GeneratedImageStore } from '../dist/proxy/http-server.js';
+import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 
 // The Images surface has a documented input contract and almost none of its
 // REJECTIONS were pinned: the successful paths were tested, so a widened bound or
@@ -45,113 +45,284 @@ async function postImages(path, body) {
 
 const GEN = '/v1/images/generations';
 
-// `n` is a documented domain: an integer in 1..10. Only the happy path was
-// covered, so widening the bound or dropping the integer check was invisible.
-for (const [label, n] of [
-  ['zero', 0],
-  ['above the maximum', 11],
-  ['fractional', 1.5],
-  ['a non-numeric string', 'two'],
-  ['negative', -1],
+// `n` is an integer in 1..10, and the direct API says which way a value is
+// wrong (measured 2026-08-30): the bound it crossed with the value it got, or
+// the JSON type it got. Each cell pins the whole envelope.
+for (const [label, n, code, message] of [
+  ['zero', 0, 'integer_below_min_value', "Invalid 'n': integer below minimum value. Expected a value >= 1, but got 0 instead."],
+  ['above the maximum', 11, 'integer_above_max_value', "Invalid 'n': integer above maximum value. Expected a value <= 10, but got 11 instead."],
+  ['fractional', 1.5, 'invalid_type', "Invalid type for 'n': expected an integer, but got a decimal number instead."],
+  ['a non-numeric string', 'two', 'invalid_type', "Invalid type for 'n': expected an integer, but got a string instead."],
+  ['a numeric string, in JSON', '2', 'invalid_type', "Invalid type for 'n': expected an integer, but got a string instead."],
+  ['a boolean', true, 'invalid_type', "Invalid type for 'n': expected an integer, but got a boolean instead."],
+  ['negative', -1, 'integer_below_min_value', "Invalid 'n': integer below minimum value. Expected a value >= 1, but got -1 instead."],
 ]) {
-  test(`generations: n ${label} is rejected`, async () => {
-    const { status, payload } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', n });
+  test(`generations: n ${label} is rejected in the direct envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', n });
     assert.equal(status, 400, `expected a rejection for n=${n}`);
-    assert.match(payload.error.message, /n must be an integer between 1 and 10/);
+    assert.equal(payload.error.param, 'n');
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
   });
 }
 
-test('generations: nullable fields treat null as omission, per the direct types', async () => {
-  // `n`, `partial_images`, `output_compression`, `response_format` are all
-  // declared nullable (`Optional[...]`) on the direct API. The explicit-null
-  // rejections of earlier rounds were anti-parity, measured against the
-  // published SDK types, and are reversed.
-  const { status, payload } = await postImages(GEN, {
-    model: 'image-2', prompt: 'a dot',
-    n: null, partial_images: null, output_compression: null, response_format: null,
+// The same three shapes for the other two integer fields.
+for (const [field, value, code, message] of [
+  ['output_compression', 101, 'integer_above_max_value', "Invalid 'output_compression': integer above maximum value. Expected a value <= 100, but got 101 instead."],
+  ['output_compression', -1, 'integer_below_min_value', "Invalid 'output_compression': integer below minimum value. Expected a value >= 0, but got -1 instead."],
+  ['output_compression', 1.5, 'invalid_type', "Invalid type for 'output_compression': expected an integer, but got a decimal number instead."],
+  ['output_compression', '50', 'invalid_type', "Invalid type for 'output_compression': expected an integer, but got a string instead."],
+  ['partial_images', 4, 'integer_above_max_value', "Invalid 'partial_images': integer above maximum value. Expected a value <= 3, but got 4 instead."],
+  ['partial_images', -1, 'integer_below_min_value', "Invalid 'partial_images': integer below minimum value. Expected a value >= 0, but got -1 instead."],
+]) {
+  test(`generations: ${field} ${JSON.stringify(value)} carries the direct integer envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', [field]: value });
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, field);
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
   });
-  assert.equal(status, 200, JSON.stringify(payload));
-  assert.equal(payload.data.length, 1, 'null n means the default of 1');
+}
+
+// Enums (measured 2026-08-30): a string outside the set lists the set with
+// "and"; a non-string lists it with "or" as a type error. `standard` and `hd`
+// were dall-e aliases and are outside the set now.
+for (const [field, value, code, message] of [
+  ['quality', 'ultra', 'invalid_value', "Invalid value: 'ultra'. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', 'standard', 'invalid_value', "Invalid value: 'standard'. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', 'hd', 'invalid_value', "Invalid value: 'hd'. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', '', 'invalid_value', "Invalid value: ''. Supported values are: 'low', 'medium', 'high', and 'auto'."],
+  ['quality', 1, 'invalid_type', "Invalid type for 'quality': expected one of 'low', 'medium', 'high', or 'auto', but got an integer instead."],
+  ['output_format', 'gif', 'invalid_value', "Invalid value: 'gif'. Supported values are: 'png', 'webp', and 'jpeg'."],
+  ['moderation', 'bogus', 'invalid_value', "Invalid value: 'bogus'. Supported values are: 'auto' and 'low'."],
+  ['background', 'bogus', 'invalid_value', "Invalid value: 'bogus'. Supported values are: 'transparent', 'opaque', and 'auto'."],
+]) {
+  test(`generations: ${field} ${JSON.stringify(value)} carries the direct enum envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', [field]: value });
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, field);
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
+  });
+}
+
+for (const [size, message] of [
+  ['bogus', "Invalid size 'bogus'. Expected WIDTHxHEIGHT, for example '1824x1024'."],
+  ['0x0', "Invalid size '0x0'. Expected WIDTHxHEIGHT, for example '1824x1024'."],
+  ['9x9', "Invalid size '9x9'. Width and height must both be divisible by 16."],
+]) {
+  test(`generations: size ${size} carries the direct size envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', size });
+    assert.equal(status, 400);
+    assert.equal(payload.error.type, 'image_generation_user_error');
+    assert.equal(payload.error.param, 'size');
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.equal(payload.error.message, message);
+  });
+}
+
+test('generations: stream that is not a boolean is a type error in JSON', async () => {
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', stream: 'yes' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'stream': expected a boolean, but got a string instead.");
 });
 
-test('generations: a numeric string n is accepted, because form fields are strings', async () => {
-  // `/v1/images/*` accepts multipart/form-data, where every field arrives as a
-  // string. Rejecting "2" would reject a well-formed form-encoded request.
-  const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', n: '2' });
+test('generations: an unknown top-level field is refused by name, as on the direct API', async () => {
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', bogus_field: 1 });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'unknown_parameter');
+  assert.equal(payload.error.param, 'bogus_field');
+  assert.equal(payload.error.message, "Unknown parameter: 'bogus_field'.");
+});
+
+test('generations: x_proxy_image_route is the one key the direct API refuses that this proxy keeps', async () => {
+  const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', x_proxy_image_route: { geometry_mode: 'strict' } });
   assert.equal(status, 200);
 });
 
-test('generations: the n boundaries are accepted', async () => {
-  for (const n of [1, 10]) {
-    const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', n });
-    assert.equal(status, 200, `n=${n} is inside the documented domain`);
+// Ordering, measured with two faults in one body: unknown keys before prompt,
+// prompt before images, images before n, n before the enums.
+test('generations: faults are reported in the direct order', async () => {
+  const cases = [
+    [{ prompt: 'a dot', bogus: 1, n: 0 }, 'bogus'],
+    [{ prompt: '', n: 0 }, 'prompt'],
+    [{ prompt: 'a dot', n: 0, quality: 'ultra' }, 'n'],
+    [{ prompt: 'a dot', n: null, output_compression: 101 }, 'output_compression'],
+  ];
+  for (const [body, param] of cases) {
+    const { payload } = await postImages(GEN, { model: 'gpt-image-2', ...body });
+    assert.equal(payload.error.param, param, JSON.stringify(body));
   }
+  const { payload } = await postImages('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', images: [], n: 0 });
+  assert.equal(payload.error.param, 'images');
+  assert.equal(payload.error.code, 'empty_array');
 });
 
-test('generations: a prompt is required', async () => {
-  const { status } = await postImages(GEN, { model: 'image-2' });
-  assert.equal(status, 400);
-});
-
-for (const [label, prompt] of [['empty', ''], ['whitespace-only', '   '], ['non-string', 42]]) {
-  test(`generations: a ${label} prompt is rejected`, async () => {
-    const { status } = await postImages(GEN, { model: 'image-2', prompt });
+for (const [label, prompt, code, message] of [
+  ['empty', '', 'empty_string', "Invalid 'prompt': empty string. Expected a string with minimum length 1, but got an empty string instead."],
+  ['null', null, 'invalid_type', "Invalid type for 'prompt': expected a string, but got null instead."],
+  ['an integer', 123, 'invalid_type', "Invalid type for 'prompt': expected a string, but got an integer instead."],
+]) {
+  test(`generations: prompt ${label} carries the direct envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt });
     assert.equal(status, 400);
+    assert.equal(payload.error.param, 'prompt');
+    assert.equal(payload.error.code, code);
+    assert.equal(payload.error.message, message);
   });
 }
 
-test('edits: an image input is required', async () => {
-  const { status, payload } = await postImages('/v1/images/edits', { model: 'image-2', prompt: 'a dot' });
+// JSON types the direct API names (measured 2026-08-30 on `model`): a
+// decimal number is not "a number".
+for (const [model, got] of [[1.5, 'a decimal number'], [true, 'a boolean'], [{}, 'an object'], [[], 'an array']]) {
+  test(`generations: model ${JSON.stringify(model)} is a type error naming ${got}`, async () => {
+    const { status, payload } = await postImages(GEN, { model, prompt: 'a dot' });
+    assert.equal(status, 400);
+    assert.equal(payload.error.code, 'invalid_type');
+    assert.equal(payload.error.message, `Invalid type for 'model': expected a string, but got ${got} instead.`);
+  });
+}
+
+test('generations: size that is not a string is a type error, not a bad size', async () => {
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', size: 123 });
   assert.equal(status, 400);
-  assert.match(payload.error.message, /image input is required/);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'size': expected a string, but got an integer instead.");
 });
 
-// The variations allow-list is two names wide. Widening it is a one-line edit,
-// and both success cases would have stayed green.
-//
-// These go through multipart, not JSON: variations reject a JSON body before the
-// model is ever looked at, so a JSON request would be a 400 that proves nothing
-// about the allow-list.
-async function postVariationForm(model) {
+// Multipart, measured 2026-08-30 with a real form: the enum envelopes are the
+// JSON ones (an empty field is a value outside the set), a non-digit integer
+// field has its own wording, and the file field spelled the JSON way is
+// pointed at the form spelling.
+test('multipart edits: a non-digit integer field has the direct wording', async () => {
+  for (const field of ['n', 'output_compression']) {
+    const { status, payload } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', [field]: 'abc' });
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, field);
+    assert.equal(payload.error.message, `Invalid type for '${field}': expected an integer, but got a string value that could not be converted into an integer.`);
+  }
+});
+
+test('multipart edits: an out-of-set or empty enum field is invalid_value, as in JSON', async () => {
+  for (const quality of ['ultra', '']) {
+    const { status, payload } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', quality });
+    assert.equal(status, 400, quality);
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.equal(payload.error.message, `Invalid value: '${quality}'. Supported values are: 'low', 'medium', 'high', and 'auto'.`);
+  }
+});
+
+test('multipart edits: an enum field sent as a file part is a type error, not a silent omission', async () => {
   const started = await startLocalApiProxy({
     backend: imageBackend(), imageGenerationClient: imageBackend(),
     host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
   });
   try {
     const form = new FormData();
-    form.set('model', model);
-    form.set('image', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'square.png');
-    const res = await fetch(`${started.url}/v1/images/variations`, { method: 'POST', body: form });
-    return { status: res.status, payload: await res.json().catch(() => ({})) };
+    form.set('model', 'gpt-image-2');
+    form.set('prompt', 'a dot');
+    form.set('image', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'x.png');
+    form.set('quality', new Blob([Buffer.from('low')], { type: 'text/plain' }), 'q.txt');
+    const res = await fetch(`${started.url}/v1/images/edits`, { method: 'POST', body: form });
+    const payload = await res.json();
+    assert.equal(res.status, 400, JSON.stringify(payload));
+    assert.equal(payload.error.param, 'quality');
+    assert.equal(payload.error.code, 'invalid_type');
   } finally {
     await started.close();
   }
-}
-
-for (const model of ['gpt-image-1', 'not-a-model', 'dall-e-3']) {
-  test(`variations: ${model} is not an allowed model`, async () => {
-    const { status, payload } = await postVariationForm(model);
-    assert.equal(status, 400, `${model} must be rejected`);
-    assert.equal(payload.error?.param, 'model', `the rejection must be about the model: ${JSON.stringify(payload)}`);
-  });
-}
-
-for (const model of ['dall-e-2', 'image-2']) {
-  test(`variations: ${model} is allowed`, async () => {
-    const { status } = await postVariationForm(model);
-    assert.equal(status, 200, `${model} is in the documented allow-list`);
-  });
-}
-
-// Documented model-specific exceptions. Each is a single guard; none was pinned.
-test('generations: image-2 rejects a transparent background', async () => {
-  const { status, payload } = await postImages(GEN, {
-    model: 'image-2', prompt: 'a dot', background: 'transparent',
-  });
-  assert.equal(status, 400);
-  assert.equal(payload.error.code, 'invalid_value');
 });
 
+test('multipart edits: a file named images is pointed at image / image[]', async () => {
+  const started = await startLocalApiProxy({
+    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const form = new FormData();
+    form.set('model', 'gpt-image-2');
+    form.set('prompt', 'a dot');
+    form.set('images', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'x.png');
+    const res = await fetch(`${started.url}/v1/images/edits`, { method: 'POST', body: form });
+    const payload = await res.json();
+    assert.equal(res.status, 400);
+    assert.equal(payload.error.param, 'images');
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.equal(payload.error.message, "Unknown parameter: 'images'. For multipart/form-data use 'image' or 'image[]'.");
+  } finally {
+    await started.close();
+  }
+});
+
+test('edits: images null is a type error, not omission', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', images: null });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'images': expected an array of objects, but got null instead.");
+});
+
+test('generations: nullable fields treat null as omission, per the direct types', async () => {
+  // `n`, `partial_images`, `output_compression` are declared nullable
+  // (`Optional[...]`) on the direct API. The explicit-null rejections of
+  // earlier rounds were anti-parity, measured against the published SDK
+  // types, and are reversed. (`response_format` is not among them any more:
+  // every live image model refuses the key, null included — measured.)
+  const { status, payload } = await postImages(GEN, {
+    model: 'gpt-image-2', prompt: 'a dot',
+    n: null, partial_images: null, output_compression: null,
+  });
+  assert.equal(status, 200, JSON.stringify(payload));
+  assert.equal(payload.data.length, 1, 'null n means the default of 1');
+});
+
+test('a numeric string n is accepted in multipart, where every field is a string', async () => {
+  // In JSON a string `n` is a type error (measured); a form field can only be
+  // a string, so there the digits are the integer they spell.
+  const { status } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', n: '2' });
+  assert.equal(status, 200);
+});
+
+test('a multipart body with a key the direct API does not know is refused too', async () => {
+  const { status, payload } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', style: 'vivid' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'unknown_parameter');
+});
+
+test('generations: the n boundaries are accepted', async () => {
+  for (const n of [1, 10]) {
+    const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', n });
+    assert.equal(status, 200, `n=${n} is inside the documented domain`);
+  }
+});
+
+test('generations: a prompt is required', async () => {
+  const { status } = await postImages(GEN, { model: 'gpt-image-2' });
+  assert.equal(status, 400);
+});
+
+for (const [label, prompt] of [['empty', ''], ['non-string', 42]]) {
+  test(`generations: a ${label} prompt is rejected`, async () => {
+    const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt });
+    assert.equal(status, 400);
+  });
+}
+
+test('generations: a whitespace-only prompt is accepted, as the direct API accepts it', async () => {
+  // Measured 2026-08-30: `"   "` generated. Blank-detection is not the direct
+  // API's rule for this field; only the empty string is refused.
+  const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: '   ' });
+  assert.equal(status, 200);
+});
+
+test('edits: an image input is required', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'missing_required_parameter');
+  assert.equal(payload.error.param, 'images');
+});
+
+// Documented model-specific exceptions. Each is a single guard; none was pinned.
 test('generations: a transparent background needs a format that carries alpha', async () => {
   const { status, payload } = await postImages(GEN, {
     model: 'gpt-image-1', prompt: 'a dot', background: 'transparent', output_format: 'jpeg',
@@ -185,22 +356,43 @@ test('generations: png with compression 99 is still rejected', async () => {
   assert.equal(payload.error.code, 'invalid_png_output_compression');
 });
 
-test('generations: input_fidelity belongs to edits', async () => {
-  const { status, payload } = await postImages(GEN, {
-    model: 'gpt-image-1', prompt: 'a dot', input_fidelity: 'high',
+// Measured on gpt-image-2 generations, 2026-08-29: the direct API does not
+// know `input_fidelity` there at all — by key, whatever the value, and it says
+// so before it looks at `n`. The enum parser used to run first, so null was a
+// 200 that generated, and an out-of-enum value was a generic 400.
+for (const [label, extra] of [
+  ['high', { input_fidelity: 'high' }],
+  ['null', { input_fidelity: null }],
+  ['out of the enum', { input_fidelity: 'bogus' }],
+  ['high, with n: 0 on the same body', { input_fidelity: 'high', n: 0 }],
+]) {
+  test(`generations: input_fidelity ${label} is an unknown parameter`, async () => {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-1', prompt: 'a dot', ...extra });
+    assert.equal(status, 400, JSON.stringify(payload));
+    assert.equal(payload.error.code, 'unknown_parameter');
+    assert.equal(payload.error.param, 'input_fidelity');
   });
-  assert.equal(status, 400);
-  assert.match(payload.error.message, /only supported for image edits/);
+}
+
+test('edits: input_fidelity null is omission there, and the request runs', async () => {
+  const { status } = await postImages('/v1/images/edits', {
+    model: 'gpt-image-1', prompt: 'a dot', images: [{ image_url: PNG_DATA_URL }], input_fidelity: null,
+  });
+  assert.equal(status, 200);
 });
 
-test('generations: style belongs to generations only, and is accepted there', async () => {
-  const { status } = await postImages(GEN, { model: 'dall-e-3', prompt: 'a dot', style: 'vivid' });
-  assert.notEqual(status, 400);
+test('generations: style is an unknown parameter on every image model the direct API serves', async () => {
+  // `style` was a dall-e-3 control; dall-e-3 is gone (2026-08-29) and gpt-image-2
+  // answers "Unknown parameter: 'style'."
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', style: 'vivid' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.param, 'style');
+  assert.equal(payload.error.code, 'unknown_parameter');
 });
 
 // Usage is part of the documented output spec and nothing asserted it.
 test('generations: a backend that reports usage has it in the response', async () => {
-  const { status, payload } = await postImages(GEN, { model: 'image-2', prompt: 'a dot' });
+  const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot' });
   assert.equal(status, 200);
   assert.ok(payload.usage, `expected usage in the response: ${JSON.stringify(payload)}`);
   assert.equal(payload.usage.input_tokens, 3);
@@ -209,34 +401,6 @@ test('generations: a backend that reports usage has it in the response', async (
 
 // The URL the proxy hands back is a client-visible resource with a lifecycle
 // that was undocumented and untested.
-test('a generated image URL serves the image, and an unknown id is a 404', async () => {
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const res = await fetch(`${started.url}${GEN}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
-    });
-    const payload = await res.json();
-    const url = payload.data[0].url;
-    assert.ok(url, `expected a url: ${JSON.stringify(payload)}`);
-
-    const fetched = await fetch(url);
-    assert.equal(fetched.status, 200);
-    assert.match(fetched.headers.get('content-type') ?? '', /^image\//);
-
-    const missing = await fetch(url.replace(/[^/]+$/, 'not-a-real-id'));
-    assert.equal(missing.status, 404);
-    const body = await missing.json();
-    assert.equal(body.error.type, 'invalid_request_error');
-  } finally {
-    await started.close();
-  }
-});
-
 // The style guard is `style && operation !== 'generation'`. Testing it only on
 // generations exercises the false branch: the guard could be deleted entirely
 // and that test would still pass.
@@ -256,315 +420,26 @@ async function postForm(path, fields) {
   }
 }
 
-for (const path of ['/v1/images/edits', '/v1/images/variations']) {
-  test(`${path}: style is rejected outside generations`, async () => {
-    const model = path.endsWith('variations') ? 'dall-e-2' : 'gpt-image-1';
-    const { status, payload } = await postForm(path, { model, prompt: 'a dot', style: 'vivid' });
-    assert.equal(status, 400, `style must be generation-only: ${JSON.stringify(payload)}`);
-    assert.match(payload.error.message, /only supported for image generations/);
-  });
-}
-
-test('generations: style is accepted, exactly 200', async () => {
-  const { status } = await postImages(GEN, { model: 'dall-e-3', prompt: 'a dot', style: 'vivid' });
-  assert.equal(status, 200);
-});
-
-test('edits: an image-2 transparent background is rejected there too', async () => {
-  // The guard is model-scoped, not operation-scoped. Adding an operation check
-  // would leave the generations test green while edits started accepting it.
-  const { status, payload } = await postForm('/v1/images/edits', {
-    model: 'image-2', prompt: 'a dot', background: 'transparent',
-  });
-  assert.equal(status, 400);
-  assert.equal(payload.error.code, 'invalid_value');
+test('edits: style is rejected there too, as the same unknown parameter', async () => {
+  const { status, payload } = await postForm('/v1/images/edits', { model: 'gpt-image-1', prompt: 'a dot', style: 'vivid' });
+  assert.equal(status, 400, JSON.stringify(payload));
+  assert.equal(payload.error.code, 'unknown_parameter');
 });
 
 test('edits: n is validated there too', async () => {
-  const { status } = await postForm('/v1/images/edits', { model: 'image-2', prompt: 'a dot', n: '11' });
+  const { status } = await postForm('/v1/images/edits', { model: 'gpt-image-2', prompt: 'a dot', n: '11' });
   assert.equal(status, 400);
-});
-
-test('variations: a missing image is rejected', async () => {
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const form = new FormData();
-    form.set('model', 'dall-e-2');
-    const res = await fetch(`${started.url}/v1/images/variations`, { method: 'POST', body: form });
-    assert.equal(res.status, 400);
-  } finally {
-    await started.close();
-  }
 });
 
 // The URL store's two promises — unguessable ids and expiry — were pinned by
 // neither. A constant id and an infinite TTL both passed.
-test('each generated image gets its own id, and each URL keeps its own bytes', async () => {
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const urls = [];
-    for (const prompt of ['first', 'second']) {
-      const res = await fetch(`${started.url}${GEN}`, {
-        method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model: 'image-2', prompt, response_format: 'url' }),
-      });
-      urls.push((await res.json()).data[0].url);
-    }
-    assert.notEqual(urls[0], urls[1], 'two images must not share a URL');
-    for (const url of urls) {
-      const id = url.split('/').pop();
-      assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, `expected a UUID: ${id}`);
-      assert.equal((await fetch(url)).status, 200, 'each URL still serves its own image');
-    }
-  } finally {
-    await started.close();
-  }
-});
-
 // The store's two remaining promises — entries expire, and the store does not
 // grow without limit — were pinned by nothing. An infinite TTL and an unbounded
 // map both passed every test above.
-test('store: an expired entry is gone, and reads as a miss', () => {
-  const store = new GeneratedImageStore(0);
-  const id = store.put('iVBORw0KGgo=', 'png');
-  assert.equal(store.get(id), null, 'a zero lifetime must not be servable');
-});
-
-test('store: an unexpired entry is served', () => {
-  const store = new GeneratedImageStore(60_000);
-  const id = store.put('iVBORw0KGgo=', 'png');
-  assert.ok(store.get(id), 'a live entry must be servable');
-});
-
-test('store: the byte bound evicts the oldest, never the entry just stored', () => {
-  const oneKiB = Buffer.alloc(1024, 7).toString('base64');
-  const store = new GeneratedImageStore(60_000, 3 * 1024);
-  const ids = Array.from({ length: 5 }, () => store.put(oneKiB, 'png'));
-
-  assert.ok(store.get(ids.at(-1)), 'the newest entry must survive its own insertion');
-  assert.equal(store.get(ids[0]), null, 'the oldest must be evicted first');
-  assert.equal(store.get(ids[1]), null);
-
-  const live = ids.filter((id) => store.get(id));
-  assert.equal(live.length, 3, `the bound holds 3 KiB, got ${live.length} entries`);
-});
-
-test('store: storing an image never evicts that same image', () => {
-  // Eviction that does not stop at the new entry deletes the image the client
-  // was just handed a URL for, so the URL 404s before any request could use it.
-  // Only a single oversized image reaches this branch — several small ones stop
-  // earlier. This is the guarantee, and it is the whole guarantee: the next test
-  // pins how far it does NOT go.
-  const store = new GeneratedImageStore(60_000, 1024);
-  const id = store.put(Buffer.alloc(4096, 7).toString('base64'), 'png');
-  const image = store.get(id);
-  assert.ok(image, 'the entry just stored must survive its own insertion');
-  assert.equal(image.bytes.byteLength, 4096);
-});
-
-test('store: an oversized image is evicted by the next request, fetched or not', () => {
-  // Documented, because it is surprising: the contract cannot promise a first
-  // fetch. Making it true would mean pinning entries until someone fetches them,
-  // and an entry nobody fetches would pin forever — the unbounded growth the
-  // budget exists to stop.
-  const store = new GeneratedImageStore(60_000, 1024);
-  const oversized = store.put(Buffer.alloc(4096, 7).toString('base64'), 'png');
-  store.put(Buffer.alloc(64, 9).toString('base64'), 'png');
-  assert.equal(store.get(oversized), null, 'the later put must reclaim the budget');
-});
-
-test('store: eviction accounting survives expiry, so the bound does not drift', () => {
-  // Dropping an expired entry must return its bytes to the budget. If it does
-  // not, the store silently shrinks to nothing over a long-running session.
-  const oneKiB = Buffer.alloc(1024, 7).toString('base64');
-  const store = new GeneratedImageStore(60_000, 3 * 1024);
-  const expiring = new GeneratedImageStore(0);
-  expiring.put(oneKiB, 'png');
-
-  const ids = Array.from({ length: 3 }, () => store.put(oneKiB, 'png'));
-  assert.equal(ids.filter((id) => store.get(id)).length, 3);
-});
-
-test('the generated image URL is a v4 UUID and serves exactly the bytes it was given', async () => {
-  // `randomUUID` is v4; asserting only the hex shape would accept a counter
-  // formatted to look like one, which is guessable across callers.
-  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
-  const backend = {
-    name: 'test', model: 'configured-model',
-    async generate() {
-      return {
-        created: 0,
-        images: [{ b64Json: png.toString('base64'), revisedPrompt: null }],
-        usage: { inputTokens: 1, outputTokens: 1, source: 'provider' },
-      };
-    },
-    async close() {},
-  };
-  const started = await startLocalApiProxy({
-    backend, imageGenerationClient: backend,
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const res = await fetch(`${started.url}${GEN}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
-    });
-    const url = (await res.json()).data[0].url;
-    const id = url.split('/').pop();
-    assert.match(
-      id,
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
-      `expected a v4 UUID (version nibble 4, variant 8..b): ${id}`,
-    );
-
-    const fetched = await fetch(url);
-    assert.equal(fetched.status, 200);
-    const served = Buffer.from(await fetched.arrayBuffer());
-    assert.ok(served.equals(png), `served bytes must be the generated bytes: ${served.toString('hex')}`);
-  } finally {
-    await started.close();
-  }
-});
-
-test('the access gate covers the generated image route', async () => {
-  // The contract says the gate applies here "like any other" route, and this is
-  // the one route whose URL the proxy itself hands out.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000, authKey: 'secret-key',
-  });
-  try {
-    const res = await fetch(`${started.url}${GEN}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: 'Bearer secret-key' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
-    });
-    const url = (await res.json()).data[0].url;
-
-    assert.equal((await fetch(url)).status, 401, 'an unauthenticated fetch must not get the bytes');
-    assert.equal(
-      (await fetch(url, { headers: { authorization: 'Bearer secret-key' } })).status,
-      200,
-    );
-  } finally {
-    await started.close();
-  }
-});
-
 // The guards below are shared across operations but were only ever exercised on
 // one of them, so an operation check added to any of them would go unnoticed.
-test('variations: n is validated there too', async () => {
-  const { status } = await postForm('/v1/images/variations', { model: 'dall-e-2', n: '11' });
-  assert.equal(status, 400);
-});
-
-test('variations: an image-2 transparent background is rejected there too', async () => {
-  const { status, payload } = await postForm('/v1/images/variations', {
-    model: 'image-2', background: 'transparent',
-  });
-  assert.equal(status, 400);
-  assert.equal(payload.error.code, 'invalid_value');
-});
-
-test('variations: input_fidelity is rejected there too', async () => {
-  const { status, payload } = await postForm('/v1/images/variations', {
-    model: 'dall-e-2', input_fidelity: 'high',
-  });
-  assert.equal(status, 400);
-  assert.match(payload.error.message, /only supported for image edits/);
-});
-
 // The URL the proxy hands back has to be one the client can actually follow.
 // `fetch` will not send a hostile or absent Host, so these go through node:http.
-async function generatedUrlWith(headers, fetchIt = false) {
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  const target = new URL(started.url);
-  try {
-    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
-    const raw = await new Promise((resolve, reject) => {
-      const req = http.request({
-        host: target.hostname, port: target.port, path: '/v1/images/generations', method: 'POST',
-        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body), ...headers },
-      }, (res) => { let d = ''; res.on('data', (c) => { d += c; }); res.on('end', () => resolve(d)); });
-      req.on('error', reject);
-      req.end(body);
-    });
-    const url = JSON.parse(raw).data[0].url;
-    // Fetched here, while the server is still listening: a URL is only useful if
-    // it resolves during the proxy's lifetime.
-    const served = fetchIt ? (await fetch(url)).status : null;
-    return { url, origin: `${target.hostname}:${target.port}`, served };
-  } finally {
-    await started.close();
-  }
-}
-
-test('a generated URL keeps the scheme the client reached the proxy with', async () => {
-  // The scheme was hard-coded `http://`. Behind an HTTPS tunnel that hands the
-  // client a link its own page refuses as mixed content, for bytes that are on
-  // the other side of the same connection.
-  const forwarded = await generatedUrlWith({ 'x-forwarded-proto': 'https' });
-  assert.match(forwarded.url, /^https:\/\//, `expected https, got ${forwarded.url}`);
-
-  const plain = await generatedUrlWith({});
-  assert.match(plain.url, /^http:\/\//, 'a plain request must stay http');
-});
-
-test('a comma-joined x-forwarded-proto uses the first hop', async () => {
-  const { url } = await generatedUrlWith({ 'x-forwarded-proto': 'https, http' });
-  assert.match(url, /^https:\/\//, `the client-facing hop is the first one: ${url}`);
-});
-
-test('an unrecognised x-forwarded-proto does not choose the scheme', async () => {
-  const { url } = await generatedUrlWith({ 'x-forwarded-proto': 'gopher' });
-  assert.match(url, /^http:\/\//, `expected the connection's own scheme: ${url}`);
-});
-
-test('a request with no Host still gets a URL pointing at this proxy', async () => {
-  // HTTP/1.0 has no Host line, and the authority used to fall back to a bare
-  // `127.0.0.1` with no port — a URL pointing at nothing.
-  //
-  // Raw socket, not `node:http`: passing `host: ''` there does NOT omit the
-  // header, it makes node substitute its own, and a test written that way passes
-  // whatever the fallback does.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  const target = new URL(started.url);
-  try {
-    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
-    const raw = await new Promise((resolve, reject) => {
-      const socket = net.connect(Number(target.port), target.hostname, () => {
-        socket.write(
-          'POST /v1/images/generations HTTP/1.0\r\n'
-          + 'Content-Type: application/json\r\n'
-          + `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
-        );
-      });
-      let data = '';
-      socket.on('data', (chunk) => { data += chunk; });
-      socket.on('end', () => resolve(data));
-      socket.on('error', reject);
-    });
-    const url = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')).data[0].url;
-    const origin = `${target.hostname}:${target.port}`;
-    assert.ok(url.includes(origin), `expected the bound address ${origin}, got ${url}`);
-    assert.equal((await fetch(url)).status, 200, 'the fallback URL must actually serve the image');
-  } finally {
-    await started.close();
-  }
-});
-
 // --- round 38: image promises the inventory showed nothing would catch ---
 
 function streamingImageBackend(usage) {
@@ -600,7 +475,7 @@ test('edits: an empty multipart upload is rejected, like every other empty image
   // The JSON encodings all reject an empty image; the multipart path accepted
   // one and sent `data:image/png;base64,` upstream as though it were a picture.
   const form = new FormData();
-  form.set('model', 'image-2');
+  form.set('model', 'gpt-image-2');
   form.set('prompt', 'make it blue');
   form.set('image', new Blob([], { type: 'image/png' }), 'empty.png');
   const { status } = await postWith(streamingImageBackend(), '/v1/images/edits', { method: 'POST', body: form });
@@ -609,7 +484,7 @@ test('edits: an empty multipart upload is rejected, like every other empty image
 
 test('edits: a multipart part that is not an image is rejected', async () => {
   const form = new FormData();
-  form.set('model', 'image-2');
+  form.set('model', 'gpt-image-2');
   form.set('prompt', 'make it blue');
   form.set('image', new Blob([Buffer.from('hello world')], { type: 'text/plain' }), 'notes.txt');
   const { status } = await postWith(streamingImageBackend(), '/v1/images/edits', { method: 'POST', body: form });
@@ -631,7 +506,7 @@ for (const stream of [false, true]) {
     const { status } = await postWith(streamingImageBackend(), GEN, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'image-2', prompt: 'a dot', partial_images: 0, ...(stream ? { stream: true } : {}),
+        model: 'gpt-image-2', prompt: 'a dot', partial_images: 0, ...(stream ? { stream: true } : {}),
       }),
     });
     assert.equal(status, 200);
@@ -640,7 +515,6 @@ for (const stream of [false, true]) {
 
 for (const [path, fields, event] of [
   ['/v1/images/edits', { model: 'gpt-image-1', prompt: 'a dot', stream: 'true' }, 'image_edit.completed'],
-  ['/v1/images/variations', { model: 'dall-e-2', stream: 'true' }, 'image_edit.completed'],
 ]) {
   test(`${path}: stream is supported there too, as ${event}`, async () => {
     // `stream` is optional on all three operations. Every streaming image test
@@ -658,7 +532,7 @@ for (const [path, fields, event] of [
 test('generations: the streamed completed event is named for its own operation', async () => {
   const { text } = await postWith(streamingImageBackend(), GEN, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'image-2', prompt: 'a dot', stream: true }),
+    body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot', stream: true }),
   });
   assert.ok(text.includes('event: image_generation.completed'), `got: ${text.slice(0, 200)}`);
 });
@@ -692,7 +566,7 @@ test('generations: a streaming response carries usage in the completed event', a
     GEN,
     {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', stream: true }),
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot', stream: true }),
     },
   );
   assert.equal(status, 200);
@@ -713,7 +587,7 @@ test('generations: a backend reporting raw image usage has it passed through', a
     GEN,
     {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot' }),
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot' }),
     },
   );
   assert.equal(status, 200);
@@ -723,105 +597,12 @@ test('generations: a backend reporting raw image usage has it passed through', a
   assert.equal(usage.total_tokens, 33);
 });
 
-test('an IPv6 listener produces bracketed, parseable URLs', async () => {
-  // `http://::1:8080` does not parse as a URL — an IPv6 authority needs
-  // brackets. Both the proxy's own url and the no-Host fallback build one.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '::1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const parsed = new URL(started.url);
-    assert.match(parsed.hostname, /^\[?::1\]?$/, `expected the IPv6 loopback: ${started.url}`);
-
-    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
-    const raw = await new Promise((resolve, reject) => {
-      const socket = net.connect(Number(parsed.port), '::1', () => {
-        socket.write(
-          'POST /v1/images/generations HTTP/1.0\r\n'
-          + 'Content-Type: application/json\r\n'
-          + `Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
-        );
-      });
-      let data = '';
-      socket.on('data', (chunk) => { data += chunk; });
-      socket.on('end', () => resolve(data));
-      socket.on('error', reject);
-    });
-    const url = JSON.parse(raw.split('\r\n\r\n').slice(1).join('\r\n\r\n')).data[0].url;
-    assert.doesNotThrow(() => new URL(url), `the fallback URL must parse: ${url}`);
-    assert.equal((await fetch(url)).status, 200, 'and it must actually serve the image');
-  } finally {
-    await started.close();
-  }
-});
-
-test('a generated id that does not percent-decode is a 404 miss, not a 500', async () => {
-  // `%FF` made decodeURIComponent throw — a 500 for an id the proxy could never
-  // have issued, where the contract promises the indistinguishable 404.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const res = await fetch(`${started.url}/v1/images/generated/%FF`);
-    assert.equal(res.status, 404);
-    const body = await res.json();
-    assert.equal(body.error.type, 'invalid_request_error');
-  } finally {
-    await started.close();
-  }
-});
-
 test('generations: partial_images null is omission — the field is nullable', async () => {
-  const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', partial_images: null });
+  const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', partial_images: null });
   assert.equal(status, 200);
 });
 
 // --- round 40 ---
-
-test('a generated id with an encoded question mark is path data, not a query', async () => {
-  // Only the first LITERAL `?` starts the query. `%3F` is part of the raw path,
-  // so appending it to a valid id must produce a different, unknown id.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const res = await fetch(`${started.url}${GEN}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
-    });
-    const url = (await res.json()).data[0].url;
-    assert.equal((await fetch(`${url}%3Fjunk`)).status, 404, 'the encoded ? extends the id');
-    assert.equal((await fetch(`${url}?junk`)).status, 200, 'a literal ? starts an ignored query');
-  } finally {
-    await started.close();
-  }
-});
-
-test('a generated path with extra separators is an unknown endpoint, whatever the method', async () => {
-  // The route is one nonempty, slash-free id segment. Prefix matching used to
-  // classify `//missing` as served and answer 405 to a POST.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    for (const [path, method] of [
-      ['/v1/images/generated//missing', 'POST'],
-      ['/v1/images/generated//missing', 'GET'],
-      ['/v1/images/generated/a/b', 'GET'],
-      ['/v1/images/generated/', 'GET'],
-    ]) {
-      const res = await fetch(`${started.url}${path}`, { method });
-      assert.equal(res.status, 404, `${method} ${path} is not the generated route`);
-      assert.match((await res.json()).error.message, /Unknown endpoint/);
-    }
-  } finally {
-    await started.close();
-  }
-});
 
 test('generations: output_compression null is omission — the field is nullable', async () => {
   const { status } = await postImages(GEN, {
@@ -849,7 +630,7 @@ test('generations: standard output_compression wins over the route hint', async 
     const res = await fetch(`${started.url}${GEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'image-2', prompt: 'a dot', output_format: 'jpeg', output_compression: 80,
+        model: 'gpt-image-2', prompt: 'a dot', output_format: 'jpeg', output_compression: 80,
         x_proxy_image_route: { output_compression: 20 },
       }),
     });
@@ -864,11 +645,15 @@ test('generations: standard output_compression wins over the route hint', async 
 
 test('a failed image stream still ends with data: [DONE]', async () => {
   // The one OpenAI surface whose mid-stream error ended without the promised
-  // terminal frame.
+  // terminal frame. The failure comes AFTER a first event: that is what makes
+  // the stream committed — a failure before any event is an HTTP error (below).
   const backend = {
     name: 'test', model: 'configured-model',
     async generate() { return { created: 0, images: [{ b64Json: 'iVBORw0KGgo=', revisedPrompt: null }] }; },
-    async *stream() { throw new Error('backend exploded'); },
+    async *stream() {
+      yield { type: 'partial_image', created: 0, image: { b64Json: 'iVBORw0KGgo=' }, partialImageIndex: 0 };
+      throw new Error('backend exploded');
+    },
     async close() {},
   };
   const started = await startLocalApiProxy({
@@ -878,7 +663,7 @@ test('a failed image stream still ends with data: [DONE]', async () => {
   try {
     const res = await fetch(`${started.url}${GEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'x', stream: true }),
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'x', stream: true }),
     });
     assert.equal(res.status, 200, 'the stream was already committed');
     const text = await res.text();
@@ -890,24 +675,67 @@ test('a failed image stream still ends with data: [DONE]', async () => {
   }
 });
 
-test('generated ids are matched byte-for-byte: encoding is not an alias', async () => {
-  // Issued ids are plain UUIDs, so no client needs encoding — and decoding
-  // created aliases: two raw targets naming one image.
+// The backend refuses a request it will not run — an option its image model
+// does not support — before any stream byte. That refusal is an HTTP error to
+// the client, streamed or not: the SSE stream commits on the first backend
+// event, not before it. Until this, `gpt-image-1` + `background: transparent`
+// with `stream: true` was a 200 carrying an error frame while the identical
+// envelope for `image-2` (a local guard) was a 400.
+test('a backend refusal before the first event is an HTTP error on the streamed path too', async () => {
+  const { ProxyRequestError } = await import('../dist/proxy/types.js');
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { throw new Error('unused'); },
+    async *stream() {
+      // The envelope the live backend returned for `background: transparent`
+      // (artifacts/codex-backend-image-probe, `slot_background`), as the
+      // codex-backend transport forwards it.
+      throw new ProxyRequestError(
+        'Transparent background is not supported for this model.', 400, 'openai',
+        'image_generation_user_error', 'tools', 'invalid_value',
+      );
+    },
+    async close() {},
+  };
   const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
+    backend, imageGenerationClient: backend,
     host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
   });
   try {
     const res = await fetch(`${started.url}${GEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' }),
+      body: JSON.stringify({ model: 'gpt-image-1', prompt: 'x', background: 'transparent', stream: true }),
     });
-    const url = (await res.json()).data[0].url;
-    assert.equal((await fetch(url)).status, 200);
-    const id = url.split('/').pop();
-    // %-encode the first hex digit: same decoded value, different raw bytes.
-    const aliased = url.replace(id, `%${id.charCodeAt(0).toString(16)}${id.slice(1)}`);
-    assert.equal((await fetch(aliased)).status, 404, 'an encoded spelling is a different, unissued id');
+    assert.equal(res.status, 400, 'nothing was on the wire, so the refusal is the status');
+    assert.match(res.headers.get('content-type'), /application\/json/);
+    const payload = await res.json();
+    assert.equal(payload.error.type, 'image_generation_user_error');
+    assert.equal(payload.error.param, 'tools');
+    assert.equal(payload.error.code, 'invalid_value');
+  } finally {
+    await started.close();
+  }
+});
+
+test('a stream that ends with no event at all is still a committed, empty stream', async () => {
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { throw new Error('unused'); },
+    async *stream() {},
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'x', stream: true }),
+    });
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get('content-type'), /text\/event-stream/);
+    assert.equal(await res.text(), '');
   } finally {
     await started.close();
   }
@@ -931,7 +759,7 @@ test('route-only output_compression is the effective value when the standard fie
     const res = await fetch(`${started.url}${GEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
-        model: 'image-2', prompt: 'a dot', output_format: 'jpeg',
+        model: 'gpt-image-2', prompt: 'a dot', output_format: 'jpeg',
         x_proxy_image_route: { output_compression: 20 },
       }),
     });
@@ -942,53 +770,7 @@ test('route-only output_compression is the effective value when the standard fie
   }
 });
 
-test('a forwarded proto with a non-OWS byte does not choose the scheme', async () => {
-  // `https` followed by byte 0xA0 is not the token `https`. String.trim ate the
-  // byte (it is U+00A0 under latin1 decoding) and upgraded the URL; OWS-only
-  // stripping leaves the token unrecognised, falling back to the connection.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  const target = new URL(started.url);
-  try {
-    const body = JSON.stringify({ model: 'image-2', prompt: 'a dot', response_format: 'url' });
-    const raw = await new Promise((resolve, reject) => {
-      const conn = net.connect(Number(target.port), target.hostname, () => {
-        conn.write(Buffer.concat([
-          Buffer.from(
-            'POST /v1/images/generations HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\n'
-            + `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\nX-Forwarded-Proto: https`,
-          ),
-          Buffer.from([0xa0]),
-          Buffer.from(`\r\n\r\n${body}`),
-        ]));
-      });
-      let data = '';
-      conn.on('data', (chunk) => { data += chunk; });
-      conn.on('end', () => resolve(data));
-      conn.on('error', reject);
-    });
-    const url = /"url":"([^"]+)"/.exec(raw)?.[1];
-    assert.ok(url, raw.slice(0, 120));
-    assert.match(url, /^http:\/\//, `the malformed hop must not upgrade the scheme: ${url}`);
-  } finally {
-    await started.close();
-  }
-});
-
 // --- round 42 ---
-
-test('store: a flood of tiny images is bounded by entry count, not only bytes', () => {
-  // The byte budget counts payloads; Map keys and entry metadata are overhead
-  // the budget never sees. 1-byte images could grow the store unboundedly.
-  const store = new GeneratedImageStore(60_000, 1024 * 1024, 50);
-  const ids = Array.from({ length: 120 }, () => store.put('AA==', 'png'));
-  const live = ids.filter((id) => store.get(id));
-  assert.ok(live.length <= 50, `entries must be bounded: ${live.length}`);
-  assert.ok(store.get(ids.at(-1)), 'the newest entry survives');
-  assert.equal(store.get(ids[0]), null, 'the oldest was evicted');
-});
 
 test('a timed-out image stream still ends with data: [DONE]', async () => {
   // The terminal-frame promise covers every mid-stream failure, the timeout
@@ -1015,7 +797,7 @@ test('a timed-out image stream still ends with data: [DONE]', async () => {
   try {
     const res = await fetch(`${started.url}${GEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'x', stream: true }),
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'x', stream: true }),
     });
     const text = await res.text();
     const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
@@ -1039,24 +821,25 @@ for (const [label, value] of [['a number', 17], ['an object', {}]]) {
   test(`generations: response_format ${label} is rejected, not defaulted`, async () => {
     // A present non-string was silently replaced with b64_json. Null is the
     // exception: the field is nullable on the direct API.
-    const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', response_format: value });
+    const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', response_format: value });
     assert.equal(status, 400, `response_format=${JSON.stringify(value)} is not b64_json or url`);
   });
 }
 
 test('generations: an empty-string enum value is a present wrong value, not omission', async () => {
-  const { status } = await postImages(GEN, { model: 'image-2', prompt: 'a dot', quality: '' });
+  const { status } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', quality: '' });
   assert.equal(status, 400, 'an empty string is outside the quality enum');
 });
 
 test('edits: a malformed member of an image array is rejected, not dropped', async () => {
   // Filtering the bad member executed the request with silently altered input.
   const { status, payload } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'make it blue',
+    model: 'gpt-image-2', prompt: 'make it blue',
     images: [{ image_url: PNG_DATA_URL }, 7],
   });
   assert.equal(status, 400, JSON.stringify(payload));
-  assert.match(payload.error.message, /image\[1\]/, 'the rejection must name the member');
+  assert.equal(payload.error.param, 'images[1]', 'the rejection must name the member');
+  assert.equal(payload.error.code, 'invalid_type');
 });
 
 test('multipart detection uses the media-type essence, not a substring', async () => {
@@ -1069,7 +852,7 @@ test('multipart detection uses the media-type essence, not a substring', async (
     const res = await fetch(`${started.url}${GEN}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json; profile="https://example.test/multipart/form-data"' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot' }),
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot' }),
     });
     assert.equal(res.status, 200, await res.text());
   } finally {
@@ -1077,117 +860,51 @@ test('multipart detection uses the media-type essence, not a substring', async (
   }
 });
 
-test('a streamed n=2 URL response serves both URLs — siblings share one pin set', async () => {
-  const big = Buffer.alloc(GENERATED_BUDGET_PROBE, 7).toString('base64');
-  const backend = {
-    name: 'test', model: 'configured-model',
-    async generate() { return { created: 0, images: [] }; },
-    async *stream() {
-      yield { type: 'completed', created: 0, image: { b64Json: big, revisedPrompt: null } };
-      yield { type: 'completed', created: 0, image: { b64Json: 'iVBORw0KGgo=', revisedPrompt: null } };
-    },
-    async close() {},
-  };
-  const started = await startLocalApiProxy({
-    backend, imageGenerationClient: backend,
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-    generatedImageStore: new GeneratedImageStore(60_000, 1024, 100),
+const PNG_DATA_URL = `data:image/png;base64,${Buffer.from('89504e470d0a1a0a', 'hex').toString('base64')}`;
+// A JSON edit names its images as `images`, an array of objects, and nothing
+// else — measured on the direct API 2026-08-29. `image` and `image[]` are the
+// multipart spellings; in JSON they are refused with a message that says so.
+test('edits: a JSON body names its images as the images array', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', {
+    model: 'gpt-image-2', prompt: 'make it blue', images: [{ image_url: PNG_DATA_URL }],
   });
-  try {
-    const res = await fetch(`${started.url}${GEN}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2, stream: true, response_format: 'url' }),
-    });
-    const text = await res.text();
-    const urls = [...text.matchAll(/"url":"([^"]+)"/g)].map((m) => m[1]);
-    assert.equal(urls.length, 2, text.slice(0, 200));
-    for (const [index, url] of urls.entries()) {
-      assert.equal((await fetch(url)).status, 200, `url[${index}] must survive its sibling`);
-    }
-  } finally {
-    await started.close();
-  }
+  assert.equal(status, 200, JSON.stringify(payload));
 });
 
-const PNG_DATA_URL = `data:image/png;base64,${Buffer.from('89504e470d0a1a0a', 'hex').toString('base64')}`;
-for (const [label, fields] of [
-  ['singular image', { image: { image_url: PNG_DATA_URL } }],
-  ['image[] spelling', { 'image[]': [{ image_url: PNG_DATA_URL }] }],
-  ['images array', { images: [{ image_url: PNG_DATA_URL }] }],
-]) {
-  test(`edits: a JSON body may name its image as ${label}`, async () => {
-    // The documented aliases hold in both encodings; JSON edits read only
-    // `images` and rejected the other two documented spellings.
+for (const alias of ['image', 'image[]']) {
+  test(`edits: the JSON spelling ${alias} is refused with the direct message`, async () => {
     const { status, payload } = await postImages('/v1/images/edits', {
-      model: 'image-2', prompt: 'make it blue', ...fields,
+      model: 'gpt-image-2', prompt: 'make it blue', [alias]: [{ image_url: PNG_DATA_URL }],
     });
-    assert.equal(status, 200, `${label} must be accepted: ${JSON.stringify(payload)}`);
+    assert.equal(status, 400);
+    assert.equal(payload.error.param, alias);
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.match(payload.error.message, /use 'images' \(array\)/);
   });
 }
 
-test('store: sibling images of one response cannot evict each other', () => {
-  // An n=2 response whose first image exceeds the budget had its first URL
-  // 404 before the response was even sent — evicted by its own sibling.
-  const store = new GeneratedImageStore(60_000, 1024, 100);
-  const batch = new Set();
-  const big = store.put(Buffer.alloc(4096, 1).toString('base64'), 'png', batch);
-  batch.add(big);
-  const second = store.put(Buffer.alloc(64, 2).toString('base64'), 'png', batch);
-  batch.add(second);
-  assert.ok(store.get(big), 'the oversized sibling must survive its own response');
-  assert.ok(store.get(second), 'and so must the second');
-});
-
-test('store: under the entry cap, eviction is still oldest-first', () => {
-  const store = new GeneratedImageStore(60_000, 1024 * 1024, 2);
-  const a = store.put('AA==', 'png');
-  const b = store.put('AA==', 'png');
-  const c = store.put('AA==', 'png');
-  assert.equal(store.get(a), null, 'A is the oldest and must go');
-  assert.ok(store.get(b), 'B stays');
-  assert.ok(store.get(c), 'C stays');
-});
-
-test('an n=2 URL response serves both URLs, even when the first image is oversized', async () => {
-  const big = Buffer.alloc(GENERATED_BUDGET_PROBE, 7).toString('base64');
-  const backend = {
-    name: 'test', model: 'configured-model',
-    async generate(request) {
-      return {
-        created: 0,
-        images: Array.from({ length: request.n ?? 1 }, (_v, i) => ({
-          b64Json: i === 0 ? big : 'iVBORw0KGgo=', revisedPrompt: null,
-        })),
-      };
-    },
-    async close() {},
-  };
-  const started = await startLocalApiProxy({
-    backend, imageGenerationClient: backend,
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-    // A store whose byte budget the first image EXCEEDS — without this the
-    // production 128 MiB budget never binds and the test pins nothing.
-    generatedImageStore: new GeneratedImageStore(60_000, 1024, 100),
+test('edits: images that is not an array names the JSON type it got', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', {
+    model: 'gpt-image-2', prompt: 'make it blue', images: { image_url: PNG_DATA_URL },
   });
-  try {
-    const res = await fetch(`${started.url}${GEN}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2, response_format: 'url' }),
-    });
-    const data = (await res.json()).data;
-    assert.equal(data.length, 2);
-    for (const [index, item] of data.entries()) {
-      assert.equal((await fetch(item.url)).status, 200, `url[${index}] must serve immediately after the response`);
-    }
-  } finally {
-    await started.close();
-  }
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'images': expected an array of objects, but got an object instead.");
+});
+
+test('edits: a string member of images is a type error, not a URL reference', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', {
+    model: 'gpt-image-2', prompt: 'make it blue', images: ['https://example.com/x.png'],
+  });
+  assert.equal(status, 400);
+  assert.equal(payload.error.param, 'images[0]');
+  assert.equal(payload.error.message, "Invalid type for 'images[0]': expected an object, but got a string instead.");
 });
 
 test('generations: the 32,000-code-unit prompt boundary is inclusive', async () => {
-  const at = await postImages(GEN, { model: 'image-2', prompt: 'x'.repeat(32_000) });
+  const at = await postImages(GEN, { model: 'gpt-image-2', prompt: 'x'.repeat(32_000) });
   assert.equal(at.status, 200, 'exactly 32,000 units is inside the bound');
-  const over = await postImages(GEN, { model: 'image-2', prompt: 'x'.repeat(32_001) });
+  const over = await postImages(GEN, { model: 'gpt-image-2', prompt: 'x'.repeat(32_001) });
   assert.equal(over.status, 400);
 });
 
@@ -1210,7 +927,7 @@ test('a non-streaming image disconnect aborts the backend', async () => {
     const controller = new AbortController();
     const pending = fetch(`${started.url}${GEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot' }), signal: controller.signal,
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot' }), signal: controller.signal,
     }).catch(() => null);
     await new Promise((r) => setTimeout(r, 150));
     controller.abort();
@@ -1224,18 +941,23 @@ test('a non-streaming image disconnect aborts the backend', async () => {
 
 // --- round 45 ---
 
-test('gpt-image-1 with response_format null behaves as omission, not unknown_parameter', async () => {
-  const { status, payload } = await postImages(GEN, {
-    model: 'gpt-image-1', prompt: 'a dot', response_format: null,
-  });
-  assert.equal(status, 200, JSON.stringify(payload));
+test('response_format is an unknown parameter on every live image model, null included', async () => {
+  // Measured 2026-08-29 on gpt-image-2: a present null is "Unknown parameter",
+  // not omission. The earlier "null is omission" reading was of the dall-e
+  // era, and dall-e is gone.
+  for (const response_format of ['url', 'b64_json', null]) {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-1', prompt: 'a dot', response_format });
+    assert.equal(status, 400, `response_format ${JSON.stringify(response_format)}`);
+    assert.equal(payload.error.code, 'unknown_parameter');
+    assert.equal(payload.error.param, 'response_format');
+  }
 });
 
 for (const path of [GEN, '/v1/images/edits']) {
   test(`${path}: an empty-string output_compression is a present wrong value`, async () => {
     const body = path === GEN
-      ? { model: 'image-2', prompt: 'a dot', output_compression: '' }
-      : { model: 'image-2', prompt: 'a dot', images: [{ image_url: PNG_DATA_URL }], output_compression: '' };
+      ? { model: 'gpt-image-2', prompt: 'a dot', output_compression: '' }
+      : { model: 'gpt-image-2', prompt: 'a dot', images: [{ image_url: PNG_DATA_URL }], output_compression: '' };
     const { status } = await postImages(path, body);
     assert.equal(status, 400, 'an empty string is not an integer');
   });
@@ -1245,7 +967,7 @@ test('edits: a malformed mask is rejected, not silently dropped', async () => {
   // Executing an unmasked edit the client never asked for is a semantic
   // alteration, not a convenience.
   const { status, payload } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'make it blue', images: [{ image_url: PNG_DATA_URL }], mask: 42,
+    model: 'gpt-image-2', prompt: 'make it blue', images: [{ image_url: PNG_DATA_URL }], mask: 42,
   });
   assert.equal(status, 400, JSON.stringify(payload));
   assert.match(payload.error.message, /mask/);
@@ -1253,78 +975,69 @@ test('edits: a malformed mask is rejected, not silently dropped', async () => {
 
 test('edits: mask null is omission — the unmasked edit was asked for', async () => {
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'make it blue', images: [{ image_url: PNG_DATA_URL }], mask: null,
+    model: 'gpt-image-2', prompt: 'make it blue', images: [{ image_url: PNG_DATA_URL }], mask: null,
   });
   assert.equal(status, 200);
 });
 
 for (const [label, model] of [['a number', 7], ['an empty string', ''], ['whitespace', '  ']]) {
-  test(`generations: model ${label} is rejected, never rewritten to dall-e-2`, async () => {
+  test(`generations: model ${label} is rejected, never rewritten to a default`, async () => {
     const { status, payload } = await postImages(GEN, { model, prompt: 'a dot' });
     assert.equal(status, 400, `model=${JSON.stringify(model)} must not select a different model`);
     assert.equal(payload.error.param, 'model');
   });
 }
 
-test('generations: model null defaults, as the nullable direct field declares', async () => {
-  const { status } = await postImages(GEN, { model: null, prompt: 'a dot' });
-  assert.equal(status, 200);
+// `model` is required on the direct API (2026-08-29): absent is
+// `missing_required_parameter`, null and a number are `invalid_type` with the
+// JSON type named, and any name it does not serve — the dead `dall-e-2`, the
+// proxy's former `image-2`, an empty string — "does not exist". The proxy used
+// to default an absent model to dall-e-2.
+test('generations: an absent model is a missing required parameter', async () => {
+  const { status, payload } = await postImages(GEN, { prompt: 'a dot' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'missing_required_parameter');
+  assert.equal(payload.error.param, 'model');
+  assert.equal(payload.error.message, "Missing required parameter: 'model'.");
 });
 
-for (const [path, extra] of [
-  [GEN, {}],
-  ['/v1/images/variations', null],
-]) {
-  test(`${path === GEN ? 'generations' : 'variations'}: image-2 input_fidelity carries its documented envelope`, async () => {
-    const { status, payload } = path === GEN
-      ? await postImages(GEN, { model: 'image-2', prompt: 'a dot', input_fidelity: 'high' })
-      : await postVariationFidelity();
+test('generations: model null is a type error, not omission', async () => {
+  const { status, payload } = await postImages(GEN, { model: null, prompt: 'a dot' });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'invalid_type');
+  assert.equal(payload.error.message, "Invalid type for 'model': expected a string, but got null instead.");
+});
+
+for (const model of ['dall-e-2', 'dall-e-3', 'image-2', '', 'gpt-image-9']) {
+  test(`generations: model ${JSON.stringify(model)} does not exist, in the direct envelope`, async () => {
+    const { status, payload } = await postImages(GEN, { model, prompt: 'a dot' });
     assert.equal(status, 400);
-    assert.equal(payload.error.type, 'image_generation_user_error', JSON.stringify(payload.error));
-    assert.equal(payload.error.code, 'invalid_input_fidelity_model');
+    assert.equal(payload.error.type, 'image_generation_user_error');
+    assert.equal(payload.error.param, 'model');
+    assert.equal(payload.error.code, 'invalid_value');
+    assert.equal(payload.error.message, `The model '${model}' does not exist.`);
   });
 }
 
-async function postVariationFidelity() {
+for (const model of ['chatgpt-image-latest', 'gpt-image-1', 'gpt-image-1-mini', 'gpt-image-1.5', 'gpt-image-2', 'gpt-image-2-2026-04-21']) {
+  test(`generations: ${model} is a live direct model and runs on the local route`, async () => {
+    const { status } = await postImages(GEN, { model, prompt: 'a dot' });
+    assert.equal(status, 200);
+  });
+}
+
+test('the variations endpoint is gone, as it is on the direct API — a bare 404', async () => {
   const started = await startLocalApiProxy({
     backend: imageBackend(), imageGenerationClient: imageBackend(),
     host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
   });
   try {
-    const form = new FormData();
-    form.set('model', 'image-2');
-    form.set('input_fidelity', 'high');
-    form.set('image', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'sq.png');
-    const res = await fetch(`${started.url}/v1/images/variations`, { method: 'POST', body: form });
-    return { status: res.status, payload: await res.json() };
-  } finally {
-    await started.close();
-  }
-}
-
-test('a runaway stream cannot emit more images than n, and pins stay bounded', async () => {
-  const backend = {
-    name: 'test', model: 'configured-model',
-    async generate() { return { created: 0, images: [] }; },
-    async *stream() {
-      for (let i = 0; i < 50; i += 1) {
-        yield { type: 'completed', created: 0, image: { b64Json: 'iVBORw0KGgo=', revisedPrompt: null } };
-      }
-    },
-    async close() {},
-  };
-  const started = await startLocalApiProxy({
-    backend, imageGenerationClient: backend,
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const res = await fetch(`${started.url}${GEN}`, {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2, stream: true, response_format: 'url' }),
+    const res = await fetch(`${started.url}/v1/images/variations`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-image-2' }),
     });
-    const text = await res.text();
-    const urls = [...text.matchAll(/"url":"([^"]+)"/g)];
-    assert.equal(urls.length, 2, `the stream must stop at n: ${urls.length}`);
+    assert.equal(res.status, 404);
+    assert.equal(await res.text(), '', 'no body, as measured on the direct API');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
   } finally {
     await started.close();
   }
@@ -1339,7 +1052,7 @@ test('multipart works with an uppercase media-type essence', async () => {
   try {
     const boundary = 'testboundary123';
     const body = [
-      `--${boundary}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${boundary}`, 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       `--${boundary}`, 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
       `--${boundary}--`, '',
     ].join('\r\n');
@@ -1364,16 +1077,20 @@ test('multipart works with an uppercase media-type essence', async () => {
 
 // --- round 46 ---
 
-test('generations and variations ignore mask entirely, as the contract says', async () => {
-  // Round 45's mask validation leaked onto the operations whose row says
-  // "ignored" — a request the contract promises succeeds was 400.
-  const gen = await postImages(GEN, { model: 'image-2', prompt: 'a dot', mask: 42 });
-  assert.equal(gen.status, 200, 'a generation ignores mask, valid or not');
+test('generations: mask and images are unknown parameters, as on the direct API', async () => {
+  // Measured 2026-08-30: a generation body carrying either key is refused by
+  // name; the earlier contract said they were ignored.
+  for (const key of ['mask', 'images']) {
+    const { status, payload } = await postImages(GEN, { model: 'gpt-image-2', prompt: 'a dot', [key]: 42 });
+    assert.equal(status, 400);
+    assert.equal(payload.error.code, 'unknown_parameter');
+    assert.equal(payload.error.param, key);
+  }
 });
 
 test('edits: a malformed array member keeps its index even when the parser throws', async () => {
   const { status, payload } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit', images: [
+    model: 'gpt-image-2', prompt: 'edit', images: [
       { image_url: PNG_DATA_URL },
       { image_url: PNG_DATA_URL, file_id: 'also-this' },
     ],
@@ -1400,7 +1117,7 @@ test('a non-streaming response also caps at n images', async () => {
   try {
     const res = await fetch(`${started.url}${GEN}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'image-2', prompt: 'a dot', n: 2 }),
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot', n: 2 }),
     });
     const data = (await res.json()).data;
     assert.equal(data.length, 2, 'the response must not exceed the requested n');
@@ -1409,50 +1126,29 @@ test('a non-streaming response also caps at n images', async () => {
   }
 });
 
-// The operation matrices the panel kept asking for: the rules hold on edits and
-// variations, not only generations.
-const EDIT_BASE = { model: 'image-2', prompt: 'edit', images: [{ image_url: PNG_DATA_URL }] };
+// The operation matrices the panel kept asking for: the rules hold on edits,
+// not only generations.
+const EDIT_BASE = { model: 'gpt-image-2', prompt: 'edit', images: [{ image_url: PNG_DATA_URL }] };
 
 test('edits: nullable leaves treat null as omission there too', async () => {
   const { status, payload } = await postImages('/v1/images/edits', {
-    ...EDIT_BASE, n: null, output_compression: null, response_format: null, partial_images: null,
+    ...EDIT_BASE, n: null, output_compression: null, partial_images: null,
   });
   assert.equal(status, 200, JSON.stringify(payload));
 });
 
-test('edits: an absent model defaults there too', async () => {
-  const { status } = await postImages('/v1/images/edits', {
+test('edits: an absent model is missing there too', async () => {
+  const { status, payload } = await postImages('/v1/images/edits', {
     prompt: 'edit', images: [{ image_url: PNG_DATA_URL }],
   });
-  assert.notEqual(status, 404, 'no model means the default route, not a rejection');
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'missing_required_parameter');
+  assert.equal(payload.error.param, 'model');
 });
 
 test('edits: an empty-string enum is rejected there too', async () => {
   const { status } = await postImages('/v1/images/edits', { ...EDIT_BASE, quality: '' });
   assert.equal(status, 400);
-});
-
-test('variations: repeated image[] parts accumulate, and text members are URL references', async () => {
-  // A multipart member is either a file part (valid base64 input) or a text
-  // value — and ANY non-empty string is a valid URL-type reference by design
-  // (the backend owns fetch failures). A shape-malformed member is therefore
-  // unreachable through multipart; the indexed-400 rule is a JSON-only path,
-  // pinned on edits. This test pins what multipart DOES promise: repeated
-  // parts accumulate rather than overwrite.
-  const started = await startLocalApiProxy({
-    backend: imageBackend(), imageGenerationClient: imageBackend(),
-    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
-  });
-  try {
-    const form = new FormData();
-    form.set('model', 'dall-e-2');
-    form.append('image[]', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'a.png');
-    form.append('image[]', new Blob([Buffer.from('iVBORw0KGgo=', 'base64')], { type: 'image/png' }), 'b.png');
-    const res = await fetch(`${started.url}/v1/images/variations`, { method: 'POST', body: form });
-    assert.equal(res.status, 200, await res.text());
-  } finally {
-    await started.close();
-  }
 });
 
 test('edits: the misleading multipart parameter is JSON there too', async () => {
@@ -1501,7 +1197,7 @@ test('boundary bytes inside multipart data are data, not delimiters', async () =
   });
   try {
     const truncatable = await send([
-      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
       `--${B}`, 'Content-Disposition: form-data; name="output_format"', '', `jpeg--${B}junk`,
       `--${B}--`, '',
@@ -1510,7 +1206,7 @@ test('boundary bytes inside multipart data are data, not delimiters', async () =
       'the whole value, marker bytes included, must reach the enum check');
 
     const control = await send([
-      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', `a dot with --${B} inside`,
       `--${B}--`, '',
     ]);
@@ -1534,7 +1230,7 @@ test('a line-starting boundary PREFIX is data: only a terminated delimiter split
   try {
     const B = 'B';
     const body = [
-      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', `--${B}X\r\ndraw a cat`,
       `--${B}--`, '',
     ].join('\r\n');
@@ -1558,7 +1254,7 @@ test('a line-starting boundary PREFIX is data: only a terminated delimiter split
 test('a case-variant data-URL media type is still an image', async () => {
   const upper = PNG_DATA_URL.replace('data:image/png', 'data:IMAGE/PNG');
   const { status, payload } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'repair', image: upper,
+    model: 'gpt-image-2', prompt: 'repair', images: [{ image_url: upper }],
   });
   assert.equal(status, 200, JSON.stringify(payload));
 });
@@ -1573,7 +1269,8 @@ test('case-variant disposition parameter names still name the part', async () =>
     const B = 'AaB03x';
     const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
     const body = [
-      `--${B}`, 'Content-Disposition: form-data; NAME="model"', '', 'dall-e-2',
+      `--${B}`, 'Content-Disposition: form-data; NAME="model"', '', 'gpt-image-2',
+      `--${B}`, 'Content-Disposition: form-data; NAME="prompt"', '', 'a dot',
       `--${B}`, `Content-Disposition: form-data; NAME="image"; FILENAME="x.png"`, 'Content-Type: image/png', '', png,
       `--${B}--`, '',
     ].join('\r\n');
@@ -1581,7 +1278,7 @@ test('case-variant disposition parameter names still name the part', async () =>
       // latin1 Buffer, not a string write: the PNG magic's \x89 would become
       // two UTF-8 bytes and overrun the latin1-counted Content-Length.
       const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.from(
-        `POST /v1/images/variations HTTP/1.1\r\nHost: h\r\n`
+        `POST /v1/images/edits HTTP/1.1\r\nHost: h\r\n`
         + `Content-Type: multipart/form-data; boundary=${B}\r\n`
         + `Content-Length: ${Buffer.byteLength(body, 'latin1')}\r\nConnection: close\r\n\r\n${body}`,
         'latin1',
@@ -1614,8 +1311,10 @@ test('a close-delimiter PREFIX is data too: later parts survive it', async () =>
     // the status. (A dropped `model` part merely falls back to the default —
     // the first version of this test passed against the broken close check.)
     const body = [
-      `--${B}`, 'Content-Disposition: form-data; name="junk"', '', `before\r\n--${B}--X\r\nafter`,
-      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      // A known field (`user` is free text) carries the fake close: an unknown
+      // part name is itself a 400 now, which would mask what this test pins.
+      `--${B}`, 'Content-Disposition: form-data; name="user"', '', `before\r\n--${B}--X\r\nafter`,
+      `--${B}`, 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       `--${B}`, 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
       `--${B}--`, 'epilogue',
     ].join('\r\n');
@@ -1668,10 +1367,10 @@ test('a folded Content-Disposition header still names its part', async () => {
   // dropped for having no colon, taking the disposition's `name` with it.
   const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
   const status = await rawMultipart([
-    '--AaB03x', 'Content-Disposition: form-data;', ' name="model"', '', 'dall-e-2',
+    '--AaB03x', 'Content-Disposition: form-data;', ' name="model"', '', 'gpt-image-2', '--AaB03x', 'Content-Disposition: form-data; name=\"prompt\"', '', 'a dot',
     '--AaB03x', 'Content-Disposition: form-data;', '\tname="image"; filename="x.png"', 'Content-Type: image/png', '', png,
     '--AaB03x--', '',
-  ], 'boundary=AaB03x', '/v1/images/variations');
+  ], 'boundary=AaB03x', '/v1/images/edits');
   assert.match(status, /200/, status);
 });
 
@@ -1689,7 +1388,7 @@ test('boundary grammar is enforced: empty and trailing-space boundaries are 400'
 
 test('a quoted boundary parameter is accepted', async () => {
   const status = await rawMultipart([
-    '--AaB03x', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--AaB03x', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
     '--AaB03x', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--AaB03x--', '',
   ], 'boundary="AaB03x"');
@@ -1706,7 +1405,7 @@ test('a decoy boundary inside another quoted parameter is text', async () => {
   const target = new URL(started.url);
   try {
     const body = [
-      '--real', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--real', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       '--real', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
       '--real--', '',
     ].join('\r\n');
@@ -1729,7 +1428,7 @@ test('a decoy boundary inside another quoted parameter is text', async () => {
 
 test('a quoted boundary with a trailing suffix is malformed, not truncated', async () => {
   const status = await rawMultipart([
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
     '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--B--', '',
   ], 'boundary="B"junk');
@@ -1745,15 +1444,15 @@ test('an empty header block does not read the content as headers', async () => {
   const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
   const status = await rawMultipart([
     '--B', '', 'Content-Disposition: form-data; name="image"; filename="x.png"', 'Content-Type: image/png', '', png,
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2', '--B', 'Content-Disposition: form-data; name=\"prompt\"', '', 'a dot',
     '--B--', '',
-  ], 'boundary=B', '/v1/images/variations');
+  ], 'boundary=B', '/v1/images/edits');
   assert.match(status, /400/, `a headerless part names nothing — the image is missing: ${status}`);
 });
 
 test('an escaped quote inside another parameter does not derail the boundary walk', async () => {
   const status = await rawMultipart([
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
     '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--B--', '',
   ], 'note="x\\";boundary=decoy"; boundary=B', '/v1/images/generations');
@@ -1762,7 +1461,7 @@ test('an escaped quote inside another parameter does not derail the boundary wal
 
 test('a quoted-pair in the boundary value decodes', async () => {
   const status = await rawMultipart([
-    '--B?', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B?', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
     '--B?', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--B?--', '',
   ], 'boundary="B\\?"', '/v1/images/generations');
@@ -1779,7 +1478,7 @@ test('a non-OWS byte beside the boundary value is not trimmed away', async () =>
   const target = new URL(started.url);
   try {
     const body = [
-      '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
       '--B--', '',
     ].join('\r\n');
@@ -1805,10 +1504,10 @@ test('a non-OWS byte beside the boundary value is not trimmed away', async () =>
 test('a quoted-pair in a disposition parameter decodes', async () => {
   const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
   const status = await rawMultipart([
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2', '--B', 'Content-Disposition: form-data; name=\"prompt\"', '', 'a dot',
     '--B', 'Content-Disposition: form-data; name="im\\age"; filename="x.png"', 'Content-Type: image/png', '', png,
     '--B--', '',
-  ], 'boundary=B', '/v1/images/variations');
+  ], 'boundary=B', '/v1/images/edits');
   assert.match(status, /200/, `name="im\\age" names image: ${status}`);
 });
 
@@ -1820,7 +1519,7 @@ test('a non-OWS byte before the boundary parameter name is not trimmed away', as
   const target = new URL(started.url);
   try {
     const body = [
-      '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
       '--B--', '',
     ].join('\r\n');
@@ -1846,20 +1545,20 @@ test('a non-OWS byte before the boundary parameter name is not trimmed away', as
 test('a semicolon inside a quoted filename cannot overwrite the field name', async () => {
   const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
   const status = await rawMultipart([
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2', '--B', 'Content-Disposition: form-data; name=\"prompt\"', '', 'a dot',
     '--B', 'Content-Disposition: form-data; name="image"; filename="x; name=bogus.png"', 'Content-Type: image/png', '', png,
     '--B--', '',
-  ], 'boundary=B', '/v1/images/variations');
+  ], 'boundary=B', '/v1/images/edits');
   assert.match(status, /200/, `the quoted semicolon is filename data: ${status}`);
 });
 
 test('a quoted filename cannot fabricate a name the part never had', async () => {
   const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
   const status = await rawMultipart([
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2', '--B', 'Content-Disposition: form-data; name=\"prompt\"', '', 'a dot',
     '--B', 'Content-Disposition: form-data; filename="x; name=image; z"', 'Content-Type: image/png', '', png,
     '--B--', '',
-  ], 'boundary=B', '/v1/images/variations');
+  ], 'boundary=B', '/v1/images/edits');
   assert.match(status, /400/, `an unnamed part names nothing — the image is missing: ${status}`);
 });
 
@@ -1872,7 +1571,7 @@ test('a non-OWS byte before a disposition parameter name is not trimmed away', a
   try {
     const png = Buffer.from('iVBORw0KGgo=', 'base64').toString('latin1');
     const head = [
-      '--B', 'Content-Disposition: form-data; name="model"', '', 'dall-e-2',
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2', '--B', 'Content-Disposition: form-data; name=\"prompt\"', '', 'a dot',
       '--B',
     ].join('\r\n');
     const tail = [
@@ -1890,7 +1589,7 @@ test('a non-OWS byte before a disposition parameter name is not trimmed away', a
     const raw = await new Promise((resolve, reject) => {
       const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
         Buffer.from(
-          'POST /v1/images/variations HTTP/1.1\r\nHost: h\r\n'
+          'POST /v1/images/edits HTTP/1.1\r\nHost: h\r\n'
           + 'Content-Type: multipart/form-data; boundary=B\r\n'
           + `Content-Length: ${body.byteLength}\r\nConnection: close\r\n\r\n`, 'latin1'),
         body,
@@ -1918,7 +1617,7 @@ test('a non-OWS byte in a part-header name or value is not trimmed away', async 
     const body = Buffer.concat([
       Buffer.from('--B\r\n', 'latin1'),
       dispositionBytes,
-      Buffer.from('\r\n\r\na dot\r\n--B\r\nContent-Disposition: form-data; name="model"\r\n\r\nimage-2\r\n--B--\r\n', 'latin1'),
+      Buffer.from('\r\n\r\na dot\r\n--B\r\nContent-Disposition: form-data; name="model"\r\n\r\ngpt-image-2\r\n--B--\r\n', 'latin1'),
     ]);
     return await new Promise((resolve, reject) => {
       const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
@@ -1964,7 +1663,7 @@ test('a malformed disposition type does not name a part', async () => {
       Buffer.from([0xa0]),
       Buffer.from(
         'form-data; name="prompt"\r\n\r\na dot\r\n'
-        + '--B\r\nContent-Disposition: form-data; name="model"\r\n\r\nimage-2\r\n--B--\r\n', 'latin1'),
+        + '--B\r\nContent-Disposition: form-data; name="model"\r\n\r\ngpt-image-2\r\n--B--\r\n', 'latin1'),
     ]);
     const raw = await new Promise((resolve, reject) => {
       const conn = net.connect(Number(target.port), target.hostname, () => conn.write(Buffer.concat([
@@ -1987,8 +1686,8 @@ test('a malformed disposition type does not name a part', async () => {
 
 test('a non-OWS byte inside a data-URL media type is not repaired away', async () => {
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit',
-    image: `data:\u00a0image/png;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+    model: 'gpt-image-2', prompt: 'edit',
+    images: [{ image_url: `data:\u00a0image/png;base64,${Buffer.from('89504e47', 'hex').toString('base64')}` }],
   });
   assert.equal(status, 400, 'the malformed token must not become image/png');
 });
@@ -1997,7 +1696,7 @@ test('delimiter-looking bytes in the epilogue are ignored', async () => {
   // After a valid close delimiter the scanner must STOP: an epilogue carrying
   // `\r\n--B\r\n...` shaped bytes is not more parts.
   const status = await rawMultipart([
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
     '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--B--', '--B', 'Content-Disposition: form-data; name="n"', '', '11', '--B--', '',
   ], 'boundary=B', '/v1/images/generations');
@@ -2008,8 +1707,8 @@ test('delimiter-looking bytes in the epilogue are ignored', async () => {
 
 test('a trailing non-OWS byte on a data-URL media type keeps it malformed', async () => {
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit',
-    image: `data:image/png\u00a0;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+    model: 'gpt-image-2', prompt: 'edit',
+    images: [{ image_url: `data:image/png\u00a0;base64,${Buffer.from('89504e47', 'hex').toString('base64')}` }],
   });
   assert.equal(status, 400, 'image/png<0xA0> is not the token image/png');
 });
@@ -2018,16 +1717,16 @@ test('a trailing non-OWS byte on a data-URL media type keeps it malformed', asyn
 
 test('an RFC 2045 subtype with braces is a valid image reference', async () => {
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit',
-    image: `data:image/x-{foo};base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+    model: 'gpt-image-2', prompt: 'edit',
+    images: [{ image_url: `data:image/x-{foo};base64,${Buffer.from('89504e47', 'hex').toString('base64')}` }],
   });
   assert.equal(status, 200, '{ and } are not tspecials — x-{foo} is a token');
 });
 
 test('a whitespace-only data-URL media type is junk, not image/png', async () => {
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit',
-    image: `data: \t;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+    model: 'gpt-image-2', prompt: 'edit',
+    images: [{ image_url: `data: \t;base64,${Buffer.from('89504e47', 'hex').toString('base64')}` }],
   });
   assert.equal(status, 400, 'OWS-only content must not be repaired into a default');
 });
@@ -2038,24 +1737,24 @@ test('Unicode case-folding cannot smuggle a non-ASCII subtype', async () => {
   // U+212A KELVIN SIGN folds to ASCII k; RFC 2045 tokens are US-ASCII, so the
   // validation must see the ORIGINAL character and reject it.
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit',
-    image: `data:image/\u212a;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+    model: 'gpt-image-2', prompt: 'edit',
+    images: [{ image_url: `data:image/\u212a;base64,${Buffer.from('89504e47', 'hex').toString('base64')}` }],
   });
   assert.equal(status, 400, 'KELVIN SIGN is not an ASCII token character');
 });
 
 test('an ASCII tspecial in the subtype is rejected', async () => {
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit',
-    image: `data:image/png?x;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+    model: 'gpt-image-2', prompt: 'edit',
+    images: [{ image_url: `data:image/png?x;base64,${Buffer.from('89504e47', 'hex').toString('base64')}` }],
   });
   assert.equal(status, 400, '? is a tspecial and ends no token');
 });
 
 test('an uppercase ASCII subtype still folds and passes', async () => {
   const { status } = await postImages('/v1/images/edits', {
-    model: 'image-2', prompt: 'edit',
-    image: `data:IMAGE/PNG;base64,${Buffer.from('89504e47', 'hex').toString('base64')}`,
+    model: 'gpt-image-2', prompt: 'edit',
+    images: [{ image_url: `data:IMAGE/PNG;base64,${Buffer.from('89504e47', 'hex').toString('base64')}` }],
   });
   assert.equal(status, 200, 'ASCII case-insensitivity is preserved');
 });
@@ -2065,7 +1764,7 @@ test('an uppercase ASCII subtype still folds and passes', async () => {
 test('duplicate part headers resolve last-wins, as documented', async () => {
   const status = await rawMultipart([
     '--B', 'Content-Disposition: form-data; name="decoy"', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
     '--B--', '',
   ], 'boundary=B', '/v1/images/generations');
   assert.match(status, /200/, `the LAST disposition names the part: ${status}`);
@@ -2080,7 +1779,7 @@ test('an unterminated final part is dropped, not guessed at', async () => {
   try {
     // The prompt lives ONLY in a final part that never closes.
     const body = [
-      '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+      '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
       '--B', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     ].join('\r\n');
     const raw = await new Promise((resolve, reject) => {
@@ -2105,7 +1804,7 @@ test('OWS between a boundary and its CRLF is permitted', async () => {
   // via the default model — the first version of this pin survived its own
   // mutation.)
   const status = await rawMultipart([
-    '--B', 'Content-Disposition: form-data; name="model"', '', 'image-2',
+    '--B', 'Content-Disposition: form-data; name="model"', '', 'gpt-image-2',
     '--B \t', 'Content-Disposition: form-data; name="prompt"', '', 'a dot',
     '--B--', '',
   ], 'boundary=B', '/v1/images/generations');

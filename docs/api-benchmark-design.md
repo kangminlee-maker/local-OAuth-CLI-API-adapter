@@ -25,7 +25,7 @@ Input/output interface contract의 단일 문서는 `docs/api-interface-contract
 
 리터럴 금지만으로는 이 경계가 지켜지지 않았다(2026-08-28 실측). 런타임의 `developerInstructions()`는 46줄까지 자랐고, 그 46줄 전부가 벤치 커밋 4개에서 들어왔으며 네 커밋 모두 같은 커밋에서 quality suite 문항 정의나 judge 루브릭을 함께 고쳤다 — contract 유래도 리뷰 유래도 0건이다. 문구는 리터럴이 아니라 **문항 내용의 패러프레이즈**였기 때문에 verifier를 그대로 통과했다: 예를 들어 `korean_incident_report`의 원인 후보("Codex turnWaitMs outlier, wrapper context 증가, usage 후착 대기 혼동")가 "wrapper context growth, usage/post-processing waits, transport timing, or provider turn waits"로 런타임에 들어와 있었다. 결과는 자기잠식이었다 — 그중 한 줄이 고정 길이 리포트를 항목당 한 문장으로 쓰라고 지시했고, 같은 suite가 그 답변을 (지시를 받지 않은) direct reference보다 얇다고 감점했다. **런타임을 그것을 재는 문항에 맞추면 그 문항은 더 이상 런타임을 재지 못한다.** 지금 그 블록은 8줄의 일반 요청 충실도 규칙만 남고, 문항형 어휘가 되돌아오면 `test/backend-contract.test.mjs`가 실패한다 — 검사 대상은 파일이 아니라 그 함수가 **반환하는 문자열**이다(파일 스캔은 이 규칙을 설명하는 주석에서 오탐이 난다).
 
-현재 Codex Images proxy에서 `image-2`는 실험적 우회가 아니라 정식 `image2_via_gpt55` 경로이다. `/v1/images/generations`, `/v1/images/edits`, `/v1/images/variations` 요청은 OpenAI Images API surface로 입력을 normalize한 뒤 Codex OAuth `gpt-5.5` backend Responses `image_generation` tool로 변환한다. Proxy runtime은 direct provider API fallback을 금지하며, benchmark 중 proxy target이 `api.openai.com` 또는 `api.anthropic.com`을 호출하면 해당 row는 0점 실패로 처리한다.
+현재 Codex Images proxy의 이미지 라우트는 정식 `image2_via_gpt55` 경로이며, 요청 `model`은 direct API의 라이브 이미지 모델명(`gpt-image-2` 등, 2026-08-29부터 — 발명된 이름 `image-2`는 direct처럼 거절)이다. `/v1/images/generations`, `/v1/images/edits` 요청은(`/variations`는 direct와 함께 404) OpenAI Images API surface로 입력을 normalize한 뒤 Codex OAuth `gpt-5.5` backend Responses `image_generation` tool로 변환한다. Proxy runtime은 direct provider API fallback을 금지하며, benchmark 중 proxy target이 `api.openai.com` 또는 `api.anthropic.com`을 호출하면 해당 row는 0점 실패로 처리한다.
 
 2026-06-04 기준으로 `image-2` route의 품질 비교 authority는 direct OpenAI Images API의 invalid-model 응답이 아니라 direct OpenAI `gpt-5.5` Responses `image_generation` 결과이다. Direct Images API의 `gpt-image-1.5` positive/negative row는 별도 baseline으로 남긴다. `input_fidelity`는 image-2 API field capability에서 비활성화된 항목으로 보고, `invalid_input_fidelity_model`은 proxy 품질 실패가 아니라 disabled-field contract 확인 row로 다룬다. Proxy-local variation JSON 오류는 proxy가 지원하는 `/v1/images/variations` 표면의 400 `invalid_request_error` contract로 별도 검증한다.
 
@@ -104,8 +104,8 @@ exit 0은 "측정했고 문제가 없었다"만을 의미한다. 다음 중 하�
 Direct GPT image model positive rows do not send `response_format`; GPT image models return `b64_json` by default and the parameter is only valid for DALL-E-style response formatting. Proxy GPT image rows reject `response_format` with the same `unknown_parameter` error surface.
 | Images reference-guided generation | style reference, product identity reference, product + palette multi-reference | deterministic reference PNG fixtures, direct Responses `input_image`, proxy Images edit JSON `images` | judge receives reference image(s) and candidate image together; style fidelity, product identity, palette transfer, and unwanted copying are scored |
 | Images edit | proxy/direct `image2_via_gpt55`, direct `gpt-image-1.5` edit positive, composition-preservation edit | mask PNG, invalid mask size | JSON `images` and multipart `image[]` validation covered; image-2 input fidelity disabled row is contract, not quality failure |
-| Images variation | proxy `image2_via_gpt55`, JSON variation negative | non-square/oversize negative | variation is multipart-only; direct Images variation remains DALL-E-2-only baseline |
-| Error parity | reasoning effort unsupported probe, missing prompt, invalid output compression, input fidelity disabled, JSON variation body | invalid enum, conflicting image fields, oversized body, bad multipart boundary | status, `error.type`, optional `param`, optional `code`, message presence match provider style |
+| Images variation | *(삭제, 2026-08-30)* — direct API가 `/v1/images/variations`를 `dall-e-2`와 함께 없앴고(빈 404) 프록시도 같다. `error_variation_json` 케이스는 양쪽 404를 고정하는 용도로만 남는다 | — | — |
+| Error parity | reasoning effort unsupported probe, missing prompt, invalid output compression, input fidelity disabled, variations 404(양쪽) | invalid enum, conflicting image fields, oversized body, bad multipart boundary | status, `error.type`, optional `param`, optional `code`, message presence match provider style |
 
 ## 품질 벤치 설계
 
@@ -160,7 +160,7 @@ Gate:
 - edit preservation score: minimum 85
 - text rendering score: minimum 80, text-heavy cases는 별도 tracked risk
 - hard fail: 빈/손상 이미지, 잘못된 content-type, prompt 핵심 객체 누락, URL fetch 실패
-- disabled-field contract: direct `gpt-5.5` image_generation이 거절하는 `background: transparent`는 proxy `image-2`에서도 400 `image_generation_user_error`로 맞춘다.
+- disabled-field contract: Codex 백엔드의 이미지 모델(`gpt-image-2-codex`)이 거절하는 `background: transparent`는 proxy에서 400 `image_generation_user_error`로 전달된다. 2026-08-30 실측으로 direct `gpt-5.6-terra`의 Responses 이미지 도구는 transparent를 **수용해 생성**하므로 이 행은 패리티 행이 아니라 백엔드 능력 격차를 고정하는 proxy 전용 행이다.
 - prompt 또는 translator 개선은 특정 benchmark 문항에만 맞춘 문구가 아니라 flat/style, geometry, edit preservation, output field translation처럼 실제 요청 전반에 적용되는 일반 규칙이어야 한다.
 - flat/vector reference-style PNG 후처리는 benchmark fixture 전용 보정이 아니라, reference-style flat graphic 요청 전반에서 gradient/background shading을 줄이는 deterministic edge-preserving 규칙이어야 한다. 작은 accent 색상과 outline/antialiasing이 손상되면 품질 실패로 본다.
 - reference-guided generation 품질 평가는 출력 이미지만 보지 않는다. judge 입력에 reference image(s)를 먼저 넣고 candidate output을 뒤에 넣어, 참조 fidelity와 요구사항 충족을 같이 평가한다.
@@ -189,6 +189,20 @@ Gate:
 - multi-image quality aggregation: 다중 이미지 케이스는 첫 이미지만 보지 않고 모든 이미지의 `imageQuality`를 채점한다. row의 `imageQuality.score`는 이미지별 점수의 최저점으로 기록해, 한 장만 실패한 경우도 게이트가 감지하도록 한다.
 - paired diagnostics keep `sampleFailures` with provider error details such as `insufficient_quota`, so a quota/rate-limit failure can be separated from proxy latency regression
 - image generation/edit은 provider 자체 변동성이 크므로 p50/p95와 outlier reason을 함께 본다
+
+## 교환 기록 (적합성 스위트 이행 1단계)
+
+모든 실행이 자신이 만든 HTTP 교환을 `artifacts/api-captures/<runId>/`에 남긴다. 교환마다 보낸 요청
+본문 원본, 상태줄, 응답 헤더, 응답 바이트, 스트림이면 **파싱 이전의 와이어 텍스트**를 저장하며, 인증
+헤더는 값 대신 `present and redacted`로 기록한다. 본문은 64KB를 넘으면 gzip한다 — 압축은 무손실이고
+잘라내기는 아니기 때문이다. 실패한 시도는 재시도가 덮어쓰지 않는다(일련번호가 정체성이다).
+
+단언은 이 기록을 읽지 않는다. 이 단계의 목적은 판정을 바꾸는 것이 아니라 **증거를 잃지 않는 것**이다:
+`bench-results/*.json`은 판정과 텍스트 표본만 남기므로, 이 프로젝트는 vendor 요청 필드 기본값을 한 번도
+관찰하지 못했다. 첫 실행에서 바로 값을 했다 — `/v1/chat/completions` 스트림의 종결자가
+`data: [DONE]\n\n`으로 와이어에 기록됐고, 이는 적합성 매트릭스에서 가장 위험한 미검증 셀이었다.
+
+끄려면 `--no-capture true`. 위치를 바꾸려면 `--capture-dir <path>`.
 
 ## 실행 명령
 

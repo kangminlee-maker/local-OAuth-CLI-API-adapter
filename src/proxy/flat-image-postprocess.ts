@@ -1,5 +1,4 @@
 import { deflateSync, inflateSync } from 'node:zlib';
-import { asksForFlatGraphicPrompt } from './image2-via-gpt55.js';
 import type {
   OpenAiGeneratedImage,
   OpenAiImageGenerationRequest,
@@ -44,6 +43,19 @@ function shouldPostprocessFlatGraphic(request: OpenAiImageGenerationRequest): bo
   return isFlatReferenceStyleRequest(request)
     && (request.outputFormat === undefined || request.outputFormat === 'png')
     && asksForFlatGraphicPrompt(request.prompt);
+}
+
+// This gate reads the caller's prompt, and it is the last thing in the image
+// path that does. It used to be shared with a block of prompt prose that fired
+// on the same words; that prose is gone, and the predicate now exists only to
+// decide whether the deterministic flattening below runs on the returned PNG.
+function asksForFlatGraphicPrompt(prompt: string): boolean {
+  const lower = prompt.toLowerCase();
+  return /\bflat\b/.test(lower)
+    || /\bsolid\b/.test(lower)
+    || /\bvector\b/.test(lower)
+    || /\bminimal(?:ist|)\b/.test(lower)
+    || /\bsimple (?:icon|shape|graphic|illustration)\b/.test(lower);
 }
 
 function isFlatReferenceStyleRequest(request: OpenAiImageGenerationRequest): boolean {

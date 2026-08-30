@@ -17,18 +17,20 @@ import { ProxyRequestError } from './types.js';
 interface NormalizedContent {
   readonly text: string;
   readonly images: readonly NormalizedImage[];
+  /** True when this text is a tool turn this normalizer flattened. */
+  readonly toolHistory?: boolean;
 }
 
 export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const input = objectBody(body);
   const messages = readOpenAiMessages(input.messages);
   const tools = readOpenAiTools(input.tools);
+  rejectUnsupportedOpenAiSampling(input, 'openai-chat');
   return {
     shape: 'openai-chat',
     model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_tokens ?? input.max_completion_tokens),
-    temperature: readOptionalNumber(input.temperature),
     reasoningEffort: readOpenAiReasoningEffort(input.reasoning_effort ?? asRecord(input.reasoning)?.effort),
     verbosity: readOpenAiVerbosity(input.verbosity ?? asRecord(input.text)?.verbosity),
     stream: input.stream === true,
@@ -53,12 +55,12 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const text = asRecord(input.text);
   const format = asRecord(text?.format);
   const reasoning = asRecord(input.reasoning);
+  rejectUnsupportedOpenAiSampling(input, 'openai-responses');
   return {
     shape: 'openai-responses',
     model: readRequiredModel(input.model, 'openai'),
     messages,
     maxTokens: readOptionalNumber(input.max_output_tokens),
-    temperature: readOptionalNumber(input.temperature),
     reasoningEffort: readOpenAiReasoningEffort(reasoning?.effort),
     verbosity: readOpenAiVerbosity(text?.verbosity),
     stream: input.stream === true,
@@ -71,6 +73,55 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     toolChoice: readOpenAiToolChoice(input.tool_choice),
     raw: body,
   };
+}
+
+/**
+ * No backend behind the OpenAI surfaces applies `temperature` or `top_p`: the
+ * Codex backend refuses both in the request body outright, and the CLIs have
+ * no such knob. The proxy used to accept any value, forward none, and echo the
+ * caller's `temperature` back from `/v1/responses` as if it had run — an
+ * option accepted and not delivered. The direct API on the same model family
+ * (measured on `gpt-5.6-terra`, 2026-08-29) rejects everything but the
+ * default, with envelopes that differ by surface; those are mirrored here
+ * verbatim. Null is omission, as on the direct API.
+ */
+function rejectUnsupportedOpenAiSampling(
+  input: Record<string, unknown>,
+  shape: 'openai-chat' | 'openai-responses',
+): void {
+  const temperature = input.temperature;
+  if (temperature !== undefined && temperature !== null && temperature !== 1) {
+    if (shape === 'openai-chat') {
+      throw new ProxyRequestError(
+        `Unsupported value: 'temperature' does not support ${JSON.stringify(temperature)} with this model. Only the default (1) value is supported.`,
+        400,
+        'openai',
+        'invalid_request_error',
+        'temperature',
+        'unsupported_value',
+      );
+    }
+    throw new ProxyRequestError(
+      "Unsupported parameter: 'temperature' is not supported with this model.",
+      400,
+      'openai',
+      'invalid_request_error',
+      'temperature',
+    );
+  }
+  const topP = input.top_p;
+  // Chat accepts the default `top_p: 1`; Responses rejects the parameter even
+  // at its default. Both measured, neither guessed.
+  if (topP !== undefined && topP !== null && (shape === 'openai-responses' || topP !== 1)) {
+    throw new ProxyRequestError(
+      "Unsupported parameter: 'top_p' is not supported with this model.",
+      400,
+      'openai',
+      'invalid_request_error',
+      'top_p',
+      shape === 'openai-chat' ? 'unsupported_parameter' : null,
+    );
+  }
 }
 
 function readOpenAiReasoningEffort(value: unknown): NormalizedReasoningEffort | undefined {
@@ -107,6 +158,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   }
   const outputConfig = asRecord(input.output_config);
   const maxTokens = readRequiredMaxTokens(input.max_tokens);
+  rejectInvalidAnthropicSampling(input);
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
   const toolChoice = readAnthropicToolChoice(input.tool_choice);
@@ -124,15 +176,22 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
       'anthropic',
     );
   }
+  // Every known field is validated before an unknown key is reported — the
+  // order the direct API reports in (measured with `max_tokens` and
+  // `temperature` faults beside an unknown key).
+  const model = readRequiredModel(input.model, 'anthropic');
+  const effort = readAnthropicEffort(outputConfig?.effort);
+  const taskBudgetTokens = readAnthropicTaskBudget(outputConfig?.task_budget);
+  const thinking = readAnthropicThinking(input.thinking, maxTokens);
+  rejectUnknownAnthropicKeys(input);
   return {
     shape: 'anthropic-messages',
-    model: readRequiredModel(input.model, 'anthropic'),
+    model,
     messages,
     maxTokens,
-    temperature: readOptionalNumber(input.temperature),
-    effort: readAnthropicEffort(outputConfig?.effort),
-    taskBudgetTokens: readAnthropicTaskBudget(outputConfig?.task_budget),
-    thinking: readAnthropicThinking(input.thinking, maxTokens),
+    effort,
+    taskBudgetTokens,
+    thinking,
     stream: input.stream === true,
     streamOptions: readStreamOptions(undefined),
     jsonMode: outputFormat !== undefined,
@@ -141,6 +200,70 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
     toolChoice,
     raw: body,
   };
+}
+
+// The top-level keys the direct Messages API accepts, measured 2026-08-30 by
+// sending each with a wrong type: a known key answers about its type, an
+// unknown one "Extra inputs are not permitted". Keys the SDK types list but
+// the API refused without a beta header (`user_profile_id`, `mcp_servers`,
+// `context_management`, `betas`) are unknown here too. Several known keys are
+// accepted by this proxy and not applied (`metadata`, `service_tier`,
+// `stop_sequences`, `container`, `inference_geo`, `cache_control`); refusing
+// them would put this surface behind the direct one.
+const ANTHROPIC_MESSAGES_KEYS: ReadonlySet<string> = new Set([
+  'model', 'messages', 'max_tokens', 'cache_control', 'container', 'inference_geo',
+  'metadata', 'output_config', 'service_tier', 'stop_sequences', 'stream', 'system',
+  'temperature', 'thinking', 'tool_choice', 'tools', 'top_k', 'top_p',
+]);
+const ANTHROPIC_MESSAGE_ITEM_KEYS: ReadonlySet<string> = new Set(['role', 'content']);
+
+// Strict schema, as the direct API's is: an unknown key is refused by name,
+// at the top level and on a message item (`messages.0.bogus`), a present null
+// included. Reported after every field's own validation, which is the order
+// the direct API reports in (a body with a bad `temperature` and an unknown
+// key is answered about `temperature`).
+function rejectUnknownAnthropicKeys(input: Record<string, unknown>): void {
+  for (const key of Object.keys(input)) {
+    if (!ANTHROPIC_MESSAGES_KEYS.has(key)) {
+      throw new ProxyRequestError(`${key}: Extra inputs are not permitted`, 400, 'anthropic');
+    }
+  }
+  if (Array.isArray(input.messages)) {
+    input.messages.forEach((item, index) => {
+      const record = asRecord(item);
+      if (!record) return;
+      for (const key of Object.keys(record)) {
+        if (!ANTHROPIC_MESSAGE_ITEM_KEYS.has(key)) {
+          throw new ProxyRequestError(`messages.${index}.${key}: Extra inputs are not permitted`, 400, 'anthropic');
+        }
+      }
+    });
+  }
+}
+
+/**
+ * `temperature`, `top_p` and `top_k` are validated exactly as the direct
+ * Messages API validates them (measured 2026-08-30) and then NOT applied: the
+ * Claude CLI has no sampling control, and the response carries no such field
+ * to echo them as applied. Refusing a valid value would put this surface
+ * behind the direct one, which accepts it — the contract says the values are
+ * accepted and inert. Note null is not omission here, unlike the OpenAI
+ * surfaces: the direct API answers "Input should be a valid number".
+ */
+function rejectInvalidAnthropicSampling(input: Record<string, unknown>): void {
+  for (const field of ['temperature', 'top_p'] as const) {
+    const value = input[field];
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new ProxyRequestError(`${field}: Input should be a valid number`, 400, 'anthropic');
+    }
+    if (value < 0 || value > 1) {
+      throw new ProxyRequestError(`${field}: range: 0..1`, 400, 'anthropic');
+    }
+  }
+  if (input.top_k !== undefined && !Number.isInteger(input.top_k)) {
+    throw new ProxyRequestError('top_k: Input should be a valid integer', 400, 'anthropic');
+  }
 }
 
 // Anthropic structured outputs: `output_config.format = {type:'json_schema', schema}`
@@ -313,6 +436,7 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
       role,
       content: content.text,
       images: content.images,
+      ...(content.toolHistory ? { toolHistory: true } : {}),
     };
   });
 }
@@ -405,6 +529,7 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
       role: readResponsesRole(msg, index),
       content: content.text,
       images: content.images,
+      ...(content.toolHistory ? { toolHistory: true } : {}),
     };
   });
 }
@@ -493,6 +618,7 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
       role,
       content: flattened.text,
       images: flattened.images,
+      ...(flattened.toolHistory ? { toolHistory: true } : {}),
     };
   });
 }
@@ -516,11 +642,13 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
     return {
       text: [`[tool result]`, `tool_call_id: ${toolCallId}`, content.text].join('\n'),
       images: content.images,
+      toolHistory: true,
     };
   }
   return {
     text: [content.text, toolCalls].filter(Boolean).join('\n\n'),
     images: content.images,
+    ...(toolCalls ? { toolHistory: true } : {}),
   };
 }
 
@@ -534,6 +662,7 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
         output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? '')),
       ].join('\n'),
       images: output.images,
+      toolHistory: true,
     };
   }
   if (msg.type === 'function_call') {
@@ -545,6 +674,7 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
         `arguments: ${typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {})}`,
       ].join('\n'),
       images: [],
+      toolHistory: true,
     };
   }
   return flattenOpenAiContent(msg.content ?? msg);
@@ -582,7 +712,15 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
     }
     return '';
   }).filter(Boolean).join('\n\n');
-  return { text, images };
+  // Same rule as the OpenAI shapes: the flag is set where THIS function wrote a
+  // marker, so a caller who types the same characters is never mistaken for a
+  // tool turn. Checking the blocks rather than the rendered text keeps the two
+  // from drifting apart.
+  const wroteToolHistory = value.some((block) => {
+    const record = asRecord(block);
+    return record?.type === 'tool_use' || record?.type === 'tool_result';
+  });
+  return { text, images, ...(wroteToolHistory ? { toolHistory: true } : {}) };
 }
 
 function flattenOpenAiContent(value: unknown): NormalizedContent {

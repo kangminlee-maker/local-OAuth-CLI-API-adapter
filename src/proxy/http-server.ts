@@ -25,7 +25,7 @@ import type {
 } from './types.js';
 import { honorRequestModel } from '../settings.js';
 import {
-  GeneratedImageStoreLike, BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
+  BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { missingToolCallArgumentDelta } from './tool-call-stream.js';
@@ -81,12 +81,8 @@ interface ParsedImageRequestBody {
 export async function startLocalApiProxy(
   options: ProxyServerOptions,
 ): Promise<StartedProxyServer> {
-  // Injectable like the backends: the store's budgets are real behaviour
-  // (eviction, pinning) that HTTP-level tests cannot exercise against the
-  // production 128 MiB constant.
-  const generatedImages = options.generatedImageStore ?? new GeneratedImageStore();
   const server = createServer((req, res) => {
-    void handleRequest(req, res, options, generatedImages);
+    void handleRequest(req, res, options);
   });
   // Node routes CONNECT to this event and, with no listener, destroys the
   // socket — the one method that got no HTTP answer at all. It is a tunnel
@@ -129,7 +125,6 @@ export async function startLocalApiProxy(
         closeImageGenerationClient(options),
         options.chatSessionManager?.closeAll() ?? Promise.resolve(),
       ]);
-      generatedImages.clear();
     },
   };
 }
@@ -149,14 +144,20 @@ const POST_ENDPOINTS = new Set([
   '/v1/messages',
   '/v1/images/generations',
   '/v1/images/edits',
-  '/v1/images/variations',
+  // `/v1/images/variations` is gone from the direct API (404, measured
+  // 2026-08-29, with the dall-e-2 model it served), so it is unknown here too.
 ]);
+
+class UnknownEndpointError extends ProxyRequestError {
+  constructor(path: string) {
+    super(`Unknown endpoint: ${path}`, 404);
+  }
+}
 
 async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStoreLike,
 ): Promise<void> {
   const { backend, requestTimeoutMs } = options;
   setCorsHeaders(res);
@@ -190,21 +191,13 @@ async function handleRequest(
       await handleLocalCliChatRequest(req, res, options, path);
       return;
     }
-    // The generated route is exactly one nonempty, slash-free id segment. A
-    // doubled slash or a deeper path is a DIFFERENT path, which the dispatch
-    // row promises is a 404 whatever the method — prefix matching was
-    // classifying it as served and answering 405.
-    const generatedId = path.startsWith('/v1/images/generated/')
-      ? path.slice('/v1/images/generated/'.length)
-      : null;
-    const isGetRoute = path === '/v1/models'
-      || (generatedId !== null && generatedId !== '' && !generatedId.includes('/'));
+    const isGetRoute = path === '/v1/models';
     // Path first, method second: `GET /v1/nope` is an unknown endpoint, not an
     // unsupported method. 405 is reserved for a path this proxy does serve —
-    // including the GET routes, so `POST /v1/models` is a method problem, not a
+    // including the GET route, so `POST /v1/models` is a method problem, not a
     // missing endpoint.
     if (!isGetRoute && !POST_ENDPOINTS.has(path)) {
-      throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
+      throw new UnknownEndpointError(path);
     }
     if (req.method !== (isGetRoute ? 'GET' : 'POST')) {
       throw new ProxyRequestError('Unsupported method.', 405);
@@ -213,27 +206,17 @@ async function handleRequest(
       writeJson(res, 200, await openAiModelsResponse(backend));
       return;
     }
-    if (path.startsWith('/v1/images/generated/')) {
-      writeGeneratedImage(res, generatedImages, path);
-      return;
-    }
 
     if (path === '/v1/images/generations') {
       const { body, isMultipart } = await readImageRequestBody(req);
       const normalized = normalizeOpenAiImageRequest(body, 'generation', isMultipart);
-      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
+      await handleOpenAiImageRequest(res, options, normalized);
       return;
     }
     if (path === '/v1/images/edits') {
       const { body, isMultipart } = await readImageRequestBody(req);
       const normalized = normalizeOpenAiImageRequest(body, 'edit', isMultipart);
-      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
-      return;
-    }
-    if (path === '/v1/images/variations') {
-      const { body, isMultipart } = await readImageRequestBody(req);
-      const normalized = normalizeOpenAiImageRequest(body, 'variation', isMultipart);
-      await handleOpenAiImageRequest(req, res, options, generatedImages, normalized);
+      await handleOpenAiImageRequest(res, options, normalized);
       return;
     }
     const body = await readJsonBody(req);
@@ -286,7 +269,7 @@ async function handleRequest(
       return;
     }
 
-    throw new ProxyRequestError(`Unknown endpoint: ${path}`, 404);
+    throw new UnknownEndpointError(path);
   } catch (err) {
     writeError(res, err, errorShape);
   }
@@ -466,19 +449,15 @@ async function handleLocalCliChatRequest(
 }
 
 async function handleOpenAiImageRequest(
-  req: IncomingMessage,
   res: ServerResponse,
   options: ProxyServerOptions,
-  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
   const client = options.imageGenerationClient ?? unsupportedLocalOAuthImageGenerationClient();
   if (request.stream) {
     await writeOpenAiImageStream(
-      req,
       res,
       runImageGenerationStreamWithTimeout(client, request, options.requestTimeoutMs, res),
-      generatedImages,
       request,
     );
     return;
@@ -490,7 +469,7 @@ async function handleOpenAiImageRequest(
   
     res,
   );
-  writeJson(res, 200, openAiImagesGenerationResponse(req, generatedImages, result, request));
+  writeJson(res, 200, openAiImagesGenerationResponse(result, request));
 }
 
 function normalizeOpenAiImageRequest(
@@ -499,78 +478,57 @@ function normalizeOpenAiImageRequest(
   isMultipart: boolean,
 ): OpenAiImageGenerationRequest {
   const input = asRecordPayload(body);
-  // "Explicit" means a real value: null is omission (the field is nullable on
-  // the direct API), so a GPT-image request carrying response_format: null must
-  // behave exactly like one without the property.
-  const explicitResponseFormat = input.response_format !== undefined && input.response_format !== null;
-  const prompt = imagePrompt(input.prompt, operation);
-  if (!prompt.trim()) {
-    throw new ProxyRequestError(
-      "Missing required parameter: 'prompt'.",
-      400,
-      'openai',
-      'invalid_request_error',
-      'prompt',
-      'missing_required_parameter',
-    );
-  }
+  // The order below is the order the direct API reports problems in, measured
+  // 2026-08-29/30 with bodies carrying two faults at once: `model`, then any
+  // key it does not know, then `prompt`, then `images`, then `n`, then the
+  // rest. A client fixing errors one at a time sees the same sequence here.
+  const model = openAiImageModel(input.model);
+  rejectUnknownOpenAiImageParameters(input, operation, isMultipart);
+  const prompt = imagePrompt(input.prompt);
   if (prompt.length > 32_000) {
     throw new ProxyRequestError('prompt must be 32000 characters or fewer.', 400);
   }
-  // Absence and null get the default (the direct API declares the field
-  // nullable); any other present value is validated rather than silently
-  // replaced with `b64_json`.
-  const responseFormat = input.response_format === undefined || input.response_format === null
-    ? 'b64_json'
-    : input.response_format;
-  if (responseFormat !== 'b64_json' && responseFormat !== 'url') {
-    throw new ProxyRequestError('response_format must be one of url or b64_json.', 400);
-  }
-  // Absence and null default (the field is nullable on the direct API); a
-  // present non-string or blank string is malformed input, not a request for
-  // dall-e-2 — substituting a model the client never named ran the wrong route.
-  if (input.model !== undefined && input.model !== null
-    && (typeof input.model !== 'string' || !input.model.trim())) {
-    throw new ProxyRequestError('model must be a non-empty string.', 400, 'openai', 'invalid_request_error', 'model');
-  }
-  const model = typeof input.model === 'string' && input.model.trim()
-    ? input.model
-    : 'dall-e-2';
-  validateOpenAiImageModelSurface(model, operation, explicitResponseFormat);
   const images = imageInputsForOperation(input, operation, isMultipart);
-  if ((operation === 'edit' || operation === 'variation') && images.length === 0) {
-    throw new ProxyRequestError('image input is required for image edits and variations.', 400);
+  if (operation === 'edit' && images.length === 0) {
+    throw new ProxyRequestError(
+      isMultipart
+        ? 'image input is required for image edits.'
+        : "Invalid 'images': empty array. Expected an array with minimum length 1, but got an empty array instead.",
+      400,
+      'openai',
+      'invalid_request_error',
+      isMultipart ? 'image' : 'images',
+      isMultipart ? null : 'empty_array',
+    );
   }
-  if (operation === 'variation' && !isMultipart) {
-    throw new ProxyRequestError('image variations require multipart/form-data with an image file.', 400);
-  }
+  const n = imageInteger(input.n, 'n', 1, 10, isMultipart) ?? 1;
+  // `quality` is checked before `output_compression`, `size` after it
+  // (measured with two faults per form).
+  const quality = imageEnum(input.quality, 'quality', ['low', 'medium', 'high', 'auto'], isMultipart);
   const proxyRoute = optionalImageProxyRoute(input.x_proxy_image_route);
-  const outputFormat = optionalEnum(input.output_format, 'output_format', ['png', 'jpeg', 'webp'])
+  const outputFormat = imageEnum(input.output_format, 'output_format', ['png', 'webp', 'jpeg'], isMultipart)
     ?? proxyRoute?.outputFormat;
-  const outputCompression = optionalInteger(input.output_compression, 'output_compression', 0, 100)
+  const outputCompression = imageInteger(input.output_compression, 'output_compression', 0, 100, isMultipart)
     ?? proxyRoute?.outputCompression;
   const request: OpenAiImageGenerationRequest = {
     operation,
     model,
     prompt,
-    n: imageGenerationCount(input.n),
+    n,
     images,
-    // Validated only where the contract gives it meaning. On generations and
-    // variations the row says "ignored" — validating an ignored field rejected
-    // requests the contract promises succeed.
+    // On a generation `mask` is an unknown parameter (rejected above); on a
+    // multipart generation it is simply not read.
     mask: operation === 'edit' ? requiredValidImageInput(input.mask, 'mask') : undefined,
     size: optionalImageSize(input.size),
-    quality: optionalEnum(input.quality, 'quality', ['standard', 'hd', 'low', 'medium', 'high', 'auto']),
-    background: optionalEnum(input.background, 'background', ['transparent', 'opaque', 'auto']),
+    quality,
+    background: imageEnum(input.background, 'background', ['transparent', 'opaque', 'auto'], isMultipart),
     outputFormat,
     outputCompression,
-    moderation: optionalEnum(input.moderation, 'moderation', ['low', 'auto']),
-    inputFidelity: optionalEnum(input.input_fidelity, 'input_fidelity', ['high', 'low']),
-    style: optionalEnum(input.style, 'style', ['vivid', 'natural']),
+    moderation: imageEnum(input.moderation, 'moderation', ['auto', 'low'], isMultipart),
+    inputFidelity: imageEnum(input.input_fidelity, 'input_fidelity', ['high', 'low'], isMultipart),
     user: optionalString(input.user),
-    responseFormat,
-    stream: optionalBoolean(input.stream, 'stream') ?? false,
-    partialImages: partialImageCount(input.partial_images),
+    stream: imageBoolean(input.stream, 'stream', isMultipart) ?? false,
+    partialImages: partialImageCount(input.partial_images, isMultipart),
     ...(proxyRoute ? { proxyRoute } : {}),
     raw: body,
   };
@@ -578,35 +536,129 @@ function normalizeOpenAiImageRequest(
   return request;
 }
 
-function validateOpenAiImageModelSurface(
-  model: string,
-  operation: OpenAiImageOperation,
-  explicitResponseFormat: boolean,
-): void {
-  if (explicitResponseFormat && openAiGptImageModelPattern().test(model)) {
+// The Images models the direct API serves, read from its `GET /v1/models` on
+// 2026-08-29. Every one of them runs on the local image backend; the name a
+// client sends selects nothing but its own validation. `dall-e-2`, `dall-e-3`
+// and the proxy's former invented route name `image-2` are refused exactly as
+// the direct API refuses them, because it does: "The model 'dall-e-2' does not
+// exist." Refresh against the live list when the vendor's changes.
+const OPENAI_IMAGE_MODELS: ReadonlySet<string> = new Set([
+  'chatgpt-image-latest',
+  'gpt-image-1',
+  'gpt-image-1-mini',
+  'gpt-image-1.5',
+  'gpt-image-2',
+  'gpt-image-2-2026-04-21',
+]);
+
+// `model` is required on the direct API (measured 2026-08-29: absent is
+// `missing_required_parameter`, null and a number are `invalid_type`, an
+// unknown or empty name "does not exist"). The proxy used to default an absent
+// model to dall-e-2, a model that no longer exists to default to.
+function openAiImageModel(value: unknown): string {
+  if (value === undefined) {
     throw new ProxyRequestError(
-      "Unknown parameter: 'response_format'.",
-      400,
-      'openai',
-      'invalid_request_error',
-      'response_format',
-      'unknown_parameter',
-    );
-  }
-  if (operation === 'variation' && model !== 'dall-e-2' && model !== 'image-2') {
-    throw new ProxyRequestError(
-      'This endpoint only supports dall-e-2.',
+      "Missing required parameter: 'model'.",
       400,
       'openai',
       'invalid_request_error',
       'model',
+      'missing_required_parameter',
+    );
+  }
+  if (typeof value !== 'string') {
+    throw new ProxyRequestError(
+      `Invalid type for 'model': expected a string, but got ${jsonTypeName(value)} instead.`,
+      400,
+      'openai',
+      'invalid_request_error',
+      'model',
+      'invalid_type',
+    );
+  }
+  if (!OPENAI_IMAGE_MODELS.has(value)) {
+    throw new ProxyRequestError(
+      `The model '${value}' does not exist.`,
+      400,
+      'openai',
+      'image_generation_user_error',
+      'model',
       'invalid_value',
     );
   }
+  return value;
 }
 
-function openAiGptImageModelPattern(): RegExp {
-  return /^gpt-image-/;
+// A JSON body may carry only the keys the direct API knows for the operation
+// (measured 2026-08-29/30: `response_format`, `style`, a generation's
+// `input_fidelity`, `mask` or `images`, and any made-up key are all "Unknown
+// parameter: 'x'.", and a present null counts as present). The one deliberate
+// exception is `x_proxy_image_route`, this proxy's documented extension —
+// the direct API refuses it, and the contract says so. A multipart edit names
+// its files `image` / `image[]` instead of `images`; in JSON those two
+// spellings get the direct API's pointer to `images` (measured), not the bare
+// unknown-parameter line. Multipart bodies are held to the same key set (the
+// direct API's form-data answer was not measured; accepting a key JSON refuses
+// would be the stranger choice).
+const OPENAI_IMAGE_GENERATION_KEYS: ReadonlySet<string> = new Set([
+  'model', 'prompt', 'n', 'size', 'quality', 'background', 'output_format',
+  'output_compression', 'moderation', 'user', 'stream', 'partial_images',
+  'x_proxy_image_route',
+]);
+const OPENAI_IMAGE_EDIT_KEYS: ReadonlySet<string> = new Set([
+  ...OPENAI_IMAGE_GENERATION_KEYS, 'images', 'mask', 'input_fidelity',
+]);
+const OPENAI_IMAGE_EDIT_MULTIPART_KEYS: ReadonlySet<string> = new Set([
+  ...[...OPENAI_IMAGE_EDIT_KEYS].filter((key) => key !== 'images'), 'image', 'image[]',
+]);
+
+function rejectUnknownOpenAiImageParameters(
+  input: Record<string, unknown>,
+  operation: OpenAiImageOperation,
+  isMultipart: boolean,
+): void {
+  const known = operation === 'edit'
+    ? (isMultipart ? OPENAI_IMAGE_EDIT_MULTIPART_KEYS : OPENAI_IMAGE_EDIT_KEYS)
+    : OPENAI_IMAGE_GENERATION_KEYS;
+  for (const name of Object.keys(input)) {
+    if (known.has(name)) continue;
+    // The two encodings spell the image field differently, and the direct API
+    // points a body at the other spelling (both measured).
+    const pointer = operation !== 'edit'
+      ? null
+      : !isMultipart && (name === 'image' || name === 'image[]')
+        ? "For application/json on /v1/images/edits, use 'images' (array)."
+        : isMultipart && name === 'images'
+          ? "For multipart/form-data use 'image' or 'image[]'."
+          : null;
+    if (pointer) {
+      throw new ProxyRequestError(`Unknown parameter: '${name}'. ${pointer}`, 400, 'openai', 'invalid_request_error', name, 'invalid_value');
+    }
+    throw unknownImageParameter(name);
+  }
+}
+
+function unknownImageParameter(name: string): ProxyRequestError {
+  return new ProxyRequestError(
+    `Unknown parameter: '${name}'.`,
+    400,
+    'openai',
+    'invalid_request_error',
+    name,
+    'unknown_parameter',
+  );
+}
+
+// The direct API's wording for a wrong JSON type — "got null / an integer / a
+// decimal number / a boolean / an object / an array instead" — each measured
+// on `model` (2026-08-30).
+function jsonTypeName(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a decimal number';
+  if (typeof value === 'boolean') return 'a boolean';
+  if (typeof value === 'object') return 'an object';
+  return `a ${typeof value}`;
 }
 
 function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void {
@@ -628,44 +680,27 @@ function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void
       'invalid_png_output_compression',
     );
   }
-  if (request.inputFidelity && request.model === 'image-2') {
-    // The model-specific rejection carries its documented envelope
-    // (image_generation_user_error); the generic operation guard below used to
-    // shadow it for generations and variations.
-    throw new ProxyRequestError(
-      'input_fidelity is disabled for image-2.',
-      400,
-      'openai',
-      'image_generation_user_error',
-      'tools',
-      'invalid_input_fidelity_model',
-    );
-  }
-  if (request.inputFidelity && request.operation !== 'edit') {
-    throw new ProxyRequestError('input_fidelity is only supported for image edits.', 400);
-  }
-  if (request.model === 'image-2' && request.background === 'transparent') {
-    throw new ProxyRequestError(
-      'Transparent background is not supported for this model.',
-      400,
-      'openai',
-      'image_generation_user_error',
-      'tools',
-      'invalid_value',
-    );
-  }
+  // `input_fidelity` on an edit is the backend's answer, forwarded — it
+  // refuses today (`invalid_input_fidelity_model`); on a generation it was
+  // refused as an unknown parameter before the body was parsed.
   if (request.background === 'transparent' && request.outputFormat === 'jpeg') {
     throw new ProxyRequestError('background transparent requires output_format to be png or webp.', 400);
   }
-  if (request.style && request.operation !== 'generation') {
-    throw new ProxyRequestError('style is only supported for image generations.', 400);
-  }
 }
 
-function imagePrompt(value: unknown, operation: OpenAiImageOperation): string {
-  if (operation === 'variation') return 'Create a variation of the provided image.';
-  if (typeof value === 'string' && value.trim()) return value;
-  return '';
+// Absent, wrong type, and empty are three different answers on the direct API
+// (measured 2026-08-30); a whitespace-only prompt is accepted and generates.
+function imagePrompt(value: unknown): string {
+  if (value === undefined) {
+    throw new ProxyRequestError("Missing required parameter: 'prompt'.", 400, 'openai', 'invalid_request_error', 'prompt', 'missing_required_parameter');
+  }
+  if (typeof value !== 'string') {
+    throw new ProxyRequestError(`Invalid type for 'prompt': expected a string, but got ${jsonTypeName(value)} instead.`, 400, 'openai', 'invalid_request_error', 'prompt', 'invalid_type');
+  }
+  if (value === '') {
+    throw new ProxyRequestError("Invalid 'prompt': empty string. Expected a string with minimum length 1, but got an empty string instead.", 400, 'openai', 'invalid_request_error', 'prompt', 'empty_string');
+  }
+  return value;
 }
 
 function imageInputsForOperation(
@@ -674,10 +709,47 @@ function imageInputsForOperation(
   isMultipart: boolean,
 ): readonly NormalizedImage[] {
   if (operation === 'generation') return [];
-  // The documented aliases hold in BOTH encodings: a JSON edit naming its
-  // image with the singular `image` field was rejected as having none.
-  const value = input.image ?? input['image[]'] ?? input.images;
-  return imageInputArray(value);
+  // A multipart edit names its files `image` or `image[]`, as the direct
+  // API's form does.
+  if (isMultipart) return imageInputArray(input.image ?? input['image[]']);
+  // A JSON edit carries `images`, an array of objects, and nothing else —
+  // measured 2026-08-29: a non-array `images` and a string member each have
+  // their own envelope (`image` / `image[]` were refused upstream, as unknown
+  // keys with the direct API's pointer). The proxy used to take them all as
+  // aliases.
+  if (input.images === undefined) {
+    throw new ProxyRequestError(
+      "Missing required parameter: 'images'.",
+      400,
+      'openai',
+      'invalid_request_error',
+      'images',
+      'missing_required_parameter',
+    );
+  }
+  if (!Array.isArray(input.images)) {
+    throw new ProxyRequestError(
+      `Invalid type for 'images': expected an array of objects, but got ${jsonTypeName(input.images)} instead.`,
+      400,
+      'openai',
+      'invalid_request_error',
+      'images',
+      'invalid_type',
+    );
+  }
+  input.images.forEach((member, index) => {
+    if (!member || typeof member !== 'object' || Array.isArray(member)) {
+      throw new ProxyRequestError(
+        `Invalid type for 'images[${index}]': expected an object, but got ${jsonTypeName(member)} instead.`,
+        400,
+        'openai',
+        'invalid_request_error',
+        `images[${index}]`,
+        'invalid_type',
+      );
+    }
+  });
+  return imageInputArray(input.images);
 }
 
 function imageInputArray(value: unknown): readonly NormalizedImage[] {
@@ -805,25 +877,87 @@ function isNormalizedImage(value: NormalizedImage | undefined): value is Normali
   return Boolean(value);
 }
 
-function imageGenerationCount(value: unknown): number {
-  // The direct API declares `n` nullable (`Optional[int]`), so null IS
-  // omission — the earlier explicit-null rejection was anti-parity, measured
-  // against the published SDK types.
-  if (value === undefined || value === null) return 1;
-  const parsed = optionalInteger(value, 'n', 1, 10);
-  if (parsed === undefined) {
-    throw new ProxyRequestError('n must be an integer between 1 and 10.', 400);
+// The direct API's integer envelopes (measured 2026-08-30 on `n`,
+// `output_compression`, `partial_images`): a wrong JSON type names the type
+// it got, a decimal is "a decimal number", and a value outside the range is
+// `integer_below_min_value` / `integer_above_max_value` naming the bound and
+// the value. Null is omission. A multipart field arrives as a string, so
+// there a digit string is the integer it spells.
+function imageInteger(
+  value: unknown,
+  field: string,
+  min: number,
+  max: number,
+  isMultipart: boolean,
+): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  let parsed: number;
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value)) throw invalidImageType(field, 'an integer', 'a decimal number');
+    parsed = value;
+  } else if (isMultipart && typeof value === 'string') {
+    if (!/^-?\d+$/.test(value.trim())) {
+      // The one type sentence the direct API ends without "instead" (measured).
+      throw new ProxyRequestError(`Invalid type for '${field}': expected an integer, but got a string value that could not be converted into an integer.`, 400, 'openai', 'invalid_request_error', field, 'invalid_type');
+    }
+    parsed = Number(value.trim());
+  } else {
+    throw invalidImageType(field, 'an integer', jsonTypeName(value));
+  }
+  if (parsed < min) {
+    throw new ProxyRequestError(`Invalid '${field}': integer below minimum value. Expected a value >= ${min}, but got ${parsed} instead.`, 400, 'openai', 'invalid_request_error', field, 'integer_below_min_value');
+  }
+  if (parsed > max) {
+    throw new ProxyRequestError(`Invalid '${field}': integer above maximum value. Expected a value <= ${max}, but got ${parsed} instead.`, 400, 'openai', 'invalid_request_error', field, 'integer_above_max_value');
   }
   return parsed;
 }
 
-function partialImageCount(value: unknown): number {
-  // Nullable on the direct API, like `n`: null is omission.
-  if (value === undefined || value === null) return 0;
-  const parsed = optionalInteger(value, 'partial_images', 0, 3);
-  if (parsed === undefined) {
-    throw new ProxyRequestError('partial_images must be an integer between 0 and 3.', 400);
+// The direct API's enum envelopes (measured 2026-08-30 on `quality`,
+// `output_format`, `moderation`, `background`): a string outside the set is
+// `invalid_value` listing the set, a non-string is `invalid_type` listing the
+// set with "or". Null is omission; the empty string is a value outside the
+// set. The order of `allowed` is the order the direct API lists.
+function imageEnum<T extends string>(
+  value: unknown,
+  field: string,
+  allowed: readonly T[],
+  isMultipart: boolean,
+): T | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') {
+    // A file part or a repeated field is not a value in the set either — in
+    // a form as in JSON, it is a type error, never a silent omission.
+    throw invalidImageType(field, `one of ${quotedList(allowed, 'or')}`, jsonTypeName(value));
   }
+  if (!allowed.includes(value as T)) {
+    throw new ProxyRequestError(`Invalid value: '${value}'. Supported values are: ${quotedList(allowed, 'and')}.`, 400, 'openai', 'invalid_request_error', field, 'invalid_value');
+  }
+  return value as T;
+}
+
+function imageBoolean(value: unknown, field: string, isMultipart: boolean): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'boolean') return value;
+  if (isMultipart && value === '') return undefined;
+  if (isMultipart && (value === 'true' || value === 'false')) return value === 'true';
+  throw invalidImageType(field, 'a boolean', jsonTypeName(value));
+}
+
+function invalidImageType(field: string, expected: string, got: string): ProxyRequestError {
+  return new ProxyRequestError(`Invalid type for '${field}': expected ${expected}, but got ${got} instead.`, 400, 'openai', 'invalid_request_error', field, 'invalid_type');
+}
+
+// "'a', 'b', and 'c'" / "'a' and 'b'" — the direct API's list punctuation.
+function quotedList(items: readonly string[], conjunction: 'and' | 'or'): string {
+  const quoted = items.map((item) => `'${item}'`);
+  if (quoted.length <= 1) return quoted.join('');
+  if (quoted.length === 2) return `${quoted[0]} ${conjunction} ${quoted[1]}`;
+  return `${quoted.slice(0, -1).join(', ')}, ${conjunction} ${quoted[quoted.length - 1]}`;
+}
+
+function partialImageCount(value: unknown, isMultipart: boolean): number {
+  const parsed = imageInteger(value, 'partial_images', 0, 3, isMultipart) ?? 0;
   if (parsed > 0) {
     throw new ProxyRequestError(
       'partial_images is not supported by this local image proxy.',
@@ -834,7 +968,7 @@ function partialImageCount(value: unknown): number {
       'unsupported_value',
     );
   }
-  return 0;
+  return parsed;
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -934,19 +1068,23 @@ function imageProxyRoutePayload(value: unknown): Record<string, unknown> {
   throw new ProxyRequestError('x_proxy_image_route must be a JSON object.', 400);
 }
 
+// The direct API's size envelopes (measured 2026-08-30): anything that is not
+// WIDTHxHEIGHT — `bogus`, `0x0` — and a dimension not divisible by 16 are
+// each `image_generation_user_error` / `size` / `invalid_value` with their own
+// sentence. `auto` passes; null is omission.
 function optionalImageSize(value: unknown): string | undefined {
-  const size = optionalString(value);
-  if (!size) return undefined;
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') throw invalidImageType('size', 'a string', jsonTypeName(value));
+  const size = value;
   if (size === 'auto') return size;
+  const invalid = (detail: string): ProxyRequestError => new ProxyRequestError(
+    `Invalid size '${size}'. ${detail}`, 400, 'openai', 'image_generation_user_error', 'size', 'invalid_value',
+  );
   const match = /^(\d+)x(\d+)$/.exec(size);
-  if (!match) {
-    throw new ProxyRequestError('size must be auto or a WIDTHxHEIGHT string.', 400);
-  }
-  const width = Number(match[1]);
-  const height = Number(match[2]);
-  if (width <= 0 || height <= 0) {
-    throw new ProxyRequestError('size width and height must be positive.', 400);
-  }
+  const width = match ? Number(match[1]) : 0;
+  const height = match ? Number(match[2]) : 0;
+  if (!match || width <= 0 || height <= 0) throw invalid("Expected WIDTHxHEIGHT, for example '1824x1024'.");
+  if (width % 16 !== 0 || height % 16 !== 0) throw invalid('Width and height must both be divisible by 16.');
   return size;
 }
 
@@ -1205,138 +1343,10 @@ interface MultipartFilePart {
   readonly data: string;
 }
 
-export class GeneratedImageStore {
-  private readonly images = new Map<string, {
-    readonly bytes: Buffer;
-    readonly contentType: string;
-    readonly expiresAt: number;
-  }>();
-
-  private heldBytes = 0;
-
-  constructor(
-    private readonly ttlMs: number = GENERATED_IMAGE_TTL_MS,
-    private readonly maxBytes: number = GENERATED_IMAGE_MAX_BYTES,
-    private readonly maxEntries: number = GENERATED_IMAGE_MAX_ENTRIES,
-  ) {}
-
-  put(b64Json: string, outputFormat: string, pinned?: ReadonlySet<string>): string {
-    this.cleanupExpired();
-    const id = randomUUID();
-    const bytes = Buffer.from(b64Json, 'base64');
-    this.images.set(id, {
-      bytes,
-      contentType: imageContentType(outputFormat),
-      expiresAt: Date.now() + this.ttlMs,
-    });
-    this.heldBytes += bytes.byteLength;
-    // Map preserves insertion order, so iteration meets oldest entries first.
-    // Never evicted: the image just stored, and any id in `pinned` — the other
-    // images of the SAME response, whose URLs are about to be handed out
-    // together. Without the pin, an oversized first image was evicted by its
-    // own sibling before the response was even sent.
-    for (const [oldest] of this.images) {
-      if (this.heldBytes <= this.maxBytes && this.images.size <= this.maxEntries) break;
-      if (oldest === id) break;
-      if (pinned?.has(oldest)) continue;
-      this.drop(oldest);
-    }
-    return id;
-  }
-
-  private drop(id: string): void {
-    const image = this.images.get(id);
-    if (!image) return;
-    this.heldBytes -= image.bytes.byteLength;
-    this.images.delete(id);
-  }
-
-  get(id: string): { readonly bytes: Buffer; readonly contentType: string } | null {
-    const image = this.images.get(id);
-    if (!image) return null;
-    if (image.expiresAt <= Date.now()) {
-      this.drop(id);
-      return null;
-    }
-    return image;
-  }
-
-  clear(): void {
-    this.images.clear();
-    this.heldBytes = 0;
-  }
-
-  private cleanupExpired(): void {
-    const now = Date.now();
-    for (const [id, image] of this.images.entries()) {
-      if (image.expiresAt <= now) this.drop(id);
-    }
-  }
-}
-
-function writeGeneratedImage(
-  res: ServerResponse,
-  generatedImages: GeneratedImageStoreLike,
-  path: string,
-): void {
-  // Byte-for-byte, no percent-decoding: issued ids are plain UUIDs, so no
-  // client ever needs encoding, and decoding created aliases — `%61bc...` and
-  // `abc...` named the same image, while `%2F` decoded into a separator the
-  // route grammar had already excluded. A `%FF` or `%2F` segment is simply an
-  // id that was never issued: the ordinary miss.
-  const id = path.slice('/v1/images/generated/'.length);
-  const image = generatedImages.get(id);
-  if (!image) {
-    writeJson(res, 404, {
-      error: {
-        message: 'Generated image URL has expired or does not exist.',
-        type: 'invalid_request_error',
-        param: null,
-        code: null,
-      },
-    });
-    return;
-  }
-  res.writeHead(200, {
-    'content-type': image.contentType,
-    'cache-control': 'private, max-age=3600',
-  });
-  res.end(image.bytes);
-}
-
 // An IPv6 literal needs brackets inside a URL authority — `http://::1:8080`
 // does not parse. Hostnames and IPv4 pass through untouched.
 function urlHostname(host: string): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
-}
-
-/**
- * The link handed back for `response_format: url`.
- *
- * The authority is the one the client addressed — `Host` is how it reached this
- * proxy, and rewriting it to the bound address would break every tunnelled
- * client. When there is no `Host` (HTTP/1.0) the bound address is the only
- * authority we know.
- *
- * The scheme is NOT hard-coded: behind an HTTPS tunnel a hard-coded `http://`
- * hands the client a link its own page will refuse as mixed content, for bytes
- * that are on the other side of the same TLS connection.
- */
-function generatedImageUrl(req: IncomingMessage, id: string): string {
-  const socket = req.socket as { encrypted?: boolean; localAddress?: string; localPort?: number };
-  const host = headerValue(req.headers.host)
-    || (socket.localAddress ? `${urlHostname(socket.localAddress)}:${socket.localPort}` : '127.0.0.1');
-  const forwarded = stripOws(headerValue(req.headers['x-forwarded-proto']).split(',')[0] ?? '').toLowerCase();
-  const scheme = forwarded === 'https' || forwarded === 'http'
-    ? forwarded
-    : (socket.encrypted ? 'https' : 'http');
-  return `${scheme}://${host}/v1/images/generated/${encodeURIComponent(id)}`;
-}
-
-function imageContentType(outputFormat: string): string {
-  if (outputFormat === 'jpeg' || outputFormat === 'jpg') return 'image/jpeg';
-  if (outputFormat === 'webp') return 'image/webp';
-  return 'image/png';
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
@@ -1644,22 +1654,14 @@ async function advertisedModels(backend: LocalCliBackend): Promise<readonly stri
 }
 
 function openAiImagesGenerationResponse(
-  req: IncomingMessage,
-  generatedImages: GeneratedImageStoreLike,
   result: OpenAiImageGenerationResult,
   request: OpenAiImageGenerationRequest,
 ): unknown {
   return {
     created: result.created,
-    // One pin set for the whole response: sibling images must not evict each
-    // other before their URLs are even sent. And at most `n` of them — the
-    // count is backend-controlled, `n` is the request's, the same rule the
-    // streamed path applies.
-    data: (() => {
-      const batch = new Set<string>();
-      return result.images.slice(0, request.n ?? 1)
-        .map((image) => openAiImageObject(req, generatedImages, image, request, batch, result.outputFormat));
-    })(),
+    // At most `n` images: the count is backend-controlled, `n` is the
+    // request's, the same rule the streamed path applies.
+    data: result.images.slice(0, request.n ?? 1).map(openAiImageObject),
     ...openAiImageResponseMetadata(result, request),
     ...(result.usage ? { usage: openAiImagesUsage(result.usage) } : {}),
   };
@@ -1693,29 +1695,7 @@ function responseSize(value: string | undefined): string | undefined {
   return value && value !== 'auto' ? value : undefined;
 }
 
-function openAiImageObject(
-  req: IncomingMessage,
-  generatedImages: GeneratedImageStoreLike,
-  image: OpenAiGeneratedImage,
-  request: OpenAiImageGenerationRequest,
-  batch?: Set<string>,
-  producedFormat?: string,
-): unknown {
-  if (request.responseFormat === 'url') {
-    const id = generatedImages.put(
-      image.b64Json,
-      // What the bytes ARE, not what was asked for: the JSON body already
-      // reports the produced format, so labelling the stored bytes from the
-      // request let one response advertise webp and serve image/png.
-      producedFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
-      batch,
-    );
-    batch?.add(id);
-    return {
-      url: generatedImageUrl(req, id),
-      ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
-    };
-  }
+function openAiImageObject(image: OpenAiGeneratedImage): unknown {
   return {
     b64_json: image.b64Json,
     ...(image.revisedPrompt ? { revised_prompt: image.revisedPrompt } : {}),
@@ -1723,26 +1703,29 @@ function openAiImageObject(
 }
 
 async function writeOpenAiImageStream(
-  req: IncomingMessage,
   res: ServerResponse,
   events: AsyncIterable<OpenAiImageGenerationStreamEvent>,
-  generatedImages: GeneratedImageStoreLike,
   request: OpenAiImageGenerationRequest,
 ): Promise<void> {
-  writeSseHeaders(res);
-  // One pin set for the whole stream: sibling images of one response must not
-  // evict each other, exactly as in the non-streaming path.
-  const batch = new Set<string>();
-  const putPinned = (b64Json: string, outputFormat?: string): string => {
-    const id = generatedImages.put(b64Json, outputFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT, batch);
-    batch.add(id);
-    return id;
+  // The stream commits on the backend's first event, not before it. A backend
+  // that refuses the request outright — an option its image model does not
+  // support — answers with an HTTP error before any stream byte, and the
+  // client gets that error as an HTTP status, exactly as the non-streaming
+  // path reports it and as the local validators do. Writing the 200 first
+  // turned the same refusal into an in-band error frame for one model and a
+  // 400 for another.
+  let committed = false;
+  const commit = (): void => {
+    if (committed) return;
+    writeSseHeaders(res);
+    committed = true;
   };
   // The event count is backend-controlled; `n` is the request's. A runaway
   // stream must not emit more images than were asked for — nor pin more.
   let completedEmitted = 0;
   try {
     for await (const event of events) {
+      commit();
       if (event.type === 'partial_image') continue;
       if (completedEmitted >= (request.n ?? 1)) break;
       completedEmitted += 1;
@@ -1754,9 +1737,7 @@ async function writeOpenAiImageStream(
         output_format: event.outputFormat ?? request.outputFormat ?? DEFAULT_IMAGE_GENERATION_OUTPUT_FORMAT,
         quality: event.quality ?? request.quality ?? DEFAULT_IMAGE_GENERATION_QUALITY,
         size: event.size ?? request.size ?? DEFAULT_IMAGE_GENERATION_SIZE,
-        ...(request.responseFormat === 'url'
-          ? { url: generatedImageUrl(req, putPinned(event.image.b64Json, event.outputFormat)) }
-          : { b64_json: event.image.b64Json }),
+        b64_json: event.image.b64Json,
         // The provider's rewrite of the prompt, which the non-streaming
         // response carries: a client comparing the two modes saw it vanish.
         ...(event.image.revisedPrompt ? { revised_prompt: event.image.revisedPrompt } : {}),
@@ -1764,13 +1745,18 @@ async function writeOpenAiImageStream(
       };
       await writeSseEvent(res, type, payload);
     }
+    // A backend that ends without an event is still a stream that ran.
+    commit();
   } catch (err) {
+    // Nothing on the wire yet: the request handler's error path writes the
+    // status and envelope.
+    if (!committed) throw err;
     await writeSseEvent(res, 'error', streamErrorPayload(err));
     // The OpenAI mid-stream contract: an in-band error, then `data: [DONE]` —
     // the images stream was the one OpenAI surface that ended without it.
     res.write('data: [DONE]\n\n');
   } finally {
-    res.end();
+    if (committed) res.end();
   }
 }
 
@@ -1778,9 +1764,7 @@ function imageStreamEventType(
   operation: OpenAiImageOperation,
   eventType: OpenAiImageGenerationStreamEvent['type'],
 ): string {
-  const prefix = operation === 'edit' || operation === 'variation'
-    ? 'image_edit'
-    : 'image_generation';
+  const prefix = operation === 'edit' ? 'image_edit' : 'image_generation';
   return eventType === 'partial_image'
     ? `${prefix}.partial_image`
     : `${prefix}.completed`;
@@ -2017,12 +2001,16 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     safety_identifier: typeof raw.safety_identifier === 'string' ? raw.safety_identifier : null,
     service_tier: 'default',
     store: raw.store === false ? false : true,
-    temperature: options.request.temperature ?? 1,
+    // Sampling is echoed at the direct API's defaults, which are the only
+    // values a request can still carry here: the normalizer rejects any other
+    // `temperature`, and `top_p` altogether, on this surface. The echo used to
+    // repeat whatever the caller sent, for a value no backend applied.
+    temperature: 1,
     text: responseTextConfig(raw.text),
     tool_choice: responseToolChoice(raw.tool_choice),
     tools: Array.isArray(raw.tools) ? raw.tools : [],
     top_logprobs: numberOrDefault(raw.top_logprobs, 0),
-    top_p: numberOrDefault(raw.top_p, 0.98),
+    top_p: 1,
     truncation: typeof raw.truncation === 'string' ? raw.truncation : 'disabled',
     usage: options.usage,
     user: typeof raw.user === 'string' ? raw.user : null,
@@ -2564,7 +2552,16 @@ async function writeOpenAiResponsesStream(
         response: openAiResponsesCompletedResponse(responseId, result, request, finalOutput),
       });
     }
-    res.write('data: [DONE]\n\n');
+    // The Responses surface ends at `response.completed`; the vendor sends no
+    // `[DONE]`. Captured 2026-08-29 against gpt-5.6-terra — nine events, same
+    // names and order as ours, and nothing after the last one. `[DONE]` is the
+    // Chat convention and stays there. An extra frame carrying a body that is
+    // not a Responses event is a shape a strict SDK has to skip or reject, and
+    // an adapter that emits what the vendor does not is diverging by addition.
+    //
+    // The error path below still writes one. That is NOT evidence-backed: no
+    // capture of a vendor Responses stream failing mid-flight exists yet, so
+    // changing it would be replacing a guess with another guess.
   } catch (err) {
     await writeResponseEvent('error', asRecordPayload(streamErrorPayload(err)));
     res.write('data: [DONE]\n\n');
@@ -3207,6 +3204,16 @@ function writeError(
         code: err.code,
       },
     });
+    return;
+  }
+  // A path this proxy does not serve answers as the direct OpenAI API does for
+  // a path it does not serve (measured 2026-08-29 on `/v1/nope`,
+  // `/v1/images/foo`, `/v1/images/variations`): a bare 404, no body,
+  // `x-content-type-options: nosniff`. The native surface keeps its own
+  // envelope for its own unknown subpaths.
+  if (err instanceof UnknownEndpointError && shape !== 'local-cli') {
+    res.writeHead(404, { 'x-content-type-options': 'nosniff' });
+    res.end();
     return;
   }
   if (err instanceof ProxyRequestError) {
