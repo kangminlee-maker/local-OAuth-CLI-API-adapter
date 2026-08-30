@@ -518,6 +518,42 @@ E2E 패리티 비교가 `n: 0` 봉투 불일치를 드러내 추가로 잰 것. 
 
 **최상위 키 집합 (같은 날, 각 키에 틀린 타입 `1`을 보내 판별)**: 아는 키 18개 — `model`·`messages`·`max_tokens`·`cache_control`("Input should be an object")·`container`·`inference_geo`·`metadata`·`output_config`·`service_tier`("Input should be 'auto' or 'standard_only'")·`stop_sequences`·`stream`("Input should be a valid boolean")·`system`·`temperature`·`thinking`·`tool_choice`·`tools`·`top_k`·`top_p`. 모르는 키 → "<key>: Extra inputs are not permitted": `user_profile_id`(SDK 타입엔 있음)·`mcp_servers`·`context_management`·`betas`·`speed`·`effort`·`seed`·`response_format`·`instructions`·`input`·`n`·`user`·`logprobs`·`stop`. 순서: `max_tokens: Field required`가 미지 키보다 먼저, `temperature: range: 0..1`도 미지 키보다 먼저, 미지 키 둘이면 본문 순서의 첫 키; `messages[0].bogus` → "messages.0.bogus: Extra inputs are not permitted"; `bogus: null`도 거절. 프록시는 이 집합을 그대로 미러한다(A-37).
 
+### 5.5.6 Responses direct 실측 (2026-08-30) — 측정 완료, **아직 미러 안 함**
+
+Chat과 같은 계기·같은 절차. 이 표면은 다음 커밋의 대상이며, 여기 있는 값이 그 커밋의 기준이다.
+(이 절이 존재하는 이유: 측정은 끝났고 구현은 안 됐다는 상태를 문서가 말하지 않으면, 다음 세션이 같은 콜을 다시 쓴다.)
+
+**키 집합**: `input`·`instructions`·`max_output_tokens`·`max_tool_calls`·`temperature`·`top_p`·`top_logprobs`·`stream`·
+`stream_options`·`text`·`tools`·`tool_choice`·`parallel_tool_calls`·`reasoning`·`include`·`store`·`background`·
+`previous_response_id`·`conversation`·`truncation`·`metadata`·`user`·`safety_identifier`·`prompt_cache_key`·
+`prompt_cache_retention`·`prompt_cache_options`·`service_tier`·`prompt`·`context_management`·`moderation`·
+`presence_penalty`·`frequency_penalty`. **모르는 키**: `n`·`stop`·`seed`·`logprobs`·`max_tokens` → `unknown_parameter`.
+`messages`는 특별하다 — `unsupported_parameter`, **`param` 없이** "In the Responses API, this parameter has moved to 'input'".
+
+| 요청 | direct 응답 |
+| --- | --- |
+| `model` 없음 / `null` | `missing_required_parameter` `model` / **`invalid_type` `model` "got an object instead"** — Chat과 다르다(Chat은 둘 다 `you must provide a model parameter`) |
+| `reasoning.effort: "max"` | **200** — Chat은 같은 값을 `unsupported_value`로 거절한다. 표면별로 enum이 다르다 |
+| `reasoning.summary: "bogus"` / `reasoning.generate_summary` / `reasoning.bogus` | `invalid_value`(`concise`·`detailed`·`auto`) / `unknown_parameter` `reasoning.generate_summary` / `unknown_parameter` `reasoning.bogus` |
+| `top_logprobs: 1` | `unsupported_parameter` "logprobs are not supported with reasoning models." (`include: ["message.output_text.logprobs"]`도 같은 봉투, param은 `include`) |
+| `presence_penalty` / `frequency_penalty` 값 | `unsupported_parameter` (타입 결함은 `invalid_type` "a decimal") |
+| `previous_response_id: "resp_없음"` | 400 `previous_response_not_found` |
+| `conversation: "conv_없음"` / `prompt: {id:"pmpt_없음"}` | **404** (`param` 없음) |
+| `truncation: "bogus"` / `include: ["bogus.thing"]` | `invalid_value` + 목록 / `invalid_value` `include[0]` + 8개 목록 |
+| `max_tool_calls: 0` / `metadata` 17쌍 | `integer_below_min_value` / `object_above_max_properties` |
+| `input[0].bogus` | `unknown_parameter` `input[0].bogus` — 항목 내부도 엄격 |
+| `service_tier` | Chat과 같은 목록·같은 해석(`fast`→`priority`). **이 필드만 이번 커밋에서 이미 미러**(에코되기 때문) |
+| `prompt_cache_retention: "in_memory"` | 400 `invalid_parameter` — Chat은 같은 문구를 **code 없이** 답한다 |
+| `context_management`·`include`·`store`·`metadata`·`user`·`safety_identifier`·`prompt_cache_*`·`truncation`·`max_tool_calls`·`text`·`parallel_tool_calls`·`instructions` | 전부 200, 요청값이 응답에 에코된다 |
+
+**보고 순서** (타입 결함, 비교 정렬 31키·124콜·대칭성 3/3·인접쌍 0실패):
+`input` → `previous_response_id` → `prompt` → `moderation` → `include` → `tools` → `tool_choice` → `metadata` → `text` →
+`temperature` → `top_p` → `presence_penalty` → `frequency_penalty` → `parallel_tool_calls` → `stream` → `stream_options` →
+`background` → `max_output_tokens` → `max_tool_calls` → `reasoning` → `user` → `safety_identifier` → `prompt_cache_options` →
+`prompt_cache_key` → `prompt_cache_retention` → `truncation` → `instructions` → `store` → `service_tier` → `top_logprobs` →
+`context_management`.
+**Chat의 순서와 완전히 다르다** — 표면마다 자기 스키마 순서이므로, 한쪽에서 잰 순서를 다른 쪽에 옮겨 쓸 수 없다.
+
 ### 5.5.5-A Anthropic Messages 나머지 행 direct 실측 (2026-08-30)
 
 `scripts/probe-text-surface-keys.mjs --phase values --only messages`. 봉투는 `{type:"error", error:{type, message}}` — `param`·`code` 없음.
