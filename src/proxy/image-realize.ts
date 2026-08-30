@@ -129,10 +129,13 @@ export async function realizeRequestedSize(
  * a failure after a billed generation — the same rule `prepareImageRealization`
  * applies to the caller's bytes on the app-server transport.
  */
-export async function prepareRequestedSize(request: OpenAiImageGenerationRequest): Promise<void> {
+export async function prepareRequestedSize(
+  request: OpenAiImageGenerationRequest,
+  load: () => Promise<unknown> = loadSharp,
+): Promise<void> {
   if (!requestedSize(request.size)) return;
   try {
-    await loadSharp();
+    await load();
   } catch (err) {
     throw new ProxyRequestError(
       `The image codec (sharp) could not be loaded, and a request with a concrete size needs it to hold the canvas it asked for: ${err instanceof Error ? err.message : String(err)}`,
