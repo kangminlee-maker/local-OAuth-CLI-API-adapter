@@ -65,7 +65,9 @@
     "smoke:real:claude:multimodal": "pnpm build && node scripts/real-proxy-smoke.mjs --runtime claude --model opus --only multimodal",
     "bench:api": "pnpm build && node scripts/api-comparison-benchmark.mjs"
   },
-  "dependencies": {},
+  "dependencies": {
+    "sharp": "^0.35.4"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "tsx": "^4.20.6",
