@@ -168,6 +168,13 @@ const chatCases = [
   ['json_schema member without a name', { messages: M, response_format: { type: 'json_schema', json_schema: {} } }],
   ['stream_options unknown member', { messages: M, stream_options: { bogus: 1 } }],
   ['model null', { messages: M, model: null }],
+  ['chat prompt_cache_retention outside the enum', { messages: M, prompt_cache_retention: 'x' }],
+  ['chat reasoning_effort unknown', { messages: M, reasoning_effort: 'bogus' }],
+  // Spelling help on an unknown key: offered for a near miss, withheld when the
+  // key it would suggest is already in the body.
+  ['chat unknown near store', { messages: M, stor: 1 }],
+  ['chat unknown near temperature', { messages: M, temperatur: 1 }],
+  ['chat unknown near a key already sent', { messages: M, messagess: 1 }],
   // Report order: each of these is invalid twice. The order is measured, not a
   // rule — a comparison sort over the same-kind faults plus these pins.
   ['order model beats unknown key', { messages: M, model: DELETE, zzz_unknown: 1 }],
@@ -200,9 +207,161 @@ const chatCases = [
   ['order reasoning_effort before metadata', { messages: M, reasoning_effort: 'bogus', metadata: 'x' }],
 ];
 
-// The Responses surface, for the one field this work touches there.
+// The Responses surface. Same rule as the Chat rows: every default case is
+// invalid on both sides, so nothing generates. `I`/`OUT` keep the bodies short.
+// `temperature: 0.5` rides along as a TRIPWIRE where a row asks "is this
+// member known?": the model-capability pass runs after every field check, so
+// the tripwire's own error only surfaces when nothing earlier is faulty.
+const I = 'ping';
+const OUT = { input: I, max_output_tokens: 16 };
+const RTOOL = { type: 'function', name: 'f', parameters: { type: 'object', properties: {} } };
 const responsesCases = [
-  ['responses service_tier unknown', { input: 'ping', max_output_tokens: 16, service_tier: 'bogus' }],
+  // Keys this surface does not know — four of them are Chat's.
+  ['responses unknown key', { ...OUT, zzz_unknown: 1 }],
+  ['responses n', { ...OUT, n: 2 }],
+  ['responses stop', { ...OUT, stop: ['ZZ'] }],
+  ['responses seed', { ...OUT, seed: 1 }],
+  ['responses logprobs', { ...OUT, logprobs: true }],
+  ['responses max_tokens', { ...OUT, max_tokens: 16 }],
+  ['responses messages instead of input', { ...OUT, messages: M }],
+  // model — measured as a different sentence from Chat's.
+  ['responses model absent', { ...OUT, model: DELETE }],
+  ['responses model null', { ...OUT, model: null }],
+  ['responses model empty', { ...OUT, model: '' }],
+  ['responses model as an integer', { ...OUT, model: 7 }],
+  // input, and the item members inside it.
+  ['responses input as an object', { ...OUT, input: { a: 1 } }],
+  ['responses input item unknown member', { ...OUT, input: [{ role: 'user', content: I, bogus: 1 }] }],
+  ['responses input item status', { ...OUT, input: [{ role: 'user', content: I, status: 'completed' }], temperature: 0.5 }],
+  ['responses input item id', { ...OUT, input: [{ role: 'user', content: I, id: 'msg_x' }], temperature: 0.5 }],
+  ['responses input item type', { ...OUT, input: [{ type: 'message', role: 'user', content: I }], temperature: 0.5 }],
+  // reasoning — its own enum, wider than Chat's.
+  ['responses reasoning as a string', { ...OUT, reasoning: 'low' }],
+  ['responses reasoning.effort unknown', { ...OUT, reasoning: { effort: 'bogus' } }],
+  ['responses reasoning.effort as an object', { ...OUT, reasoning: { effort: { __probe__: 'wrong type' } } }],
+  ['responses reasoning.summary unknown', { ...OUT, reasoning: { summary: 'bogus' } }],
+  ['responses reasoning.generate_summary', { ...OUT, reasoning: { generate_summary: 'concise' } }],
+  ['responses reasoning unknown member', { ...OUT, reasoning: { bogus: 1 } }],
+  // Sampling and penalties: refused by parameter, and by type before that.
+  ['responses temperature 0.5', { ...OUT, temperature: 0.5 }],
+  ['responses temperature as a string', { ...OUT, temperature: 'hot' }],
+  ['responses top_p 0.5', { ...OUT, top_p: 0.5 }],
+  ['responses top_p as a string', { ...OUT, top_p: 'wide' }],
+  ['responses presence_penalty', { ...OUT, presence_penalty: 0.5 }],
+  ['responses frequency_penalty', { ...OUT, frequency_penalty: 0.5 }],
+  ['responses presence_penalty as a string', { ...OUT, presence_penalty: 'x' }],
+  // logprobs, by either door.
+  ['responses top_logprobs', { ...OUT, top_logprobs: 1 }],
+  ['responses top_logprobs as a string', { ...OUT, top_logprobs: 'x' }],
+  ['responses include logprobs', { ...OUT, include: ['message.output_text.logprobs'] }],
+  // Server-side state this proxy holds none of.
+  ['responses previous_response_id unknown', { ...OUT, previous_response_id: 'resp_probe_does_not_exist' }],
+  ['responses previous_response_id as an object', { ...OUT, previous_response_id: { a: 1 } }],
+  ['responses conversation unknown', { ...OUT, conversation: 'conv_probe_does_not_exist' }],
+  ['responses prompt id unknown', { ...OUT, prompt: { id: 'pmpt_probe_does_not_exist' } }],
+  ['responses prompt as a string', { ...OUT, prompt: 'x' }],
+  // Enums and bounds.
+  ['responses truncation unknown', { ...OUT, truncation: 'bogus' }],
+  ['responses truncation as an object', { ...OUT, truncation: { a: 1 } }],
+  ['responses include unknown member', { ...OUT, include: ['bogus.thing'] }],
+  ['responses include as a string', { ...OUT, include: 'wrong type' }],
+  ['responses max_tool_calls 0', { ...OUT, max_tool_calls: 0 }],
+  ['responses max_tool_calls as a string', { ...OUT, max_tool_calls: 'x' }],
+  ['responses max_output_tokens 0', { ...OUT, max_output_tokens: 0 }],
+  ['responses max_output_tokens as a string', { ...OUT, max_output_tokens: 'x' }],
+  ['responses metadata too many properties', { ...OUT, metadata: Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`k${i}`, 'v'])) }],
+  ['responses metadata as a string', { ...OUT, metadata: 'x' }],
+  ['responses service_tier unknown', { ...OUT, service_tier: 'bogus' }],
+  ['responses service_tier as an object', { ...OUT, service_tier: { a: 1 } }],
+  ['responses prompt_cache_retention in_memory', { ...OUT, prompt_cache_retention: 'in_memory' }],
+  ['responses prompt_cache_retention as an object', { ...OUT, prompt_cache_retention: { a: 1 } }],
+  ['responses prompt_cache_options unknown member', { ...OUT, prompt_cache_options: { bogus: 1 } }],
+  ['responses prompt_cache_key as an object', { ...OUT, prompt_cache_key: { a: 1 } }],
+  // stream_options: `include_usage` is a Chat key and unknown here (P-10).
+  ['responses stream_options include_usage', { ...OUT, stream_options: { include_usage: true } }],
+  ['responses stream_options unknown member', { ...OUT, stream_options: { bogus: 1 } }],
+  ['responses stream_options as a string', { ...OUT, stream_options: 'x' }],
+  // Plain type checks across the rest of the key set.
+  ['responses stream as a string', { ...OUT, stream: 'yes' }],
+  ['responses background as a string', { ...OUT, background: 'yes' }],
+  ['responses store as a string', { ...OUT, store: 'yes' }],
+  ['responses parallel_tool_calls as a string', { ...OUT, parallel_tool_calls: 'yes' }],
+  ['responses instructions as an object', { ...OUT, instructions: { a: 1 } }],
+  ['responses user as an object', { ...OUT, user: { a: 1 } }],
+  ['responses safety_identifier as an object', { ...OUT, safety_identifier: { a: 1 } }],
+  ['responses text as a string', { ...OUT, text: 'wrong type' }],
+  ['responses tools as a string', { ...OUT, tools: 'wrong type' }],
+  ['responses context_management as a string', { ...OUT, context_management: 'wrong type' }],
+  ['responses moderation as a string', { ...OUT, moderation: 'wrong type' }],
+  // tool_choice: a different sentence and a different object shape from Chat's.
+  ['responses tool_choice as an integer', { ...OUT, tool_choice: 7 }],
+  ['responses tool_choice unknown string', { ...OUT, tools: [RTOOL], tool_choice: 'bogus' }],
+  ['responses tool_choice object without a name', { ...OUT, tools: [RTOOL], tool_choice: { type: 'function' } }],
+  ['responses chat-shaped tool_choice', { ...OUT, tools: [RTOOL], tool_choice: { type: 'function', function: { name: 'f' } } }],
+  // Report order — this surface's own, nothing like Chat's (§5.5.6).
+  ['responses order unknown key beats input item', { ...OUT, input: [{ role: 'user', content: I, bogus: 1 }], zzz_unknown: 1 }],
+  ['responses order model beats unknown key', { ...OUT, model: DELETE, zzz_unknown: 1 }],
+  ['responses order input beats truncation', { ...OUT, input: 7, truncation: 'bogus' }],
+  ['responses order input beats previous_response_id', { ...OUT, input: 7, previous_response_id: 'resp_x' }],
+  ['responses order previous_response_id beats prompt', { ...OUT, previous_response_id: 'resp_x', prompt: { id: 'pmpt_x' } }],
+  ['responses order prompt beats include', { ...OUT, prompt: { id: 'pmpt_x' }, include: ['bogus.thing'] }],
+  ['responses order include beats tools', { ...OUT, include: ['bogus.thing'], tools: 'x' }],
+  ['responses order tools beats metadata', { ...OUT, tools: 'x', metadata: 'x' }],
+  ['responses order metadata beats text', { ...OUT, metadata: 'x', text: 'x' }],
+  ['responses order text beats temperature', { ...OUT, text: 'x', temperature: 'x' }],
+  ['responses order temperature beats top_p', { ...OUT, temperature: 'x', top_p: 'x' }],
+  ['responses order top_p beats presence_penalty', { ...OUT, top_p: 'x', presence_penalty: 'x' }],
+  ['responses order parallel_tool_calls beats stream', { ...OUT, parallel_tool_calls: 'x', stream: 'x' }],
+  ['responses order stream beats stream_options', { ...OUT, stream: 'x', stream_options: 'x' }],
+  ['responses order stream_options beats background', { ...OUT, stream_options: 'x', background: 'x' }],
+  ['responses order background beats max_output_tokens', { ...OUT, background: 'x', max_output_tokens: 'x' }],
+  ['responses order max_output_tokens beats max_tool_calls', { ...OUT, max_output_tokens: 'x', max_tool_calls: 'x' }],
+  ['responses order max_tool_calls beats reasoning', { ...OUT, max_tool_calls: 'x', reasoning: 'x' }],
+  ['responses order reasoning beats user', { ...OUT, reasoning: 'x', user: 7 }],
+  ['responses order user beats safety_identifier', { ...OUT, user: 7, safety_identifier: 7 }],
+  ['responses order safety_identifier beats prompt_cache_options', { ...OUT, safety_identifier: 7, prompt_cache_options: 'x' }],
+  ['responses order prompt_cache_options beats prompt_cache_key', { ...OUT, prompt_cache_options: 'x', prompt_cache_key: 7 }],
+  ['responses order prompt_cache_key beats prompt_cache_retention', { ...OUT, prompt_cache_key: 7, prompt_cache_retention: 'x' }],
+  ['responses order prompt_cache_retention beats truncation', { ...OUT, prompt_cache_retention: 'x', truncation: 'x' }],
+  ['responses order truncation beats instructions', { ...OUT, truncation: 'x', instructions: 7 }],
+  ['responses order instructions beats store', { ...OUT, instructions: 7, store: 'x' }],
+  ['responses order store beats service_tier', { ...OUT, store: 'x', service_tier: 'bogus' }],
+  ['responses order service_tier beats top_logprobs', { ...OUT, service_tier: 'bogus', top_logprobs: 'x' }],
+  ['responses order top_logprobs beats context_management', { ...OUT, top_logprobs: 'x', context_management: 'x' }],
+  ['responses order moderation beats include', { ...OUT, moderation: 'x', include: ['bogus.thing'] }],
+  // Spelling help, and its two measured limits: distance 2 suggests, 3 does
+  // not, and a key already in the body is never suggested.
+  ['responses unknown near store at 2', { ...OUT, sto: 1 }],
+  ['responses unknown too far', { ...OUT, st: 1 }],
+  ['responses unknown near two keys', { ...OUT, stre: 1 }],
+  ['responses unknown nearer one of two', { ...OUT, strem: 1 }],
+  ['responses unknown near tools', { ...OUT, tool: 1 }],
+  ['responses unknown near user', { ...OUT, usr: 1 }],
+  ['responses unknown near include', { ...OUT, inclde: 1 }],
+  ['responses unknown near a key already sent', { ...OUT, inpu: 1 }],
+  ['responses unknown near model already sent', { ...OUT, modell: 1 }],
+  // reasoning.effort: the schema layer, the model layer, and two type branches.
+  ['responses reasoning.effort minimal', { ...OUT, reasoning: { effort: 'minimal' } }],
+  ['responses reasoning.effort as an integer', { ...OUT, reasoning: { effort: 5 } }],
+  ['responses reasoning.effort as an array', { ...OUT, reasoning: { effort: ['low'] } }],
+  // The floor, from both sides of it.
+  ['responses max_output_tokens 15', { ...OUT, max_output_tokens: 15 }],
+  ['responses max_output_tokens 16 with a tripwire', { ...OUT, max_output_tokens: 16, top_p: 0.5 }],
+  ['responses prompt_cache_retention outside the enum', { ...OUT, prompt_cache_retention: 'x' }],
+  // The server-state phase: after every schema check, before the capability
+  // pass, and internally ordered.
+  ['responses state after schema (prompt)', { ...OUT, prompt: { id: 'pmpt_x' }, truncation: 'bogus' }],
+  ['responses state after schema (previous)', { ...OUT, previous_response_id: 'resp_x', truncation: 'bogus' }],
+  ['responses state before capability (prompt)', { ...OUT, prompt: { id: 'pmpt_x' }, temperature: 0.5 }],
+  ['responses state before capability (previous)', { ...OUT, previous_response_id: 'resp_x', temperature: 0.5 }],
+  ['responses state before capability (conversation)', { ...OUT, conversation: 'conv_x', temperature: 0.5 }],
+  ['responses conversation beats prompt', { ...OUT, conversation: 'conv_x', prompt: { id: 'pmpt_x' } }],
+  ['responses conversation with previous_response_id', { ...OUT, conversation: 'conv_x', previous_response_id: 'resp_x' }],
+  ['responses include logprobs beats tools', { ...OUT, include: ['message.output_text.logprobs'], tools: 'x' }],
+  ['responses top_logprobs refusal vs a later field', { ...OUT, top_logprobs: 1, context_management: 'x' }],
+  ['responses top_logprobs refusal vs temperature', { ...OUT, top_logprobs: 1, temperature: 0.5 }],
+  ['responses include logprobs vs temperature', { ...OUT, include: ['message.output_text.logprobs'], temperature: 0.5 }],
+  ['responses include logprobs vs top_logprobs', { ...OUT, include: ['message.output_text.logprobs'], top_logprobs: 1 }],
 ];
 
 if (!only || only === 'chat') {

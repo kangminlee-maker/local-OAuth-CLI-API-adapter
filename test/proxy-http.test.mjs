@@ -1583,8 +1583,12 @@ test('auth-key gate: open proxy without a key allows unauthenticated requests', 
 });
 
 test('/v1/responses echoes sampling at the direct defaults, not the caller\'s value', async () => {
-  // The echo used to repeat `request.temperature` — a value no backend applied
-  // — and `top_p: 0.98` where the provider echoes `1`.
+  // The echo used to repeat `request.temperature` — a value no backend
+  // applied. The defaults themselves are measured, not assumed: a Responses
+  // request that sends no `top_p` (the only possibility, since this surface
+  // refuses the parameter) is echoed `top_p: 0.98`, not `1`. This file
+  // asserted `1` on the strength of a comment; the capture of 2026-08-30 says
+  // otherwise.
   const res = await postJson('/v1/responses', {
     model: 'fake-local-model',
     input: 'Say OK',
@@ -1593,7 +1597,7 @@ test('/v1/responses echoes sampling at the direct defaults, not the caller\'s va
   const body = await res.json();
   assert.equal(res.status, 200);
   assert.equal(body.temperature, 1);
-  assert.equal(body.top_p, 1);
+  assert.equal(body.top_p, 0.98);
 });
 
 test('/v1/chat/completions rejects a non-default temperature in the direct envelope', async () => {

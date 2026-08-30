@@ -2120,7 +2120,7 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     object: 'response',
     created_at: now,
     status: options.status,
-    background: false,
+    background: raw.background === true ? true : false,
     ...(options.includeBilling === false ? {} : { billing: { payer: 'developer' } }),
     completed_at: options.completed ? now : null,
     error: null,
@@ -2128,14 +2128,21 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     incomplete_details: null,
     instructions: typeof raw.instructions === 'string' ? raw.instructions : null,
     max_output_tokens: options.request.maxTokens ?? null,
-    max_tool_calls: null,
+    max_tool_calls: numberOrNull(raw.max_tool_calls),
     model: options.model,
     moderation: null,
     output: options.output,
-    parallel_tool_calls: true,
+    parallel_tool_calls: raw.parallel_tool_calls === false ? false : true,
     presence_penalty: numberOrDefault(raw.presence_penalty, 0),
     previous_response_id: typeof raw.previous_response_id === 'string' ? raw.previous_response_id : null,
     prompt_cache_key: typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : null,
+    // Echoed with its defaults filled in, as the direct API echoes it
+    // (measured 2026-08-30: `{ttl:'30m'}` in, `{mode:'implicit', ttl:'30m'}`
+    // out), and absent from the body when the caller sent none.
+    ...(raw.prompt_cache_options && typeof raw.prompt_cache_options === 'object'
+      ? { prompt_cache_options: { mode: 'implicit', ttl: '30m', ...asRecordPayload(raw.prompt_cache_options) } }
+      : {}),
+    // The only value this surface accepts; `in_memory` is refused at the door.
     prompt_cache_retention: '24h',
     reasoning: responseReasoning(raw.reasoning),
     safety_identifier: typeof raw.safety_identifier === 'string' ? raw.safety_identifier : null,
@@ -2146,11 +2153,15 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     // `temperature`, and `top_p` altogether, on this surface. The echo used to
     // repeat whatever the caller sent, for a value no backend applied.
     temperature: 1,
+    // Measured, not assumed: with no `top_p` in the request — the only
+    // possibility, since this surface refuses the parameter — the direct API
+    // echoes 0.98, not 1.
+
     text: responseTextConfig(raw.text),
     tool_choice: responseToolChoice(raw.tool_choice),
     tools: Array.isArray(raw.tools) ? raw.tools : [],
     top_logprobs: numberOrDefault(raw.top_logprobs, 0),
-    top_p: 1,
+    top_p: 0.98,
     truncation: typeof raw.truncation === 'string' ? raw.truncation : 'disabled',
     usage: options.usage,
     user: typeof raw.user === 'string' ? raw.user : null,
@@ -2209,6 +2220,10 @@ function responseToolChoice(value: unknown): unknown {
   if (typeof value === 'string') return value;
   if (value && typeof value === 'object') return value;
   return 'auto';
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function numberOrDefault(value: unknown, fallback: number): number {

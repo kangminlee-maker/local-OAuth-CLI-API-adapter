@@ -45,6 +45,7 @@ const OPENAI_TOOL_CHOICE_MODES = ['none', 'auto', 'required'] as const;
 const OPENAI_CHAT_ROLES = ['system', 'assistant', 'user', 'function', 'tool', 'developer'] as const;
 const OPENAI_PROMPT_CACHE_OPTION_KEYS: ReadonlySet<string> = new Set(['ttl', 'mode']);
 const OPENAI_STREAM_OPTION_KEYS: ReadonlySet<string> = new Set(['include_usage', 'include_obfuscation']);
+const OPENAI_PROMPT_CACHE_RETENTIONS = ['in_memory', '24h'] as const;
 const OPENAI_METADATA_MAX_PROPERTIES = 16;
 const OPENAI_METADATA_MAX_KEY_LENGTH = 64;
 const OPENAI_METADATA_MAX_VALUE_LENGTH = 512;
@@ -203,8 +204,13 @@ function validateOpenAiChatFields(
   }
   if (present('prompt_cache_retention')) {
     const retention = input.prompt_cache_retention;
+    if (typeof retention !== 'string') {
+      throw invalidType('prompt_cache_retention', `one of ${listOfQuoted(OPENAI_PROMPT_CACHE_RETENTIONS, 'or')}`, retention);
+    }
     if (retention !== 'in_memory' && retention !== '24h') {
-      throw invalidType('prompt_cache_retention', "one of 'in_memory' or '24h'", retention);
+      // Chat's own sentence for this one field: no code, no list, no period.
+      // Responses answers the same input with a standard `invalid_value`.
+      throw new ProxyRequestError('Invalid prompt_cache_retention argument', 400, 'openai', 'invalid_request_error', 'prompt_cache_retention');
     }
     if (retention === 'in_memory') {
       // Not an enum fault: the value is valid and this model family refuses it.
@@ -273,11 +279,17 @@ function validateOpenAiMetadata(value: unknown): void {
   }
 }
 
-// The direct API shortens an over-long property NAME in its message while the
-// `param` carries it whole (measured on a 70-character key: `'kkk...kkk'`).
-// Fitted to that one observation; the parity instrument re-checks it.
+/**
+ * The direct API shortens a long name to its first and last three characters
+ * in a message while the `param` carries it whole. The threshold is bracketed
+ * by measurement rather than assumed: `'conversation'` (12) is printed whole
+ * and `'previous_response_id'` (20) is elided in the same sentence, the
+ * `include` members (24+) are elided in their type message, and a 70-character
+ * metadata key came back as `'kkk...kkk'`. Everything shorter that has been
+ * measured — `'detailed'`, `'in_memory'`, `'priority'` — is printed whole.
+ */
 function elideLongName(name: string): string {
-  return name.length > 6 ? `${name.slice(0, 3)}...${name.slice(-3)}` : name;
+  return name.length > 12 ? `${name.slice(0, 3)}...${name.slice(-3)}` : name;
 }
 
 function validateOpenAiChatResponseFormat(value: unknown): void {
@@ -318,8 +330,43 @@ function unsupportedParameter(field: string, message?: string): ProxyRequestErro
   );
 }
 
-function unknownParameter(field: string): ProxyRequestError {
-  return new ProxyRequestError(`Unknown parameter: '${field}'.`, 400, 'openai', 'invalid_request_error', field, 'unknown_parameter');
+/**
+ * An unknown key, with the direct API's spelling help. The suggestion rule is
+ * measured, not guessed: candidates are known keys within an edit distance of
+ * 2 (`'sto'`→`'store'` suggests, `'st'` does not) that the body does NOT
+ * already carry (`'modell'` suggests nothing while `model` is present, and
+ * `'inpu'` nothing while `input` is), nearest first (`'strem'` answers
+ * `'stream' or 'store'`, so the order is by distance and not alphabetical),
+ * ties alphabetical (`'stor'` on Chat answers `'stop' or 'store'`).
+ */
+function unknownParameter(field: string, suggestions: readonly string[] = []): ProxyRequestError {
+  const help = suggestions.length ? ` Did you mean ${listOfQuoted(suggestions, 'or')}?` : '';
+  return new ProxyRequestError(`Unknown parameter: '${field}'.${help}`, 400, 'openai', 'invalid_request_error', field, 'unknown_parameter');
+}
+
+function spellingSuggestions(unknown: string, known: ReadonlySet<string>, body: Record<string, unknown>): string[] {
+  return [...known]
+    .filter((key) => !(key in body))
+    .map((key) => ({ key, distance: editDistance(unknown, key) }))
+    .filter((candidate) => candidate.distance <= 2)
+    .sort((a, b) => a.distance - b.distance || (a.key < b.key ? -1 : 1))
+    .map((candidate) => candidate.key);
+}
+
+function editDistance(a: string, b: string): number {
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+  return previous[b.length];
 }
 
 function missingRequiredParameter(field: string): ProxyRequestError {
@@ -354,15 +401,25 @@ function integerAboveMax(field: string, value: number, max: number): ProxyReques
   );
 }
 
-/** "'a', 'b', or 'c'" — the direct API's own list punctuation. */
+/**
+ * "'a', 'b', or 'c'" — the direct API's own list punctuation, including its
+ * serial comma, which it drops for a two-member list: `'auto' and 'disabled'`,
+ * not `'auto', and 'disabled'` (measured on `truncation`, and on
+ * `prompt_cache_retention`'s two-member type message).
+ */
 function listOfQuoted(values: readonly string[], conjunction: 'or' | 'and'): string {
   const quoted = values.map((value) => `'${value}'`);
   if (quoted.length <= 1) return quoted.join('');
+  if (quoted.length === 2) return `${quoted[0]} ${conjunction} ${quoted[1]}`;
   return `${quoted.slice(0, -1).join(', ')}, ${conjunction} ${quoted[quoted.length - 1]}`;
 }
 
 /** The direct API's own type words for its "got X instead" messages. */
 export function jsonTypeName(value: unknown): string {
+  // `null` here, not "an object": the Images surface words a JSON null that way
+  // (measured on `model` and `prompt`, 2026-08-30). Responses words the SAME
+  // value as "an object" — see `readRequiredOpenAiModel`, where that one
+  // surface's wording is kept local rather than generalized from it.
   if (value === null) return 'null';
   if (Array.isArray(value)) return 'an array';
   if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a decimal number';
@@ -376,7 +433,7 @@ export function jsonTypeName(value: unknown): string {
 // parameters' presence and before every other field's validation.
 function rejectUnknownOpenAiKeys(input: Record<string, unknown>, known: ReadonlySet<string>): void {
   for (const key of Object.keys(input)) {
-    if (!known.has(key)) throw unknownParameter(key);
+    if (!known.has(key)) throw unknownParameter(key, spellingSuggestions(key, known, input));
   }
 }
 
@@ -390,9 +447,29 @@ function readRequiredOpenAiModel(value: unknown, shape: 'openai-chat' | 'openai-
     }
     throw missingRequiredParameter('model');
   };
-  if (value === undefined || value === null) missing();
+  if (value === undefined) missing();
+  // Chat treats `null` and `''` as an absent model; Responses treats neither
+  // that way. `null` is a TYPE fault there — and the direct API words JSON
+  // null as "an object" in that sentence — while `''` is a model that does not
+  // exist. Both measured 2026-08-30; neither was mirrored before.
+  if (value === null) {
+    if (shape === 'openai-chat') missing();
+    // Responses alone words a JSON null as "an object" — measured against the
+    // Images surface, which words the identical fault as "null". One surface's
+    // phrasing is not the API's phrasing.
+    throw new ProxyRequestError(
+      "Invalid type for 'model': expected a string, but got an object instead.",
+      400, 'openai', 'invalid_request_error', 'model', 'invalid_type',
+    );
+  }
   if (typeof value !== 'string') throw invalidType('model', 'a string', value);
-  if (!value.trim()) missing();
+  if (!value.trim()) {
+    if (shape === 'openai-chat') missing();
+    throw new ProxyRequestError(
+      `The requested model '${value}' does not exist.`,
+      400, 'openai', 'invalid_request_error', 'model', 'model_not_found',
+    );
+  }
   return value as string;
 }
 
@@ -484,8 +561,54 @@ function readOpenAiLegacyFunctionCall(value: unknown): NormalizedToolChoice {
   return { type: 'tool', name: call.name };
 }
 
+// The top-level keys the direct Responses API knows, measured 2026-08-30
+// (§5.5.6). `n`, `stop`, `seed`, `logprobs` and `max_tokens` are Chat keys and
+// unknown here; `messages` is unknown with a sentence of its own.
+const OPENAI_RESPONSES_KEYS: ReadonlySet<string> = new Set([
+  'model', 'input', 'instructions', 'max_output_tokens', 'max_tool_calls', 'temperature', 'top_p',
+  'top_logprobs', 'stream', 'stream_options', 'text', 'tools', 'tool_choice', 'parallel_tool_calls',
+  'reasoning', 'include', 'store', 'background', 'previous_response_id', 'conversation',
+  'truncation', 'metadata', 'user', 'safety_identifier', 'prompt_cache_key',
+  'prompt_cache_retention', 'prompt_cache_options', 'service_tier', 'prompt', 'context_management',
+  'moderation', 'presence_penalty', 'frequency_penalty',
+]);
+/**
+ * Two enums, because the direct API answers in two layers (measured):
+ *
+ *   `'bogus'`   → `invalid_value`, listing the SCHEMA set (with `minimal`)
+ *   `'minimal'` → `unsupported_value`, naming the model and listing the set
+ *                 that model takes (without `minimal`)
+ *
+ * and `max` — refused on Chat — is in both here. A single list would have to
+ * answer one of those two wrongly.
+ */
+const OPENAI_RESPONSES_EFFORT_SCHEMA = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+const OPENAI_RESPONSES_REASONING_EFFORTS = ['none', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+/** The narrower list the direct API prints when the value is an integer. */
+const OPENAI_RESPONSES_EFFORT_INTEGER_BRANCH = ['minimal', 'low', 'medium', 'high'] as const;
+const OPENAI_RESPONSES_REASONING_SUMMARIES = ['concise', 'detailed', 'auto'] as const;
+const OPENAI_RESPONSES_REASONING_KEYS: ReadonlySet<string> = new Set(['effort', 'summary']);
+const OPENAI_RESPONSES_TRUNCATIONS = ['auto', 'disabled'] as const;
+const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
+// Only `include_obfuscation` — `include_usage` is a Chat key and unknown here
+// (P-10), which this proxy used to accept as an extension.
+const OPENAI_RESPONSES_STREAM_OPTION_KEYS: ReadonlySet<string> = new Set(['include_obfuscation']);
+const OPENAI_RESPONSES_INCLUDES = [
+  'file_search_call.results', 'web_search_call.results', 'web_search_call.action.sources',
+  'message.input_image.image_url', 'computer_call_output.output.image_url',
+  'code_interpreter_call.outputs', 'reasoning.encrypted_content', 'message.output_text.logprobs',
+] as const;
+
 export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedRequest {
   const input = objectBody(body);
+  // Same three-step order as Chat, with this surface's own sentences: the
+  // required parameter first, then unknown keys, then the fields in the order
+  // measured for THIS surface — which is nothing like Chat's, because each
+  // surface reports in its own schema order (§5.5.6).
+  const model = readRequiredOpenAiModel(input.model, 'openai-responses');
+  rejectUnknownOpenAiResponsesKeys(input);
+  validateOpenAiResponsesFields(input, model);
+
   const messages: NormalizedMessage[] = [];
   if (typeof input.instructions === 'string' && input.instructions.trim()) {
     messages.push({ role: 'system', content: input.instructions, images: [] });
@@ -494,18 +617,12 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const text = asRecord(input.text);
   const format = asRecord(text?.format);
   const reasoning = asRecord(input.reasoning);
-  rejectUnsupportedOpenAiSampling(input, 'openai-responses');
-  // The one Responses field this commit touches: its value is echoed, so it
-  // cannot go unvalidated — an unknown tier is `invalid_value` there too,
-  // with the same list (measured 2026-08-30). The rest of this surface's
-  // schema is still the pre-existing lenient one.
-  if (input.service_tier !== undefined && input.service_tier !== null) readOpenAiServiceTier(input.service_tier);
   return {
     shape: 'openai-responses',
-    model: readRequiredModel(input.model, 'openai'),
+    model,
     messages,
     maxTokens: readOptionalNumber(input.max_output_tokens),
-    reasoningEffort: readOpenAiReasoningEffort(reasoning?.effort),
+    reasoningEffort: readOpenAiResponsesReasoningEffort(reasoning?.effort, model),
     verbosity: readOpenAiVerbosity(text?.verbosity),
     stream: input.stream === true,
     streamOptions: readStreamOptions(input.stream_options),
@@ -514,10 +631,268 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     jsonSchemaName: format?.type === 'json_schema' ? readOptionalString(format.name) : undefined,
     jsonSchemaStrict: format?.type === 'json_schema' ? readOptionalBoolean(format.strict) : undefined,
     tools: readOpenAiTools(input.tools),
-    toolChoice: readOpenAiToolChoice(input.tool_choice),
-    ...(typeof input.n === 'number' && input.n !== 1 ? { choices: input.n } : {}),
+    toolChoice: readOpenAiToolChoice(input.tool_choice, 'openai-responses'),
     raw: body,
   };
+}
+
+function rejectUnknownOpenAiResponsesKeys(input: Record<string, unknown>): void {
+  for (const key of Object.keys(input)) {
+    if (OPENAI_RESPONSES_KEYS.has(key)) continue;
+    // The one unknown key with a sentence of its own, and no `param` at all.
+    if (key === 'messages') {
+      throw new ProxyRequestError(
+        "Unsupported parameter: 'messages'. In the Responses API, this parameter has moved to 'input'. Try again with the new parameter. See the API documentation for more information: https://platform.openai.com/docs/api-reference/responses/create.",
+        400, 'openai', 'invalid_request_error', null, 'unsupported_parameter',
+      );
+    }
+    throw unknownParameter(key, spellingSuggestions(key, OPENAI_RESPONSES_KEYS, input));
+  }
+}
+
+/**
+ * The Responses fields, in the order this surface reports them (§5.5.6: 31
+ * keys, comparison sort, 124 calls, antisymmetry checked, adjacent pairs
+ * re-verified). Three of its rules differ from Chat's and are the reason a
+ * shared validator would be wrong: `reasoning.effort: "max"` is accepted here,
+ * `prompt_cache_retention: "in_memory"` carries a code here, and `model: null`
+ * is a type fault here.
+ *
+ * Server-side state is where this surface diverges on purpose. The direct API
+ * refuses an unknown `previous_response_id`, `conversation` or `prompt.id`;
+ * this proxy stores none of them, so EVERY id is unknown and every one of
+ * those requests is refused with the direct envelope. That is the honest
+ * answer: the alternative — the previous behaviour — was to echo the id back
+ * and run the turn with no prior context at all.
+ */
+function validateOpenAiResponsesFields(input: Record<string, unknown>, model: string): void {
+  const present = (key: string): boolean => input[key] !== undefined && input[key] !== null;
+
+  if (present('input')) {
+    if (typeof input.input !== 'string' && !Array.isArray(input.input)) {
+      throw invalidType('input', 'one of a string or array of input items', input.input);
+    }
+    // Inside the item, at the `input` position of the order — a fault here
+    // beats every later field's, which is what the measurement shows.
+    if (Array.isArray(input.input)) {
+      input.input.forEach((item, index) => {
+        const msg = asRecord(item);
+        if (msg) rejectUnknownResponsesMessageKeys(msg, index);
+      });
+    }
+  }
+  if (present('previous_response_id') && typeof input.previous_response_id !== 'string') {
+    throw invalidType('previous_response_id', 'a string', input.previous_response_id);
+  }
+  if (present('prompt') && !asRecord(input.prompt)) throw invalidType('prompt', 'an object', input.prompt);
+  if (present('moderation') && !asRecord(input.moderation)) {
+    throw invalidType('moderation', 'an object', input.moderation);
+  }
+  if (present('include')) {
+    if (!Array.isArray(input.include)) {
+      // The type message abbreviates each member to its first and last three
+      // characters (`'fil...lts'`); the VALUE message spells them out. Both
+      // are measured — the abbreviation is not a formatting choice of ours.
+      throw invalidType('include', `an array of one of ${listOfQuoted(OPENAI_RESPONSES_INCLUDES.map(elideLongName), 'or')}`, input.include);
+    }
+    input.include.forEach((member, index) => {
+      if (!OPENAI_RESPONSES_INCLUDES.some((candidate) => candidate === member)) {
+        throw invalidValue(`include[${index}]`, String(member), OPENAI_RESPONSES_INCLUDES);
+      }
+    });
+
+  }
+  if (present('tools') && !Array.isArray(input.tools)) throw invalidType('tools', 'an array of tools', input.tools);
+  if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice, 'openai-responses');
+  if (present('metadata')) validateOpenAiMetadata(input.metadata);
+  if (present('text') && !asRecord(input.text)) throw invalidType('text', 'an object', input.text);
+  if (present('temperature') && typeof input.temperature !== 'number') {
+    throw invalidType('temperature', 'a decimal', input.temperature);
+  }
+  if (present('top_p') && typeof input.top_p !== 'number') {
+    throw invalidType('top_p', 'a decimal', input.top_p);
+  }
+  for (const key of ['presence_penalty', 'frequency_penalty'] as const) {
+    if (present(key) && typeof input[key] !== 'number') throw invalidType(key, 'a decimal', input[key]);
+  }
+  if (present('parallel_tool_calls') && typeof input.parallel_tool_calls !== 'boolean') {
+    throw invalidType('parallel_tool_calls', 'a boolean', input.parallel_tool_calls);
+  }
+  if (present('stream') && typeof input.stream !== 'boolean') throw invalidType('stream', 'a boolean', input.stream);
+  if (present('stream_options')) {
+    const options = asRecord(input.stream_options);
+    if (!options) throw invalidType('stream_options', 'an object', input.stream_options);
+    for (const key of Object.keys(options)) {
+      if (!OPENAI_RESPONSES_STREAM_OPTION_KEYS.has(key)) throw unknownParameter(`stream_options.${key}`);
+    }
+  }
+  if (present('background') && typeof input.background !== 'boolean') {
+    throw invalidType('background', 'a boolean', input.background);
+  }
+  if (present('max_output_tokens')) {
+    if (!Number.isInteger(input.max_output_tokens)) throw invalidType('max_output_tokens', 'an integer', input.max_output_tokens);
+    // 16, not 1 — measured at 1, 15 and 16. `max_tool_calls`'s floor IS 1.
+    if ((input.max_output_tokens as number) < OPENAI_RESPONSES_MIN_OUTPUT_TOKENS) {
+      throw integerBelowMin('max_output_tokens', input.max_output_tokens as number, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS);
+    }
+  }
+  if (present('max_tool_calls')) {
+    if (!Number.isInteger(input.max_tool_calls)) throw invalidType('max_tool_calls', 'an integer', input.max_tool_calls);
+    if ((input.max_tool_calls as number) < 1) throw integerBelowMin('max_tool_calls', input.max_tool_calls as number, 1);
+  }
+  if (present('reasoning')) validateOpenAiResponsesReasoning(input.reasoning, model);
+  if (present('user') && typeof input.user !== 'string') throw invalidType('user', 'a string', input.user);
+  if (present('safety_identifier') && typeof input.safety_identifier !== 'string') {
+    throw invalidType('safety_identifier', 'a string', input.safety_identifier);
+  }
+  if (present('prompt_cache_options')) {
+    const options = asRecord(input.prompt_cache_options);
+    if (!options) throw invalidType('prompt_cache_options', 'an object', input.prompt_cache_options);
+    for (const key of Object.keys(options)) {
+      if (!OPENAI_PROMPT_CACHE_OPTION_KEYS.has(key)) throw unknownParameter(`prompt_cache_options.${key}`);
+    }
+  }
+  if (present('prompt_cache_key') && typeof input.prompt_cache_key !== 'string') {
+    throw invalidType('prompt_cache_key', 'a string', input.prompt_cache_key);
+  }
+  if (present('prompt_cache_retention')) {
+    const retention = input.prompt_cache_retention;
+    if (typeof retention !== 'string') {
+      throw invalidType('prompt_cache_retention', `one of ${listOfQuoted(OPENAI_PROMPT_CACHE_RETENTIONS, 'or')}`, retention);
+    }
+    if (retention !== 'in_memory' && retention !== '24h') {
+      throw invalidValue('prompt_cache_retention', retention, OPENAI_PROMPT_CACHE_RETENTIONS);
+    }
+    if (retention === 'in_memory') {
+      // The same sentence Chat gives, with a code Chat does not carry.
+      throw new ProxyRequestError(
+        'This model is compatible only with 24h extended prompt caching',
+        400, 'openai', 'invalid_request_error', 'prompt_cache_retention', 'invalid_parameter',
+      );
+    }
+  }
+  if (present('truncation')) {
+    if (typeof input.truncation !== 'string') throw invalidType('truncation', `one of ${listOfQuoted(OPENAI_RESPONSES_TRUNCATIONS, 'or')}`, input.truncation);
+    if (!OPENAI_RESPONSES_TRUNCATIONS.some((candidate) => candidate === input.truncation)) {
+      throw invalidValue('truncation', input.truncation, OPENAI_RESPONSES_TRUNCATIONS);
+    }
+  }
+  if (present('instructions') && typeof input.instructions !== 'string') {
+    throw invalidType('instructions', 'a string', input.instructions);
+  }
+  if (present('store') && typeof input.store !== 'boolean') throw invalidType('store', 'a boolean', input.store);
+  if (present('service_tier')) readOpenAiServiceTier(input.service_tier);
+  if (present('top_logprobs') && !Number.isInteger(input.top_logprobs)) {
+    throw invalidType('top_logprobs', 'an integer', input.top_logprobs);
+  }
+  if (present('context_management') && !Array.isArray(input.context_management)) {
+    throw invalidType('context_management', 'an array of objects', input.context_management);
+  }
+  refuseOpenAiResponsesServerState(input);
+
+  // The model-capability value checks, after every field check — the same
+  // second pass Chat has. Logprobs live here rather than at their fields'
+  // slots: a later field's type fault beats them, so the refusal is about what
+  // the model can do and not about the shape of the body. Both doors to them
+  // are refused; the proxy used to accept the `include` member and run the
+  // turn, answering with no logprobs in it at all.
+  rejectUnsupportedOpenAiSampling(input, 'openai-responses', 'temperature');
+  rejectUnsupportedOpenAiSampling(input, 'openai-responses', 'top_p');
+  // `include` first: sent together, the direct API names that door (measured).
+  if (Array.isArray(input.include) && input.include.includes('message.output_text.logprobs')) {
+    throw unsupportedParameter('include', 'logprobs are not supported with reasoning models.');
+  }
+  if (present('top_logprobs')) {
+    throw unsupportedParameter('top_logprobs', 'logprobs are not supported with reasoning models.');
+  }
+  for (const key of ['presence_penalty', 'frequency_penalty'] as const) {
+    // Chat carries `unsupported_parameter` here; Responses carries no code at
+    // all for the same sentence (measured on both).
+    if (present(key)) {
+      throw new ProxyRequestError(
+        `Unsupported parameter: '${key}' is not supported with this model.`,
+        400, 'openai', 'invalid_request_error', key,
+      );
+    }
+  }
+}
+
+/**
+ * Server-side state, which this proxy holds none of. The direct API resolves
+ * these three ids after it has validated the whole body and before it checks
+ * what the model supports — measured on both sides of that boundary: a bad
+ * `truncation` beats an unknown `prompt`, and an unknown `prompt` beats a
+ * refused `temperature`. Their own order is `conversation`, then `prompt`,
+ * then `previous_response_id`, and the first two pair is refused as mutually
+ * exclusive before either is looked up.
+ *
+ * Every id is unknown here, so every one of these requests is refused. That is
+ * the honest answer: the alternative — the previous behaviour — was to echo
+ * the id back and run the turn with no prior context at all.
+ */
+function refuseOpenAiResponsesServerState(input: Record<string, unknown>): void {
+  const has = (key: string): boolean => input[key] !== undefined && input[key] !== null;
+  if (has('previous_response_id') && has('conversation')) {
+    throw new ProxyRequestError(
+      `Mutually exclusive parameters: ''. Ensure you are only providing one of: ${listOfQuoted(['previous_response_id', 'conversation'].map(elideLongName), 'or')}.`,
+      400, 'openai', 'invalid_request_error', null, 'mutually_exclusive_parameters',
+    );
+  }
+  if (has('conversation')) {
+    const conversation = asRecord(input.conversation);
+    if (conversation && typeof conversation.id !== 'string') throw missingRequiredParameter('conversation.id');
+    const id = typeof input.conversation === 'string' ? input.conversation : String(conversation?.id ?? '');
+    throw new ProxyRequestError(`Conversation with id '${id}' not found.`, 404, 'openai', 'invalid_request_error', null, null);
+  }
+  if (has('prompt')) {
+    throw new ProxyRequestError(
+      `Prompt with id '${String(asRecord(input.prompt)?.id ?? '')}' not found.`,
+      404, 'openai', 'invalid_request_error', null, null,
+    );
+  }
+  if (has('previous_response_id')) {
+    throw new ProxyRequestError(
+      `Previous response with id '${String(input.previous_response_id)}' not found.`,
+      400, 'openai', 'invalid_request_error', 'previous_response_id', 'previous_response_not_found',
+    );
+  }
+}
+
+function validateOpenAiResponsesReasoning(value: unknown, model: string): void {
+  const reasoning = asRecord(value);
+  if (!reasoning) throw invalidType('reasoning', 'an object', value);
+  for (const key of Object.keys(reasoning)) {
+    if (!OPENAI_RESPONSES_REASONING_KEYS.has(key)) throw unknownParameter(`reasoning.${key}`);
+  }
+  const summary = reasoning.summary;
+  if (summary !== undefined && summary !== null && !OPENAI_RESPONSES_REASONING_SUMMARIES.some((candidate) => candidate === summary)) {
+    throw invalidValue('reasoning.summary', String(summary), OPENAI_RESPONSES_REASONING_SUMMARIES);
+  }
+  readOpenAiResponsesReasoningEffort(reasoning.effort, model);
+}
+
+function readOpenAiResponsesReasoningEffort(value: unknown, model: string): NormalizedReasoningEffort | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string') {
+    // An integer gets the narrow branch's list; anything else gets the whole
+    // union, integer included. Two sentences for one field, both measured.
+    const expected = typeof value === 'number' && Number.isInteger(value)
+      ? `one of ${listOfQuoted(OPENAI_RESPONSES_EFFORT_INTEGER_BRANCH, 'or')}`
+      : `one of one of ${listOfQuoted(OPENAI_RESPONSES_EFFORT_SCHEMA, 'or')} or integer`;
+    throw invalidType('reasoning.effort', expected, value);
+  }
+  if (!OPENAI_RESPONSES_EFFORT_SCHEMA.some((candidate) => candidate === value)) {
+    throw invalidValue('reasoning.effort', value, OPENAI_RESPONSES_EFFORT_SCHEMA);
+  }
+  if (!OPENAI_RESPONSES_REASONING_EFFORTS.some((candidate) => candidate === value)) {
+    throw new ProxyRequestError(
+      `Unsupported value: '${value}' is not supported with the '${model}' model. Supported values are: ${listOfQuoted(OPENAI_RESPONSES_REASONING_EFFORTS, 'and')}.`,
+      400, 'openai', 'invalid_request_error', 'reasoning.effort', 'unsupported_value',
+    );
+  }
+  // `max` is in this surface's enum and outside the normalized set the
+  // backends take; it runs at the highest effort they have.
+  return value === 'max' ? 'xhigh' : (value as NormalizedReasoningEffort);
 }
 
 /**
@@ -1042,6 +1417,22 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
 }
 
 /**
+ * The direct API is strict inside an input item too, not only at the top level
+ * (measured: `input[0].bogus` answers `unknown_parameter` with that exact
+ * param). Only MESSAGE items are checked here — a typed item belongs to a
+ * union that grows with the API, and pinning its members would 400 tomorrow's
+ * valid items for no measurement's sake.
+ */
+const OPENAI_RESPONSES_MESSAGE_KEYS: ReadonlySet<string> = new Set(['type', 'role', 'content', 'status', 'id']);
+
+function rejectUnknownResponsesMessageKeys(msg: Record<string, unknown>, index: number): void {
+  if (msg.type !== undefined && msg.type !== 'message') return;
+  for (const key of Object.keys(msg)) {
+    if (!OPENAI_RESPONSES_MESSAGE_KEYS.has(key)) throw unknownParameter(`input[${index}].${key}`);
+  }
+}
+
+/**
  * Responses input items are polymorphic: typed items (`function_call`,
  * `function_call_output`, `reasoning`, ...) have no `role` and are valid
  * without one. Only a message item — no `type`, or `type: "message"` — carries
@@ -1450,20 +1841,43 @@ function readAnthropicTools(value: unknown): NormalizedTool[] {
 // list, a non-string non-object is `invalid_type`, and an object is required
 // to carry `function` and then `function.name` — whatever its `type` says.
 // The proxy used to read everything else as `auto`.
-function readOpenAiToolChoice(value: unknown): NormalizedToolChoice {
+/**
+ * The two surfaces word the same fault differently and name the tool
+ * differently, so this takes the surface rather than guessing:
+ *
+ *   Chat      `expected one of one of 'none', 'auto', or 'required' or object`
+ *   Responses `expected one of an object or 'none', 'auto', or 'required'`
+ *
+ * and the object form is `{type:'function', function:{name}}` on Chat against
+ * `{type:'function', name}` on Responses — a Chat-shaped choice sent to
+ * Responses names no tool at all.
+ */
+function readOpenAiToolChoice(
+  value: unknown,
+  shape: 'openai-chat' | 'openai-responses' = 'openai-chat',
+): NormalizedToolChoice {
   if (value === undefined || value === null || value === 'auto') return { type: 'auto' };
   if (value === 'none') return { type: 'none' };
   if (value === 'required') return { type: 'required' };
   if (typeof value === 'string') throw invalidValue('tool_choice', value, OPENAI_TOOL_CHOICE_MODES);
   const choice = asRecord(value);
   if (!choice) {
-    throw invalidType('tool_choice', `one of one of ${listOfQuoted(OPENAI_TOOL_CHOICE_MODES, 'or')} or object`, value);
+    const expected = shape === 'openai-chat'
+      ? `one of one of ${listOfQuoted(OPENAI_TOOL_CHOICE_MODES, 'or')} or object`
+      : `one of an object or ${listOfQuoted(OPENAI_TOOL_CHOICE_MODES, 'or')}`;
+    throw invalidType('tool_choice', expected, value);
+  }
+  if (shape === 'openai-responses') {
+    if (typeof choice.name !== 'string') throw missingRequiredParameter('tool_choice.name');
+    return { type: 'tool', name: choice.name };
   }
   const fn = asRecord(choice.function);
   if (!fn) throw missingRequiredParameter('tool_choice.function');
   if (typeof fn.name !== 'string') throw missingRequiredParameter('tool_choice.function.name');
   return { type: 'tool', name: fn.name };
 }
+
+
 
 function readStreamOptions(value: unknown) {
   const options = asRecord(value);
