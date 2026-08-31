@@ -254,9 +254,35 @@ test('chat accepts the penalties and logprobs once the model stops reasoning', a
   assert.equal(status, 200);
 });
 
-test('chat accepts a message with no content, and one with null content', async () => {
-  const { status } = await chat({ messages: [{ role: 'user' }, { role: 'assistant', content: null }, { role: 'user', content: 'ping' }] });
-  assert.equal(status, 200);
+test('chat requires content, and the assistant schema says what stands in for it', async () => {
+  // This test asserted the opposite until 2026-08-31. Re-measured on
+  // gpt-5.6-terra, gpt-5.5 and gpt-5.6-sol, with `content:"hi"` as the positive
+  // control: an absent or null `content` is 400 on every role, and only an
+  // assistant message carrying one of the schema's substitutes is exempt.
+  const missing = await chat({ messages: [{ role: 'user' }, { role: 'assistant', content: null }, { role: 'user', content: 'ping' }] });
+  assert.equal(missing.status, 400);
+  assert.equal(missing.payload.error.param, 'messages.[0].content');
+  assert.equal(missing.payload.error.code, null);
+  assert.equal(missing.payload.error.message, "Invalid value for 'content': expected a string, got null.");
+  // The empty string and the empty array are CONTENT — present, and accepted.
+  for (const content of ['', []]) {
+    const { status } = await chat({ messages: [{ role: 'user', content }] });
+    assert.equal(status, 200, `content ${JSON.stringify(content)} is present`);
+  }
+  // Each substitute alone stands in for content on an assistant message.
+  for (const [label, extra] of [
+    ['tool_calls', { tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] }],
+    ['function_call', { function_call: { name: 'f', arguments: '{}' } }],
+    ['refusal', { refusal: 'no' }],
+    ['audio', { audio: { id: 'a1' } }],
+  ]) {
+    const { status } = await chat({ messages: [{ role: 'user', content: 'a' }, { role: 'assistant', ...extra }] });
+    assert.equal(status, 200, `an assistant carrying ${label} needs no content`);
+  }
+  // And an assistant carrying none of them does need it.
+  const bare = await chat({ messages: [{ role: 'user', content: 'a' }, { role: 'assistant' }] });
+  assert.equal(bare.status, 400);
+  assert.equal(bare.payload.error.param, 'messages.[1].content');
 });
 
 // `service_tier` is echoed, so it is the one accepted-and-not-applied key with

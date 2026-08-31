@@ -248,7 +248,46 @@ function validateOpenAiChatFields(
     if (present('frequency_penalty')) throw unsupportedParameter('frequency_penalty');
     if (input.logprobs === true) throw unsupportedParameter('logprobs');
   }
+  refuseOpenAiChatMissingContent(input.messages);
   return { messages, reasoningEffort };
+}
+
+/**
+ * `content` is REQUIRED on every message, and this is the last check of all.
+ *
+ * Measured 2026-08-31 on gpt-5.6-terra, gpt-5.5 and gpt-5.6-sol alike, with
+ * `{"role":"user","content":"hi"}` as the positive control: `{"role":"user"}`
+ * and `{"role":"user","content":null}` both answer 400 `Invalid value for
+ * 'content': expected a string, got null.` at param `messages.[<i>].content` —
+ * the dotted-bracket form, and no `code` at all, neither of which any other
+ * fault on this surface uses. This file's previous note recorded the opposite
+ * ("ABSENT or `null` on any role too, measured 2026-08-30") and removed the
+ * check on that reading, which turned a 400 into a 200.
+ *
+ * The exemption is the assistant schema's own: an assistant message needs at
+ * least ONE of content, `tool_calls`, `function_call`, `refusal` or `audio`, so
+ * any of those stands in for content (each measured to answer 200, or to answer
+ * about something other than content). Every other role needs content itself.
+ *
+ * Last of all: it loses to the content TYPE check at any index, to a bad role
+ * at any index, to `n`, `stop`, `temperature` and an unknown key.
+ */
+const OPENAI_CHAT_ASSISTANT_CONTENT_SUBSTITUTES = ['tool_calls', 'function_call', 'refusal', 'audio'] as const;
+
+function refuseOpenAiChatMissingContent(value: unknown): void {
+  if (!Array.isArray(value)) return;
+  for (const [index, item] of value.entries()) {
+    const msg = asRecord(item);
+    if (!msg || (msg.content !== undefined && msg.content !== null)) continue;
+    if (
+      msg.role === 'assistant'
+      && OPENAI_CHAT_ASSISTANT_CONTENT_SUBSTITUTES.some((key) => msg[key] !== undefined)
+    ) continue;
+    throw new ProxyRequestError(
+      "Invalid value for 'content': expected a string, got null.",
+      400, 'openai', 'invalid_request_error', `messages.[${index}].content`, null,
+    );
+  }
 }
 
 function validateOpenAiMetadata(value: unknown): void {
@@ -480,7 +519,11 @@ function readRequiredOpenAiModel(value: unknown, shape: 'openai-chat' | 'openai-
 }
 
 function requireOpenAiChatMessages(value: unknown): void {
-  if (value === undefined || value === null) throw missingRequiredParameter('messages');
+  // Only ABSENCE is a missing parameter here. `messages: null` is a wrong TYPE
+  // and gets the type sentence (measured 2026-08-31: "Invalid type for
+  // 'messages': expected an array of objects, but got null instead."), which
+  // `readOpenAiMessages` already writes — this used to answer both the same way.
+  if (value === undefined) throw missingRequiredParameter('messages');
 }
 
 function readOpenAiChatReasoningEffort(value: unknown): NormalizedReasoningEffort | undefined {
@@ -1697,12 +1740,9 @@ function readOpenAiChatRole(value: unknown, index: number): NormalizedMessage['r
 }
 
 /**
- * `content` as the direct API accepts it: a string or an array of parts, on
- * any role — and ABSENT or `null` on any role too, measured 2026-08-30
- * (`{"role":"user"}` and `{"role":"user","content":null}` both pass its
- * validation). The proxy used to require it except on an assistant turn
- * carrying `tool_calls`, so a body the direct API runs was a 400 here. A
- * defined value of another type keeps the direct envelope.
+ * `content`'s TYPE, at the `messages` position: a string or an array of parts,
+ * on any role. Absence and `null` are not this check's business — they are
+ * required-ness, decided last, in `refuseOpenAiChatMissingContent`.
  */
 function requireOpenAiChatContent(msg: Record<string, unknown>, index: number): void {
   const content = msg.content;

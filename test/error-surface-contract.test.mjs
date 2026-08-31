@@ -877,25 +877,48 @@ for (const [label, content] of [['a number', 42], ['a bare object', { type: 'tex
   });
 }
 
-// Measured 2026-08-30, and it overturned this file's earlier premise: the
-// direct Chat API accepts a message with no `content` and one with
-// `content: null`, on any role — `{"role":"user"}` beside a `temperature: 0.5`
-// tripwire is answered about the temperature, so the message passed validation.
-// Requiring content here made the proxy refuse bodies the direct API runs.
-for (const [label, message] of [
-  ['absent', { role: 'user' }],
-  ['null', { role: 'user', content: null }],
-  ['absent on an assistant turn with no tool calls', { role: 'assistant' }],
+// This block asserted the OPPOSITE until 2026-08-31, on a reading that the
+// instrument itself produced. The note read: "`{"role":"user"}` beside a
+// `temperature: 0.5` tripwire is answered about the temperature, so the message
+// passed validation." The tripwire technique needs the ridden fault to be
+// checked LATER than the field under test — and `content`'s required-ness is
+// checked later than the capability pass, so `temperature` wins over it no
+// matter what the message says. The probe could not have reported anything
+// else, and the conclusion was inverted.
+//
+// Re-measured directly, with no tripwire, on gpt-5.6-terra, gpt-5.5 and
+// gpt-5.6-sol, with `content: "hi"` as the positive control: every one of these
+// is 400.
+for (const [label, message, at] of [
+  ['absent', { role: 'user' }, 1],
+  ['null', { role: 'user', content: null }, 1],
+  ['absent on an assistant turn with no substitute', { role: 'assistant' }, 1],
+  ['absent on a system item', { role: 'system' }, 1],
 ]) {
-  test(`a message whose content is ${label} is accepted, as on the direct API`, async () => {
-    const { status } = await call(
+  test(`a message whose content is ${label} is refused, as on the direct API`, async () => {
+    const { status, text } = await call(
       backendThat({}),
       '/v1/chat/completions',
       { model: 'a-model', messages: [{ role: 'user', content: 'hi' }, message] },
     );
-    assert.equal(status, 200);
+    assert.equal(status, 400);
+    const error = JSON.parse(text).error;
+    assert.equal(error.param, `messages.[${at}].content`, 'the dotted-bracket form this fault alone uses');
+    assert.equal(error.code, null, 'and no code at all');
+    assert.equal(error.message, "Invalid value for 'content': expected a string, got null.");
   });
 }
+
+test('an empty string and an empty array are content, and are accepted', async () => {
+  for (const content of ['', []]) {
+    const { status } = await call(
+      backendThat({}),
+      '/v1/chat/completions',
+      { model: 'a-model', messages: [{ role: 'user', content }] },
+    );
+    assert.equal(status, 200, `content ${JSON.stringify(content)} is present`);
+  }
+});
 
 test('an assistant tool-call turn needs no content, as on the direct API', async () => {
   // "Required unless tool_calls or function_call is specified" — a client
@@ -1320,8 +1343,8 @@ test('/v1/responses: an item type outside the union is rejected, whatever its JS
 // --- round 39 coverage: promises the inventory showed nothing pins ---
 
 test('an assistant with the singular deprecated function_call needs no content either', async () => {
-  // The exemption names tool_calls AND function_call; only tool_calls was
-  // pinned, so the function_call half could be deleted unnoticed.
+  // The exemption names every substitute in the assistant schema, not only
+  // tool_calls; each half could be deleted unnoticed.
   const { status } = await call(
     backendThat({}),
     '/v1/chat/completions',

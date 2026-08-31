@@ -201,6 +201,21 @@ const chatCases = [
   ['response_format without type', { messages: M, response_format: {} }],
   ['response_format unknown type', { messages: M, response_format: { type: 'bogus' } }],
   ['messages as a string', { messages: 'ping' }],
+  // `content` is required on every message, and it is the LAST check of all —
+  // measured 2026-08-31 on three model families with a positive control. Its
+  // param is the dotted-bracket `messages.[i].content` and it carries no code.
+  ['chat content absent', { messages: [{ role: 'user' }] }],
+  ['chat content null', { messages: [{ role: 'user', content: null }] }],
+  ['chat content absent at index 1', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant' }] }],
+  ['chat content absent on a system item', { messages: [{ role: 'system' }, { role: 'user', content: 'a' }] }],
+  ['chat content absent loses to an unknown key', { messages: [{ role: 'user' }], zzz_unknown: 1 }],
+  ['chat content absent loses to the capability pass', { messages: [{ role: 'user' }], temperature: 0.5 }],
+  ['chat content absent loses to a field type fault', { messages: [{ role: 'user' }], n: 'x' }],
+  ['chat content absent loses to a content type fault', { messages: [{ role: 'user' }, { role: 'user', content: 7 }] }],
+  ['chat content absent loses to a bad role', { messages: [{ role: 'user' }, { role: 'bogus', content: 'x' }] }],
+  ['chat content absent on a tool item', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] }, { role: 'tool', tool_call_id: 'c1' }] }],
+  ['chat messages null is a type fault', { messages: null }],
+  ['chat messages as a string is a type fault', { messages: 'x' }],
   ['messages absent', { messages: DELETE }],
   ['messages empty', { messages: [] }],
   ['message item not an object', { messages: ['ping'] }],

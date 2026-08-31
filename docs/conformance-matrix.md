@@ -618,6 +618,27 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 **대가**: 스키마를 실은 턴은 상시 세션을 잃고 매번 새 CLI를 띄운다. 약속이 있는 곳에서만 치르는 값이고,
 스키마 없는 턴은 그대로 자식을 재사용한다. 회귀는 `test/claude-code-backend.test.mjs`의 argv 단언이 잡는다.
 
+#### 5.5.5-A Chat `content` 필수 규칙 — 4라운드 실측 (2026-08-31)
+
+**이 항목은 2026-08-30에 반대로 기록됐고, 그 오독을 만든 것은 계기 자체였다.**
+당시 노트: "`{"role":"user"}`에 `temperature: 0.5` 트립와이어를 태웠더니 temperature로 답했다 → 메시지는 검증을 통과했다."
+트립와이어는 **타고 가는 결함이 검사 대상보다 늦게** 검사될 때만 성립한다. 그런데 `content` 필수 검사는
+capability 패스보다 **더 뒤**다 — 그래서 메시지가 무엇이든 temperature가 이긴다. 그 프로브는 다른 답을 낼 수 없었고, 결론이 뒤집혔다.
+그 오독으로 **맞던 검사를 지웠고**, direct가 400을 주는 본문에 프록시가 200을 주게 됐다.
+
+**재측정**(트립와이어 없이, `gpt-5.6-terra`·`gpt-5.5`·`gpt-5.6-sol` 세 계열, `content:"hi"` 양성 대조):
+
+| 본문 | direct |
+| --- | --- |
+| `content` 생략 / `null` (role 무관) | 400, param **`messages.[i].content`**(점+대괄호 형태), **code 없음**, `Invalid value for 'content': expected a string, got null.` |
+| `content: ""` / `content: []` | **200** — 비어 있어도 *있는* 것이다 |
+| assistant + `tool_calls`·`function_call`·`refusal`·`audio` 중 하나 | **200** — assistant 스키마 자신의 대체 집합 |
+| assistant에 아무 대체도 없음 / `system`·`tool` 항목 | 400 |
+| `messages: null`·`'x'`·`7` | 400 `invalid_type` `Invalid type for 'messages': expected an array of objects, but got <타입> instead.` (프록시는 null을 `missing_required_parameter`로 답하고 있었다) |
+
+**단계**: `content` 필수 검사는 **전부의 마지막**이다 — 어느 인덱스의 content 타입 결함에도, 어느 인덱스의 잘못된 role에도,
+`n`·`stop`·`temperature`·미지 키에도 전부 진다.
+
 #### 5.5.6-A `input` 필수 규칙 — 4라운드 실측 (2026-08-31)
 
 3라운드까지 이 프록시는 `input`이 **없으면 빈 user 턴을 대신 넣고 200**을 줬다. direct는 그러지 않는다.
