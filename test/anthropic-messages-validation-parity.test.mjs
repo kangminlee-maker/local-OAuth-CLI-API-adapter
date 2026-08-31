@@ -145,6 +145,24 @@ const REJECTIONS = [
   ["order a known field beats the container refusal", { container: 'container_x', inference_geo: 7 }, "inference_geo: Input should be a valid string"],
   ["order a missing model beats a bad optional field", { model: DELETE, stop_sequences: 'ZZ' }, "model: Field required"],
   ["order a bad item beats an unknown key", { messages: [{ role: 'user', content: 'ping', bogus: 1 }], zzz_unknown: 1 }, "messages.0.bogus: Extra inputs are not permitted"],
+  // The conversation's SHAPE, a phase of its own: after every field's type
+  // check and after the unknown-key refusal, before the container one.
+  ["shape system precedes a user", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 'sys' }, { role: 'user', content: 'b' }] }, "messages.1: role 'system' must precede an 'assistant' message or end the array; the directive-only form (content: [] with output_config) is accepted at any position"],
+  ["shape system content empty past the head", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }] }, "messages.1: system content must contain at least one block"],
+  ["shape system content empty beats position", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }, { role: 'user', content: 'b' }] }, "messages.1: system content must contain at least one block"],
+  ["shape system whitespace text", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: '  ' }] }, "messages.1: system text blocks must contain non-whitespace text"],
+  ["shape system one empty block of two", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [{ type: 'text', text: 'x' }, { type: 'text', text: '' }] }] }, "messages.1: system text blocks must contain non-whitespace text"],
+  ["shape system position beats whitespace", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: '  ' }, { role: 'user', content: 'b' }] }, "messages.1: role 'system' must precede an 'assistant' message or end the array; the directive-only form (content: [] with output_config) is accepted at any position"],
+  ["shape system at the head empty", { messages: [{ role: 'system', content: [] }, { role: 'user', content: 'a' }] }, "messages.0: system content must contain at least one block"],
+  ["shape system at the head whitespace", { messages: [{ role: 'system', content: '  ' }, { role: 'user', content: 'a' }] }, "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position"],
+  ["shape empty user turn alone", { messages: [{ role: 'user', content: [] }] }, "messages.0: user messages must have non-empty content"],
+  ["shape empty user string alone", { messages: [{ role: 'user', content: '' }] }, "messages.0: user messages must have non-empty content"],
+  ["shape empty user turn after an assistant", { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }] }, "messages.2: user messages must have non-empty content"],
+  ["shape empty user run of two is reported at its first item", { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }, { role: 'user', content: [] }] }, "messages.2: user messages must have non-empty content"],
+  ["shape order a field type fault beats an empty turn", { messages: [{ role: 'user', content: [] }], temperature: 'x' }, "temperature: Input should be a valid number"],
+  ["shape order an unknown key beats an empty turn", { messages: [{ role: 'user', content: [] }], zzz_unknown: 1 }, "zzz_unknown: Extra inputs are not permitted"],
+  ["shape order an empty turn beats container", { messages: [{ role: 'user', content: [] }], container: 'container_x' }, "messages.0: user messages must have non-empty content"],
+  ["shape order a bad role beats an empty system", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }, { role: 'bogus', content: 'x' }] }, "messages: Unexpected role \"bogus\". Allowed roles are \"user\" or \"assistant\""],
 ];
 
 for (const [name, fragment, message] of REJECTIONS) {
@@ -156,6 +174,46 @@ for (const [name, fragment, message] of REJECTIONS) {
     assert.equal(payload.error.message, message);
     assert.equal(payload.error.param, undefined, 'this envelope carries no param');
     assert.equal(payload.error.code, undefined, 'and no code');
+  });
+}
+
+// Bodies the direct API ACCEPTS. A shape rule that refuses one of these is the
+// worst failure this surface can have — a working client stops working — and no
+// rejection row can see it.
+const ACCEPTED = [
+  ["system ends the array", [{ role: 'user', content: 'a' }, { role: 'system', content: 'sys' }]],
+  ["system precedes an assistant", [{ role: 'user', content: 'a' }, { role: 'system', content: 'sys' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'b' }]],
+  ["a run of system items", [{ role: 'user', content: 'a' }, { role: 'system', content: 's1' }, { role: 'system', content: 's2' }]],
+  ["an empty user turn a later one gives content", [{ role: 'user', content: [] }, { role: 'user', content: 'a' }]],
+  ["an empty user turn an earlier one gives content", [{ role: 'user', content: 'a' }, { role: 'user', content: [] }]],
+  ["an empty user turn inside a run with content", [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }, { role: 'user', content: 'b' }]],
+  ["an empty assistant turn", [{ role: 'user', content: 'a' }, { role: 'assistant', content: [] }]],
+  ["a system item whose blocks all carry text", [{ role: 'user', content: 'a' }, { role: 'system', content: [{ type: 'text', text: 'x' }] }]],
+];
+
+for (const [name, list] of ACCEPTED) {
+  test(`/v1/messages accepts ${name}, as the direct API does`, async () => {
+    const started = await startLocalApiProxy({
+      backend: {
+        name: 'test', model: 'configured-model',
+        async generate() {
+          return { id: 'x', model: 'configured-model', text: 'pong', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 };
+        },
+        async *stream() { throw new Error('unused'); },
+        async close() {},
+      },
+      host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+    });
+    try {
+      const res = await fetch(`${started.url}/v1/messages`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'claude-sonnet-5', max_tokens: 16, messages: list }),
+      });
+      const payload = await res.json();
+      assert.equal(res.status, 200, JSON.stringify(payload));
+    } finally {
+      await started.close();
+    }
   });
 }
 

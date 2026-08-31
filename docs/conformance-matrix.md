@@ -224,7 +224,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-1 | `model` | string, required | none | the model; echoed in `model` | 400 / `invalid_request_error` (Anthropic envelope has **no `param`/`code`**) | supported; required non-empty string; 404 `not_found_error` when honouring is on (contract `:301`, `:405` ff.) | VERIFIED-weak (`anthropic.messages.text` vs `anthropic-api`; **the archive shows this case both passing and failing across runs**) |
 | A-2 | `max_tokens` | integer, **required** | none | caps output; `stop_reason:"max_tokens"` | 400 / `invalid_request_error` | supported and required; **`0` accepted** on the claim that the direct API accepts it (contract `:316`) — an unverified claim about the provider | DOC? |
 | A-3 | `messages` | array, `minItems: 1`, required | none | the conversation | 400 / `invalid_request_error` | supported | VERIFIED-weak (same caveat as A-1) |
-| A-4 | `messages[].role` | `user`\|`assistant`, plus `system` past index 0 | none | turn attribution | 400 / `invalid_request_error` | supported; `system` at index 0 is 400 with guidance toward the top-level parameter and elsewhere is accepted, and only its POSITION is exempt — the rest of the item's schema still applies at `messages.<i>` (§5.5.7). Anything else 400 in the Anthropic envelope | VERIFIED |
+| A-4 | `messages[].role` | `user`\|`assistant`, plus `system` in the positions §5.5.7 measures | none | turn attribution | 400 / `invalid_request_error` | supported; `system` carries POSITION rules decided in their own late phase — index 0 is 400 with guidance toward the top-level parameter, and elsewhere a system run must precede an `assistant` message or end the array. Everything else about the item is the ordinary item schema at `messages.<i>` (§5.5.7, which also names the one clause not mirrored). Anything else 400 in the Anthropic envelope | VERIFIED |
 | A-5 | `messages[].content` | string \| block array | none | the turn | 400 / `invalid_request_error` | supported | VERIFIED-weak |
 | A-6 | `content[].type:"text"` | `{text, cache_control?, citations?}` | — | text input | 400 / `invalid_request_error` | supported | VERIFIED-weak |
 | A-7 | `content[].type:"image"` | `source`: `{type:"base64", media_type, data}` \| `{type:"url", url}` \| `{type:"file", file_id}` | — | vision input | 400 / `invalid_request_error` | base64 + url supported; **`file` rejected pre-execution** (contract `:307`) — the provider accepts it via the Files API, so this is a real capability gap surfaced as a 400 | VERIFIED-weak for base64/url (`anthropic.messages.image.schema_exact`) |
@@ -638,6 +638,31 @@ OpenAI 표면들이 능력 거절을 맨 뒤에 두는 것과 같은 모양이�
 | `max_tokens` 없음 / 문자열·null / `-1` / `0` | `max_tokens: Field required` / `Input should be a valid integer` / `must be greater than or equal to 0` / **수용** |
 | 항목 `role` 없음 / `"developer"` / **`"system"` 0번** / `"system"` 1번 이후 | `messages.0.role: Field required` / `messages: Unexpected role "developer". Allowed roles are "user" or "assistant"` / `messages.0: use the top-level 'system' parameter …` / **200 수용** |
 | **`"system"` 1번 이후의 나머지 스키마** (2026-08-31 3라운드 추가 측정) | 위치만 면제이고 항목 스키마는 그대로 적용된다: content 없음 → `messages.1.content: Field required`, `content: null`·정수 → `messages.1.content: Input should be a valid array`, 블록에 type 없음 → `messages.1.content.0.type: Field required`, 미지 멤버 → `messages.1.bogus: Extra inputs are not permitted`(뒤 필드의 타입 결함을 이긴다). 프록시는 조기 `return`으로 앞의 셋을 **200**으로 답하고 미지 멤버를 **미지 키 단계**에서 보고하고 있었다 |
+
+**대화 모양(shape) 단계 — 4라운드 실측(2026-08-31)**: 위 3라운드 표에서 "1번 이후는 200 수용"이라고 적은 것은 **너무 거칠었다**.
+`system` 항목의 규칙은 **위치 규칙**이고, 위치 규칙은 항목 스키마와 다른 **별도의 늦은 단계**에 있다.
+
+**단계 위치**: 필드 18개 순회 → 미지 키 거절 → **여기** → container 거절.
+(`messages:[{role:'user',content:[]}]` + `temperature:'x'` → temperature. + `zzz_unknown:1` → 미지 키. + `container:'x'` → messages.)
+
+| 규칙 | direct 실측 |
+| --- | --- |
+| `system` 항목 하나 안에서의 우선순위 | ① content 길이 0 → `messages.<i>: system content must contain at least one block` ② index 0 → `messages.0: use the top-level 'system' parameter …` ③ 위치 → `messages.<i>: role 'system' must precede an 'assistant' message or end the array; …` ④ 공백 → `messages.<i>: system text blocks must contain non-whitespace text` |
+| `system` 위치 | 연속된 `system` 묶음의 **마지막**이 `assistant`를 앞서거나 배열을 끝내야 한다. `[U,S]` 200 · `[U,S,S]` 200 · `[U,S,A,U]` 200 · `[U,S,U]` **400** |
+| `system` 공백 | 텍스트 블록 **하나라도** 공백뿐이면 400. `content:'   '`도, `[text:'x', text:'']`도 400 |
+| `user` 빈 턴 | **연속 같은 역할은 한 턴으로 합쳐진다.** 합쳐진 턴 전체가 비어야 400이고, 그 턴의 **첫 빈 항목** 자리에서 보고된다. `[user:[]]` 400 · `[user:[],user:'a']` **200** · `[user:'a',user:[]]` **200** · `[U,A,user:[]]` 400@2 · `[U,A,user:[],user:[]]` 400@2 |
+| `assistant` 빈 턴 | 규칙 **없음** — `[U, assistant:[]]` 200 |
+
+**프록시가 틀렸던 것 넷**: ① `user content:[]`를 **모든** 위치에서 거절 → direct가 200 주는 본문을 400으로 막고 있었다(가장 나쁜 방향).
+② `system`의 빈·공백 content를 1번 이후에서 **수용**. ③ `system` 위치 규칙 자체가 없었다. ④ 이 규칙들과 index 0 안내 문장을
+`messages` 단계(4번)에서 던져서, direct가 `temperature`(12번)·미지 키로 답하는 본문에 다른 답을 했다.
+
+**측정했으나 미러하지 않음**: `system` 항목은 `user` 메시지 **또는 서버 툴 결과로 끝나는 assistant 메시지**를 뒤따라야 한다
+(`[U,A,S]` → 400 `messages.2: role 'system' must follow a 'user' message or an 'assistant' message ending in a server tool result; …`).
+면제 조건이 이 프록시가 만들어낼 수 없는 **서버 사이드 툴 결과**에 걸려 있어서, 주절만 보고 거절하면 direct가 받는 본문을 거절하게 된다 —
+이 표면이 절대 하면 안 되는 그 한 가지다. 그래서 수용 쪽으로 남긴다.
+또 하나: 마지막 `user` 턴의 빈 텍스트 블록은 `messages: text content blocks must be non-empty`(인덱스 **없음**)로 거절되는데,
+같은 블록이 대화 중간에서는 200이다. 같은 계열의 규칙이나 문장이 다르고 조건이 덜 측정돼 있어 이번에는 미러하지 않는다.
 | 항목 `content` 없음 / null·정수·객체 / `[]` / `[7]` / `[{}]` | `messages.0.content: Field required` / `messages.0.content: Input should be a valid array`(문자열은 수용) / `messages.0: user messages must have non-empty content` / `messages.0.content.0: Input should be an object` / `messages.0.content.0.type: Field required` |
 | 항목 미지 멤버 | `messages.0.bogus: Extra inputs are not permitted` — `messages` 자리에서 보고된다 |
 | `null`의 의미 | **생략**: `metadata`·`inference_geo`·`stop_sequences`·`cache_control`·`container`. **타입 결함**: 그 밖 전부(`stream`·`system`·`tools`·`tool_choice`·`thinking`·`output_config`·`service_tier`·`top_k`·`top_p`·`temperature`). OpenAI 표면처럼 일률적이지 않다 |

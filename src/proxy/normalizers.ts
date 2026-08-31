@@ -1138,10 +1138,109 @@ function validateAnthropicMessagesFields(input: Record<string, unknown>): void {
  */
 function refuseAnthropicUnknownAndContainer(input: Record<string, unknown>): void {
   rejectUnknownAnthropicKeys(input);
+  // Measured 2026-08-31: the conversation-shape rules below sit HERE — after
+  // every field's type check and after the unknown-key refusal, and before the
+  // container one. `messages: [{role:'user',content:[]}]` with `temperature:
+  // 'x'` answers about `temperature`; with `zzz_unknown: 1` it answers about
+  // the unknown key; with `container: 'x'` it answers about the messages.
+  refuseAnthropicMessageShape(input.messages);
   // The direct API allows a container only alongside the code execution tool,
   // which this proxy does not serve, so every value gets that refusal.
   if (input.container !== undefined && input.container !== null) {
     throw anthropicFault('container: Container identifier can only be provided when using the code execution tool');
+  }
+}
+
+/** A message's content counted the way the non-empty rules count it. */
+function anthropicContentLength(value: unknown): number | null {
+  if (typeof value === 'string') return value.length;
+  if (Array.isArray(value)) return value.length;
+  return null;
+}
+
+/** Every text this item contributes, so a whitespace-only item can be spotted. */
+function anthropicItemTexts(content: unknown): string[] {
+  if (typeof content === 'string') return [content];
+  if (!Array.isArray(content)) return [];
+  return content.flatMap((part) => {
+    const block = asRecord(part);
+    return block?.type === 'text' && typeof block.text === 'string' ? [block.text] : [];
+  });
+}
+
+const SYSTEM_ITEM_SUFFIX = '; the directive-only form (content: [] with output_config) is accepted at any position';
+
+/**
+ * The rules about the conversation's SHAPE rather than any one item's schema:
+ * where a `system` item may sit, and which turns may be empty. All measured on
+ * the direct API 2026-08-31, all in this phase.
+ *
+ * - A `system` item at index 0 is refused with guidance toward the top-level
+ *   parameter.
+ * - A `system` item's content must be non-empty and must carry non-whitespace
+ *   text, at EVERY index — including the one at 0, whose emptiness is reported
+ *   before the top-level-parameter guidance.
+ * - The last `system` item of a consecutive run must precede an `assistant`
+ *   message or end the array. (`[user, system, user]` is refused; `[user,
+ *   system]`, `[user, system, system]` and `[user, system, assistant, user]`
+ *   are not.)
+ * - A `user` turn may be empty as long as the consecutive run it belongs to is
+ *   not: `[user:[], user:'ping']` is accepted and `[user:'ping', assistant,
+ *   user:[]]` is not, reported at the run's first empty item.
+ *
+ * NOT mirrored, and why: a `system` item must also FOLLOW a user message or an
+ * assistant message ending in a SERVER TOOL RESULT (`[user, assistant, system]`
+ * is refused). The exemption turns on server-side tool results this proxy never
+ * produces, so refusing on the rule's main clause would refuse bodies the
+ * direct API accepts — the one failure this surface must not have. Recorded in
+ * §5.5.7 instead.
+ */
+function refuseAnthropicMessageShape(value: unknown): void {
+  if (!Array.isArray(value)) return;
+  const roleAt = (index: number): unknown => asRecord(value[index])?.role;
+  for (const [index, item] of value.entries()) {
+    const message = asRecord(item);
+    if (!message) continue;
+    const length = anthropicContentLength(message.content);
+    if (message.role === 'system') {
+      // Measured order within one system item: empty content, then the
+      // index-0 guidance, then position, then whitespace. `[user, system('  '),
+      // user]` answers about POSITION, and `[user, system('  ')]` — where the
+      // position is fine — answers about the whitespace.
+      if (length === 0) {
+        throw anthropicFault(`messages.${index}: system content must contain at least one block`);
+      }
+      if (index === 0) {
+        throw anthropicFault(
+          `messages.0: use the top-level 'system' parameter for the initial system prompt${SYSTEM_ITEM_SUFFIX}`,
+        );
+      }
+      // A run of system items is one block; only where it ENDS is constrained.
+      const next = roleAt(index + 1);
+      if (next !== undefined && next !== 'system' && next !== 'assistant') {
+        throw anthropicFault(
+          `messages.${index}: role 'system' must precede an 'assistant' message or end the array${SYSTEM_ITEM_SUFFIX}`,
+        );
+      }
+      if (length !== null && anthropicItemTexts(message.content).some((text) => !text.trim())) {
+        throw anthropicFault(`messages.${index}: system text blocks must contain non-whitespace text`);
+      }
+      continue;
+    }
+    if (message.role !== 'user' || length !== 0) continue;
+    // The run this empty item belongs to. Consecutive same-role items are one
+    // turn, so `[user:[], user:'ping']` has content and is accepted.
+    let end = index;
+    while (roleAt(end + 1) === 'user') end += 1;
+    const runHasContent = value.slice(index, end + 1)
+      .some((sibling) => (anthropicContentLength(asRecord(sibling)?.content) ?? 1) > 0);
+    if (runHasContent) continue;
+    // Reported at the run's FIRST empty item, which is where the scan is only
+    // when nothing before it in the run had content.
+    const startsRun = roleAt(index - 1) !== 'user';
+    if (startsRun) {
+      throw anthropicFault(`messages.${index}: user messages must have non-empty content`);
+    }
   }
 }
 
@@ -1164,21 +1263,12 @@ function validateAnthropicMessageItem(item: unknown, index: number): void {
   // there it is refused with guidance toward the top-level parameter, and
   // ANYWHERE ELSE it is accepted (measured — a system message at index 1
   // returns 200). This proxy used to refuse it at every position.
-  const system = message.role === 'system';
-  if (system && index === 0) {
-    throw anthropicFault(Array.isArray(message.content) && message.content.length === 0
-      ? 'messages.0: system content must contain at least one block'
-      : "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position");
-  }
-  // Only the ROLE check is skipped past index 0; the rest of the item's schema
-  // still applies, with the same sentences at the same position (measured
-  // 2026-08-31: `messages.1.content: Field required`, `messages.1.content:
-  // Input should be a valid array`, `messages.1.content.0.type: Field
-  // required`, and `messages.1.bogus: Extra inputs are not permitted` beating a
-  // later field's type fault). Returning here instead answered those four with
-  // a 200, and reported the item's unknown member from the unknown-keys phase
-  // — after every known field rather than at the `messages` position.
-  if (!system && !ANTHROPIC_ROLES.some((role) => role === message.role)) {
+  // `system` is a recognized role whose rules are POSITIONAL, and positional
+  // rules are decided in a later phase (`refuseAnthropicMessageShape`) — a
+  // `temperature` type fault and an unknown top-level key both beat them
+  // (measured). Everything else about the item is this phase's business, and
+  // applies to a system item exactly as it does to a user one.
+  if (message.role !== 'system' && !ANTHROPIC_ROLES.some((role) => role === message.role)) {
     throw anthropicFault(`messages: Unexpected role "${String(message.role)}". Allowed roles are "user" or "assistant"`);
   }
   if (message.content === undefined) throw anthropicFault(`messages.${index}.content: Field required`);
@@ -1188,9 +1278,6 @@ function validateAnthropicMessageItem(item: unknown, index: number): void {
     throw anthropicFault(`messages.${index}.content: Input should be a valid array`);
   }
   if (Array.isArray(message.content)) {
-    if (message.content.length === 0 && message.role === 'user') {
-      throw anthropicFault(`messages.${index}: user messages must have non-empty content`);
-    }
     message.content.forEach((block, at) => {
       if (!asRecord(block)) throw anthropicFault(`messages.${index}.content.${at}: Input should be an object`);
       if (asRecord(block)?.type === undefined) {

@@ -520,6 +520,27 @@ const messagesCases = [
   ['messages item system past the head content block without a type', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [{ text: 'x' }] }] }],
   ['messages item system past the head unknown member', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 'x', bogus: 1 }], temperature: 'x' }],
   ['messages item user unknown member beats a later field', { messages: [{ role: 'user', content: 'a', bogus: 1 }], temperature: 'x' }],
+  // The conversation's SHAPE — where a system item may sit, and which turns may
+  // be empty. Measured 2026-08-31: these sit AFTER every field's type check and
+  // after the unknown-key refusal, and BEFORE the container one. Only the
+  // REFUSED half is here; a body this API accepts would bill a real turn, so the
+  // accepted half is pinned in `test/anthropic-messages-validation-parity.test.mjs`.
+  ['messages shape system precedes a user', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 'sys' }, { role: 'user', content: 'b' }] }],
+  ['messages shape system content empty past the head', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }] }],
+  ['messages shape system content empty beats position', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }, { role: 'user', content: 'b' }] }],
+  ['messages shape system whitespace text', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: '  ' }] }],
+  ['messages shape system one empty block of two', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [{ type: 'text', text: 'x' }, { type: 'text', text: '' }] }] }],
+  ['messages shape system position beats whitespace', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: '  ' }, { role: 'user', content: 'b' }] }],
+  ['messages shape system at the head empty', { messages: [{ role: 'system', content: [] }, { role: 'user', content: 'a' }] }],
+  ['messages shape system at the head whitespace', { messages: [{ role: 'system', content: '  ' }, { role: 'user', content: 'a' }] }],
+  ['messages shape empty user turn alone', { messages: [{ role: 'user', content: [] }] }],
+  ['messages shape empty user string alone', { messages: [{ role: 'user', content: '' }] }],
+  ['messages shape empty user turn after an assistant', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }] }],
+  ['messages shape empty user run of two', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }, { role: 'user', content: [] }] }],
+  ['messages shape order a field type fault beats an empty turn', { messages: [{ role: 'user', content: [] }], temperature: 'x' }],
+  ['messages shape order an unknown key beats an empty turn', { messages: [{ role: 'user', content: [] }], zzz_unknown: 1 }],
+  ['messages shape order an empty turn beats container', { messages: [{ role: 'user', content: [] }], container: 'x' }],
+  ['messages shape order a bad role beats an empty system', { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }, { role: 'bogus', content: 'x' }] }],
   ['messages item content missing', { messages: [{ role: 'user' }] }],
   ['messages item content null', { messages: [{ role: 'user', content: null }] }],
   ['messages item content as an integer', { messages: [{ role: 'user', content: 7 }] }],

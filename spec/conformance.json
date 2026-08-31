@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "36028e206c3c681d91ffd03a9c2153e1def6ad87da422a9c5ed0a93174429e89",
+    "matrixDigest": "e9bd449972aa4bf1e36acd679aa2c6beefa8ac11c4a20b310f0078560ef8943c",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -2679,14 +2679,14 @@
       "matrixLine": 227,
       "field": "`messages[].role`",
       "vendor": {
-        "valueSpace": "`user`|`assistant`, plus `system` past index 0",
+        "valueSpace": "`user`|`assistant`, plus `system` in the positions §5.5.7 measures",
         "defaultWhenOmitted": "none",
         "observableEffect": "turn attribution",
         "invalidValue": "400 / `invalid_request_error`"
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported; `system` at index 0 is 400 with guidance toward the top-level parameter and elsewhere is accepted, and only its POSITION is exempt — the rest of the item's schema still applies at `messages.<i>` (§5.5.7). Anything else 400 in the Anthropic envelope",
+      "claimedNote": "supported; `system` carries POSITION rules decided in their own late phase — index 0 is 400 with guidance toward the top-level parameter, and elsewhere a system run must precede an `assistant` message or end the array. Everything else about the item is the ordinary item schema at `messages.<i>` (§5.5.7, which also names the one clause not mirrored). Anything else 400 in the Anthropic envelope",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED",
       "liveParityRow": true
