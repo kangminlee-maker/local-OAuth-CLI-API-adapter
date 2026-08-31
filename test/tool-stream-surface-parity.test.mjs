@@ -1228,6 +1228,11 @@ const TAIL_RELATIONS = [
   // Bytes already delivered cannot be retracted, so a final text that
   // contradicts or falls short of them leaves the client with what it received.
   ['a divergent final text', ['hello'], 'hullo', 'hello'],
+  // Divergent AND longer, which is the case the prefix guard exists for:
+  // without it the tail is spliced onto a prefix the model never wrote, and
+  // the client assembles "Hxllo" — three characters of one string and two of
+  // another.
+  ['a divergent, longer final text', ['Hxl'], 'Hello', 'Hxl'],
   ['a shorter final text', ['hello'], 'hel', 'hello'],
   ['an empty final text', ['hello'], '', 'hello'],
   ['nothing at all', [], '', ''],
