@@ -2201,3 +2201,113 @@ test('a param that already fits is delivered untouched', async () => {
   const error = JSON.parse(text).error;
   assert.equal(error.param, 'zzz_unknown');
 });
+
+// Every other bound test in this file derives its fixtures from
+// MAX_ERROR_MESSAGE_CHARS, which is right — a fixture written beside the
+// constant stops testing anything when the constant moves. But it leaves the
+// VALUE tested against itself: changing the export to 1025 kept all 392
+// relevant tests green while clients started receiving 1025 characters. The
+// documented number needs one assertion that does not import it.
+test('the documented ceiling is 1024 characters, written out', () => {
+  // docs/conformance-matrix.md and docs/api-interface-contract.md both state
+  // 1024. Raising it is a decision about what clients receive, not a refactor,
+  // so it fails here first and the docs move with it.
+  assert.equal(MAX_ERROR_MESSAGE_CHARS, 1024);
+});
+
+test('a diagnostic is cut at 1024 characters on the wire, counted independently', async () => {
+  const { text } = await call(
+    backendThat({ fail: () => new Error('M'.repeat(5000)) }),
+    '/v1/chat/completions',
+    CHAT,
+  );
+  // Counted from the response, against the literal — not against the constant
+  // the producer used.
+  assert.equal(JSON.parse(text).error.message.length, 1024);
+});
+
+// `type` and `code` are DISCRIMINATORS a client switches on, and they arrive
+// from an upstream body — a backend-controlled channel into every envelope.
+// Measured before this: a backend error carrying a 4096-character `type` and
+// `code` put both at full length into the Responses and Anthropic envelopes,
+// beside a `message` the ceiling had already bounded.
+const PROVIDER_FLOOD = () => new Error(JSON.stringify({
+  status: 429,
+  error: { message: 'bounded message', type: 'T'.repeat(4096), param: 'p', code: 'C'.repeat(4096) },
+}));
+
+for (const [path, body, headers] of [
+  ['/v1/chat/completions', CHAT, {}],
+  ['/v1/responses', { model: 'a-model', input: 'hi' }, {}],
+  ['/v1/messages', MESSAGES, {}],
+]) {
+  test(`${path}: an upstream's oversized type and code do not reach the client`, async () => {
+    const { text } = await call(backendThat({ fail: PROVIDER_FLOOD }), path, body, headers);
+    const error = JSON.parse(text).error;
+    assert.ok(
+      String(error.type ?? '').length <= MAX_ERROR_MESSAGE_CHARS,
+      `type must be bounded, got ${String(error.type ?? '').length}`,
+    );
+    assert.ok(
+      String(error.code ?? '').length <= MAX_ERROR_MESSAGE_CHARS,
+      `code must be bounded, got ${String(error.code ?? '').length}`,
+    );
+    // A discriminator past the ceiling is not a shortened discriminator — it is
+    // no discriminator, so it falls back to what a missing one gets.
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code ?? null, null);
+    // And the ones that DO fit still arrive whole.
+    assert.equal(error.message, 'bounded message');
+  });
+}
+
+test('an upstream type and code that fit are passed through untouched', async () => {
+  const fits = () => new Error(JSON.stringify({
+    status: 429,
+    error: { message: 'slow down', type: 'rate_limit_error', param: null, code: 'rate_limit_exceeded' },
+  }));
+  const { text } = await call(backendThat({ fail: fits }), '/v1/responses', { model: 'a-model', input: 'hi' });
+  const error = JSON.parse(text).error;
+  assert.equal(error.type, 'rate_limit_error');
+  assert.equal(error.code, 'rate_limit_exceeded');
+});
+
+// The `param` bound has two writers — the JSON one and the SSE one — and only
+// the buffered half was pinned. A stream that has already committed its 200
+// carries its error in-band, which is the half a client with a long-running
+// request actually receives.
+test('an oversized param is bounded in the SSE error frame too', async () => {
+  const { text } = await call(
+    backendThat({ delta: true, fail: PROVIDER_FLOOD }),
+    '/v1/chat/completions',
+    { ...CHAT, stream: true },
+  );
+  const frame = text.split('\n').find((line) => line.includes('"error"'));
+  assert.ok(frame, `expected an error frame: ${text.slice(0, 200)}`);
+  const error = JSON.parse(frame.replace(/^data: /, '')).error;
+  assert.ok(String(error.type ?? '').length <= MAX_ERROR_MESSAGE_CHARS, `type ${String(error.type ?? '').length}`);
+  assert.ok(String(error.code ?? '').length <= MAX_ERROR_MESSAGE_CHARS, `code ${String(error.code ?? '').length}`);
+  assert.equal(error.type, 'invalid_request_error');
+});
+
+test('a caller-supplied param is bounded in the SSE error frame', async () => {
+  // The unknown key reaches the stream writer's own envelope, not the JSON one:
+  // a validation fault on a `stream: true` request that has already committed.
+  const started = await startLocalApiProxy({ backend: backendThat({ delta: true }), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    const res = await fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'a-model', stream: true, messages: [{ role: 'user', content: 'hi' }], [OVERSIZED]: 1 }),
+    });
+    const body = await res.text();
+    const frame = body.split('\n').find((line) => line.includes('"error"')) ?? body;
+    const error = JSON.parse(frame.replace(/^data: /, '')).error;
+    assert.ok(
+      error.param.length <= MAX_ERROR_MESSAGE_CHARS,
+      `param must ride the ceiling in every writer, got ${error.param.length}`,
+    );
+    assert.ok(error.param.endsWith('...[truncated]'));
+  } finally {
+    await started.close();
+  }
+});

@@ -238,10 +238,15 @@ test('honour-on: streaming chunks report the executed model, not the request ech
 // A fan-out's shared cancel lives on the writer, and honour-on can fail before
 // the writer exists: `streamEvents` prefetches each turn's first event, so a
 // turn that throws before that event rejects while its siblings are already
-// running. Measured before the fix, with `n: 3` and the first turn throwing:
-// the client was answered in 13ms, turns 1 and 2 were still suspended, and the
-// abort signal had fired zero times — two backend turns generating for nobody
-// until their own request timeouts.
+// running. Measured before the first fix, with `n: 3` and the first turn
+// throwing: the client was answered in 13ms, turns 1 and 2 were still
+// suspended, and the abort signal had fired zero times — two backend turns
+// generating for nobody until their own request timeouts.
+//
+// The first fix cancelled once every start had SETTLED, which is not a fix for
+// the case here: the siblings produce no first event until they are aborted, so
+// waiting for them is waiting for the thing the cancel is meant to end.
+// Measured with a 300ms timeout: 500 at 326ms, aborts at 319ms.
 test('honour-on: a fan-out turn that fails to start cancels its siblings', async () => {
   const root = await mkdtemp(join(tmpdir(), 'fan-out-prefetch-'));
   trees.push(root);
@@ -266,13 +271,15 @@ test('honour-on: a fan-out turn that fails to start cancels its siblings', async
         live.add(turn);
         try {
           if (turn === 0) throw new Error('this turn failed');
-          yield { type: 'text_delta', delta: 'hello' };
-          // Long enough that only a cancel — never this turn's own timer — can
-          // end it inside the test's lifetime.
+          // No first event until something aborts this turn. That is the case
+          // that separates "cancel once every start has settled" from "cancel
+          // on the first start that fails": with the former, the wait is for
+          // the very turns the cancel is meant to end.
           await new Promise((resolveP, rejectP) => {
             const timer = setTimeout(resolveP, 20000);
             signal?.addEventListener('abort', () => { clearTimeout(timer); rejectP(new Error('aborted')); }, { once: true });
           });
+          yield { type: 'text_delta', delta: 'hello' };
           yield { type: 'completed', result: { id: 'x', model: 'live-model', text: 'hello', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 } };
         } finally {
           live.delete(turn);
@@ -281,7 +288,9 @@ test('honour-on: a fan-out turn that fails to start cancels its siblings', async
       async close() {},
     };
 
-    const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30000 });
+    // A SHORT request timeout, so "the client waited out the timeout" and "the
+    // client was answered at once" are far apart in the assertion below.
+    const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 3000 });
     const began = Date.now();
     const res = await fetch(started.url + '/v1/chat/completions', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -298,7 +307,10 @@ test('honour-on: a fan-out turn that fails to start cancels its siblings', async
   const { stdout } = await execFileAsync(process.execPath, [scriptPath], { cwd: root });
   const result = JSON.parse(stdout);
   assert.equal(result.status, 500, `the failure must reach the client: ${result.text}`);
-  assert.ok(result.answeredMs < 5_000, `the client waited ${result.answeredMs}ms for an error it should have had at once`);
+  assert.ok(
+    result.answeredMs < 1_000,
+    `the client waited ${result.answeredMs}ms of a 3000ms timeout for an error known in milliseconds`,
+  );
   assert.equal(result.state.turns, 3, 'all three turns did start');
   assert.equal(result.state.aborts, 2, 'both surviving turns must be cancelled');
   assert.deepEqual(result.state.suspended, [], 'and no turn may be left generating for nobody');

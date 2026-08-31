@@ -2015,3 +2015,44 @@ test('a runtime diagnostic under the client ceiling is not clipped by the operat
     else process.env.CLAUDE_TEST_DETAIL_CHARS = previousChars;
   }
 });
+
+// F7 unified the NUMBER and left the RULE: `boundedText` reserved the marker
+// unconditionally, so a diagnostic in the 14-character window just under the
+// ceiling lost its tail and gained a marker it did not need — while the HTTP
+// serializer, whose own comment names that bug as fixed, would have passed the
+// same string through whole. The window is where the two rules differ, so it is
+// where the test has to be.
+for (const [label, length] of [
+  ['well under the ceiling', MAX_ERROR_MESSAGE_CHARS - 200],
+  ['inside the marker window', MAX_ERROR_MESSAGE_CHARS - 9],
+  ['exactly at the ceiling', MAX_ERROR_MESSAGE_CHARS],
+]) {
+  test(`a runtime diagnostic ${label} arrives whole`, async () => {
+    const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+    const previousChars = process.env.CLAUDE_TEST_DETAIL_CHARS;
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    try {
+      process.stderr.write = () => true;
+      process.env.CLAUDE_TEST_RESULT_SHAPE = 'sized_detail';
+      process.env.CLAUDE_TEST_DETAIL_CHARS = String(length);
+      await assert.rejects(
+        () => runAgainstRejectingClaude(
+          openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+          'claude-opus-4-8',
+          { honorRequestModel: true, command: resultShapes },
+        ),
+        (err) => {
+          assert.equal(err.message.length, length, 'a diagnostic that fits must not be shortened');
+          assert.ok(!err.message.includes('...[truncated]'), 'nor marked');
+          return true;
+        },
+      );
+    } finally {
+      process.stderr.write = originalWrite;
+      if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+      else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+      if (previousChars === undefined) delete process.env.CLAUDE_TEST_DETAIL_CHARS;
+      else process.env.CLAUDE_TEST_DETAIL_CHARS = previousChars;
+    }
+  });
+}

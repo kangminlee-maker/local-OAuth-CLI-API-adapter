@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
-import { OPENAI_RESPONSES_KEYS } from '../dist/proxy/normalizers.js';
+import { OPENAI_RESPONSES_KEYS, editDistanceCandidates } from '../dist/proxy/normalizers.js';
 
 // The Responses twin of `openai-chat-validation-parity.test.mjs`, and the same
 // rule: every row is a DIRECT API observation taken 2026-08-30 against
@@ -368,9 +368,38 @@ test('replayed output reaches the model as the turn it was, not as its own JSON'
     // told `{"id":"rs_…","type":"reasoning","summary":[]}` in the user's voice.
     const withReasoning = [{ id: 'rs_abc', type: 'reasoning', summary: [] }, ...conversation];
     assert.deepEqual(await send(withReasoning), expected, 'a reasoning item must not become a turn');
-    // Same for a hosted-tool call this runtime never made.
-    const withHostedCall = [{ id: 'ws_abc', type: 'web_search_call', status: 'completed' }, ...conversation];
-    assert.deepEqual(await send(withHostedCall), expected, 'a hosted-tool call must not become a turn');
+    // A `reasoning` item's schema HAS a `content` member — `[{type:
+    // 'reasoning_text'}]` — and the API's own description tells a client
+    // managing context by hand to replay these items. Keying the drop on
+    // "carries no content" instead of on the item's KIND read that member as a
+    // message's and put the model's chain of thought in front of it in the
+    // user's voice: the same corruption, with better grammar.
+    for (const [label, content] of [
+      ['the array form', [{ type: 'reasoning_text', text: 'CHAIN_OF_THOUGHT' }]],
+      ['the string form', 'CHAIN_OF_THOUGHT'],
+    ]) {
+      const replayed = await send([{ id: 'rs_abc', type: 'reasoning', summary: [], content }, ...conversation]);
+      assert.deepEqual(replayed, expected, `a reasoning item carrying ${label} must not become a turn`);
+      assert.ok(
+        !JSON.stringify(replayed).includes('CHAIN_OF_THOUGHT'),
+        'and none of it may reach the model at all',
+      );
+    }
+    // A hosted-tool item is NOT the same as a reasoning item, and treating it
+    // as one erased results a client replayed on purpose: `program_output`
+    // carries the output of work a previous turn did, which is exactly what
+    // feeding `output` back as `input` is for. This runtime cannot re-run the
+    // work, so the record goes in as tool history — present, and not in the
+    // user's voice.
+    const withProgramOutput = [
+      { type: 'program_output', id: 'prog_out_1', call_id: 'call_prog_1', result: 'SECRET_RESULT', status: 'completed' },
+      ...conversation,
+    ];
+    const replayedProgram = await send(withProgramOutput);
+    assert.equal(replayedProgram.length, expected.length + 1, 'the record must survive as its own turn');
+    assert.match(replayedProgram[0].content, /SECRET_RESULT/, 'and it must carry the result the client sent');
+    assert.match(replayedProgram[0].content, /program_output/, 'named by the item type it came from');
+    assert.deepEqual(replayedProgram.slice(1), expected, 'the conversation around it is untouched');
     // And the items that DO carry a turn still do.
     const withToolHistory = [
       { role: 'user', content: 'ping' },
@@ -394,42 +423,34 @@ test('replayed output reaches the model as the turn it was, not as its own JSON'
 // unknown key goes from ~2ms to ~1000ms of synchronous work, blocking the
 // whole server for it.
 //
-// So this asserts the cost. The baseline is the SAME request size rejected at
-// the same phase with no suggestion work, which cancels the ~1MB JSON parse
-// and leaves only the suggester: measured 2ms with the filter, 960ms without.
-test('a huge unknown key costs no more than parsing it', async () => {
-  const started = await startLocalApiProxy({ backend: backend(), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
-  const huge = 'z'.repeat(1_000_000);
-  const base = { model: 'gpt-5.6-terra', input: 'ping', max_output_tokens: 16 };
-  const timed = async (body) => {
-    const began = process.hrtime.bigint();
-    const res = await fetch(`${started.url}/v1/responses`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-    });
-    const payload = await res.json();
-    assert.equal(res.status, 400, JSON.stringify(payload).slice(0, 200));
-    return Number(process.hrtime.bigint() - began) / 1e6;
-  };
-  try {
-    // A body of the same size whose rejection runs no suggester: the 1M chars
-    // sit in a known key's VALUE, and `temperature` is what is reported.
-    const withoutSuggestions = { ...base, prompt_cache_key: huge, temperature: 0.5 };
-    const withSuggestions = { ...base, [huge]: 1 };
-    await timed(withSuggestions);
-    let smallestDelta = Infinity;
-    // The smallest of five rounds: this runs beside the rest of the suite, so a
-    // scheduling hiccup must not decide it — and the gap being guarded is three
-    // orders of magnitude wide, so the smallest sample is still decisive.
-    for (let round = 0; round < 5; round += 1) {
-      const baseline = await timed(withoutSuggestions);
-      const probe = await timed(withSuggestions);
-      smallestDelta = Math.min(smallestDelta, probe - baseline);
-    }
-    assert.ok(
-      smallestDelta < 400,
-      `suggesting for a 1M-char key cost ${smallestDelta.toFixed(0)}ms over parsing it — the length pre-filter is gone`,
+// This asserted a WALL CLOCK until a reviewer named what that means: one
+// delayed baseline sample makes a deleted filter pass, and a paused probe fails
+// correct code. The filter's own output is the exact thing to assert instead.
+test('a key no known key can be close to never reaches the distance routine', async () => {
+  const longest = Math.max(...[...OPENAI_RESPONSES_KEYS].map((key) => key.length));
+  for (const [label, unknown] of [
+    ['a megabyte', 'z'.repeat(1_000_000)],
+    ['just out of range', 'z'.repeat(longest + 3)],
+    ['the empty key', ''],
+  ]) {
+    assert.deepEqual(
+      editDistanceCandidates(unknown, OPENAI_RESPONSES_KEYS, {}),
+      [],
+      `${label}: no known key is within 2 edits of it, so none may be measured against it`,
     );
-  } finally {
-    await started.close();
   }
+  // The other side, or an empty return would pass this test for free: a key one
+  // edit from a real one still reaches the routine.
+  assert.ok(
+    editDistanceCandidates('storee', OPENAI_RESPONSES_KEYS, {}).includes('store'),
+    'a near miss must still be a candidate',
+  );
+  assert.ok(
+    !editDistanceCandidates('storee', OPENAI_RESPONSES_KEYS, { store: 1 }).includes('store'),
+    'a key the body already carries is never its own suggestion',
+  );
+  // And the promise end to end: a megabyte key still gets the ordinary answer.
+  const { status, payload } = await responses({ ...OUT, ['z'.repeat(1_000_000)]: 1 });
+  assert.equal(status, 400);
+  assert.equal(payload.error.code, 'unknown_parameter');
 });

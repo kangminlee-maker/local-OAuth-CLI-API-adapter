@@ -549,7 +549,13 @@ class CodexBackendStreamState {
       // calling a tool sends both — and the streamed deltas already delivered
       // the narration, so dropping it here made streaming and non-streaming
       // clients disagree about what the model said.
-      text: this.text.trim(),
+      //
+      // Not trimmed, for the same reason. The deltas went out untrimmed, so a
+      // trim here is a transformation on ONE of the two paths: a narration
+      // ending in a newline arrived as two different strings, and a
+      // whitespace-only one gave the stream a message item the buffered body
+      // did not have. The vendor returns what the model emitted; so does this.
+      text: this.text,
       ...(this.stopReason ? { stopReason: this.stopReason } : {}),
       // The completed result flattens the turn's text into one string, so this
       // is the one ordering a non-streaming client cannot reconstruct — and

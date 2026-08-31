@@ -271,3 +271,44 @@ test('narration that comes with a tool call survives the wrapper', () => {
     },
   );
 });
+
+// Both ordered surfaces report a turn's parts in production order and read it
+// from `toolCallsBeforeText`. Only `CodexBackendTransport` ever set it, so the
+// two backends that go through `ToolCallDeltaExtractor` streamed `[call, text]`
+// while their buffered body said `[text, call]`. The wrapper's own key order is
+// the artifact BOTH paths see, so it is what decides.
+const ORDER_REQUEST = {
+  shape: 'openai-responses', model: 'm', messages: [], stream: false, streamOptions: {},
+  tools: [{ name: 'get_weather', description: 'w', parameters: {} }], toolChoice: { type: 'auto' }, raw: {},
+};
+const CALL = '{"id":"c1","name":"get_weather","arguments":"{}"}';
+
+for (const [label, raw, expected] of [
+  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`, false],
+  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`, true],
+  ['toolCalls with no text at all', `{"status":"tool_calls","toolCalls":[${CALL}]}`, true],
+  ['text with no calls', '{"status":"message","text":"just talking"}', false],
+]) {
+  test(`the wrapper's key order decides production order: ${label}`, () => {
+    const parsed = parseBackendOutput(ORDER_REQUEST, raw);
+    assert.equal(parsed.toolCallsBeforeText ?? false, expected);
+  });
+}
+
+test('the extractor emits in the order the flag reports', async () => {
+  // The flag is only worth anything if the STREAM agrees with it, so drive the
+  // shipped extractor over the same two wrappers and compare.
+  const { ToolCallDeltaExtractor } = await import('../dist/proxy/tool-call-stream.js');
+  const firstKinds = (raw) => {
+    const extractor = new ToolCallDeltaExtractor();
+    const kinds = [];
+    for (const chunk of raw.match(/.{1,8}/g) ?? []) {
+      for (const event of extractor.push(chunk)) {
+        if (kinds[kinds.length - 1] !== event.type) kinds.push(event.type);
+      }
+    }
+    return kinds;
+  };
+  assert.equal(firstKinds(`{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`)[0], 'text_delta');
+  assert.equal(firstKinds(`{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`)[0], 'tool_call_delta');
+});

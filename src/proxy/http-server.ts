@@ -1328,17 +1328,31 @@ async function startFanOutStreams(
   start: () => Promise<AsyncIterable<LocalStreamEvent>>,
   cancel: () => void,
 ): Promise<AsyncIterable<LocalStreamEvent>[]> {
-  const settled = await Promise.allSettled(
-    Array.from({ length: count }, () => start()),
-  );
-  const started = settled.filter((entry) => entry.status === 'fulfilled');
-  if (started.length === settled.length) return started.map((entry) => entry.value);
-  cancel();
+  let failure: { readonly reason: unknown } | undefined;
+  // Cancel on the FIRST start to fail, not once every start has settled.
+  // Awaiting all of them first cannot work: the siblings being cancelled are
+  // exactly the ones still pending, so the wait is for the thing the cancel is
+  // supposed to end. Measured before this, with a 300ms request timeout: the
+  // client got its 500 at 326ms and the sibling aborts fired at 319ms — the
+  // whole timeout, and at 30s the client would have waited 30s for an error
+  // known in milliseconds.
+  const started = await Promise.all(Array.from({ length: count }, () => start().then(
+    (events) => ({ events }),
+    (reason: unknown) => {
+      if (!failure) {
+        failure = { reason };
+        cancel();
+      }
+      return { events: undefined };
+    },
+  )));
+  const live = started.map((entry) => entry.events).filter((events) => events !== undefined);
+  if (!failure) return live;
   // Cancel first, then collect: an iterator suspended inside `next()` queues a
   // `return()` behind that call, which is the same trap `mergeTaggedStreams`
-  // documents in its own `finally`.
-  await Promise.allSettled(started.map((entry) => entry.value[Symbol.asyncIterator]().return?.()));
-  throw (settled.find((entry) => entry.status === 'rejected') as PromiseRejectedResult).reason;
+  // documents in its own `finally`. The cancel above has already run.
+  await Promise.allSettled(live.map((events) => events[Symbol.asyncIterator]().return?.()));
+  throw failure.reason;
 }
 
 function streamEvents(
@@ -2831,16 +2845,30 @@ async function writeOpenAiResponsesStream(
             item: messageItem,
           });
         };
-        // Output positions follow production order, which is the same knob the
-        // buffered body reads through `orderedByEmission`. Text already
-        // streamed has its position, so only a turn that streamed none of it
-        // can still put the call first.
-        if (result.toolCallsBeforeText && !streamedText) {
-          await finishTools();
+        // Two different questions, and conflating them made
+        // `response.output_item.done` non-monotonic.
+        //
+        // For an item ALREADY announced, its position is fixed and the only
+        // thing left to decide is the order of the terminal frames — which has
+        // to be the order the stream announced them in, or a client is told a
+        // later item finished before an earlier one, and the `arguments.done`
+        // frame that promises a call is final arrives after a whole other item
+        // has closed.
+        //
+        // For a turn that announced NOTHING until it completed — every tool
+        // call on the claude native-schema channel — this call is where both
+        // positions are allocated, so production order decides, through the
+        // same `toolCallsBeforeText` knob the buffered body reads.
+        const announced = streamedText || toolState.firstAnnouncedIndex !== Infinity;
+        const messageFirst = announced
+          ? messageOutputIndex !== -1 && messageOutputIndex < toolState.firstAnnouncedIndex
+          : !result.toolCallsBeforeText;
+        if (messageFirst) {
           await finishMessage();
+          await finishTools();
         } else {
-          await finishMessage();
           await finishTools();
+          await finishMessage();
         }
       } else {
         await ensureTextStarted();
@@ -2939,6 +2967,17 @@ class OpenAiResponsesToolStreamState {
       event.name ?? 'tool',
     );
     if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
+  }
+
+  /**
+   * The lowest position any call has been announced at, or `Infinity` when none
+   * has. The terminal frames go out in announced order, and only an item that
+   * is already announced has a position to compare.
+   */
+  get firstAnnouncedIndex(): number {
+    let lowest = Infinity;
+    for (const state of this.items.values()) lowest = Math.min(lowest, state.outputIndex);
+    return lowest;
   }
 
   /** The finished items with the output position each was announced at. */
@@ -3697,11 +3736,26 @@ function providerErrorFromBackendError(err: unknown): {
   if (!statusCode || statusCode < 400 || statusCode >= 600 || !message) return null;
   return {
     statusCode,
-    type: typeof error.type === 'string' ? error.type : 'invalid_request_error',
+    type: boundedDiscriminator(error.type) ?? 'invalid_request_error',
     message,
     param: typeof error.param === 'string' ? error.param : null,
-    code: typeof error.code === 'string' ? error.code : null,
+    code: boundedDiscriminator(error.code),
   };
+}
+
+/**
+ * `type` and `code` come from an upstream body, which makes them a
+ * backend-controlled channel into every client-visible envelope — and unlike
+ * `message` and `param`, they are DISCRIMINATORS: a client switches on them.
+ * Truncating one leaves a value that is neither the real one nor a known one,
+ * so anything past the ceiling is dropped to the same default a missing one
+ * gets. Measured before this: a backend error carrying a 4096-character `type`
+ * and `code` put both, at full length, in the Responses envelope and the
+ * Anthropic one.
+ */
+function boundedDiscriminator(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > MAX_ERROR_MESSAGE_CHARS) return null;
+  return value;
 }
 
 function providerErrorParamForShape(

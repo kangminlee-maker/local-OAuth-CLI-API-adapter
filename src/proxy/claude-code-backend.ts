@@ -469,6 +469,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       model: request.model,
       text: parsed.text,
       toolCalls: parsed.toolCalls,
+      ...(parsed.toolCallsBeforeText ? { toolCallsBeforeText: true } : {}),
       usage,
       latencyMs: Date.now() - startedAt,
       stopReason: turn.stopReason,
@@ -1079,6 +1080,11 @@ function claudeProcessFailure(
  * walks code points so a boundary cannot split an astral character.
  */
 function boundedText(message: string): string {
+  // Same NUMBER and same RULE as the serializer. Reserving the marker
+  // unconditionally shortened messages that were never too long — measured, a
+  // 1015-character diagnostic came back as 1024 with a marker it did not need,
+  // where the HTTP layer would have passed all 1015 through untouched.
+  if (message.length <= MAX_ERROR_MESSAGE_CHARS) return message;
   const budget = MAX_ERROR_MESSAGE_CHARS - TRUNCATION_MARKER.length;
   let out = '';
   for (const ch of message) {

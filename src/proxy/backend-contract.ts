@@ -80,10 +80,30 @@ export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
   return request.tools.length > 0 && request.toolChoice.type !== 'none';
 }
 
+/**
+ * Whether the wrapper produced its calls before its narration.
+ *
+ * Both ordered surfaces report a turn's parts in production order, and they
+ * read it from `toolCallsBeforeText` — which only `CodexBackendTransport` ever
+ * set. The backends that go through `ToolCallDeltaExtractor` emit
+ * `tool_call_delta` before `text_delta` whenever the model writes `toolCalls`
+ * first, so their STREAM said `[call, text]` while their buffered body, with
+ * the flag absent, said `[text, call]`: the same turn, two orders.
+ *
+ * The wrapper's own key order is the artifact both paths see — the streamed
+ * extractor decodes it left to right, and the buffered parse has the whole
+ * string — so it is what decides, rather than one path's incidental timing.
+ */
+function wrapperToolCallsBeforeText(raw: string): boolean {
+  const calls = raw.indexOf('"toolCalls"');
+  const narration = raw.indexOf('"text"');
+  return calls !== -1 && (narration === -1 || calls < narration);
+}
+
 export function parseBackendOutput(
   request: NormalizedRequest,
   text: string,
-): { text: string; toolCalls: readonly LocalToolCall[] } {
+): { text: string; toolCalls: readonly LocalToolCall[]; toolCallsBeforeText?: boolean } {
   if (!hasToolDecisionSchema(request)) {
     return { text, toolCalls: [] };
   }
@@ -110,7 +130,11 @@ export function parseBackendOutput(
       // surface reports text alongside tool calls, and dropping it here made
       // this runtime the one that silently did not. The wrapper has a `text`
       // field for exactly this.
-      return { text: typeof obj.text === 'string' ? obj.text : '', toolCalls: calls };
+      return {
+        text: typeof obj.text === 'string' ? obj.text : '',
+        toolCalls: calls,
+        ...(calls.length > 0 && wrapperToolCallsBeforeText(text) ? { toolCallsBeforeText: true } : {}),
+      };
     }
     // Only a wrapper this backend produced may be unwrapped. A json-mode client
     // gets its OWN object back from the runtime, and reading that as a wrapper

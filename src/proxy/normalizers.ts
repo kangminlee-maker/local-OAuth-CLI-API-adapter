@@ -383,7 +383,20 @@ function unknownParameter(field: string, suggestions: readonly string[] = []): P
   return new ProxyRequestError(`Unknown parameter: '${field}'.${help}`, 400, 'openai', 'invalid_request_error', field, 'unknown_parameter');
 }
 
-function spellingSuggestions(unknown: string, known: ReadonlySet<string>, body: Record<string, unknown>): string[] {
+/**
+ * The keys whose edit distance will actually be COMPUTED.
+ *
+ * Exported because the pre-filter is a cost promise and nothing about the
+ * output can catch its removal: `|len(a) - len(b)| <= distance` holds for
+ * unit-cost Levenshtein, so the keys it drops were never going to be within 2.
+ * A wall-clock test of that is a verdict on the scheduler, not on the code —
+ * this is the seam an assertion can be exact about.
+ */
+export function editDistanceCandidates(
+  unknown: string,
+  known: ReadonlySet<string>,
+  body: Record<string, unknown>,
+): string[] {
   return [...known]
     .filter((key) => !(key in body))
     // A length gap over 2 IS a distance over 2 — each edit changes the length
@@ -391,7 +404,11 @@ function spellingSuggestions(unknown: string, known: ReadonlySet<string>, body: 
     // Without it the cost is the unknown key's length times every known key's,
     // synchronously: a 45 MB key inside the body cap held the whole server for
     // 50 seconds, and every other client with it.
-    .filter((key) => Math.abs(key.length - unknown.length) <= 2)
+    .filter((key) => Math.abs(key.length - unknown.length) <= 2);
+}
+
+function spellingSuggestions(unknown: string, known: ReadonlySet<string>, body: Record<string, unknown>): string[] {
+  return editDistanceCandidates(unknown, known, body)
     .map((key) => ({ key, distance: editDistance(unknown, key) }))
     .filter((candidate) => candidate.distance <= 2)
     .sort((a, b) => a.distance - b.distance || (a.key < b.key ? -1 : 1))
@@ -2009,9 +2026,23 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
  * One input item as a turn, or `null` for an item that is not one.
  *
  * A message item always carries `content` — `validateOpenAiResponsesInputItem`
- * requires it — so an item without one is a typed item of some other kind: a
- * reasoning item, a hosted-tool call this runtime never made. Those replay as
- * nothing rather than as their own JSON.
+ * requires it — so an item without one is a typed item of some other kind.
+ * There are two kinds of those and they are not the same:
+ *
+ * A `reasoning` item is STATE. Its `summary` is a rendering of thinking, its
+ * `content` is `reasoning_text`, and its `encrypted_content` is opaque to
+ * everything but the server that issued it; no runtime here has a slot for any
+ * of them, so it replays as nothing. It used to be stringified into a `user`
+ * turn, which told the model `{"id":"rs_…","type":"reasoning","summary":[]}` in
+ * the user's voice — and reading its `content` as a message's put the chain of
+ * thought there instead, which is the same corruption with better grammar.
+ *
+ * Every other typed item — the hosted-tool calls and their outputs — carries
+ * the RESULT of work a previous turn did, which is exactly what a client
+ * replays `output` as `input` to preserve. This runtime cannot re-run that
+ * work, but the model still has to see it, so it goes in as tool history:
+ * dropping it erased results a client sent on purpose, and calling it a user
+ * message put a tool's own output in the user's voice.
  */
 function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedContent | null {
   if (msg.type === 'function_call_output') {
@@ -2038,8 +2069,19 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
       toolHistory: true,
     };
   }
-  if (msg.content === undefined) return null;
-  return flattenOpenAiContent(msg.content);
+  // Keyed on the item's KIND, never on whether it happens to carry a `content`
+  // member. `content === undefined` implies "not a message item", but the
+  // converse is false and reading it that way was its own corruption: a
+  // reasoning item's schema has `content: [{type:'reasoning_text'}]`, so a
+  // client replaying one — which the API's own description tells it to do —
+  // had the model's chain of thought put in front of it in the USER's voice.
+  if (msg.type === undefined || msg.type === 'message') return flattenOpenAiContent(msg.content);
+  if (msg.type === 'reasoning') return null;
+  return {
+    text: [TOOL_RESULT_MARKER, `type: ${readString(msg.type, 'item')}`, JSON.stringify(msg)].join('\n'),
+    images: [],
+    toolHistory: true,
+  };
 }
 
 function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedContent {

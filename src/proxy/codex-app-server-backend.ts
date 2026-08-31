@@ -565,6 +565,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
         model: request.model,
         text: parsed.text,
         toolCalls: parsed.toolCalls,
+        ...(parsed.toolCallsBeforeText ? { toolCallsBeforeText: true } : {}),
         usage,
         latencyMs: totalMs,
       };
@@ -940,7 +941,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       waiter.usageGraceTimer = undefined;
     }
     waiter.resolve({
-      text: waiter.text.trim(),
+      // Untrimmed: the streamed deltas carried it untrimmed, and a transform on
+      // one path only makes the same turn two different strings.
+      text: waiter.text,
       usage: waiter.usage,
       usageWaitMs: waiter.completedAt
         ? Math.max(0, (waiter.usageUpdatedAt ?? Date.now()) - waiter.completedAt)
