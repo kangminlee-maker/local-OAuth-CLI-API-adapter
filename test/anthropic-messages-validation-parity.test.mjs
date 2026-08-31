@@ -155,6 +155,11 @@ const REJECTIONS = [
   ["shape system position beats whitespace", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: '  ' }, { role: 'user', content: 'b' }] }, "messages.1: role 'system' must precede an 'assistant' message or end the array; the directive-only form (content: [] with output_config) is accepted at any position"],
   ["shape system at the head empty", { messages: [{ role: 'system', content: [] }, { role: 'user', content: 'a' }] }, "messages.0: system content must contain at least one block"],
   ["shape system at the head whitespace", { messages: [{ role: 'system', content: '  ' }, { role: 'user', content: 'a' }] }, "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position"],
+  // A system item's blocks are its own set, and the check sits between the
+  // empty-content one and the index-0 guidance.
+  ["shape system block type", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' } }] }] }, "messages.1: role 'system' supports text, tool_addition, and tool_removal blocks only"],
+  ["shape system block type beats position", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' } }] }, { role: 'user', content: 'b' }] }, "messages.1: role 'system' supports text, tool_addition, and tool_removal blocks only"],
+  ["shape system block type at the head", { messages: [{ role: 'system', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==' } }] }, { role: 'user', content: 'a' }] }, "messages.0: role 'system' supports text, tool_addition, and tool_removal blocks only"],
   ["shape empty user turn alone", { messages: [{ role: 'user', content: [] }] }, "messages.0: user messages must have non-empty content"],
   ["shape empty user string alone", { messages: [{ role: 'user', content: '' }] }, "messages.0: user messages must have non-empty content"],
   ["shape empty user turn after an assistant", { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }] }, "messages.2: user messages must have non-empty content"],
@@ -189,6 +194,7 @@ const ACCEPTED = [
   ["an empty user turn inside a run with content", [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }, { role: 'user', content: 'b' }]],
   ["an empty assistant turn", [{ role: 'user', content: 'a' }, { role: 'assistant', content: [] }]],
   ["a system item whose blocks all carry text", [{ role: 'user', content: 'a' }, { role: 'system', content: [{ type: 'text', text: 'x' }] }]],
+  ["a system item of two text blocks", [{ role: 'user', content: 'a' }, { role: 'system', content: [{ type: 'text', text: 'x' }, { type: 'text', text: 'y' }] }]],
 ];
 
 for (const [name, list] of ACCEPTED) {

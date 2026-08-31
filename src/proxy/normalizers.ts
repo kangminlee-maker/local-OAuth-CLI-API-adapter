@@ -1253,6 +1253,9 @@ function anthropicItemTexts(content: unknown): string[] {
 
 const SYSTEM_ITEM_SUFFIX = '; the directive-only form (content: [] with output_config) is accepted at any position';
 
+/** A system item takes these blocks and no others (measured 2026-08-31). */
+const ANTHROPIC_SYSTEM_ITEM_BLOCKS = ['text', 'tool_addition', 'tool_removal'] as const;
+
 /**
  * The rules about the conversation's SHAPE rather than any one item's schema:
  * where a `system` item may sit, and which turns may be empty. All measured on
@@ -1286,12 +1289,21 @@ function refuseAnthropicMessageShape(value: unknown): void {
     if (!message) continue;
     const length = anthropicContentLength(message.content);
     if (message.role === 'system') {
-      // Measured order within one system item: empty content, then the
-      // index-0 guidance, then position, then whitespace. `[user, system('  '),
-      // user]` answers about POSITION, and `[user, system('  ')]` — where the
-      // position is fine — answers about the whitespace.
+      // Measured order within one system item: empty content, then the block
+      // types, then the index-0 guidance, then position, then whitespace.
+      // `[user, system([image]), user]` answers about the BLOCK where the
+      // position is also wrong, and `[user, system('  '), user]` answers about
+      // POSITION where only the whitespace is.
       if (length === 0) {
         throw anthropicFault(`messages.${index}: system content must contain at least one block`);
+      }
+      if (Array.isArray(message.content) && message.content.some((part) => {
+        const type = asRecord(part)?.type;
+        return type !== undefined && !ANTHROPIC_SYSTEM_ITEM_BLOCKS.some((allowed) => allowed === type);
+      })) {
+        throw anthropicFault(
+          `messages.${index}: role 'system' supports ${listOfQuoted(ANTHROPIC_SYSTEM_ITEM_BLOCKS, 'and').replace(/'/g, '')} blocks only`,
+        );
       }
       if (index === 0) {
         throw anthropicFault(

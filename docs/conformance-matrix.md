@@ -703,11 +703,16 @@ OpenAI 표면들이 능력 거절을 맨 뒤에 두는 것과 같은 모양이�
 ② `system`의 빈·공백 content를 1번 이후에서 **수용**. ③ `system` 위치 규칙 자체가 없었다. ④ 이 규칙들과 index 0 안내 문장을
 `messages` 단계(4번)에서 던져서, direct가 `temperature`(12번)·미지 키로 답하는 본문에 다른 답을 했다.
 
+| `system` 블록 타입 | `text`·`tool_addition`·`tool_removal` **뿐**. 그 밖(이미지·tool_result 등) → `messages.<i>: role 'system' supports text, tool_addition, and tool_removal blocks only`. 항목 안 우선순위에서 **빈 content 다음, index 0 안내 앞** |
+
 **측정했으나 미러하지 않음**: `system` 항목은 `user` 메시지 **또는 서버 툴 결과로 끝나는 assistant 메시지**를 뒤따라야 한다
 (`[U,A,S]` → 400 `messages.2: role 'system' must follow a 'user' message or an 'assistant' message ending in a server tool result; …`).
 면제 조건이 이 프록시가 만들어낼 수 없는 **서버 사이드 툴 결과**에 걸려 있어서, 주절만 보고 거절하면 direct가 받는 본문을 거절하게 된다 —
 이 표면이 절대 하면 안 되는 그 한 가지다. 그래서 수용 쪽으로 남긴다.
-또 하나: 마지막 `user` 턴의 빈 텍스트 블록은 `messages: text content blocks must be non-empty`(인덱스 **없음**)로 거절되는데,
+또 하나: 대화가 `assistant` 턴으로 끝나면 `claude-sonnet-5`는 400
+`This model does not support assistant message prefill. The conversation must end with a user message.`로 답한다.
+문장이 **모델을 지목**하고 prefill은 모델마다 있고 없는 능력이라, 한 모델이 거절한다는 이유로 백엔드가 할 수 있는 턴을 막으면
+그것이 위반이다(`chat-function-tools-with-reasoning-effort`와 같은 모양). 그리고 하나 더: 마지막 `user` 턴의 빈 텍스트 블록은 `messages: text content blocks must be non-empty`(인덱스 **없음**)로 거절되는데,
 같은 블록이 대화 중간에서는 200이다. 같은 계열의 규칙이나 문장이 다르고 조건이 덜 측정돼 있어 이번에는 미러하지 않는다.
 | 항목 `content` 없음 / null·정수·객체 / `[]` / `[7]` / `[{}]` | `messages.0.content: Field required` / `messages.0.content: Input should be a valid array`(문자열은 수용) / `messages.0: user messages must have non-empty content` / `messages.0.content.0: Input should be an object` / `messages.0.content.0.type: Field required` |
 | 항목 미지 멤버 | `messages.0.bogus: Extra inputs are not permitted` — `messages` 자리에서 보고된다 |
