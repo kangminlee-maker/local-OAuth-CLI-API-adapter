@@ -625,6 +625,28 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 **대가**: 스키마를 실은 턴은 상시 세션을 잃고 매번 새 CLI를 띄운다. 약속이 있는 곳에서만 치르는 값이고,
 스키마 없는 턴은 그대로 자식을 재사용한다. 회귀는 `test/claude-code-backend.test.mjs`의 argv 단언이 잡는다.
 
+#### 5.5.9 수용된 200의 **봉투 모양** 실측 (2026-08-31) — 미결
+
+라이브 계기는 **거절만** 보낸다(수용 본문은 실제 턴을 청구한다). 그래서 200의 봉투는 거의 측정된 적이 없었다.
+같은 본문을 direct와 프록시에 보내고 **키와 JSON 타입만** 비교한 결과(값은 모델이 다르니 당연히 다르다):
+
+| 표면 | 프록시에 **없는** 필드 (direct에는 있음) | 프록시에만 있는 필드 |
+| --- | --- | --- |
+| `/v1/chat/completions` | `usage.prompt_tokens_details.cache_write_tokens` | 없음 |
+| `/v1/responses` | `usage.input_tokens_details.cache_write_tokens`, `reasoning.mode`, `tool_usage.web_search.num_requests`, `tool_usage.image_gen.*`(8개) | 없음 |
+| `/v1/messages` | `usage.cache_creation_input_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation.ephemeral_1h_input_tokens`, `usage.cache_creation.ephemeral_5m_input_tokens`, `usage.output_tokens_details.thinking_tokens`, `usage.service_tier`, `usage.inference_geo` | 없음 |
+
+**한 방향으로만 어긋난다** — 프록시가 없는 필드를 지어내지는 않는다. 하지만 direct가 늘 주는 필드를 읽는
+클라이언트는 `0`이 아니라 `undefined`를 받는다.
+
+**미결인 이유**: `/v1/messages`의 캐시 카운터 생략은 **이미 한 번 판단된 결정**이다
+(`anthropicUsage`의 주석: "A zero is not a report … treating 0 as 'this runtime reports caching' put
+`cache_read_input_tokens: 0` on every cache-miss turn and re-hid a real hit behind a merged zero").
+캐시를 실제로 쓰지 않는 런타임이 `0`을 보고하는 것과, 보고 자체를 하지 않는 것 중 무엇이 클라이언트에게
+정직한지는 **트레이드오프이지 결함이 아니다** — 이 표는 그 결정을 되돌리지 않고 사실만 남긴다.
+`tool_usage`·`reasoning.mode`·`thinking_tokens`는 이 프록시가 실행하지 않는 기능의 보고 필드라 값의 의미를
+따로 측정해야 하며, 추측으로 채우지 않는다.
+
 #### 5.5.5-A Chat `content` 필수 규칙 — 4라운드 실측 (2026-08-31)
 
 **이 항목은 2026-08-30에 반대로 기록됐고, 그 오독을 만든 것은 계기 자체였다.**
