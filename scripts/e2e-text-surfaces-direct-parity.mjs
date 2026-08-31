@@ -305,6 +305,22 @@ const responsesCases = [
   ['responses model null', { ...OUT, model: null }],
   ['responses model empty', { ...OUT, model: '' }],
   ['responses model as an integer', { ...OUT, model: 7 }],
+  // `input`, which the proxy used to substitute rather than require. Its
+  // absence outranks everything but `model`; an input that is PRESENT but
+  // carries nothing is a different sentence with no `param` at all, placed
+  // after the state phase and before the capability pass.
+  ['responses input absent', { ...OUT, input: DELETE }],
+  ['responses input absent beats an unknown key', { ...OUT, input: DELETE, zzz_unknown: 1 }],
+  ['responses input absent beats a bad field', { ...OUT, input: DELETE, truncation: 'bogus' }],
+  ['responses input absent beats the state phase', { ...OUT, input: DELETE, previous_response_id: 'resp_x' }],
+  ['responses input absent loses to a missing model', { ...OUT, input: DELETE, model: DELETE }],
+  ['responses input empty array', { ...OUT, input: [] }],
+  ['responses input empty string', { ...OUT, input: '' }],
+  ['responses input empty loses to an unknown key', { ...OUT, input: [], zzz_unknown: 1 }],
+  ['responses input empty loses to a bad field', { ...OUT, input: [], truncation: 'bogus' }],
+  ['responses input empty loses to the state phase', { ...OUT, input: [], previous_response_id: 'resp_x' }],
+  ['responses input empty beats the capability pass', { ...OUT, input: [], temperature: 0.5 }],
+  ['responses input null', { ...OUT, input: null }],
   // input, and the item members inside it.
   ['responses input as an object', { ...OUT, input: { a: 1 } }],
   ['responses input item unknown member', { ...OUT, input: [{ role: 'user', content: I, bogus: 1 }] }],

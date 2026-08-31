@@ -27,6 +27,15 @@
       "measuredAt": "2026-08-31",
       "evidence": "docs/conformance-matrix.md §5.5.7",
       "claim": "messages-whitespace-model-is-a-400"
+    },
+    {
+      "id": "responses-replayed-item-ids-are-not-looked-up",
+      "surface": "/v1/responses",
+      "behavior": "The proxy accepts a replayed `reasoning` or hosted-tool item without checking its id, and replays it as nothing. The direct API answers 404 `Item with id '<id>' not found.` for an id it does not hold — including alongside a valid user turn — and finds the id when the item really came from its own previous response.",
+      "why": "Measured 2026-08-31. Feeding `output` back as `input` is the documented way to hold a conversation on a surface that stores none, and this proxy stores none either: it has no id table to look one up in. Mirroring the 404 would mean refusing EVERY replayed item, the legitimate ones included, which would break the round trip the surface exists for. Accepting and replaying nothing is what a runtime with no reasoning slot can honestly do.",
+      "measuredAt": "2026-08-31",
+      "evidence": "docs/conformance-matrix.md §5.5.6-A",
+      "claim": "responses-replayed-item-ids-are-not-looked-up"
     }
   ]
 }

@@ -618,6 +618,24 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 **대가**: 스키마를 실은 턴은 상시 세션을 잃고 매번 새 CLI를 띄운다. 약속이 있는 곳에서만 치르는 값이고,
 스키마 없는 턴은 그대로 자식을 재사용한다. 회귀는 `test/claude-code-backend.test.mjs`의 argv 단언이 잡는다.
 
+#### 5.5.6-A `input` 필수 규칙 — 4라운드 실측 (2026-08-31)
+
+3라운드까지 이 프록시는 `input`이 **없으면 빈 user 턴을 대신 넣고 200**을 줬다. direct는 그러지 않는다.
+
+| 본문 | direct | 프록시(3라운드까지) |
+| --- | --- | --- |
+| `input` 생략 | 400 `missing_required_parameter` param `input` — `Missing required parameter: 'input'.` | **200** |
+| `input: []` / `input: ''` | 400 `missing_required_parameter` **param 없음(null)** — `One of "input" or "previous_response_id" or 'prompt' or 'conversation' must be provided.` | **200** |
+| `input: null` | 400 `invalid_type` `Invalid type for 'input': expected a string, but got an object instead.` — `model: null`과 같은 "null은 실패한 STRING" 어법 | 프록시가 지어낸 문장 `input must be a string or an array of input items.`, code 없음 |
+
+**단계**: 생략 검사는 `model` **바로 다음**이고 그 뒤 전부를 이긴다(미지 키·`truncation`·`previous_response_id`·`conversation`).
+비어 있음 검사는 **상태 단계 뒤, capability 패스 앞**이다(`previous_response_id`에 지고 `temperature`를 이긴다).
+
+**미러하지 않음**: 되먹인 `reasoning`·hosted-tool 항목의 **id 조회**. direct는 `[{id:'rs_abc',type:'reasoning'}]`에
+404 `Item with id 'rs_abc' not found.`로 답하고, 진짜 왕복(같은 서버가 방금 낸 id)에서는 찾는다.
+이 프록시는 상태를 저장하지 않아 id를 조회할 수단이 없다 — 흉내 내려면 **정당한 되먹임까지 전부** 거절해야 하므로 수용 쪽으로 남긴다.
+그 결과 항목이 전부 드롭돼 턴이 하나도 남지 않는 본문은 빈 대화로 실행된다(비어 있음 검사는 `input` 자체가 비었을 때만 걸린다).
+
 ### 5.5.7 Anthropic Messages 필드 검증·보고 순서 실측 (2026-08-31) — **미러 완료**
 
 `claude-sonnet-5`. 봉투는 `{type:"error", error:{type, message}}` — **`param`도 `code`도 없다**.

@@ -68,6 +68,21 @@ const REJECTIONS = [
   ["model null", { ...OUT, model: null }, { param: "model", code: "invalid_type", message: "Invalid type for 'model': expected a string, but got an object instead." }],
   ["model empty", { ...OUT, model: '' }, { param: "model", code: "model_not_found", message: "The requested model '' does not exist." }],
   ["model as an integer", { ...OUT, model: 7 }, { param: "model", code: "invalid_type", message: "Invalid type for 'model': expected a string, but got an integer instead." }],
+  // `input`, required. Absence outranks everything but `model`; present-but-empty
+  // is a different sentence with no `param`, after the state phase and before
+  // the capability pass.
+  ["input absent", { ...OUT, input: DELETE }, { param: "input", code: "missing_required_parameter", message: "Missing required parameter: 'input'." }],
+  ["input absent beats an unknown key", { ...OUT, input: DELETE, zzz_unknown: 1 }, { param: "input", code: "missing_required_parameter", message: "Missing required parameter: 'input'." }],
+  ["input absent beats a bad field", { ...OUT, input: DELETE, truncation: 'bogus' }, { param: "input", code: "missing_required_parameter", message: "Missing required parameter: 'input'." }],
+  ["input absent beats the state phase", { ...OUT, input: DELETE, previous_response_id: 'resp_x' }, { param: "input", code: "missing_required_parameter", message: "Missing required parameter: 'input'." }],
+  ["input absent loses to a missing model", { ...OUT, input: DELETE, model: DELETE }, { param: "model", code: "missing_required_parameter", message: "Missing required parameter: 'model'." }],
+  ["input empty array", { ...OUT, input: [] }, { param: null, code: "missing_required_parameter", message: "One of \"input\" or \"previous_response_id\" or 'prompt' or 'conversation' must be provided." }],
+  ["input empty string", { ...OUT, input: '' }, { param: null, code: "missing_required_parameter", message: "One of \"input\" or \"previous_response_id\" or 'prompt' or 'conversation' must be provided." }],
+  ["input empty loses to an unknown key", { ...OUT, input: [], zzz_unknown: 1 }, { param: "zzz_unknown", code: "unknown_parameter", message: "Unknown parameter: 'zzz_unknown'." }],
+  ["input empty loses to a bad field", { ...OUT, input: [], truncation: 'bogus' }, { param: "truncation", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'auto' and 'disabled'." }],
+  ["input empty beats the capability pass", { ...OUT, input: [], temperature: 0.5 }, { param: null, code: "missing_required_parameter", message: "One of \"input\" or \"previous_response_id\" or 'prompt' or 'conversation' must be provided." }],
+  ["input empty loses to the state phase", { ...OUT, input: [], previous_response_id: 'resp_x' }, { param: "previous_response_id", code: "previous_response_not_found", message: "Previous response with id 'resp_x' not found." }],
+  ["input null", { ...OUT, input: null }, { param: "input", code: "invalid_type", message: "Invalid type for 'input': expected a string, but got an object instead." }],
   // input, and the item members inside it.
   ["input as an object", { ...OUT, input: { a: 1 } }, { param: "input", code: "invalid_type", message: "Invalid type for 'input': expected one of a string or array of input items, but got an object instead." }],
   ["input item unknown member", { ...OUT, input: [{ role: 'user', content: I, bogus: 1 }] }, { param: "input[0].bogus", code: "unknown_parameter", message: "Unknown parameter: 'input[0].bogus'." }],

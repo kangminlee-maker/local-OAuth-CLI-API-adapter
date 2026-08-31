@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "e9bd449972aa4bf1e36acd679aa2c6beefa8ac11c4a20b310f0078560ef8943c",
+    "matrixDigest": "95c7013bdd1b0527306c892b485e98639db82d2b6de34feb1eb1a2e9641a659f",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -121,6 +121,12 @@
       "id": "messages-whitespace-model-is-a-400",
       "surface": "/v1/messages",
       "evidence": "docs/conformance-matrix.md §5.5.7",
+      "measuredAt": "2026-08-31"
+    },
+    {
+      "id": "responses-replayed-item-ids-are-not-looked-up",
+      "surface": "/v1/responses",
+      "evidence": "docs/conformance-matrix.md §5.5.6-A",
       "measuredAt": "2026-08-31"
     }
   ],

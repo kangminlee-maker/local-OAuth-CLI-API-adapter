@@ -612,6 +612,11 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   // measured for THIS surface — which is nothing like Chat's, because each
   // surface reports in its own schema order (§5.5.6).
   const model = readRequiredOpenAiModel(input.model, 'openai-responses');
+  // `input` is required, and its absence outranks everything but `model` —
+  // measured 2026-08-31: an unknown key, a bad `truncation`, a
+  // `previous_response_id` and a `conversation` all lose to it. The proxy used
+  // to substitute an empty user turn and answer 200.
+  if (input.input === undefined) throw missingRequiredParameter('input');
   rejectUnknownOpenAiResponsesKeys(input);
   validateOpenAiResponsesFields(input, model);
 
@@ -674,6 +679,15 @@ function rejectUnknownOpenAiResponsesKeys(input: Record<string, unknown>): void 
 function validateOpenAiResponsesFields(input: Record<string, unknown>, model: string): void {
   const present = (key: string): boolean => input[key] !== undefined && input[key] !== null;
 
+  if (input.input === null) {
+    // The same quirk `model: null` has on this surface: null is described as a
+    // failed STRING and worded "an object", where every other wrong type gets
+    // the union's own sentence and its own type name.
+    throw new ProxyRequestError(
+      "Invalid type for 'input': expected a string, but got an object instead.",
+      400, 'openai', 'invalid_request_error', 'input', 'invalid_type',
+    );
+  }
   if (present('input')) {
     if (typeof input.input !== 'string' && !Array.isArray(input.input)) {
       throw invalidType('input', 'one of a string or array of input items', input.input);
@@ -804,6 +818,15 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
     throw invalidType('context_management', 'an array of objects', input.context_management);
   }
   refuseOpenAiResponsesServerState(input);
+  // Present but carrying nothing. Measured: it loses to the state phase above
+  // and beats the capability pass below, and it names no `param` — the sentence
+  // is about the request as a whole, not about one field.
+  if (Array.isArray(input.input) ? input.input.length === 0 : input.input === '') {
+    throw new ProxyRequestError(
+      'One of "input" or "previous_response_id" or \'prompt\' or \'conversation\' must be provided.',
+      400, 'openai', 'invalid_request_error', null, 'missing_required_parameter',
+    );
+  }
 
   // The model-capability value checks, after every field check — the same
   // second pass Chat has. Logprobs live here rather than at their fields'

@@ -1274,14 +1274,29 @@ test('a non-ASCII key sent as its UTF-8 bytes authenticates', async () => {
   }
 });
 
-test('/v1/responses: a non-string non-array input is rejected, omission is not', async () => {
+test('/v1/responses: input is required, and carrying nothing is not carrying it', async () => {
+  // This test used to end with `assert.equal(omitted.status, 200, 'omission
+  // keeps its existing behaviour')` — it pinned a divergence as the contract.
+  // Measured 2026-08-31: the direct API requires `input`, and its absence
+  // outranks an unknown key, a bad field and the state phase alike.
   for (const input of [7, null, true, {}]) {
     const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input });
     assert.equal(status, 400, `input=${JSON.stringify(input)} is not a string or array`);
     assert.equal(JSON.parse(text).error.param, 'input');
   }
   const omitted = await call(backendThat({}), '/v1/responses', { model: 'a-model' });
-  assert.equal(omitted.status, 200, 'omission keeps its existing behaviour');
+  assert.equal(omitted.status, 400, 'omission is a missing required parameter');
+  assert.equal(JSON.parse(omitted.text).error.code, 'missing_required_parameter');
+  assert.equal(JSON.parse(omitted.text).error.param, 'input');
+  // Present but empty is a different sentence, and names no param at all.
+  for (const input of [[], '']) {
+    const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input });
+    const error = JSON.parse(text).error;
+    assert.equal(status, 400, `input=${JSON.stringify(input)} carries no turn`);
+    assert.equal(error.param, null);
+    assert.equal(error.code, 'missing_required_parameter');
+    assert.equal(error.message, 'One of "input" or "previous_response_id" or \'prompt\' or \'conversation\' must be provided.');
+  }
 });
 
 test('/v1/responses: an item type outside the union is rejected, whatever its JSON type', async () => {
