@@ -281,8 +281,19 @@ function refuseOpenAiChatMissingContent(value: unknown): void {
     if (!msg || (msg.content !== undefined && msg.content !== null)) continue;
     if (
       msg.role === 'assistant'
-      && OPENAI_CHAT_ASSISTANT_CONTENT_SUBSTITUTES.some((key) => msg[key] !== undefined)
+      // A substitute that is present but NULL is not a substitute: every one of
+      // `tool_calls`, `function_call`, `refusal` and `audio` set to null falls
+      // through to the content fault (measured).
+      && OPENAI_CHAT_ASSISTANT_CONTENT_SUBSTITUTES.some((key) => msg[key] !== undefined && msg[key] !== null)
     ) continue;
+    // `developer` is its own schema and answers in its own words: a missing
+    // parameter for an absent value, a type fault for `null`, and the plain
+    // `messages[i].content` param where every other role gets the
+    // dotted-bracket `messages.[i].content` (all measured).
+    if (msg.role === 'developer') {
+      if (msg.content === undefined) throw missingRequiredParameter(`messages[${index}].content`);
+      throw invalidType(`messages[${index}].content`, 'one of a string or array of objects', msg.content);
+    }
     throw new ProxyRequestError(
       "Invalid value for 'content': expected a string, got null.",
       400, 'openai', 'invalid_request_error', `messages.[${index}].content`, null,
@@ -1731,6 +1742,7 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
     if (!msg) throw invalidType(`messages[${index}]`, 'an object', item);
     const role = readOpenAiChatRole(msg.role, index);
     requireOpenAiChatContent(msg, index);
+    validateOpenAiChatToolCalls(msg, index, role);
     const content = flattenOpenAiMessage(msg, role);
     return {
       role,
@@ -1778,6 +1790,33 @@ function requireOpenAiChatContent(msg: Record<string, unknown>, index: number): 
   if (content === undefined || content === null) return;
   if (typeof content === 'string' || Array.isArray(content)) return;
   throw invalidType(`messages[${index}].content`, 'one of a string or array of objects', content);
+}
+
+/**
+ * An assistant message's `tool_calls`, at the `messages` position.
+ *
+ * Measured 2026-08-31: an empty array is its own refusal with its own code, and
+ * it fires even when the message also carries content — so it is not part of
+ * the content rules and cannot be read as one of their substitutes. It is
+ * assistant-only: `tool_calls: []` on a user message is a 200, because the user
+ * schema has no such member and this surface ignores members it does not know.
+ * Within the item it comes after the role and the content TYPE, and before the
+ * required-ness check that runs last of all.
+ */
+function validateOpenAiChatToolCalls(
+  msg: Record<string, unknown>,
+  index: number,
+  role: NormalizedMessage['role'],
+): void {
+  const calls = msg.tool_calls;
+  if (role !== 'assistant' || calls === undefined || calls === null) return;
+  if (!Array.isArray(calls)) throw invalidType(`messages[${index}].tool_calls`, 'an array of objects', calls);
+  if (calls.length === 0) {
+    throw new ProxyRequestError(
+      `Invalid 'messages[${index}].tool_calls': empty array. Expected an array with minimum length 1, but got an empty array instead.`,
+      400, 'openai', 'invalid_request_error', `messages[${index}].tool_calls`, 'empty_array',
+    );
+  }
 }
 
 function readResponsesInput(value: unknown): NormalizedMessage[] {

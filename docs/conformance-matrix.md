@@ -643,6 +643,16 @@ capability 패스보다 **더 뒤**다 — 그래서 메시지가 무엇이든 t
 | assistant에 아무 대체도 없음 / `system`·`tool` 항목 | 400 |
 | `messages: null`·`'x'`·`7` | 400 `invalid_type` `Invalid type for 'messages': expected an array of objects, but got <타입> instead.` (프록시는 null을 `missing_required_parameter`로 답하고 있었다) |
 
+**역할별 차이와 대체 규칙(4라운드 스윕에서 추가 실측)**:
+
+| 본문 | direct |
+| --- | --- |
+| `developer` 항목 content 생략 | 400 `missing_required_parameter` param **`messages[i].content`**(점 없음) — `Missing required parameter: 'messages[i].content'.` |
+| `developer` 항목 content `null` | 400 `invalid_type` param `messages[i].content` — 다른 역할과 **다른 문장** |
+| assistant 대체 멤버가 `null` | 대체가 **아니다**. `tool_calls`·`function_call`·`refusal`·`audio` 어느 것이든 `null`이면 content 결함으로 떨어진다 |
+| assistant `tool_calls: []` | 400 `empty_array` param `messages[i].tool_calls` — content가 **있어도** 난다. `messages` 단계(역할·content 타입 다음)에 있고 capability 패스·뒤 항목의 잘못된 role을 이기며 미지 키에만 진다. user 항목의 `tool_calls: []`는 200 |
+| assistant `tool_calls` 타입 오류 | 400 `invalid_type` `expected an array of objects` |
+
 **단계**: `content` 필수 검사는 **전부의 마지막**이다 — 어느 인덱스의 content 타입 결함에도, 어느 인덱스의 잘못된 role에도,
 `n`·`stop`·`temperature`·미지 키에도 전부 진다.
 

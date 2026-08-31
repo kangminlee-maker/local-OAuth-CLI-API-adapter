@@ -39,6 +39,19 @@ async function chat(extra, path = '/v1/chat/completions') {
 
 // [name, request fragment, {status, param, code, message}]
 const REJECTIONS = [
+  // `content` required-ness, measured 2026-08-31. `developer` is its own schema
+  // and answers in its own words; a substitute that is present but NULL is not
+  // a substitute; `tool_calls: []` is its own refusal in the messages phase.
+  ['content absent on a developer item', { messages: [{ role: 'user', content: 'a' }, { role: 'developer' }] }, { param: 'messages[1].content', code: 'missing_required_parameter', message: "Missing required parameter: 'messages[1].content'." }],
+  ['content null on a developer item', { messages: [{ role: 'user', content: 'a' }, { role: 'developer', content: null }] }, { param: 'messages[1].content', code: 'invalid_type', message: "Invalid type for 'messages[1].content': expected one of a string or array of objects, but got null instead." }],
+  ['a null refusal is no substitute', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', refusal: null }] }, { param: 'messages.[1].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  ['a null tool_calls is no substitute', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', tool_calls: null }] }, { param: 'messages.[1].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  ['a null function_call is no substitute', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', function_call: null }] }, { param: 'messages.[1].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  ['an empty tool_calls', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', tool_calls: [] }] }, { param: 'messages[1].tool_calls', code: 'empty_array', message: "Invalid 'messages[1].tool_calls': empty array. Expected an array with minimum length 1, but got an empty array instead." }],
+  ['an empty tool_calls beside content', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'x', tool_calls: [] }] }, { param: 'messages[1].tool_calls', code: 'empty_array', message: "Invalid 'messages[1].tool_calls': empty array. Expected an array with minimum length 1, but got an empty array instead." }],
+  ['an empty tool_calls beats the capability pass', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'x', tool_calls: [] }], temperature: 0.5 }, { param: 'messages[1].tool_calls', code: 'empty_array', message: "Invalid 'messages[1].tool_calls': empty array. Expected an array with minimum length 1, but got an empty array instead." }],
+  ['an empty tool_calls loses to a content type fault', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 7, tool_calls: [] }] }, { param: 'messages[1].content', code: 'invalid_type', message: "Invalid type for 'messages[1].content': expected one of a string or array of objects, but got an integer instead." }],
+  ['a tool_calls of the wrong type', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'x', tool_calls: 'x' }] }, { param: 'messages[1].tool_calls', code: 'invalid_type', message: "Invalid type for 'messages[1].tool_calls': expected an array of objects, but got a string instead." }],
   // Unknown top-level keys — the strict schema P-5 found and §5.5.5 enumerated.
   ['an invented key', { zzz_unknown: 1 }, { param: 'zzz_unknown', code: 'unknown_parameter', message: "Unknown parameter: 'zzz_unknown'." }],
   ['audio', { audio: { voice: 'alloy', format: 'wav' } }, { param: 'audio', code: 'unknown_parameter', message: "Unknown parameter: 'audio'." }],
