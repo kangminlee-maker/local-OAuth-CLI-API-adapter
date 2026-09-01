@@ -200,7 +200,14 @@ class CodexBackendStreamState {
   private failure?: string;
   private settled = false;
   private stopReason?: string;
-  private toolCallsBeforeText?: boolean;
+  /**
+   * How many tool calls this turn had ANNOUNCED when its text began. Recorded
+   * here because this is the one backend that can genuinely interleave the
+   * two, so it is the only one that can produce a turn the old boolean could
+   * not describe: a call, then narration, then another call.
+   */
+  private textOrdinal?: number;
+  private announcedCalls = 0;
   private reasoning?: LocalReasoningItem;
 
   constructor(
@@ -294,6 +301,10 @@ class CodexBackendStreamState {
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+      // Fixed at the first text the client is actually told about, against the
+      // calls announced so far — the same instant, and the same counter, the
+      // stream itself used to place the message item.
+      if (this.textOrdinal === undefined && event.delta !== '') this.textOrdinal = this.announcedCalls;
       this.text += event.delta;
       out.push({ type: 'text_delta', delta: event.delta });
       return out;
@@ -445,13 +456,13 @@ class CodexBackendStreamState {
     const out: LocalStreamEvent[] = [];
     if (!state.started) {
       state.started = true;
-      // Decided HERE, at the first thing the client is told about a tool, not
+      // Counted HERE, at the first thing the client is told about a tool, not
       // when the backend opened state for one: arguments held until the call is
       // named arrive before any text, but they are not announced until after
-      // whatever narration streamed while they waited. Recording the order at
-      // state creation claimed the tool came first on exactly that path — the
+      // whatever narration streamed while they waited. Counting at state
+      // creation claimed the tool came first on exactly that path — the
       // contradiction between stream and body this whole rule exists to remove.
-      if (this.toolCallsBeforeText === undefined) this.toolCallsBeforeText = this.text === '';
+      this.announcedCalls += 1;
       out.push({
         type: 'tool_call_delta',
         index,
@@ -560,7 +571,9 @@ class CodexBackendStreamState {
       // The completed result flattens the turn's text into one string, so this
       // is the one ordering a non-streaming client cannot reconstruct — and
       // both ordered surfaces need it to agree with the stream.
-      ...(this.toolCallsBeforeText && toolCalls.length > 0 ? { toolCallsBeforeText: true } : {}),
+      ...(toolCalls.length > 0 && this.textOrdinal !== undefined && this.textOrdinal > 0
+        ? { textOrdinal: Math.min(this.textOrdinal, toolCalls.length) }
+        : {}),
       ...(this.reasoning ? { reasoning: this.reasoning } : {}),
       toolCalls,
       usage: this.usage ?? usageFor(this.request, this.text, toolCalls),

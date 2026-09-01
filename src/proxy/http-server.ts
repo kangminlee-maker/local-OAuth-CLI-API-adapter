@@ -2000,14 +2000,29 @@ function openAiResponsesResponse(
  * The turn's parts in the order they were produced. A tool call that arrived
  * before any text is streamed as the first block, so the completed body has to
  * report it as the first block too — the two surfaces describe one turn.
+ *
+ * The text goes in at `textOrdinal`, splitting the calls around it, because a
+ * turn can run a call, say something, then run another call. Choosing between
+ * two whole groups here is what made the buffered body contradict the stream
+ * on exactly that shape.
  */
 function orderedByEmission(
   result: LocalCompletionResult,
   parts: { readonly text: readonly unknown[]; readonly toolCalls: readonly unknown[] },
 ): unknown[] {
-  return result.toolCallsBeforeText
-    ? [...parts.toolCalls, ...parts.text]
-    : [...parts.text, ...parts.toolCalls];
+  const at = textOrdinalOf(result, parts.toolCalls.length);
+  return [...parts.toolCalls.slice(0, at), ...parts.text, ...parts.toolCalls.slice(at)];
+}
+
+/**
+ * The turn's text position, clamped to the calls actually being rendered. A
+ * backend that reports an ordinal past its own call count would otherwise move
+ * the text somewhere the stream never put it.
+ */
+function textOrdinalOf(result: LocalCompletionResult, callCount: number): number {
+  const raw = result.textOrdinal;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(Math.floor(raw), callCount);
 }
 
 /**
@@ -2858,12 +2873,17 @@ async function writeOpenAiResponsesStream(
         // For a turn that announced NOTHING until it completed — every tool
         // call on the claude native-schema channel — this call is where both
         // positions are allocated, so production order decides, through the
-        // same `toolCallsBeforeText` knob the buffered body reads.
-        const announced = streamedText || toolState.firstAnnouncedIndex !== Infinity;
-        const messageFirst = announced
-          ? messageOutputIndex !== -1 && messageOutputIndex < toolState.firstAnnouncedIndex
-          : !result.toolCallsBeforeText;
-        if (messageFirst) {
+        // same `textOrdinal` knob the buffered body reads.
+        if (messageOutputIndex !== -1) {
+          // The message already holds a position, so there is nothing left to
+          // decide: one walk closes every item where it actually sits.
+          for (const { outputIndex, item } of await toolState.finish(
+            result.toolCalls,
+            { outputIndex: messageOutputIndex, emit: finishMessage },
+          )) {
+            finalItems.set(outputIndex, item);
+          }
+        } else if (textOrdinalOf(result, result.toolCalls.length) === 0) {
           await finishMessage();
           await finishTools();
         } else {
@@ -2980,13 +3000,29 @@ class OpenAiResponsesToolStreamState {
     return lowest;
   }
 
-  /** The finished items with the output position each was announced at. */
+  /**
+   * The finished items with the output position each was announced at.
+   *
+   * `message` is the turn's message item and how to close it, when it already
+   * holds a position. Calls are closed in ascending announced index and the
+   * message goes out at its own — one walk over the whole turn. Closing the
+   * tools as one group and the message as another could not express a turn
+   * that called, narrated, then called again, and told the client that item 2
+   * had finished before item 1.
+   */
   async finish(
     toolCalls: readonly LocalToolCall[],
+    message?: { readonly outputIndex: number; readonly emit: () => Promise<void> },
   ): Promise<ReadonlyArray<{ readonly outputIndex: number; readonly item: unknown }>> {
     const output: Array<{ outputIndex: number; item: unknown }> = [];
+    let pendingMessage = message;
     for (const [index, call] of toolCalls.entries()) {
       const state = await this.ensureStarted(index, call.id, call.name);
+      if (pendingMessage && pendingMessage.outputIndex < state.outputIndex) {
+        const emit = pendingMessage.emit;
+        pendingMessage = undefined;
+        await emit();
+      }
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);
       const item = {
@@ -3010,6 +3046,7 @@ class OpenAiResponsesToolStreamState {
         item,
       });
     }
+    if (pendingMessage) await pendingMessage.emit();
     return output;
   }
 
@@ -3212,7 +3249,7 @@ async function writeAnthropicMessagesStream(
         // reports through `orderedByEmission`. A turn whose tools came before
         // any text was answered here in the other order — the same turn read
         // as [text, tool_use] streamed and [tool_use, text] buffered.
-        if (result.toolCallsBeforeText && !streamedText) {
+        if (textOrdinalOf(result, result.toolCalls.length) > 0 && !streamedText) {
           await toolState.finish(result.toolCalls);
           for (const chunk of chunkText(gated.tail)) await writeText(chunk);
           await closeOpenTextBlock();

@@ -1798,3 +1798,58 @@ test('text.verbosity is sent only when someone actually asked for it', async () 
   await silent.generate({ ...base, jsonMode: true });
   assert.deepEqual(sent.text, { format: { type: 'json_object' } }, 'json mode still carries its format, with no verbosity added');
 });
+
+// `textOrdinal` is DERIVED here, from the upstream's own event order, and this
+// is the only backend that can produce a turn the old boolean could not
+// describe: a call, then narration, then another call. A surface test that
+// hands the field to a stub proves the surfaces read it; only this proves
+// anything writes it.
+async function turnFor(events) {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse(events), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  return backend.generate({
+    ...textRequest(),
+    tools: [{ name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } }],
+    toolChoice: { type: 'auto' },
+  });
+}
+
+const CREATED = { type: 'response.created', response: { id: 'r', model: 'x', status: 'in_progress' } };
+const DONE = { type: 'response.completed', response: { id: 'r', model: 'x' } };
+const callAdded = (outputIndex, n) => ({
+  type: 'response.output_item.added',
+  output_index: outputIndex,
+  item: { type: 'function_call', id: `fc${n}`, call_id: `c${n}`, name: 'get_weather', arguments: '' },
+});
+const callDone = (outputIndex, n) => ({
+  type: 'response.output_item.done',
+  output_index: outputIndex,
+  item: { type: 'function_call', id: `fc${n}`, call_id: `c${n}`, name: 'get_weather', arguments: '{}' },
+});
+
+test('the transport reports the text position for a call/text/call turn', async () => {
+  const turn = await turnFor([
+    CREATED, callAdded(0, 1), callDone(0, 1),
+    { type: 'response.output_text.delta', delta: 'BETWEEN' },
+    callAdded(2, 2), callDone(2, 2), DONE,
+  ]);
+  assert.equal(turn.toolCalls.length, 2);
+  assert.equal(turn.textOrdinal, 1, 'one call came before the narration');
+});
+
+test('the transport reports every call before the text as the full count', async () => {
+  const turn = await turnFor([
+    CREATED, callAdded(0, 1), callDone(0, 1), callAdded(1, 2), callDone(1, 2),
+    { type: 'response.output_text.delta', delta: 'AFTER' }, DONE,
+  ]);
+  assert.equal(turn.textOrdinal, 2);
+});
+
+test('the transport reports text-first as no calls before it', async () => {
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'FIRST' },
+    callAdded(1, 1), callDone(1, 1), DONE,
+  ]);
+  assert.equal(turn.textOrdinal ?? 0, 0);
+});

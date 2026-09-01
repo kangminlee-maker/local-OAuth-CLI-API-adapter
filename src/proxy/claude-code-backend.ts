@@ -469,7 +469,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       model: request.model,
       text: parsed.text,
       toolCalls: parsed.toolCalls,
-      ...(parsed.toolCallsBeforeText ? { toolCallsBeforeText: true } : {}),
+      ...(parsed.textOrdinal ? { textOrdinal: parsed.textOrdinal } : {}),
       usage,
       latencyMs: Date.now() - startedAt,
       stopReason: turn.stopReason,

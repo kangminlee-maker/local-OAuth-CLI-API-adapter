@@ -136,14 +136,23 @@ export interface LocalCompletionResult {
   readonly text: string;
   readonly toolCalls: readonly LocalToolCall[];
   /**
-   * True when the turn's first tool call came before any text. `text` is one
-   * flattened string, so this is the only ordering a non-streaming client
-   * cannot reconstruct — and the Responses `output` array and the Anthropic
-   * `content` array are ordered surfaces, so without it the body contradicts
-   * the stream that carried the same turn. Absent means text came first, which
-   * is what a backend that cannot interleave the two always produces.
+   * How many of `toolCalls` the backend produced BEFORE this turn's text.
+   * `text` is one flattened string, so this is the only ordering a
+   * non-streaming client cannot reconstruct — and the Responses `output` array
+   * and the Anthropic `content` array are ordered surfaces, so without it the
+   * body contradicts the stream that carried the same turn.
+   *
+   * A COUNT rather than the boolean this used to be. The boolean could say
+   * only "all calls before the text" or "all calls after it", and a turn that
+   * ran a call, said something, then ran another call is neither: the stream
+   * announced [call, text, call] while the buffered body claimed
+   * [call, call, text]. One turn, two orders, on both ordered surfaces.
+   *
+   * 0 (or absent) means the text came first, which is what a backend that
+   * cannot interleave the two always produces; `toolCalls.length` means every
+   * call came first.
    */
-  readonly toolCallsBeforeText?: boolean;
+  readonly textOrdinal?: number;
   /**
    * The reasoning item the backend reported for this turn, when it reported
    * one. Its presence is the fact — a turn that did not reason has no such
