@@ -246,7 +246,18 @@ test('honour-on: streaming chunks report the executed model, not the request ech
 // The first fix cancelled once every start had SETTLED, which is not a fix for
 // the case here: the siblings produce no first event until they are aborted, so
 // waiting for them is waiting for the thing the cancel is meant to end.
-// Measured with a 300ms timeout: 500 at 326ms, aborts at 319ms.
+//
+// That history makes an elapsed-time assertion tempting, and this test used to
+// carry one — `answeredMs < 1000` against a 3000ms request timeout. It is the
+// wrong instrument in both directions: a loaded machine fails it with no
+// invariant broken, and a fast one passes it even when the aborts came from the
+// per-turn timeouts rather than the shared cancel, because a clock cannot say
+// which one fired. The barrier below states the invariant itself. The siblings
+// hold until either their own signal aborts them or the DRIVER releases them,
+// and the cancel has to be observed WITHOUT that release. The request timeout
+// is 30s so it cannot stand in for the cancel, and the driver never sleeps: it
+// advances on backend milestones and then drains a bounded NUMBER of event-loop
+// turns, which is a count, not a duration.
 test('honour-on: a fan-out turn that fails to start cancels its siblings', async () => {
   const root = await mkdtemp(join(tmpdir(), 'fan-out-prefetch-'));
   trees.push(root);
@@ -260,24 +271,57 @@ test('honour-on: a fan-out turn that fails to start cancels its siblings', async
   await writeFile(scriptPath, `
     import { startLocalApiProxy } from ${JSON.stringify(join(root, 'dist/proxy/http-server.js'))};
 
-    const state = { turns: 0, aborts: 0, suspended: [] };
+    const state = {
+      turns: 0,
+      aborts: 0,
+      // What the shared cancel achieved on its own, before the driver let any
+      // sibling go. This is the whole test.
+      abortsWithoutRelease: -1,
+      suspendedWithoutRelease: null,
+      eventLoopTurnsToSettle: -1,
+      suspended: [],
+    };
     const live = new Set();
+
+    // The barrier every sibling holds on, and the only thing besides an abort
+    // that can let one go. No timer: a sibling cannot drift out of it because
+    // the machine was slow or fast.
+    let releaseBarrier;
+    const barrier = new Promise((r) => { releaseBarrier = r; });
+    // Two milestones the driver waits on instead of waiting on a clock.
+    let markAllStarted;
+    const allStarted = new Promise((r) => { markAllStarted = r; });
+    let markFailed;
+    const failingTurnThrew = new Promise((r) => { markFailed = r; });
+
+    // Counted even when the signal aborted before this turn's body ran: an
+    // 'abort' listener added to an already-aborted signal never fires, and
+    // missing the count that way would fail the test with the product correct.
+    const countAborts = (signal) => {
+      if (!signal) return;
+      if (signal.aborted) { state.aborts += 1; return; }
+      signal.addEventListener('abort', () => { state.aborts += 1; }, { once: true });
+    };
+
     const backend = {
       name: 'live', model: 'live-model',
       async generate() { throw new Error('unused'); },
       async *stream(request, signal) {
         const turn = state.turns++;
-        signal?.addEventListener('abort', () => { state.aborts += 1; }, { once: true });
+        countAborts(signal);
         live.add(turn);
+        if (state.turns === 3) markAllStarted();
         try {
-          if (turn === 0) throw new Error('this turn failed');
-          // No first event until something aborts this turn. That is the case
-          // that separates "cancel once every start has settled" from "cancel
-          // on the first start that fails": with the former, the wait is for
-          // the very turns the cancel is meant to end.
+          if (turn === 0) { markFailed(); throw new Error('this turn failed'); }
+          // No first event until something aborts this turn, or the driver
+          // releases the barrier. That is the case separating "cancel once
+          // every start has settled" from "cancel on the first start that
+          // fails": with the former, the wait is for the very turns the cancel
+          // is meant to end.
           await new Promise((resolveP, rejectP) => {
-            const timer = setTimeout(resolveP, 20000);
-            signal?.addEventListener('abort', () => { clearTimeout(timer); rejectP(new Error('aborted')); }, { once: true });
+            if (signal && signal.aborted) { rejectP(new Error('aborted')); return; }
+            barrier.then(resolveP);
+            if (signal) signal.addEventListener('abort', () => rejectP(new Error('aborted')), { once: true });
           });
           yield { type: 'text_delta', delta: 'hello' };
           yield { type: 'completed', result: { id: 'x', model: 'live-model', text: 'hello', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 } };
@@ -288,30 +332,64 @@ test('honour-on: a fan-out turn that fails to start cancels its siblings', async
       async close() {},
     };
 
-    // A SHORT request timeout, so "the client waited out the timeout" and "the
-    // client was answered at once" are far apart in the assertion below.
-    const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 3000 });
-    const began = Date.now();
-    const res = await fetch(started.url + '/v1/chat/completions', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: 'live-model', stream: true, n: 3, messages: [{ role: 'user', content: 'hi' }] }),
-    });
-    const text = await res.text();
-    const answeredMs = Date.now() - began;
-    await new Promise((r) => setTimeout(r, 250));
+    // A LONG request timeout, so an abort seen below can only have come from
+    // the shared cancel. With the old 3000ms one, a stalled driver would have
+    // read the per-turn timeouts' aborts as the cancel's and passed.
+    const started = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30000 });
+    const responded = (async () => {
+      const res = await fetch(started.url + '/v1/chat/completions', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'live-model', stream: true, n: 3, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      return { status: res.status, text: await res.text() };
+    })();
+    // Raced with each wait below so a regression that answers early, or never
+    // starts a turn, fails an assertion instead of hanging the run.
+    const respondedSettled = responded.then(() => {}, () => {});
+    await Promise.race([allStarted, respondedSettled]);
+    await Promise.race([failingTurnThrew, respondedSettled]);
+
+    // Advance the event loop by a bounded number of TURNS until the cancel has
+    // visibly finished. The cancel path is promise work with no timer in it, so
+    // it needs a handful of turns on any machine; the cap is margin and the
+    // loop costs microseconds whether it exits early or runs out.
+    const cancelSettled = () => state.aborts === 2 && live.size === 0;
+    let loopTurns = 0;
+    while (loopTurns < 200 && !cancelSettled()) {
+      loopTurns += 1;
+      await new Promise((r) => setImmediate(r));
+    }
+    state.eventLoopTurnsToSettle = loopTurns;
+    state.abortsWithoutRelease = state.aborts;
+    state.suspendedWithoutRelease = [...live];
+
+    // Only now let a sibling that was NOT cancelled proceed, so a broken cancel
+    // ends in a failed assertion rather than a hung run.
+    releaseBarrier();
+
+    const outcome = await responded;
     state.suspended = [...live];
     await started.close();
-    process.stdout.write(JSON.stringify({ status: res.status, answeredMs, text, state }));
+    process.stdout.write(JSON.stringify({ ...outcome, state }));
     process.exit(0);
   `);
   const { stdout } = await execFileAsync(process.execPath, [scriptPath], { cwd: root });
   const result = JSON.parse(stdout);
   assert.equal(result.status, 500, `the failure must reach the client: ${result.text}`);
-  assert.ok(
-    result.answeredMs < 1_000,
-    `the client waited ${result.answeredMs}ms of a 3000ms timeout for an error known in milliseconds`,
-  );
   assert.equal(result.state.turns, 3, 'all three turns did start');
+  // The replacement for the old wall-clock threshold: the cancel is observed
+  // while the siblings are still held, so it cannot have come from their own
+  // timeouts and cannot have been waiting on them.
+  assert.equal(
+    result.state.abortsWithoutRelease,
+    2,
+    `both siblings must be cancelled before anything releases them; saw ${result.state.abortsWithoutRelease} after ${result.state.eventLoopTurnsToSettle} event-loop turns`,
+  );
+  assert.deepEqual(
+    result.state.suspendedWithoutRelease,
+    [],
+    'and no turn may still be generating at that point',
+  );
   assert.equal(result.state.aborts, 2, 'both surviving turns must be cancelled');
   assert.deepEqual(result.state.suspended, [], 'and no turn may be left generating for nobody');
 });
