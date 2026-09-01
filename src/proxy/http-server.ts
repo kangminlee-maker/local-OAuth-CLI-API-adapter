@@ -3258,7 +3258,12 @@ async function writeAnthropicMessagesStream(
   }
 }
 
+/** The single exit for the Anthropic surface's in-band error event. */
 function anthropicStreamErrorPayload(err: unknown): Record<string, unknown> {
+  return boundedErrorEnvelope(rawAnthropicStreamErrorPayload(err));
+}
+
+function rawAnthropicStreamErrorPayload(err: unknown): Record<string, unknown> {
   const provider = err instanceof ProxyRequestError
     ? { type: err.type, message: err.message }
     : providerErrorFromBackendError(err);
@@ -3415,7 +3420,15 @@ function parseToolArguments(value: string): unknown {
   }
 }
 
+/**
+ * The single exit for every OpenAI-shape SSE error frame — chat, responses,
+ * images and the native surface all write what this returns.
+ */
 function streamErrorPayload(err: unknown): unknown {
+  return boundedErrorEnvelope(rawStreamErrorPayload(err));
+}
+
+function rawStreamErrorPayload(err: unknown): unknown {
   if (err instanceof ProxyRequestError) {
     return {
       error: {
@@ -3594,13 +3607,22 @@ function boundedErrorMessage(message: string): string {
   return `${out}${ERROR_TRUNCATION_MARKER}`;
 }
 
+/**
+ * Every client-visible JSON error body leaves through here. `writeJson` is
+ * shared with the success writers, so the envelope bound belongs on the error
+ * side of it rather than inside it.
+ */
+function writeErrorJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+  writeJson(res, statusCode, boundedErrorEnvelope(payload));
+}
+
 function writeError(
   res: ServerResponse,
   err: unknown,
   shape: ErrorResponseShape = 'openai',
 ): void {
   if (err instanceof LocalCliChatError) {
-    writeJson(res, err.statusCode, {
+    writeErrorJson(res, err.statusCode, {
       error: {
         message: boundedErrorMessage(err.message),
         type: 'local_cli_chat_error',
@@ -3625,7 +3647,7 @@ function writeError(
     // and configuration failures included — they happen before its handler,
     // but the caller is still a native-surface caller.
     if (shape === 'local-cli') {
-      writeJson(res, err.statusCode, {
+      writeErrorJson(res, err.statusCode, {
         error: {
           message: boundedErrorMessage(err.message),
           type: 'local_cli_chat_error',
@@ -3642,7 +3664,7 @@ function writeError(
     // `invalid_request_error`, the type these throws carry, is native to both
     // vocabularies.
     if (err.provider === 'anthropic' || shape === 'anthropic') {
-      writeJson(res, err.statusCode, {
+      writeErrorJson(res, err.statusCode, {
         type: 'error',
         error: {
           type: err.type,
@@ -3651,7 +3673,7 @@ function writeError(
       });
       return;
     }
-    writeJson(res, err.statusCode, {
+    writeErrorJson(res, err.statusCode, {
       error: {
         message: boundedErrorMessage(err.message),
         type: err.type,
@@ -3667,7 +3689,7 @@ function writeError(
     // caller's surface. A 429 on the native surface is still a 429 — reported
     // as this surface reports errors.
     if (shape === 'local-cli') {
-      writeJson(res, providerError.statusCode, {
+      writeErrorJson(res, providerError.statusCode, {
         error: {
           message: boundedErrorMessage(providerError.message),
           type: 'local_cli_chat_error',
@@ -3678,7 +3700,7 @@ function writeError(
       return;
     }
     if (shape === 'anthropic') {
-      writeJson(res, providerError.statusCode, {
+      writeErrorJson(res, providerError.statusCode, {
         type: 'error',
         error: {
           type: providerError.type,
@@ -3687,7 +3709,7 @@ function writeError(
       });
       return;
     }
-    writeJson(res, providerError.statusCode, {
+    writeErrorJson(res, providerError.statusCode, {
       error: {
         message: boundedErrorMessage(providerError.message),
         type: providerError.type,
@@ -3702,16 +3724,16 @@ function writeError(
   // the OpenAI body there hands an Anthropic client something it cannot parse.
   const message = boundedErrorMessage(err instanceof Error ? err.message : String(err));
   if (shape === 'local-cli') {
-    writeJson(res, 500, {
+    writeErrorJson(res, 500, {
       error: { message, type: 'local_cli_chat_error', param: null, code: null },
     });
     return;
   }
   if (shape === 'anthropic') {
-    writeJson(res, 500, { type: 'error', error: { type: 'api_error', message } });
+    writeErrorJson(res, 500, { type: 'error', error: { type: 'api_error', message } });
     return;
   }
-  writeJson(res, 500, {
+  writeErrorJson(res, 500, {
     error: {
       message,
       type: 'server_error',
@@ -3756,6 +3778,34 @@ function providerErrorFromBackendError(err: unknown): {
 function boundedDiscriminator(value: unknown): string | null {
   if (typeof value !== 'string' || value.length > MAX_ERROR_MESSAGE_CHARS) return null;
   return value;
+}
+
+/**
+ * The one exit every client-visible error envelope passes through — the JSON
+ * writer and both SSE writers. A discriminator reaches an envelope from two
+ * sources, and only one of them was bounded: `providerErrorFromBackendError`
+ * parses an upstream body and bounds what it reads, but `codexBackendError`
+ * has already copied that same upstream's `type` and `code` onto a
+ * `ProxyRequestError` verbatim, and every writer read those two fields off the
+ * error directly. Measured before this: an upstream 400 carrying a
+ * 4096-character `type` and `code` arrived at full length on all six
+ * client-visible surfaces — Responses, Chat and Anthropic, buffered and
+ * streamed alike. Bounding the ENVELOPE rather than each reader is the point:
+ * a writer added later cannot reopen it. The upstream STATUS is untouched;
+ * only the nonconforming discriminator is sacrificed.
+ */
+function boundedErrorEnvelope<T>(payload: T): T {
+  const envelope = payload as unknown;
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return payload;
+  const error = (envelope as Record<string, unknown>).error;
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return payload;
+  const fields = error as Record<string, unknown>;
+  const bounded: Record<string, unknown> = { ...fields };
+  // Absent stays absent: the Anthropic envelope has no `code`, and inventing
+  // one is a different divergence from leaking an oversized one.
+  if ('type' in fields) bounded.type = boundedDiscriminator(fields.type) ?? 'invalid_request_error';
+  if ('code' in fields) bounded.code = boundedDiscriminator(fields.code);
+  return { ...(envelope as Record<string, unknown>), error: bounded } as T;
 }
 
 function providerErrorParamForShape(

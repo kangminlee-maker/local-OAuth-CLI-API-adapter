@@ -4,6 +4,7 @@ import http from 'node:http';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { MAX_ERROR_MESSAGE_CHARS } from '../dist/proxy/types.js';
 import { unsupportedModelError } from '../dist/proxy/types.js';
+import { ProxyRequestError } from '../dist/proxy/types.js';
 import { LocalCliChatError } from '../dist/chat/types.js';
 
 // What a client actually receives when something goes wrong, per surface. These
@@ -2290,24 +2291,201 @@ test('an oversized param is bounded in the SSE error frame too', async () => {
   assert.equal(error.type, 'invalid_request_error');
 });
 
-test('a caller-supplied param is bounded in the SSE error frame', async () => {
-  // The unknown key reaches the stream writer's own envelope, not the JSON one:
-  // a validation fault on a `stream: true` request that has already committed.
-  const started = await startLocalApiProxy({ backend: backendThat({ delta: true }), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+// A stream that has committed its 200 carries its failure IN-BAND. Reading the
+// frames through here is what stops a plain JSON 400 — the answer to a request
+// rejected BEFORE any header is written — from being mistaken for a frame: the
+// status, the content type, and the fact that the stream ran at all are
+// asserted before anything is parsed out of it. The test this replaces did the
+// opposite, falling back to `?? body` and parsing a JSON 400 as its frame.
+async function committedStreamFrames(backend, path, body) {
+  const started = await startLocalApiProxy({
+    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, `a committed stream answers 200: ${text.slice(0, 200)}`);
+    const contentType = res.headers.get('content-type') ?? '';
+    assert.ok(
+      contentType.startsWith('text/event-stream'),
+      `expected a stream, got ${contentType}: ${text.slice(0, 200)}`,
+    );
+    const frames = text.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6).trim())
+      .filter((data) => data && data !== '[DONE]')
+      .map((data) => JSON.parse(data));
+    assert.ok(frames.length >= 2, `expected the stream to have run: ${text.slice(0, 200)}`);
+    return frames;
+  } finally {
+    await started.close();
+  }
+}
+
+function inBandError(frames) {
+  const error = frames.map((frame) => frame.error).find(Boolean);
+  assert.ok(error, `expected an in-band error frame: ${JSON.stringify(frames).slice(0, 300)}`);
+  return error;
+}
+
+test('an oversized unknown key on a stream:true request never reaches the SSE writer', async () => {
+  // What the test that used to stand here CLAIMED to exercise: a caller-supplied
+  // key reaching the stream writer's own envelope. It cannot. Normalization
+  // rejects the key before a single header is written, so the answer is an
+  // ordinary JSON 400 — which the old test's `?? body` fallback then parsed and
+  // called a frame, leaving the SSE `param` bound unguarded. The reachable
+  // behaviour is pinned here, in the envelope it actually lands in.
+  const started = await startLocalApiProxy({
+    backend: backendThat({ delta: true }), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
   try {
     const res = await fetch(`${started.url}/v1/chat/completions`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ model: 'a-model', stream: true, messages: [{ role: 'user', content: 'hi' }], [OVERSIZED]: 1 }),
     });
-    const body = await res.text();
-    const frame = body.split('\n').find((line) => line.includes('"error"')) ?? body;
-    const error = JSON.parse(frame.replace(/^data: /, '')).error;
+    const text = await res.text();
+    assert.equal(res.status, 400, `rejected before the stream commits: ${text.slice(0, 200)}`);
     assert.ok(
-      error.param.length <= MAX_ERROR_MESSAGE_CHARS,
-      `param must ride the ceiling in every writer, got ${error.param.length}`,
+      (res.headers.get('content-type') ?? '').startsWith('application/json'),
+      'the rejection is a JSON body, not an event stream',
     );
+    assert.ok(!text.startsWith('data: '), 'a JSON body is not a frame');
+    const error = JSON.parse(text).error;
+    assert.equal(error.param.length, MAX_ERROR_MESSAGE_CHARS);
     assert.ok(error.param.endsWith('...[truncated]'));
   } finally {
     await started.close();
   }
 });
+
+test('an oversized param from a mid-stream failure is bounded in the real SSE frame', async () => {
+  // The half no test reached: a `ProxyRequestError` raised AFTER the 200 is
+  // committed, whose `param` is the transport's own. Removing `boundedErrorParam`
+  // from that writer left every test in this file green.
+  const param = 'P'.repeat(MAX_ERROR_MESSAGE_CHARS * 2);
+  assert.ok(param.length > MAX_ERROR_MESSAGE_CHARS, 'the fixture must exceed the ceiling');
+  const frames = await committedStreamFrames(
+    backendThat({
+      delta: true,
+      fail: () => new ProxyRequestError('mid-stream', 400, 'openai', 'invalid_request_error', param, 'some_code'),
+    }),
+    '/v1/chat/completions',
+    { ...CHAT, stream: true },
+  );
+  assert.ok(
+    JSON.stringify(frames).includes('partial'),
+    'the stream must have emitted its delta before it failed',
+  );
+  const error = inBandError(frames);
+  assert.equal(error.param.length, MAX_ERROR_MESSAGE_CHARS, `param must ride the ceiling in every writer, got ${error.param.length}`);
+  assert.ok(error.param.endsWith('...[truncated]'));
+  // The discriminators that FIT still arrive whole.
+  assert.equal(error.type, 'invalid_request_error');
+  assert.equal(error.code, 'some_code');
+});
+
+// ── The transport's own error object, not a body this proxy parsed ──────────
+// `codexBackendError` copies the upstream body's `type` and `code` onto a
+// `ProxyRequestError` verbatim, and every writer read those two fields off the
+// error directly — a branch `PROVIDER_FLOOD` above never enters, because that
+// one arrives as a generic Error the proxy parses. Measured at HEAD through the
+// REAL transport, with fetch answering an upstream 400 whose `type` and `code`
+// were 4096 characters each: all six client-visible surfaces published both at
+// full length beside a status the mapping had got right.
+const TRANSPORT_TYPE = 'T'.repeat(MAX_ERROR_MESSAGE_CHARS * 4);
+const TRANSPORT_CODE = 'C'.repeat(MAX_ERROR_MESSAGE_CHARS * 4);
+const TRANSPORT_FLOOD = () => new ProxyRequestError(
+  'upstream said no', 400, 'openai', TRANSPORT_TYPE, 'p', TRANSPORT_CODE,
+);
+
+for (const [path, body, envelope] of [
+  ['/v1/chat/completions', CHAT, 'openai'],
+  ['/v1/responses', { model: 'a-model', input: 'hi' }, 'openai'],
+  ['/v1/messages', MESSAGES, 'anthropic'],
+]) {
+  test(`${path}: a transport error's oversized type and code do not reach the client`, async () => {
+    assert.equal(TRANSPORT_TYPE.length, 4096, 'the fixture must be oversized');
+    assert.equal(TRANSPORT_CODE.length, 4096, 'the fixture must be oversized');
+    const { status, text } = await call(backendThat({ fail: TRANSPORT_FLOOD }), path, body);
+    // The upstream STATUS is the mapping and survives exactly; only the
+    // nonconforming discriminator is sacrificed.
+    assert.equal(status, 400);
+    const parsed = JSON.parse(text);
+    if (envelope === 'anthropic') assert.equal(parsed.type, 'error');
+    const error = parsed.error;
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code ?? null, null);
+    assert.equal(error.message, 'upstream said no');
+  });
+}
+
+for (const [path, body] of [
+  ['/v1/chat/completions', { ...CHAT, stream: true }],
+  ['/v1/responses', { model: 'a-model', input: 'hi', stream: true }],
+  ['/v1/messages', { ...MESSAGES, stream: true }],
+]) {
+  test(`${path}: a transport error's oversized type and code are bounded in the SSE frame`, async () => {
+    assert.equal(TRANSPORT_TYPE.length, 4096, 'the fixture must be oversized');
+    const frames = await committedStreamFrames(
+      backendThat({ delta: true, fail: TRANSPORT_FLOOD }), path, body,
+    );
+    const error = inBandError(frames);
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code ?? null, null);
+  });
+}
+
+// The ceiling is a `>`: exactly MAX survives, MAX+1 does not. Each side needs
+// its own case and each discriminator needs its own fixture — mutating that `>`
+// to `>=` dropped every value AT the ceiling and this file stayed green at
+// 161/161, because nothing here had ever sent one.
+const AT_CEILING = 'A'.repeat(MAX_ERROR_MESSAGE_CHARS);
+const PAST_CEILING = 'B'.repeat(MAX_ERROR_MESSAGE_CHARS + 1);
+
+for (const [route, fail] of [
+  // Both readers of a discriminator, held to the same ceiling.
+  ['a parsed upstream body', (type, code) => () => new Error(JSON.stringify({
+    status: 400, error: { message: 'bounded message', type, param: 'p', code },
+  }))],
+  ['the transport error object', (type, code) => () => new ProxyRequestError(
+    'bounded message', 400, 'openai', type, 'p', code,
+  )],
+]) {
+  test(`a type of exactly ${1024} characters survives (${route})`, async () => {
+    assert.equal(AT_CEILING.length, 1024, 'the fixture is the ceiling itself');
+    const { text } = await call(backendThat({ fail: fail(AT_CEILING, 'short_code') }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.type.length, 1024);
+    assert.equal(error.type, AT_CEILING);
+    assert.equal(error.code, 'short_code', 'the other discriminator is untouched');
+  });
+
+  test(`a type of ${1025} characters is dropped (${route})`, async () => {
+    assert.equal(PAST_CEILING.length, 1025, 'the fixture is one past the ceiling');
+    const { text } = await call(backendThat({ fail: fail(PAST_CEILING, 'short_code') }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code, 'short_code', 'the other discriminator is untouched');
+  });
+
+  test(`a code of exactly ${1024} characters survives (${route})`, async () => {
+    assert.equal(AT_CEILING.length, 1024, 'the fixture is the ceiling itself');
+    const { text } = await call(backendThat({ fail: fail('rate_limit_error', AT_CEILING) }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.code.length, 1024);
+    assert.equal(error.code, AT_CEILING);
+    assert.equal(error.type, 'rate_limit_error', 'the other discriminator is untouched');
+  });
+
+  test(`a code of ${1025} characters is dropped (${route})`, async () => {
+    assert.equal(PAST_CEILING.length, 1025, 'the fixture is one past the ceiling');
+    const { text } = await call(backendThat({ fail: fail('rate_limit_error', PAST_CEILING) }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.code ?? null, null);
+    assert.equal(error.type, 'rate_limit_error', 'the other discriminator is untouched');
+  });
+}
