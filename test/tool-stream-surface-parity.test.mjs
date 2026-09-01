@@ -1379,3 +1379,104 @@ test('items complete in the order the stream announced them', async () => {
     assert.ok(argumentsDone < messageDone, 'the call is finalized before a later item closes');
   });
 });
+
+// The completion-only turn: the backend announces NOTHING while it runs — no
+// text delta, no tool item — and the entire answer first exists at `completed`.
+// Both output positions are then allocated inside that terminal branch, so
+// nothing has been "announced" to order them by and PRODUCTION order is the
+// only thing left, read from `toolCallsBeforeText` exactly as the buffered body
+// reads it. The narration tests above use this shape with the flag unset only;
+// with it SET the branch was unprotected, and a mutant pinning it to
+// message-first left every ordering suite green.
+function completionOnlyBackend(toolCallsBeforeText) {
+  const result = {
+    id: 'x',
+    model: 'configured-model',
+    text: 'Checking the weather.',
+    toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+    usage: { inputTokens: 20, outputTokens: 8, source: 'provider' },
+    latencyMs: 1,
+    ...(toolCallsBeforeText ? { toolCallsBeforeText: true } : {}),
+  };
+  return {
+    name: 'test',
+    model: 'configured-model',
+    async generate() { return result; },
+    async *stream() { yield { type: 'completed', result }; },
+    async close() {},
+  };
+}
+
+const COMPLETION_ONLY_ORDERS = [
+  ['the turn narrated before it called', false, ['message', 'function_call']],
+  ['the turn called before it narrated', true, ['function_call', 'message']],
+];
+
+for (const [label, toolCallsBeforeText, expected] of COMPLETION_ONLY_ORDERS) {
+  test(`a responses stream that announced nothing orders its items by production when ${label}`, async () => {
+    const server = await startLocalApiProxy({
+      backend: completionOnlyBackend(toolCallsBeforeText),
+      host: '127.0.0.1',
+      port: 0,
+      requestTimeoutMs: 30_000,
+    });
+    const post = (body) => realFetch(`${server.url}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'm',
+        input: 'w',
+        tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+        ...body,
+      }),
+    });
+    try {
+      const buffered = await (await post({})).json();
+      const events = sseEvents(await (await post({ stream: true })).text());
+
+      // Nothing reached the client before `completed`, so these added frames are
+      // the terminal branch's own — their order IS the decision under test.
+      const added = events.filter((event) => event.type === 'response.output_item.added');
+      assert.deepEqual(added.map((event) => event.item.type), expected, 'items are announced in production order');
+      assert.deepEqual(added.map((event) => event.output_index), [0, 1], 'taking the output positions in that order');
+
+      const done = events.filter((event) => event.type === 'response.output_item.done');
+      assert.deepEqual(done.map((event) => event.item.type), expected, 'the terminal frames follow the announced order');
+      assert.deepEqual(done.map((event) => event.output_index), [0, 1], 'and close positions monotonically');
+
+      const completed = events.find((event) => event.type === 'response.completed')?.response?.output ?? [];
+      assert.deepEqual(completed.map((item) => item.type), expected, 'the completed output says the same thing the stream did');
+      assert.deepEqual(
+        (buffered.output ?? []).map((item) => item.type),
+        expected,
+        'which is the order the buffered body reports for this same turn',
+      );
+
+      // The frame that promises a call is final may not arrive after a later
+      // item has already closed.
+      const argumentsDone = events.findIndex((event) => event.type === 'response.function_call_arguments.done');
+      const callDone = events.findIndex((event) => event.type === 'response.output_item.done' && event.item.type === 'function_call');
+      assert.ok(argumentsDone >= 0, 'the call was finalized');
+      assert.ok(argumentsDone < callDone, 'the call is finalized before its own item closes');
+
+      // Reordering may not cost the turn its content.
+      assert.equal(
+        events.filter((event) => event.type === 'response.output_text.delta').map((event) => event.delta).join(''),
+        'Checking the weather.',
+        'the narration still reaches the client exactly once',
+      );
+      assert.equal(
+        completed.find((item) => item.type === 'message')?.content?.[0]?.text,
+        'Checking the weather.',
+        'and the message item reports it',
+      );
+      assert.equal(
+        completed.find((item) => item.type === 'function_call')?.arguments,
+        '{"city":"Seoul"}',
+        'and the call still carries its arguments',
+      );
+    } finally {
+      await server.close();
+    }
+  });
+}
