@@ -21,6 +21,19 @@ interface NormalizedContent {
   readonly toolHistory?: boolean;
 }
 
+/**
+ * How a replayed Responses item that is not a message, a `function_call`, a
+ * `function_call_output` or a `reasoning` item is written into the prompt.
+ *
+ * Deliberately NOT in `tool-history-markers.ts`. That module exists because
+ * three places have to agree on a literal — the normalizer writes it and the
+ * transports read it back. This one has exactly one place: it is written here
+ * and parsed nowhere, which is the property that keeps a record's own text from
+ * forging a tool-result boundary. Moving it next to the parsed markers would
+ * invite a reader.
+ */
+const REPLAYED_ITEM_LABEL = '[replayed item]';
+
 // The top-level keys the direct Chat Completions API knows, measured
 // 2026-08-30 on `gpt-5.6-terra` by sending each with a value of a type it
 // cannot take (§5.5.5): a known key answers about its own type or value, an
@@ -2032,7 +2045,7 @@ function readResponsesRole(msg: Record<string, unknown>, index: number): Normali
  * API accepts anywhere but the head.
  */
 function readAnthropicMessages(value: unknown): NormalizedMessage[] {
-  return (value as unknown[]).map((item) => {
+  const items = (value as unknown[]).map((item) => {
     const msg = asRecord(item) as Record<string, unknown>;
     const flattened = flattenAnthropicMessage(msg);
     return {
@@ -2042,6 +2055,40 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
       ...(flattened.toolHistory ? { toolHistory: true } : {}),
     };
   });
+  return items.filter((item, index) => !isAbsorbedEmptyItem(items, index));
+}
+
+/** Nothing for a backend to say: no text, no image, no tool turn. */
+function contributesNothing(message: NormalizedMessage): boolean {
+  return message.content.trim() === ''
+    && message.images.length === 0
+    && message.toolHistory !== true;
+}
+
+/**
+ * Whether an item is an empty part of a turn that has content elsewhere.
+ *
+ * `refuseAnthropicMessageShape` already treats a consecutive same-role run as
+ * ONE turn — measured, and why `[user:[], user:'ping']` is accepted where
+ * `[user:[]]` is not. But it merged only to decide acceptance, and the
+ * projection then emitted each item as its own backend turn, so that accepted
+ * body reached the model as `[{text:''}, {text:'ping'}]` — a leading turn the
+ * client never sent, ahead of the one it did.
+ *
+ * The same merge is applied here, and it takes away only what the client did
+ * not send: two NON-EMPTY same-role items are two real turns and both stay, and
+ * a run that is empty ALL THE WAY THROUGH is the whole turn, so its items stay
+ * too (an empty trailing `assistant` item is a prefill the direct API accepts —
+ * matrix §5.5.7 `assistant` 빈 턴).
+ */
+function isAbsorbedEmptyItem(items: readonly NormalizedMessage[], index: number): boolean {
+  if (!contributesNothing(items[index])) return false;
+  const { role } = items[index];
+  let start = index;
+  while (start > 0 && items[start - 1].role === role) start -= 1;
+  let end = index;
+  while (end + 1 < items.length && items[end + 1].role === role) end += 1;
+  return items.slice(start, end + 1).some((sibling) => !contributesNothing(sibling));
 }
 
 function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMessage['role']): NormalizedContent {
@@ -2091,9 +2138,22 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
  * Every other typed item — the hosted-tool calls and their outputs — carries
  * the RESULT of work a previous turn did, which is exactly what a client
  * replays `output` as `input` to preserve. This runtime cannot re-run that
- * work, but the model still has to see it, so it goes in as tool history:
- * dropping it erased results a client sent on purpose, and calling it a user
- * message put a tool's own output in the user's voice.
+ * work, but the model still has to see it, so it replays as a transcript
+ * record: dropping it erased results a client sent on purpose, and calling it
+ * a plain user message put a tool's own output in the user's voice.
+ *
+ * The record is NOT written as tool history, which is the one thing that must
+ * not happen to it. `toolHistory` is a promise to the transports that this text
+ * is `[tool result]`/`[assistant tool_call]` grammar they can parse back into
+ * their own items, and a generic record is not: on the default Codex transport
+ * `responseToolHistoryItems` found no `tool_call_id:` line, replaced the record
+ * with `{"type":"function_call_output","call_id":"tool_call","output":""}` and
+ * the result the client sent never reached the model. Marked as a record
+ * instead, it survives every consumer — `buildPrompt` and
+ * `claudeMessageContentFor` render `content` as it stands, and the Codex
+ * transport carries it as an `input_text` message — and, because nothing parses
+ * the label back, no text a client puts INSIDE the record can forge a
+ * tool-result boundary in it.
  */
 function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedContent | null {
   if (msg.type === 'function_call_output') {
@@ -2129,9 +2189,8 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
   if (msg.type === undefined || msg.type === 'message') return flattenOpenAiContent(msg.content);
   if (msg.type === 'reasoning') return null;
   return {
-    text: [TOOL_RESULT_MARKER, `type: ${readString(msg.type, 'item')}`, JSON.stringify(msg)].join('\n'),
+    text: [REPLAYED_ITEM_LABEL, `type: ${readString(msg.type, 'item')}`, JSON.stringify(msg)].join('\n'),
     images: [],
-    toolHistory: true,
   };
 }
 

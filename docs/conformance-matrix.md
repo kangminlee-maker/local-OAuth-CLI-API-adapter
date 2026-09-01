@@ -735,6 +735,11 @@ OpenAI 표면들이 능력 거절을 맨 뒤에 두는 것과 같은 모양이�
 ② `system`의 빈·공백 content를 1번 이후에서 **수용**. ③ `system` 위치 규칙 자체가 없었다. ④ 이 규칙들과 index 0 안내 문장을
 `messages` 단계(4번)에서 던져서, direct가 `temperature`(12번)·미지 키로 답하는 본문에 다른 답을 했다.
 
+**합침은 수용 판정만이 아니라 투영에도 적용된다**: 내용이 있는 런 안의 빈 항목은 턴이 아니므로 백엔드에 가지 않는다.
+비어 있지 않은 항목 둘은 둘 다 진짜 턴이라 그대로 남고, 런 전체가 빈 경우(`[U, assistant:[]]`)는 그 항목이 곧 턴이라 남는다.
+이 규칙이 400 여부만 정하는 동안 `[user:[], user:'PING']`은 200을 받고도 백엔드에는
+`[{text:''}, {text:'PING'}]`으로 — 클라이언트가 보내지 않은 빈 턴을 앞세워 — 도착했다.
+
 | `system` 블록 타입 | `text`·`tool_addition`·`tool_removal` **뿐**. 그 밖(이미지·tool_result 등) → `messages.<i>: role 'system' supports text, tool_addition, and tool_removal blocks only`. 항목 안 우선순위에서 **빈 content 다음, index 0 안내 앞** |
 
 **direct가 광고하지만 지키지 않는 면제 하나 (2026-09-01 실측)**: 위치 규칙 문장이 스스로 덧붙이는 꼬리말은
