@@ -273,10 +273,12 @@ test('narration that comes with a tool call survives the wrapper', () => {
 });
 
 // Both ordered surfaces report a turn's parts in production order and read it
-// from `toolCallsBeforeText`. Only `CodexBackendTransport` ever set it, so the
-// two backends that go through `ToolCallDeltaExtractor` streamed `[call, text]`
-// while their buffered body said `[text, call]`. The wrapper's own key order is
-// the artifact BOTH paths see, so it is what decides.
+// from `textOrdinal` — how many calls came before the narration. Only
+// `CodexBackendTransport` ever set it, so the two backends that go through
+// `ToolCallDeltaExtractor` streamed `[call, text]` while their buffered body
+// said `[text, call]`. The wrapper's own key order is the artifact BOTH paths
+// see, so it is what decides. The wrapper holds one array and one text field,
+// so it can only say all-before (the call count) or all-after (0).
 const ORDER_REQUEST = {
   shape: 'openai-responses', model: 'm', messages: [], stream: false, streamOptions: {},
   tools: [{ name: 'get_weather', description: 'w', parameters: {} }], toolChoice: { type: 'auto' }, raw: {},
@@ -284,14 +286,14 @@ const ORDER_REQUEST = {
 const CALL = '{"id":"c1","name":"get_weather","arguments":"{}"}';
 
 for (const [label, raw, expected] of [
-  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`, false],
-  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`, true],
-  ['toolCalls with no text at all', `{"status":"tool_calls","toolCalls":[${CALL}]}`, true],
-  ['text with no calls', '{"status":"message","text":"just talking"}', false],
+  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`, 0],
+  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`, 1],
+  ['toolCalls with no text at all', `{"status":"tool_calls","toolCalls":[${CALL}]}`, 1],
+  ['text with no calls', '{"status":"message","text":"just talking"}', 0],
 ]) {
   test(`the wrapper's key order decides production order: ${label}`, () => {
     const parsed = parseBackendOutput(ORDER_REQUEST, raw);
-    assert.equal(parsed.toolCallsBeforeText ?? false, expected);
+    assert.equal(parsed.textOrdinal ?? 0, expected);
   });
 }
 
