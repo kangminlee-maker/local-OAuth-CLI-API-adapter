@@ -1384,11 +1384,11 @@ test('items complete in the order the stream announced them', async () => {
 // text delta, no tool item — and the entire answer first exists at `completed`.
 // Both output positions are then allocated inside that terminal branch, so
 // nothing has been "announced" to order them by and PRODUCTION order is the
-// only thing left, read from `toolCallsBeforeText` exactly as the buffered body
-// reads it. The narration tests above use this shape with the flag unset only;
-// with it SET the branch was unprotected, and a mutant pinning it to
+// only thing left, read from `textOrdinal` exactly as the buffered body reads
+// it. The narration tests above use this shape with the text first only; with a
+// call ahead of it the branch was unprotected, and a mutant pinning it to
 // message-first left every ordering suite green.
-function completionOnlyBackend(toolCallsBeforeText) {
+function completionOnlyBackend(textOrdinal) {
   const result = {
     id: 'x',
     model: 'configured-model',
@@ -1396,7 +1396,7 @@ function completionOnlyBackend(toolCallsBeforeText) {
     toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
     usage: { inputTokens: 20, outputTokens: 8, source: 'provider' },
     latencyMs: 1,
-    ...(toolCallsBeforeText ? { toolCallsBeforeText: true } : {}),
+    ...(textOrdinal ? { textOrdinal } : {}),
   };
   return {
     name: 'test',
@@ -1408,14 +1408,14 @@ function completionOnlyBackend(toolCallsBeforeText) {
 }
 
 const COMPLETION_ONLY_ORDERS = [
-  ['the turn narrated before it called', false, ['message', 'function_call']],
-  ['the turn called before it narrated', true, ['function_call', 'message']],
+  ['the turn narrated before it called', 0, ['message', 'function_call']],
+  ['the turn called before it narrated', 1, ['function_call', 'message']],
 ];
 
-for (const [label, toolCallsBeforeText, expected] of COMPLETION_ONLY_ORDERS) {
+for (const [label, textOrdinal, expected] of COMPLETION_ONLY_ORDERS) {
   test(`a responses stream that announced nothing orders its items by production when ${label}`, async () => {
     const server = await startLocalApiProxy({
-      backend: completionOnlyBackend(toolCallsBeforeText),
+      backend: completionOnlyBackend(textOrdinal),
       host: '127.0.0.1',
       port: 0,
       requestTimeoutMs: 30_000,
