@@ -20,20 +20,47 @@ export interface NormalizedThinking {
   // The contract's `thinking` row documents the divergence.
 }
 
+/** One result of a tool turn the normalizer flattened. */
+export interface NormalizedToolResult {
+  readonly callId: string;
+  readonly output: string;
+}
+
+/**
+ * A tool turn as STRUCTURE, recorded where the normalizer already knew it.
+ *
+ * `content` still renders the same turn as text, because the claude runtime
+ * puts `content` in its prompt verbatim and has no items to build. Backends
+ * that DO have items build them from here.
+ */
+export interface NormalizedToolTurn {
+  /** `LocalToolCall` is already this shape — one name for one thing. */
+  readonly calls: readonly LocalToolCall[];
+  readonly results: readonly NormalizedToolResult[];
+  /** The prose the same turn carried outside its tool blocks. */
+  readonly narration: string;
+}
+
 export interface NormalizedMessage {
   readonly role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
   readonly content: string;
   readonly images: readonly NormalizedImage[];
   /**
-   * Set only when the normalizer itself flattened a tool turn into this text.
-   * Downstream readers turn tool history back into their transport's native
-   * items, and they used to decide by looking for the marker in the text — which
-   * a caller can write. A user message beginning `[tool result]` became a
-   * `function_call_output` with an empty body: the text was dropped and a tool
-   * result the caller never sent was invented. Provenance is a field, not a
-   * prefix.
+   * Set only when the normalizer itself flattened a tool turn into this text,
+   * and carrying that turn's own calls and results.
+   *
+   * It began as a boolean saying "this proxy wrote the grammar", because
+   * downstream readers used to decide by looking for the marker in the text —
+   * which a caller can write, so a user message beginning `[tool result]` became
+   * a `function_call_output` with an empty body. But a flag bounds who wrote the
+   * text, not WHERE the grammar is: a GENUINE tool result whose OUTPUT carried
+   * those lines — a fetched page, a file, a command's stdout, none of it authored
+   * by the client — was re-parsed into a second result under a call id nobody
+   * sent, and the real output was truncated at the marker. Provenance is not a
+   * prefix, and structure is not text: this field carries the parse instead of
+   * inviting one.
    */
-  readonly toolHistory?: boolean;
+  readonly tool?: NormalizedToolTurn;
 }
 
 export type NormalizedImageDetail = 'low' | 'high' | 'auto' | 'original';

@@ -8,10 +8,12 @@
 //   input [{type:'program_output', call_id:'call_prog_1', result:'SECRET_RESULT'}]
 //     → upstream [{"type":"function_call_output","call_id":"tool_call","output":""}]
 //
-// The record was flattened with `toolHistory: true`, so the default Codex
-// transport parsed it as tool-result grammar, found no `tool_call_id:` line and
-// replaced the whole item with an invented empty result: `SECRET_RESULT` never
-// reached the model and the call id was fabricated.
+// The record was flattened as tool history, so the default Codex transport
+// parsed it as tool-result grammar, found no `tool_call_id:` line and replaced
+// the whole item with an invented empty result: `SECRET_RESULT` never reached
+// the model and the call id was fabricated. A record now carries no `tool`
+// field, and nothing parses the flattened text at all — see
+// `tool-history-structure.test.mjs`.
 //
 //   messages [{role:'user',content:[]},{role:'user',content:'PING'}]
 //     → upstream [{…input_text:""},{…input_text:"PING"}]

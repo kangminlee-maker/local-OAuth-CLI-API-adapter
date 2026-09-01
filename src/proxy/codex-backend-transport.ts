@@ -35,12 +35,6 @@ import type {
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
-import {
-  ASSISTANT_TOOL_CALL_MARKER,
-  TOOL_RESULT_MARKER,
-  markerIndex,
-  splitAtMarkers,
-} from './tool-history-markers.js';
 
 const CHATGPT_CODEX_BACKEND_URL = 'https://chatgpt.com/backend-api/codex';
 const CODEX_REFRESH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
@@ -1683,16 +1677,16 @@ async function responseInputItems(request: NormalizedRequest): Promise<unknown[]
 }
 
 async function responseInputItemsForMessage(message: NormalizedMessage): Promise<unknown[]> {
-  const toolHistory = responseToolHistoryItems(message);
-  if (toolHistory) {
-    if (message.images.length === 0) return toolHistory;
+  const toolItems = responseToolHistoryItems(message);
+  if (toolItems) {
+    if (message.images.length === 0) return toolItems;
     // The call still has to be answered — an unanswered `function_call` is a
     // 400 from this API — and the picture the tool returned still has to
     // arrive. `function_call_output` carries a string, so the image travels
     // beside it as its own user message rather than being dropped with the
     // answer.
     return [
-      ...toolHistory,
+      ...toolItems,
       {
         type: 'message',
         role: 'user',
@@ -1720,95 +1714,57 @@ async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
 /**
  * The tool turns of the conversation, as this API's own items.
  *
+ * Built from the structure the normalizer recorded when it flattened the turn,
+ * never from the flattened TEXT. This used to re-parse `message.content` for
+ * `[tool result]` / `[assistant tool_call]` lines, gated on a boolean saying
+ * this proxy had written that grammar. The gate was honest about WHO wrote the
+ * message and said nothing about WHERE the grammar was, so a GENUINE tool
+ * result whose OUTPUT contained those lines — a fetched page, a file, a
+ * command's stdout, none of it authored by the client — split into a second
+ * `function_call_output` under a call id nobody sent, and the real output was
+ * truncated at the marker. Whoever controls a tool's output is not whoever
+ * controls the conversation; structure carried is structure that cannot be
+ * forged.
+ *
  * Images used to disqualify a message from being read as tool history at all,
  * which left the `function_call` before it unanswered — a 400 here, and prose
  * saying `[tool result]` in the prompt if it got through. The images come back
  * beside these items instead; see `responseInputItemsForMessage`.
  */
 function responseToolHistoryItems(message: NormalizedMessage): unknown[] | null {
-  // Provenance, not pattern. The markers are written by the normalizer when it
-  // flattens a tool turn; a caller can type the same characters, and reading
-  // them as tool history turned a user message beginning `[tool result]` into an
-  // empty `function_call_output` — the text dropped, a result invented. The flag
-  // is set only where this proxy wrote the marker itself.
-  if (message.toolHistory !== true) return null;
-  const text = message.content.trim();
-  const callAt = markerIndex(text, ASSISTANT_TOOL_CALL_MARKER);
-  if (callAt !== -1) {
-    // The narration the model wrote alongside its call is part of the turn, and
-    // the call must survive it. Reading tool history only from position 0 made
-    // a "let me check…" before the call turn the whole message into prose, so
-    // the call vanished and the result that answered it had nothing to pair
-    // with — a 400 from this API.
-    const narration = text.slice(0, callAt).trim();
-    const items: unknown[] = parseAssistantToolCalls(text.slice(callAt)).map((call) => ({
-      type: 'function_call',
-      call_id: call.id,
-      name: call.name,
-      arguments: call.arguments,
-    }));
-    if (narration) {
-      items.unshift({
-        type: 'message',
-        role: 'assistant',
-        content: [{ type: 'output_text', text: narration }],
-      });
-    }
-    return items;
-  }
-  const resultAt = markerIndex(text, TOOL_RESULT_MARKER);
-  if (resultAt !== -1) {
-    // One output per result. Parallel calls answer in a single user turn, and
-    // reading one `tool_call_id:` for the whole message answered the first call
-    // and left the rest unanswered — the other half of the same 400.
-    const items: unknown[] = splitAtMarkers(text.slice(resultAt), TOOL_RESULT_MARKER).map((block) => {
-      const result = parseToolResult(block);
-      return { type: 'function_call_output', call_id: result.callId, output: result.output };
+  const { tool } = message;
+  if (!tool) return null;
+  const items: unknown[] = [];
+  // The narration the model wrote alongside its call is part of the turn, and
+  // the call must survive it: dropping it made a "let me check…" before the
+  // call turn the whole message into prose, so the call vanished and the result
+  // that answered it had nothing to pair with — a 400 from this API.
+  if (tool.calls.length > 0 && tool.narration) {
+    items.push({
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'output_text', text: tool.narration }],
     });
-    const preamble = text.slice(0, resultAt).trim();
-    if (preamble) {
-      items.push({
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: preamble }],
-      });
-    }
-    return items.length > 0 ? items : null;
   }
-  return null;
-}
-
-function parseAssistantToolCalls(text: string): LocalToolCall[] {
-  return text
-    .split(ASSISTANT_TOOL_CALL_MARKER)
-    .map((block) => block.trim())
-    .filter(Boolean)
-    .map((block, index) => ({
-      id: markerValue(block, 'id') ?? `call_${index + 1}`,
-      name: markerValue(block, 'name') ?? 'tool',
-      arguments: markerValue(block, 'arguments') ?? '{}',
-    }));
-}
-
-function parseToolResult(text: string): { callId: string; output: string } {
-  const lines = text.split(/\r?\n/);
-  const idIndex = lines.findIndex((line) => line.startsWith('tool_call_id:'));
-  const callId = idIndex >= 0 ? lines[idIndex].slice('tool_call_id:'.length).trim() : 'tool_call';
-  const output = idIndex >= 0 ? lines.slice(idIndex + 1).join('\n').trim() : '';
-  return { callId: callId || 'tool_call', output };
-}
-
-function markerValue(block: string, key: string): string | undefined {
-  const marker = `${key}:`;
-  const index = block.indexOf(marker);
-  if (index < 0) return undefined;
-  const valueStart = index + marker.length;
-  if (key === 'arguments') return block.slice(valueStart).trim();
-  const newlineIndex = block.indexOf('\n', valueStart);
-  const value = newlineIndex >= 0
-    ? block.slice(valueStart, newlineIndex)
-    : block.slice(valueStart);
-  return value.trim();
+  for (const call of tool.calls) {
+    items.push({ type: 'function_call', call_id: call.id, name: call.name, arguments: call.arguments });
+  }
+  // One output per result. Parallel calls answer in a single user turn, and
+  // reading one `tool_call_id:` for the whole message answered the first call
+  // and left the rest unanswered — the other half of the same 400.
+  for (const result of tool.results) {
+    items.push({ type: 'function_call_output', call_id: result.callId, output: result.output });
+  }
+  // A turn that is only results carries its prose in the user's voice, after
+  // them; a turn that called carries it in the assistant's, before them.
+  if (tool.calls.length === 0 && tool.results.length > 0 && tool.narration) {
+    items.push({
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: tool.narration }],
+    });
+  }
+  return items.length > 0 ? items : null;
 }
 
 async function responseImagePart(image: NormalizedImage): Promise<unknown> {

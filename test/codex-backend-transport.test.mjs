@@ -1720,11 +1720,13 @@ function tinyPngBase64() {
   return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 }
 
-// The two tool turns below carry `toolHistory: true` because that is what the
-// normalizer sets when it flattens them — this fixture simulates its output, so
-// it has to match it. Dropping the flag makes the transport read these as
-// ordinary prose, which is the correct behaviour for text a CALLER wrote and the
-// wrong behaviour for a turn this proxy flattened itself.
+// The two tool turns below carry a `tool` field because that is what the
+// normalizer records when it flattens them — this fixture simulates its output,
+// so it has to match it. `content` is the same turn rendered as text, which is
+// what the claude runtime reads; the codex transport builds its items from the
+// field. Dropping the field makes the transport read these as ordinary prose,
+// which is the correct behaviour for text a CALLER wrote and the wrong behaviour
+// for a turn this proxy flattened itself.
 function chatToolResultRequest() {
   return {
     ...textRequest(),
@@ -1740,7 +1742,11 @@ function chatToolResultRequest() {
           'arguments: {"city":"Seoul"}',
         ].join('\n'),
         images: [],
-        toolHistory: true,
+        tool: {
+          calls: [{ id: 'call_weather', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+          results: [],
+          narration: '',
+        },
       },
       {
         role: 'tool',
@@ -1750,7 +1756,11 @@ function chatToolResultRequest() {
           '{"city":"Seoul","temperature_c":23,"condition":"clear"}',
         ].join('\n'),
         images: [],
-        toolHistory: true,
+        tool: {
+          calls: [],
+          results: [{ callId: 'call_weather', output: '{"city":"Seoul","temperature_c":23,"condition":"clear"}' }],
+          narration: '',
+        },
       },
     ],
     tools: [{

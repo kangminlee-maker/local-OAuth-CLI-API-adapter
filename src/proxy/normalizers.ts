@@ -1,6 +1,7 @@
 import { ASSISTANT_TOOL_CALL_MARKER, TOOL_RESULT_MARKER } from './tool-history-markers.js';
 import { fileURLToPath } from 'node:url';
 import type {
+  LocalToolCall,
   NormalizedAnthropicEffort,
   NormalizedImage,
   NormalizedImageDetail,
@@ -10,6 +11,8 @@ import type {
   NormalizedThinking,
   NormalizedTool,
   NormalizedToolChoice,
+  NormalizedToolResult,
+  NormalizedToolTurn,
   NormalizedVerbosity,
 } from './types.js';
 import { ProxyRequestError } from './types.js';
@@ -17,20 +20,23 @@ import { ProxyRequestError } from './types.js';
 interface NormalizedContent {
   readonly text: string;
   readonly images: readonly NormalizedImage[];
-  /** True when this text is a tool turn this normalizer flattened. */
-  readonly toolHistory?: boolean;
+  /**
+   * The tool turn this normalizer flattened into `text`, as structure. Present
+   * only where THIS module wrote the markers, and carrying the calls and
+   * results it wrote them from, so a backend never has to read them back out.
+   */
+  readonly tool?: NormalizedToolTurn;
 }
 
 /**
  * How a replayed Responses item that is not a message, a `function_call`, a
  * `function_call_output` or a `reasoning` item is written into the prompt.
  *
- * Deliberately NOT in `tool-history-markers.ts`. That module exists because
- * three places have to agree on a literal — the normalizer writes it and the
- * transports read it back. This one has exactly one place: it is written here
- * and parsed nowhere, which is the property that keeps a record's own text from
- * forging a tool-result boundary. Moving it next to the parsed markers would
- * invite a reader.
+ * Deliberately NOT in `tool-history-markers.ts`. That module holds the two
+ * literals that TWO writers have to agree on — this normalizer and the image
+ * labeller in `multimodal.ts`. This one has exactly one writer, so it stays
+ * here. Nothing parses any of them back, which is what keeps a record's own
+ * text from forging a tool-result boundary.
  */
 const REPLAYED_ITEM_LABEL = '[replayed item]';
 
@@ -1761,7 +1767,7 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
       role,
       content: content.text,
       images: content.images,
-      ...(content.toolHistory ? { toolHistory: true } : {}),
+      ...(content.tool ? { tool: content.tool } : {}),
     };
   });
 }
@@ -1865,7 +1871,7 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
       role: readResponsesRole(msg, index),
       content: content.text,
       images: content.images,
-      ...(content.toolHistory ? { toolHistory: true } : {}),
+      ...(content.tool ? { tool: content.tool } : {}),
     }];
   });
 }
@@ -2052,7 +2058,7 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
       role: msg.role as NormalizedMessage['role'],
       content: flattened.text,
       images: flattened.images,
-      ...(flattened.toolHistory ? { toolHistory: true } : {}),
+      ...(flattened.tool ? { tool: flattened.tool } : {}),
     };
   });
   return items.filter((item, index) => !isAbsorbedEmptyItem(items, index));
@@ -2062,7 +2068,7 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
 function contributesNothing(message: NormalizedMessage): boolean {
   return message.content.trim() === ''
     && message.images.length === 0
-    && message.toolHistory !== true;
+    && message.tool === undefined;
 }
 
 /**
@@ -2093,31 +2099,51 @@ function isAbsorbedEmptyItem(items: readonly NormalizedMessage[], index: number)
 
 function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMessage['role']): NormalizedContent {
   const content = flattenOpenAiContent(msg.content);
-  const toolCalls = Array.isArray(msg.tool_calls)
+  // Read once, into structure; the text below is a RENDERING of that structure
+  // rather than the place it lives. The two used to be the same thing, so a
+  // backend had to parse the rendering back — and could not tell this module's
+  // markers from the same characters inside a tool's own output.
+  const calls: LocalToolCall[] = Array.isArray(msg.tool_calls)
     ? msg.tool_calls.map((toolCall) => {
         const call = asRecord(toolCall);
         const fn = asRecord(call?.function);
-        return [
-          ASSISTANT_TOOL_CALL_MARKER,
-          `id: ${readString(call?.id, 'tool_call')}`,
-          `name: ${readString(fn?.name, 'tool')}`,
-          `arguments: ${typeof fn?.arguments === 'string' ? fn.arguments : JSON.stringify(fn?.arguments ?? {})}`,
-        ].join('\n');
-      }).join('\n')
-    : '';
+        return {
+          id: readString(call?.id, 'tool_call'),
+          name: readString(fn?.name, 'tool'),
+          arguments: typeof fn?.arguments === 'string' ? fn.arguments : JSON.stringify(fn?.arguments ?? {}),
+        };
+      })
+    : [];
+  const toolCalls = calls.map((call) => renderToolCall(call)).join('\n');
   if (role === 'tool') {
     const toolCallId = typeof msg.tool_call_id === 'string' ? msg.tool_call_id : 'tool_call';
+    const result: NormalizedToolResult = { callId: toolCallId, output: content.text };
     return {
-      text: [`[tool result]`, `tool_call_id: ${toolCallId}`, content.text].join('\n'),
+      text: renderToolResult(result),
       images: content.images,
-      toolHistory: true,
+      tool: { calls: [], results: [result], narration: '' },
     };
   }
   return {
     text: [content.text, toolCalls].filter(Boolean).join('\n\n'),
     images: content.images,
-    ...(toolCalls ? { toolHistory: true } : {}),
+    ...(calls.length > 0 ? { tool: { calls, results: [], narration: content.text } } : {}),
   };
+}
+
+/** The one place a call is written as text; nothing reads it back. */
+function renderToolCall(call: LocalToolCall): string {
+  return [
+    ASSISTANT_TOOL_CALL_MARKER,
+    `id: ${call.id}`,
+    `name: ${call.name}`,
+    `arguments: ${call.arguments}`,
+  ].join('\n');
+}
+
+/** The one place a result is written as text; nothing reads it back. */
+function renderToolResult(result: NormalizedToolResult): string {
+  return [TOOL_RESULT_MARKER, `tool_call_id: ${result.callId}`, result.output].join('\n');
 }
 
 /**
@@ -2142,42 +2168,40 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
  * record: dropping it erased results a client sent on purpose, and calling it
  * a plain user message put a tool's own output in the user's voice.
  *
- * The record is NOT written as tool history, which is the one thing that must
- * not happen to it. `toolHistory` is a promise to the transports that this text
- * is `[tool result]`/`[assistant tool_call]` grammar they can parse back into
- * their own items, and a generic record is not: on the default Codex transport
- * `responseToolHistoryItems` found no `tool_call_id:` line, replaced the record
- * with `{"type":"function_call_output","call_id":"tool_call","output":""}` and
- * the result the client sent never reached the model. Marked as a record
- * instead, it survives every consumer — `buildPrompt` and
- * `claudeMessageContentFor` render `content` as it stands, and the Codex
- * transport carries it as an `input_text` message — and, because nothing parses
- * the label back, no text a client puts INSIDE the record can forge a
- * tool-result boundary in it.
+ * The record carries NO `tool` field, which is the one thing that must not
+ * happen to it. That field is a turn's calls and results, and a generic record
+ * has neither: while the record was flagged as tool history instead, the
+ * default Codex transport parsed its text, found no `tool_call_id:` line and
+ * replaced the record with
+ * `{"type":"function_call_output","call_id":"tool_call","output":""}` — the
+ * result the client sent never reached the model. Marked as a record instead,
+ * it survives every consumer: `buildPrompt` and `claudeMessageContentFor`
+ * render `content` as it stands, and the Codex transport carries it as an
+ * `input_text` message.
  */
 function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedContent | null {
   if (msg.type === 'function_call_output') {
     const output = flattenOpenAiContent(msg.output);
+    const result: NormalizedToolResult = {
+      callId: readString(msg.call_id, 'tool_call'),
+      output: output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? '')),
+    };
     return {
-      text: [
-        TOOL_RESULT_MARKER,
-        `tool_call_id: ${readString(msg.call_id, 'tool_call')}`,
-        output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? '')),
-      ].join('\n'),
+      text: renderToolResult(result),
       images: output.images,
-      toolHistory: true,
+      tool: { calls: [], results: [result], narration: '' },
     };
   }
   if (msg.type === 'function_call') {
+    const call: LocalToolCall = {
+      id: readString(msg.call_id, 'tool_call'),
+      name: readString(msg.name, 'tool'),
+      arguments: typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {}),
+    };
     return {
-      text: [
-        ASSISTANT_TOOL_CALL_MARKER,
-        `id: ${readString(msg.call_id, 'tool_call')}`,
-        `name: ${readString(msg.name, 'tool')}`,
-        `arguments: ${typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {})}`,
-      ].join('\n'),
+      text: renderToolCall(call),
       images: [],
-      toolHistory: true,
+      tool: { calls: [call], results: [], narration: '' },
     };
   }
   // Keyed on the item's KIND, never on whether it happens to carry a `content`
@@ -2198,43 +2222,57 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
   const value = msg.content;
   if (!Array.isArray(value)) return flattenAnthropicContent(value);
   const images: NormalizedImage[] = [];
+  const calls: LocalToolCall[] = [];
+  const results: NormalizedToolResult[] = [];
+  const narration: string[] = [];
   const text = value.map((part) => {
     const block = asRecord(part);
-    if (!block) return String(part ?? '');
-    if (block.type === 'text' && typeof block.text === 'string') return block.text;
+    if (!block) {
+      const rest = String(part ?? '');
+      if (rest) narration.push(rest);
+      return rest;
+    }
+    if (block.type === 'text' && typeof block.text === 'string') {
+      if (block.text) narration.push(block.text);
+      return block.text;
+    }
     if (block.type === 'image') {
       const image = readAnthropicImage(block);
       if (image) images.push(image);
       return '';
     }
     if (block.type === 'tool_use') {
-      return [
-        ASSISTANT_TOOL_CALL_MARKER,
-        `id: ${readString(block.id, 'tool_call')}`,
-        `name: ${readString(block.name, 'tool')}`,
-        `arguments: ${JSON.stringify(block.input ?? {})}`,
-      ].join('\n');
+      const call: LocalToolCall = {
+        id: readString(block.id, 'tool_call'),
+        name: readString(block.name, 'tool'),
+        arguments: JSON.stringify(block.input ?? {}),
+      };
+      calls.push(call);
+      return renderToolCall(call);
     }
     if (block.type === 'tool_result') {
       const resultContent = flattenAnthropicContent(block.content);
       images.push(...resultContent.images);
-      return [
-        TOOL_RESULT_MARKER,
-        `tool_call_id: ${readString(block.tool_use_id, 'tool_call')}`,
-        resultContent.text,
-      ].join('\n');
+      const result: NormalizedToolResult = {
+        callId: readString(block.tool_use_id, 'tool_call'),
+        output: resultContent.text,
+      };
+      results.push(result);
+      return renderToolResult(result);
     }
     return '';
   }).filter(Boolean).join('\n\n');
-  // Same rule as the OpenAI shapes: the flag is set where THIS function wrote a
-  // marker, so a caller who types the same characters is never mistaken for a
-  // tool turn. Checking the blocks rather than the rendered text keeps the two
-  // from drifting apart.
-  const wroteToolHistory = value.some((block) => {
-    const record = asRecord(block);
-    return record?.type === 'tool_use' || record?.type === 'tool_result';
-  });
-  return { text, images, ...(wroteToolHistory ? { toolHistory: true } : {}) };
+  // Same rule as the OpenAI shapes: the turn is recorded from the BLOCKS this
+  // function read, so a caller who types the same characters into a text block
+  // is never mistaken for a tool turn — and neither is a tool whose own output
+  // contains them, because that output is one result's `output`, not a boundary.
+  return {
+    text,
+    images,
+    ...(calls.length > 0 || results.length > 0
+      ? { tool: { calls, results, narration: narration.join('\n\n') } }
+      : {}),
+  };
 }
 
 function flattenOpenAiContent(value: unknown): NormalizedContent {
