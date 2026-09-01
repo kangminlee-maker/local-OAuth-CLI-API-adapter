@@ -148,6 +148,14 @@ const REJECTIONS = [
   // The conversation's SHAPE, a phase of its own: after every field's type
   // check and after the unknown-key refusal, before the container one.
   ["shape system precedes a user", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 'sys' }, { role: 'user', content: 'b' }] }, "messages.1: role 'system' must precede an 'assistant' message or end the array; the directive-only form (content: [] with output_config) is accepted at any position"],
+  // WHICH item of a system RUN the position fault is reported at: the LAST.
+  // A run of consecutive `system` items is one block and only where it ENDS is
+  // constrained, so the index in the sentence is the run's last item, not its
+  // first. Measured 2026-09-01 (§5.5.7). The single-item row above cannot see
+  // this — first and last are the same item there — and "report the run at its
+  // first item" left the whole suite green until these two rows.
+  ["shape a system run of two is reported at its LAST item", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 's1' }, { role: 'system', content: 's2' }, { role: 'user', content: 'b' }] }, "messages.2: role 'system' must precede an 'assistant' message or end the array; the directive-only form (content: [] with output_config) is accepted at any position"],
+  ["shape a system run of three is reported at its LAST item", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: 's1' }, { role: 'system', content: 's2' }, { role: 'system', content: 's3' }, { role: 'user', content: 'b' }] }, "messages.3: role 'system' must precede an 'assistant' message or end the array; the directive-only form (content: [] with output_config) is accepted at any position"],
   ["shape system content empty past the head", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }] }, "messages.1: system content must contain at least one block"],
   ["shape system content empty beats position", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: [] }, { role: 'user', content: 'b' }] }, "messages.1: system content must contain at least one block"],
   ["shape system whitespace text", { messages: [{ role: 'user', content: 'a' }, { role: 'system', content: '  ' }] }, "messages.1: system text blocks must contain non-whitespace text"],
@@ -189,6 +197,12 @@ const ACCEPTED = [
   ["system ends the array", [{ role: 'user', content: 'a' }, { role: 'system', content: 'sys' }]],
   ["system precedes an assistant", [{ role: 'user', content: 'a' }, { role: 'system', content: 'sys' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'b' }]],
   ["a run of system items", [{ role: 'user', content: 'a' }, { role: 'system', content: 's1' }, { role: 'system', content: 's2' }]],
+  // The controls for the two rejection rows above: the SAME runs, ended
+  // legally. Only where a run ends is constrained, so a run of any length that
+  // ends the array or precedes an assistant is accepted — a rule that reported
+  // at the run's first item would have to refuse these to refuse the others.
+  ["a run of three system items ending the array", [{ role: 'user', content: 'a' }, { role: 'system', content: 's1' }, { role: 'system', content: 's2' }, { role: 'system', content: 's3' }]],
+  ["a run of two system items preceding an assistant", [{ role: 'user', content: 'a' }, { role: 'system', content: 's1' }, { role: 'system', content: 's2' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'b' }]],
   ["an empty user turn a later one gives content", [{ role: 'user', content: [] }, { role: 'user', content: 'a' }]],
   ["an empty user turn an earlier one gives content", [{ role: 'user', content: 'a' }, { role: 'user', content: [] }]],
   ["an empty user turn inside a run with content", [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'ok' }, { role: 'user', content: [] }, { role: 'user', content: 'b' }]],
