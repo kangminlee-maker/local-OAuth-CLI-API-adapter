@@ -303,6 +303,14 @@ rl.on('line', (line) => {
       }, 0);
       return;
     }
+    if (input.includes('PADDED_NARRATION')) {
+      // A completed turn whose text carries leading and trailing whitespace.
+      // Every other narration here is whitespace-free, so a `.trim()` on the
+      // way out of this backend is invisible to all of them.
+      result(payload.id, { turn: { id: turnId } });
+      setTimeout(() => emitTurn(threadId, turnId, '\n  MEDIUM_OK  '), 0);
+      return;
+    }
     if (input.includes('DEBUG_PAYLOAD')) {
       result(payload.id, { turn: { id: turnId } });
       setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(debugPayload())), 0);

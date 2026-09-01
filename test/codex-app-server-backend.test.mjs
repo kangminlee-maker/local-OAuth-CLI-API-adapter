@@ -156,6 +156,35 @@ test('CodexAppServerBackend records app-server tool stream timing checkpoints', 
   }
 });
 
+// The app-server half of the removed `.trim()`. `test/tool-stream-surface-parity`
+// pins the codex TRANSPORT half; this backend resolves its completed turn in
+// `resolveTurnWaiter`, and re-adding the trim there is invisible to every other
+// assertion in this file because every fixture narration is whitespace-free.
+// The vendor returns what the model emitted, so a turn's text must reach the
+// client as the backend wrote it — leading and trailing whitespace included.
+test('CodexAppServerBackend returns a completed turn untrimmed', async () => {
+  process.env.CODEX_HOME = await createCodexHome();
+  const backend = new CodexAppServerBackend({
+    command: fakeCodex,
+    cwd: process.cwd(),
+    timeoutMs: 30_000,
+  });
+
+  try {
+    const result = await backend.generate({
+      ...textRequest(),
+      messages: [{ role: 'user', content: 'PADDED_NARRATION' }],
+    });
+    assert.equal(result.text, '\n  MEDIUM_OK  ');
+    // The control: the trim is invisible unless the padding is, so assert the
+    // padding is what makes this row different from the ordinary narration.
+    assert.notEqual(result.text, 'MEDIUM_OK');
+    assert.equal(result.text.trim(), 'MEDIUM_OK');
+  } finally {
+    await backend.close();
+  }
+});
+
 test('CodexAppServerBackend does not pass direct provider env to child CLI', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   setProviderEnv();

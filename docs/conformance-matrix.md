@@ -694,7 +694,19 @@ capability 패스보다 **더 뒤**다 — 그래서 메시지가 무엇이든 t
 **미러하지 않음**: 되먹인 `reasoning`·hosted-tool 항목의 **id 조회**. direct는 `[{id:'rs_abc',type:'reasoning'}]`에
 404 `Item with id 'rs_abc' not found.`로 답하고, 진짜 왕복(같은 서버가 방금 낸 id)에서는 찾는다.
 이 프록시는 상태를 저장하지 않아 id를 조회할 수단이 없다 — 흉내 내려면 **정당한 되먹임까지 전부** 거절해야 하므로 수용 쪽으로 남긴다.
-그 결과 항목이 전부 드롭돼 턴이 하나도 남지 않는 본문은 빈 대화로 실행된다(비어 있음 검사는 `input` 자체가 비었을 때만 걸린다).
+
+**id를 수용한 다음 그 항목이 무엇이 되는가는 별개의 행동이다 (2026-09-01 실측).** 이 절은 한동안 둘을 한 문장으로 묶어
+"`reasoning`·hosted-tool 항목을 **아무것도 아닌 것으로** 되재생한다"고 적어 뒀는데, 지금은 `reasoning`에만 참이다.
+
+| 되먹인 항목 | 백엔드에 도착하는 것 |
+| --- | --- |
+| `reasoning` (`summary`·`encrypted_content` 포함) | **없음.** 드롭된다. 이 항목 하나뿐인 본문은 `messages: []` — 빈 대화로 실행된다(비어 있음 검사는 `input` 자체가 비었을 때만 걸린다) |
+| `function_call` / `function_call_output` 쌍 | 이 프록시 자신의 툴 히스토리로 되재생돼 네이티브 항목으로 도착한다 |
+| 그 밖에 표면이 아는 타입 전부 (hosted-tool 호출·출력, `web_search_call` 등) | **라벨 붙은 전사 기록** 한 건: 리터럴 `[replayed item]` → `type: <타입>` → 항목 자신의 JSON. 그 턴의 역할 그대로 도착하며 내용이 온전히 실린다. 라벨을 되파싱하는 곳이 없으므로 기록 안의 텍스트가 툴 결과 경계를 위조할 수 없다 |
+| 표면이 **모르는** 타입 | 되재생 자체가 없다 — 400 `invalid_value` param `input[<i>]`, 아는 타입을 전부 나열한다 |
+
+두 행동은 `spec/declared-divergences.json`에 각각 `responses-replayed-item-ids-are-not-looked-up`(id 조회)과
+`responses-replayed-hosted-tool-items-are-transcript-records`(무엇이 되는가)로 나뉘어 등록돼 있다.
 
 ### 5.5.7 Anthropic Messages 필드 검증·보고 순서 실측 (2026-08-31) — **미러 완료**
 
@@ -727,6 +739,7 @@ OpenAI 표면들이 능력 거절을 맨 뒤에 두는 것과 같은 모양이�
 | --- | --- |
 | `system` 항목 하나 안에서의 우선순위 | ① content 길이 0 → `messages.<i>: system content must contain at least one block` ② index 0 → `messages.0: use the top-level 'system' parameter …` ③ 위치 → `messages.<i>: role 'system' must precede an 'assistant' message or end the array; …` ④ 공백 → `messages.<i>: system text blocks must contain non-whitespace text` |
 | `system` 위치 | 연속된 `system` 묶음의 **마지막**이 `assistant`를 앞서거나 배열을 끝내야 한다. `[U,S]` 200 · `[U,S,S]` 200 · `[U,S,A,U]` 200 · `[U,S,U]` **400** |
+| `system` 런의 **보고 인덱스** (2026-09-01 실측) | 위반은 런의 **마지막 항목** 자리에서 보고된다. `[U,S,U]` → `messages.1` · `[U,S,S,U]` → `messages.2` · `[U,S,S,S,U]` → `messages.3`. 위 행의 `[U,S,U]` 하나만으로는 "런의 첫 항목" 읽기와 "런의 마지막 항목" 읽기가 같은 답을 내 구분되지 않는다 — 런 길이 2·3을 재야 갈린다. 대조군은 같은 런을 합법으로 끝낸 `[U,S,S,S]` 200 · `[U,S,S,A,U]` 200 |
 | `system` 공백 | 텍스트 블록 **하나라도** 공백뿐이면 400. `content:'   '`도, `[text:'x', text:'']`도 400 |
 | `user` 빈 턴 | **연속 같은 역할은 한 턴으로 합쳐진다.** 합쳐진 턴 전체가 비어야 400이고, 그 턴의 **첫 빈 항목** 자리에서 보고된다. `[user:[]]` 400 · `[user:[],user:'a']` **200** · `[user:'a',user:[]]` **200** · `[U,A,user:[]]` 400@2 · `[U,A,user:[],user:[]]` 400@2 |
 | `assistant` 빈 턴 | 규칙 **없음** — `[U, assistant:[]]` 200 |
@@ -876,6 +889,14 @@ logit_bias↔verbosity, metadata↔temperature(값), verbosity↔logprobs(값).
 **의도된 발산 1건**: direct는 `gpt-5.6-terra`·`gpt-5.6-sol`의 Chat에서 **함수 도구와 `reasoning_effort`의 조합 자체를 거절한다**
 (`Function tools with reasoning_effort are not supported for <model> in /v1/chat/completions`; `gpt-5.5`는 수용). 프록시의 백엔드는
 이 조합을 실제로 실행하므로 미러하지 않는다 — 실현 가능한 것을 거절하는 쪽이 규칙 위반이다. `spec/declared-divergences.json`에 등록.
+
+**의도된 발산 1건 추가 (2026-09-01 실측)**: `function` **역할**. direct는 `gpt-5.6-terra`에서 content가 무엇이든 이 역할을 통째로 거절한다 —
+400 `unsupported_value`, param `messages[2].role`, `Unsupported value: 'messages[2].role' does not support 'function' with this mode`
+(`content: null`도, `content: '23C'`도 같은 답). 프록시는 `{role:'function', name:'f', content:'23C'}`를 **수용**해 백엔드까지 보내고,
+`content: null`은 자신의 평소 답인 param `messages.[2].content`·code 없음·`Invalid value for 'content': expected a string, got null.`로 거절한다.
+거절 문장이 **mode를 지목**하므로 `chat-function-tools-with-reasoning-effort`와 같은 계열이다 — 벤더 모델 하나의 능력이지 이 표면의 규칙이 아니고,
+백엔드가 실행할 수 있는 턴을 막는 쪽이 위반이다. 두 방향 중 **안전한 쪽**이기도 하다(이 역할을 안 쓰는 클라이언트는 차이를 못 느끼고, 쓰는 쪽은 400 대신 턴을 받는다).
+`spec/declared-divergences.json`의 `chat-function-role-is-not-refused`에 등록.
 
 **범위 밖에서 드러난 것**: 위 `content` 행이 이 저장소의 기존 전제를 뒤집었다. 프록시는 `content` 없음/`null`을 400으로 거절해 왔고
 (테스트 3건이 그 전제를 지키고 있었다) direct는 수용한다. 이번 커밋에서 함께 고쳤다.

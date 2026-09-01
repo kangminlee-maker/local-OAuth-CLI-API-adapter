@@ -454,3 +454,70 @@ test('a key no known key can be close to never reaches the distance routine', as
   assert.equal(status, 400);
   assert.equal(payload.error.code, 'unknown_parameter');
 });
+
+// The test above asserts the pre-filter's OWN output. Nothing in it says the
+// suggester calls it — and it does not have to: the filter changes no message,
+// so the caller can drop it and every assertion in this file, that one
+// included, still passes. Measured: bypassing it takes a 1,000,000-character
+// unknown key on this route from 14 ms to 1112 ms of SYNCHRONOUS work, same
+// status, same param, same sentence.
+//
+// So this asserts the caller instead, and counts rather than times: the
+// distance routine allocates its first row with `Array.from({length: …})`
+// exactly once per invocation, so an `Array.from` counter installed around the
+// request IS an invocation counter for it. The count must equal the number of
+// candidates the pre-filter yields for that body — not merely be small — which
+// is the same statement as "the caller measures these keys and no others".
+test('the suggester measures the pre-filter\'s candidates and no other key', async () => {
+  const started = await startLocalApiProxy({ backend: backend(), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  const realArrayFrom = Array.from;
+  const countFor = async (unknown) => {
+    const body = { model: 'gpt-5.6-terra', ...OUT, [unknown]: 1 };
+    let calls = 0;
+    // Installed only around the request: the server is already up, so nothing
+    // else in this process is running while it is patched.
+    Array.from = function patched(...args) { calls += 1; return realArrayFrom.apply(this, args); };
+    let payload;
+    try {
+      const res = await fetch(`${started.url}/v1/responses`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      payload = await res.json();
+    } finally {
+      Array.from = realArrayFrom;
+    }
+    return { calls, expected: editDistanceCandidates(unknown, OPENAI_RESPONSES_KEYS, body).length, payload };
+  };
+
+  try {
+    // A key one edit from a real one: the count is NONZERO, which is what makes
+    // the counter an instrument rather than a constant zero.
+    const near = await countFor('temperatur');
+    assert.ok(near.expected > 0, 'the control must have candidates, or it proves nothing');
+    assert.equal(near.calls, near.expected, 'every candidate is measured, and only candidates are');
+    assert.equal(near.payload.error.message, "Unknown parameter: 'temperatur'. Did you mean 'temperature'?");
+
+    // A second body whose candidate set is a DIFFERENT size, so a counter that
+    // happened to match one number cannot match both.
+    const other = await countFor('stor');
+    assert.ok(other.expected > 0 && other.expected !== near.expected, 'the two controls must differ in size');
+    assert.equal(other.calls, other.expected);
+
+    // And the far side, which is the cost promise itself: a key no known key
+    // can be within two edits of reaches the distance routine ZERO times. A
+    // caller that skipped the pre-filter would measure every known key here —
+    // the same answer, at 1,000,000 characters apiece.
+    for (const [label, unknown] of [
+      ['just out of range', 'z'.repeat(Math.max(...[...OPENAI_RESPONSES_KEYS].map((key) => key.length)) + 3)],
+      ['a megabyte', 'z'.repeat(1_000_000)],
+    ]) {
+      const far = await countFor(unknown);
+      assert.equal(far.expected, 0, `${label}: the pre-filter yields no candidate`);
+      assert.equal(far.calls, 0, `${label}: so the distance routine must never run`);
+      assert.equal(far.payload.error.code, 'unknown_parameter', `${label}: and the answer is unchanged`);
+    }
+  } finally {
+    Array.from = realArrayFrom;
+    await started.close();
+  }
+});

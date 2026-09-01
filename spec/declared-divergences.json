@@ -31,11 +31,20 @@
     {
       "id": "responses-replayed-item-ids-are-not-looked-up",
       "surface": "/v1/responses",
-      "behavior": "The proxy accepts a replayed `reasoning` or hosted-tool item without checking its id, and replays it as nothing. The direct API answers 404 `Item with id '<id>' not found.` for an id it does not hold — including alongside a valid user turn — and finds the id when the item really came from its own previous response.",
-      "why": "Measured 2026-08-31. Feeding `output` back as `input` is the documented way to hold a conversation on a surface that stores none, and this proxy stores none either: it has no id table to look one up in. Mirroring the 404 would mean refusing EVERY replayed item, the legitimate ones included, which would break the round trip the surface exists for. Accepting and replaying nothing is what a runtime with no reasoning slot can honestly do.",
+      "behavior": "The proxy accepts a replayed item — `reasoning`, a hosted-tool call or its output — without checking its `id`. The direct API answers 404 `Item with id '<id>' not found.` for an id it does not hold, including alongside a valid user turn, and finds the id when the item really came from its own previous response. This entry is about the ID LOOKUP only. What an accepted item then becomes is a separate behaviour and a separate entry: `responses-replayed-hosted-tool-items-are-transcript-records`.",
+      "why": "Measured 2026-08-31. Feeding `output` back as `input` is the documented way to hold a conversation on a surface that stores none, and this proxy stores none either: it has no id table to look one up in. Mirroring the 404 would mean refusing EVERY replayed item, the legitimate ones included, which would break the round trip the surface exists for.",
       "measuredAt": "2026-08-31",
       "evidence": "docs/conformance-matrix.md §5.5.6-A",
       "claim": "responses-replayed-item-ids-are-not-looked-up"
+    },
+    {
+      "id": "responses-replayed-hosted-tool-items-are-transcript-records",
+      "surface": "/v1/responses",
+      "behavior": "What a replayed item BECOMES, once its id has been accepted, depends on the item. A `reasoning` item replays as NOTHING — it is dropped, and a body whose only item is one runs as an empty conversation (`messages: []` reaches the backend). Every OTHER typed item the surface knows, other than the `function_call`/`function_call_output` pair this proxy replays as its own tool history — the hosted-tool calls and outputs a client feeds back to preserve them, `web_search_call` and the rest — replays as a LABELLED TRANSCRIPT RECORD in the turn's own role: the literal `[replayed item]`, then `type: <the item type>`, then the item's own JSON, and that message reaches the backend intact. A `type` the surface does not know is not replayed at all: it is 400 `invalid_value` at `input[<i>]` listing the types it does know. The direct API replays each of these against its own stored copy of the item.",
+      "why": "Measured 2026-09-01 at this baseline. The previous wording of `responses-replayed-item-ids-are-not-looked-up` said a hosted-tool item is 'replayed as nothing', which conflated two behaviours and is now false for everything but `reasoning`. These runtimes have no hosted-tool slot to replay such an item INTO, so the honest options are to drop it or to hand the model the record of it; dropping it silently loses conversation the client sent, and writing it as a function tool result made the default transport parse it back into an empty `function_call_output` under an invented id, so the record never reached the model at all. The labelled record is the one form that carries the item's own content through, and nothing parses the label back — so text inside a record cannot forge a tool-result boundary. `reasoning` stays dropped for its own reason: its `summary`, `reasoning_text` and `encrypted_content` have no slot in either runtime, and putting them in a turn told the model its own chain of thought in the user's voice.",
+      "measuredAt": "2026-09-01",
+      "evidence": "docs/conformance-matrix.md §5.5.6-A",
+      "claim": "responses-replayed-hosted-tool-items-are-transcript-records"
     },
     {
       "id": "messages-assistant-prefill-is-not-refused",
@@ -45,6 +54,15 @@
       "measuredAt": "2026-08-31",
       "evidence": "docs/conformance-matrix.md §5.5.7",
       "claim": "messages-assistant-prefill-is-not-refused"
+    },
+    {
+      "id": "chat-function-role-is-not-refused",
+      "surface": "/v1/chat/completions",
+      "behavior": "The proxy accepts a `function` role message and runs the turn: `{\"role\":\"function\",\"name\":\"f\",\"content\":\"23C\"}` reaches the backend. The direct API refuses the role OUTRIGHT for `gpt-5.6-terra`, whatever the content — 400 `unsupported_value`, param `messages[2].role`, message \"Unsupported value: 'messages[2].role' does not support 'function' with this mode\" — with `content: null` and with `content: '23C'` alike. The proxy's own answer for `content: null` is its ordinary missing-content one, at param `messages.[2].content` with no code and the sentence \"Invalid value for 'content': expected a string, got null.\", so the two sides differ in which fault they report as well as in whether they refuse. `function` remains a value the role enum names on both sides: the proxy's `messages[i].role` enum sentence lists it, and so does the direct API's.",
+      "why": "Measured 2026-09-01. The refusal names the MODE — 'does not support ... with this mode' — which puts it in the same class as `chat-function-tools-with-reasoning-effort` and `messages-assistant-prefill-is-not-refused`: a refusal whose sentence names the model or the mode is a capability of that vendor model, not of this surface. The deprecated `function` role is an ordinary transcript turn, and the backends behind this proxy serve it. Refusing a turn the backends CAN serve because one vendor model will not is itself the violation, and this is the safer direction of the two — a client that never sends the role sees no difference, and one that does gets its turn run instead of a 400. Mirroring the refusal would take a working request away for nothing.",
+      "measuredAt": "2026-09-01",
+      "evidence": "docs/conformance-matrix.md §5.5.5",
+      "claim": "chat-function-role-is-not-refused"
     }
   ]
 }

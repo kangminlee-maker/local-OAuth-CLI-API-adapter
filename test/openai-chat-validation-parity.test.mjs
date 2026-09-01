@@ -52,6 +52,38 @@ const REJECTIONS = [
   ['an empty tool_calls beats the capability pass', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'x', tool_calls: [] }], temperature: 0.5 }, { param: 'messages[1].tool_calls', code: 'empty_array', message: "Invalid 'messages[1].tool_calls': empty array. Expected an array with minimum length 1, but got an empty array instead." }],
   ['an empty tool_calls loses to a content type fault', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 7, tool_calls: [] }] }, { param: 'messages[1].content', code: 'invalid_type', message: "Invalid type for 'messages[1].content': expected one of a string or array of objects, but got an integer instead." }],
   ['a tool_calls of the wrong type', { messages: [{ role: 'user', content: 'a' }, { role: 'assistant', content: 'x', tool_calls: 'x' }] }, { param: 'messages[1].tool_calls', code: 'invalid_type', message: "Invalid type for 'messages[1].tool_calls': expected an array of objects, but got a string instead." }],
+
+  // WHERE the content check sits: last of all. The docstring on
+  // `refuseOpenAiChatMissingContent` says it loses to the content TYPE check at
+  // any index, to a bad role at any index, and to the capability pass — and
+  // until these rows nothing under `test/` saw it. Moving the check to the
+  // front of the field walk changed all three answers with the suite green,
+  // because every earlier row carries exactly one fault. Each row here is
+  // invalid TWICE and its control below is the same body with the earlier
+  // fault removed, so the two answers are opposites rather than one repeated.
+  ['a content type fault at a LATER index beats a missing content at an earlier one', { messages: [{ role: 'user' }, { role: 'user', content: 7 }] }, { param: 'messages[1].content', code: 'invalid_type', message: "Invalid type for 'messages[1].content': expected one of a string or array of objects, but got an integer instead." }],
+  ['CONTROL: with a valid content at index 1 the missing one at index 0 answers', { messages: [{ role: 'user' }, { role: 'user', content: 'a' }] }, { param: 'messages.[0].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  ['a refused temperature VALUE beats a missing content', { messages: [{ role: 'user' }], temperature: 0.5 }, { param: 'temperature', code: 'unsupported_value', message: "Unsupported value: 'temperature' does not support 0.5 with this model. Only the default (1) value is supported." }],
+  ['CONTROL: at the default temperature the missing content answers', { messages: [{ role: 'user' }], temperature: 1 }, { param: 'messages.[0].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  ['a bad role at a LATER index beats a missing content at an earlier one', { messages: [{ role: 'user' }, { role: 'bogus', content: 'a' }] }, { param: 'messages[1].role', code: 'invalid_value', message: "Invalid value: 'bogus'. Supported values are: 'system', 'assistant', 'user', 'function', 'tool', and 'developer'." }],
+  ['CONTROL: with a known role at index 1 the missing content at index 0 answers', { messages: [{ role: 'user' }, { role: 'assistant', content: 'a' }] }, { param: 'messages.[0].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+
+  // WHOSE content the substitutes stand in for: the assistant's alone.
+  // `tool_calls`, `function_call`, `refusal` and `audio` are the assistant
+  // schema's own one-of, so on any other role they are ordinary extra members
+  // and the message still needs content. Relaxing the check's `role ===
+  // 'assistant'` to `role !== undefined` turned every row here into a 200 with
+  // the suite green. The opposite answer for the identical substitute — an
+  // assistant message that carries it and is accepted — is the paired loop in
+  // `chat requires content, and the assistant schema says what stands in for it`.
+  ['a tool message carrying a refusal still needs content', { messages: [{ role: 'user', content: 'a' }, { role: 'tool', tool_call_id: 'c', refusal: 'no' }] }, { param: 'messages.[1].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  ['a system message carrying audio still needs content', { messages: [{ role: 'system', audio: { id: 'a' } }, { role: 'user', content: 'a' }] }, { param: 'messages.[0].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  ['a user message carrying tool_calls still needs content', { messages: [{ role: 'user', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'f', arguments: '{}' } }] }] }, { param: 'messages.[0].content', code: null, message: "Invalid value for 'content': expected a string, got null." }],
+  // `developer` keeps its own schema's words even here: the plain
+  // `messages[i].content` param and a missing-parameter code, not the
+  // dotted-bracket sentence every other role gets.
+  ['a developer message carrying a refusal still needs content, in its own words', { messages: [{ role: 'user', content: 'a' }, { role: 'developer', refusal: 'no' }] }, { param: 'messages[1].content', code: 'missing_required_parameter', message: "Missing required parameter: 'messages[1].content'." }],
+
   // Unknown top-level keys — the strict schema P-5 found and §5.5.5 enumerated.
   ['an invented key', { zzz_unknown: 1 }, { param: 'zzz_unknown', code: 'unknown_parameter', message: "Unknown parameter: 'zzz_unknown'." }],
   ['audio', { audio: { voice: 'alloy', format: 'wav' } }, { param: 'audio', code: 'unknown_parameter', message: "Unknown parameter: 'audio'." }],
@@ -291,6 +323,16 @@ test('chat requires content, and the assistant schema says what stands in for it
   ]) {
     const { status } = await chat({ messages: [{ role: 'user', content: 'a' }, { role: 'assistant', ...extra }] });
     assert.equal(status, 200, `an assistant carrying ${label} needs no content`);
+    // The same substitute on a role that is not `assistant` is no substitute at
+    // all — it is the assistant schema's own one-of. This is the opposite
+    // answer for the identical member, and the pair is what pins the scoping:
+    // widening the check's `role === 'assistant'` makes the 400 a 200 and every
+    // assertion above still passes.
+    const other = await chat({ messages: [{ role: 'user', content: 'a' }, { role: 'user', ...extra }] });
+    assert.equal(other.status, 400, `a user message carrying ${label} still needs content`);
+    assert.equal(other.payload.error.param, 'messages.[1].content');
+    assert.equal(other.payload.error.code, null);
+    assert.equal(other.payload.error.message, "Invalid value for 'content': expected a string, got null.");
   }
   // And an assistant carrying none of them does need it.
   const bare = await chat({ messages: [{ role: 'user', content: 'a' }, { role: 'assistant' }] });
@@ -364,6 +406,70 @@ test('chat runs function tools with a reasoning effort, the one declared diverge
   } finally {
     await started.close();
   }
+});
+
+test('chat runs a function-role turn, the second declared divergence', async () => {
+  // `spec/declared-divergences.json` says this proxy accepts a role the direct
+  // API refuses outright for `gpt-5.6-terra` — 400 `unsupported_value` at
+  // `messages[2].role`, "does not support 'function' with this mode", with any
+  // content. The sentence names the MODE, so it is that vendor model's
+  // capability rather than this surface's rule, and refusing a turn the
+  // backends serve would be the violation. Same guard as the row above: a
+  // declaration nothing exercises is a claim.
+  const { readFile } = await import('node:fs/promises');
+  const declared = JSON.parse(await readFile(new URL('../spec/declared-divergences.json', import.meta.url), 'utf8'));
+  assert.ok(
+    declared.divergences.some((entry) => entry.claim === 'chat-function-role-is-not-refused'),
+    'the declaration this test guards is missing; remove the test with it',
+  );
+  let reached = null;
+  const started = await startLocalApiProxy({
+    backend: {
+      name: 'test', model: 'configured-model',
+      async generate(request) {
+        reached = request.messages;
+        return { id: 'x', model: 'configured-model', text: 'ok', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1 };
+      },
+      async close() {},
+    },
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'a-model',
+        messages: [
+          { role: 'user', content: 'weather?' },
+          { role: 'assistant', content: 'checking' },
+          { role: 'function', name: 'f', content: '23C' },
+        ],
+      }),
+    });
+    assert.equal(res.status, 200, await res.text());
+    assert.ok(reached, 'the turn must reach the backend, which is what the divergence claims');
+    assert.ok(
+      reached.some((message) => String(message.content).includes('23C')),
+      "the function turn's content must reach the backend, not just the request",
+    );
+  } finally {
+    await started.close();
+  }
+  // The other half of the same declaration, and the opposite answer: the role
+  // is accepted, but it is NOT exempt from the content rule — a null content on
+  // it is this proxy's ordinary missing-content sentence, not the direct API's
+  // role refusal. Both were measured 2026-09-01.
+  const nulled = await chat({
+    messages: [
+      { role: 'user', content: 'weather?' },
+      { role: 'assistant', content: 'checking' },
+      { role: 'function', name: 'f', content: null },
+    ],
+  });
+  assert.equal(nulled.status, 400);
+  assert.equal(nulled.payload.error.param, 'messages.[2].content');
+  assert.equal(nulled.payload.error.code, null);
+  assert.equal(nulled.payload.error.message, "Invalid value for 'content': expected a string, got null.");
 });
 
 test('the Python-style rendering of a refused value is Python, not string surgery', async () => {
