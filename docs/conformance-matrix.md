@@ -737,6 +737,23 @@ OpenAI 표면들이 능력 거절을 맨 뒤에 두는 것과 같은 모양이�
 
 | `system` 블록 타입 | `text`·`tool_addition`·`tool_removal` **뿐**. 그 밖(이미지·tool_result 등) → `messages.<i>: role 'system' supports text, tool_addition, and tool_removal blocks only`. 항목 안 우선순위에서 **빈 content 다음, index 0 안내 앞** |
 
+**direct가 광고하지만 지키지 않는 면제 하나 (2026-09-01 실측)**: 위치 규칙 문장이 스스로 덧붙이는 꼬리말은
+`the directive-only form (content: [] with output_config) is accepted at any position`이다.
+리뷰가 이 문장을 근거로 "`content:[]`에 `output_config`가 붙으면 수용해야 하는데 프록시가 400을 준다"고 지적했으나, **재보니 아니다**.
+처음 측정은 `output_config` 자체가 잘못된 모양이어서 `output_config.format`이 먼저 답해버려 질문에 닿지 못했다(계기 결함).
+`additionalProperties`까지 갖춘 **유효한** `output_config`로 다시 재면 — 그 `output_config` 단독은 200이다 —
+
+| 본문 | direct |
+| --- | --- |
+| `[{system, content:[]}, U]` + `output_config`(json_schema, 유효) | 400 `messages.0: system content must contain at least one block` |
+| `[U, {system, content:[]}]` + `output_config`(json_schema, 유효) | 400 `messages.1: …` |
+| `[U, {system, content:[]}]` + `output_config`(effort) | 400 `messages.1: …` |
+| `[U]` + `output_config`(json_schema, 유효) — 대조 | **200** |
+
+즉 꼬리말이 면제하는 것은 **위치 규칙**뿐이고 **content 길이 0 규칙은 면제하지 않는다**.
+문장이 광고하는 것과 서버가 하는 것이 다른 경우이며, 미러의 권위는 문장이 아니라 측정이므로 프록시의 `length === 0` 거절이 옳다.
+꼬리말 자체는 direct 문구를 그대로 복사한 것이라 그대로 둔다.
+
 **측정했으나 미러하지 않음**: `system` 항목은 `user` 메시지 **또는 서버 툴 결과로 끝나는 assistant 메시지**를 뒤따라야 한다
 (`[U,A,S]` → 400 `messages.2: role 'system' must follow a 'user' message or an 'assistant' message ending in a server tool result; …`).
 면제 조건이 이 프록시가 만들어낼 수 없는 **서버 사이드 툴 결과**에 걸려 있어서, 주절만 보고 거절하면 direct가 받는 본문을 거절하게 된다 —

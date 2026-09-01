@@ -54,22 +54,75 @@ const started = await startLocalApiProxy({
 
 let failures = 0;
 let checks = 0;
+let skipped = 0;
 function record(name, ok, detail = '') {
   checks += 1;
   if (!ok) failures += 1;
   process.stdout.write(`${ok ? 'PASS' : 'FAIL'} ${name} ${detail}\n`);
 }
 
+/**
+ * A row whose body the direct API ACCEPTS is not a rejection probe, and the
+ * refusing backend turns the proxy's acceptance into a 500 — so comparing
+ * envelopes reports FAIL for two completely different situations. Tell them
+ * apart instead of printing one word for both:
+ *
+ *   proxy also accepted  -> the row is mis-filed, not a defect (SKIP)
+ *   proxy REFUSED        -> the worst direction there is, and the whole reason
+ *                           this instrument exists (FAIL, loudly)
+ *
+ * Written after a run reported five FAILs that were all mis-filed rows, which
+ * cost a full re-derivation to tell from real over-refusal.
+ */
+const REACHED_BACKEND = 'a rejection case reached the backend';
+function recordAcceptedByDirect(name, p) {
+  const proxyAccepted = p.status === 200 || p.text.includes(REACHED_BACKEND);
+  if (proxyAccepted) {
+    skipped += 1;
+    process.stdout.write(`SKIP parity ${name} — the direct API accepts this body; the proxy accepts it too, so it is not a free probe. Pin it in the offline ACCEPTED table instead.\n`);
+    return;
+  }
+  record(`parity ${name}`, false,
+    `\n   !! OVER-REFUSAL: direct accepted this body (200) and the proxy answered ${p.status}.\n   proxy : ${p.text.slice(0, 300)}`);
+}
+
+/**
+ * One hung direct request must not take down a 400-row sweep. Twice now a
+ * single call sat until undici's 300s HTTP/2 stream timeout and killed the
+ * whole run with an uncaught `fetch failed`, losing every row after it. Each
+ * attempt gets its own deadline and a couple of retries; a row that still
+ * cannot be measured is reported as a LOUD failure rather than crashing the
+ * process, so the run finishes and names exactly what went unmeasured.
+ */
+const POST_TIMEOUT_MS = 45_000;
+const POST_ATTEMPTS = 3;
+
 async function post(base, path, body, headers = {}) {
-  const res = await fetch(`${base}${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...headers },
-    body: JSON.stringify(body),
-  });
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch { /* not JSON */ }
-  return { status: res.status, text, json };
+  let lastErr;
+  for (let attempt = 1; attempt <= POST_ATTEMPTS; attempt += 1) {
+    try {
+      const res = await fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+      });
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* not JSON */ }
+      return { status: res.status, text, json };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < POST_ATTEMPTS) await new Promise((r) => setTimeout(r, 1_000 * attempt));
+    }
+  }
+  // Not a measurement. Never let this shape read as a matching envelope.
+  return {
+    status: 0,
+    text: `UNMEASURED: ${base}${path} failed ${POST_ATTEMPTS}x — ${lastErr?.message ?? lastErr}`,
+    json: null,
+    unmeasured: true,
+  };
 }
 
 function envelope(r) {
@@ -94,15 +147,22 @@ async function anthropicParity(name, body) {
     post(started.url, MESSAGES, sent),
     post(ANTHROPIC, MESSAGES, sent, { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' }),
   ]);
+  // Two unmeasured sides compare EQUAL and would read as PASS. An absent
+  // measurement is never agreement.
+  if (p.unmeasured || d.unmeasured) {
+    record(`parity ${name}`, false, `\n   !! UNMEASURED — this row proves nothing.\n   proxy : ${p.unmeasured ? p.text : 'ok'}\n   direct: ${d.unmeasured ? d.text : 'ok'}`);
+    return;
+  }
+  if (d.status === 200 && !generate) {
+    recordAcceptedByDirect(name, p);
+    return;
+  }
   const pe = anthropicEnvelope(p);
   const de = anthropicEnvelope(d);
   const same = JSON.stringify(pe) === JSON.stringify(de);
   record(`parity ${name}`, same, same
     ? `→ ${de.status} ${de.message ?? ''}`
     : `\n   proxy : ${JSON.stringify(pe)}\n   direct: ${JSON.stringify(de)}`);
-  if (d.status === 200 && !generate) {
-    process.stdout.write(`   !! the direct API accepted "${name}" — that case is not a free probe\n`);
-  }
 }
 
 async function parity(name, path, body) {
@@ -112,15 +172,22 @@ async function parity(name, path, body) {
     post(started.url, path, sent),
     post(DIRECT, path, sent, { authorization: `Bearer ${KEY}` }),
   ]);
+  // Two unmeasured sides compare EQUAL and would read as PASS. An absent
+  // measurement is never agreement.
+  if (p.unmeasured || d.unmeasured) {
+    record(`parity ${name}`, false, `\n   !! UNMEASURED — this row proves nothing.\n   proxy : ${p.unmeasured ? p.text : 'ok'}\n   direct: ${d.unmeasured ? d.text : 'ok'}`);
+    return;
+  }
+  if (d.status === 200 && !generate) {
+    recordAcceptedByDirect(name, p);
+    return;
+  }
   const pe = envelope(p);
   const de = envelope(d);
   const same = JSON.stringify(pe) === JSON.stringify(de);
   record(`parity ${name}`, same, same
     ? `→ ${de.status} ${de.code ?? ''} ${de.param ?? ''}`
     : `\n   proxy : ${JSON.stringify(pe)}\n   direct: ${JSON.stringify(de)}`);
-  if (d.status === 200 && !generate) {
-    process.stdout.write(`   !! the direct API accepted "${name}" — that case is not a free probe\n`);
-  }
 }
 
 const DELETE = Symbol('delete the key');
@@ -694,7 +761,7 @@ if (generate && (!only || only === 'chat')) {
 }
 
 await started.close();
-process.stdout.write(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILED`} — ${checks - failures}/${checks}\n`);
+process.stdout.write(`\n${failures === 0 ? 'ALL PASS' : `${failures} FAILED`} — ${checks - failures}/${checks}${skipped ? ` (+${skipped} SKIP: accepted by direct, not a probe)` : ''}\n`);
 process.exit(failures === 0 ? 0 : 1);
 
 function readArg(name) {
