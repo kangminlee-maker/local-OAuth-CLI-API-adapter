@@ -6,6 +6,10 @@ import type {
   NormalizedRequest,
 } from './types.js';
 import { estimateTokens } from './types.js';
+// The tool grammar has ONE writer. A prompt that spelled `[tool result]` and
+// `[assistant tool_call]` itself would be a second, and a grammar with two
+// writers drifts.
+import { renderToolCall, renderToolResult } from './normalizers.js';
 import { wrapperCallsPrecedeText } from './tool-call-stream.js';
 
 interface BuildPromptOptions {
@@ -387,15 +391,21 @@ function normalizeToolArgumentsText(value: string): string {
  * list — the one the runtime is actually handed — so `[image N]` names the Nth
  * picture the runtime received rather than the Nth of this message.
  *
- * A tool turn keeps the old shape. Its parts are calls and results whose text
- * rendering lives in `content` and not in the sequence, so walking the sequence
- * here would drop the turn's own words; its pictures are named by the tool-result
- * labels instead, which say which call each one answers.
+ * A TOOL turn is walked the same way. It used to take the images-first branch
+ * on the reading that its calls and results have no text in the sequence — but
+ * they do: the grammar's one writer renders them, and this walk calls it. While
+ * they did not, the two prompt backends announced every picture at the head of
+ * the turn while the codex transport was already sending the client's order, so
+ * one conversation reached two backends described differently.
+ *
+ * A message with no sequence at all — built by hand rather than read from a
+ * client body — keeps the images-first shape: there is no client order to
+ * preserve and claiming one would invent it.
  */
 function renderMessageContent(message: NormalizedMessage, firstImage: number): string {
   const images = message.images ?? [];
   if (images.length === 0) return message.content;
-  if (message.tool || !message.parts) {
+  if (!message.parts) {
     const imageReferences = images
       .map((image, index) => formatImageReference(image, firstImage + index))
       .join('\n');
@@ -403,18 +413,30 @@ function renderMessageContent(message: NormalizedMessage, firstImage: number): s
   }
   const positions = new Map<NormalizedImage, number>();
   images.forEach((image, index) => positions.set(image, firstImage + index));
+  // A picture the message's own list does not hold has no number to give, and
+  // inventing one would name a picture the runtime never receives.
+  const reference = (image: NormalizedImage): string | null => {
+    const index = positions.get(image);
+    return index === undefined ? null : formatImageReference(image, index);
+  };
   const lines: string[] = [];
   for (const part of message.parts) {
     if (part.kind === 'text') {
       if (part.text) lines.push(part.text);
     } else if (part.kind === 'image') {
-      const index = positions.get(part.image);
-      // A picture the message's own list does not hold has no number to give,
-      // and inventing one would name a picture the runtime never receives.
-      if (index !== undefined) lines.push(formatImageReference(part.image, index));
+      const line = reference(part.image);
+      if (line) lines.push(line);
+    } else if (part.kind === 'call') {
+      lines.push(renderToolCall(part.call));
+    } else {
+      lines.push(renderToolResult(part.result, reference));
     }
   }
-  return lines.join('\n');
+  // The separator `content` renders this shape's blocks with: a tool turn's
+  // blocks are a blank line apart, an ordinary message's text runs and pictures
+  // one line. Adding a picture to a turn must not also re-space the words
+  // around it.
+  return lines.join(message.tool ? '\n\n' : '\n');
 }
 
 function isInstructionMessage(message: NormalizedMessage): boolean {

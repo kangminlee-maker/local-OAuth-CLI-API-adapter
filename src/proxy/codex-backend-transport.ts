@@ -25,6 +25,7 @@ import type {
   LocalUsage,
   NormalizedImage,
   NormalizedMessage,
+  NormalizedPart,
   NormalizedRequest,
   NormalizedReasoningEffort,
   NormalizedToolChoice,
@@ -35,7 +36,7 @@ import type {
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { messageParts, ProxyRequestError } from './types.js';
+import { messageParts, ProxyRequestError, toolResultImages } from './types.js';
 
 const CHATGPT_CODEX_BACKEND_URL = 'https://chatgpt.com/backend-api/codex';
 const CODEX_REFRESH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
@@ -1712,7 +1713,7 @@ function toolTurnImages(message: NormalizedMessage): Set<NormalizedImage> {
   const placed = new Set<NormalizedImage>();
   for (const part of message.tool?.parts ?? []) {
     if (part.kind === 'result') {
-      for (const image of part.result.images ?? []) placed.add(image);
+      for (const image of toolResultImages(part.result)) placed.add(image);
     } else if (part.kind === 'image') {
       placed.add(part.image);
     }
@@ -1798,24 +1799,44 @@ async function responseToolHistoryItems(
         arguments: part.call.arguments,
       });
     } else if (part.kind === 'result') {
-      items.push({ type: 'function_call_output', call_id: part.result.callId, output: part.result.output });
-      // Beside THIS result, not after the whole turn. `function_call_output`
-      // carries a string, so a picture cannot ride inside the answer — it comes
-      // as a companion message in the very next position. Appending every one of
-      // the message's images after the last part instead put the picture a
-      // parallel turn's FIRST call returned behind the SECOND call's output,
-      // with nothing saying which call it answered: the position-guessing the
-      // per-result `images` list exists to end, reintroduced one level down.
-      // The caption is the labeller's, not a second grammar written here.
-      const images = part.result.images ?? [];
-      if (images.length > 0) {
+      // A result's OWN sequence, split where this API's shape forces a split.
+      //
+      // `function_call_output.output` is one STRING: a picture cannot ride
+      // inside the answer, and neither can the prose that came after a picture,
+      // because that prose would then be read ahead of it. So the output
+      // carries the result's text UP TO its first picture, and everything from
+      // that picture on — the picture, and any words that followed it — arrives
+      // in the companion message that comes immediately after, in the client's
+      // order. Sending the whole text and then the pictures is what delivered
+      // `[text, image, text]` as `out("BEFORE\nAFTER") image`, with the second
+      // sentence ahead of the picture it followed.
+      //
+      // Beside THIS result, not after the whole turn: appending every one of the
+      // message's images after the last part put the picture a parallel turn's
+      // FIRST call returned behind the SECOND call's output, with nothing saying
+      // which call it answered. The caption is the labeller's, not a second
+      // grammar written here.
+      const inner = part.result.parts ?? [];
+      const firstImage = inner.findIndex((entry) => entry.kind === 'image');
+      items.push({
+        type: 'function_call_output',
+        call_id: part.result.callId,
+        // `output` verbatim where no picture splits it — it is the whole of a
+        // result whose text this runtime stringified rather than read as blocks.
+        output: firstImage < 0 ? part.result.output : resultText(inner.slice(0, firstImage)),
+      });
+      if (firstImage >= 0) {
         const content: unknown[] = [];
-        for (const image of images) {
-          const label = labels.get(image);
-          if (label) content.push({ type: 'input_text', text: label });
-          content.push(await responseImagePart(image));
+        for (const entry of inner.slice(firstImage)) {
+          if (entry.kind === 'image') {
+            const label = labels.get(entry.image);
+            if (label) content.push({ type: 'input_text', text: label });
+            content.push(await responseImagePart(entry.image));
+          } else if (entry.kind === 'text' && entry.text) {
+            content.push({ type: 'input_text', text: entry.text });
+          }
         }
-        items.push({ type: 'message', role: 'user', content });
+        if (content.length > 0) items.push({ type: 'message', role: 'user', content });
       }
     } else if (part.kind === 'image') {
       // A picture the turn carried as a block of its own. It answers no call,
@@ -1833,6 +1854,19 @@ async function responseToolHistoryItems(
     }
   }
   return items.length > 0 ? items : null;
+}
+
+/**
+ * A run of a result's own blocks as the one string `output` can be.
+ *
+ * `\n` is the separator both content readers join a result's text runs with, so
+ * a result with no picture in it flattens here to exactly the bytes `output`
+ * already holds.
+ */
+function resultText(parts: readonly NormalizedPart[]): string {
+  return parts
+    .flatMap((part) => (part.kind === 'text' && part.text ? [part.text] : []))
+    .join('\n');
 }
 
 async function responseImagePart(image: NormalizedImage): Promise<unknown> {

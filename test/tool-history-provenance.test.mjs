@@ -58,7 +58,14 @@ test('a real tool result is flagged, and carries its call id', () => {
     parts: [{ kind: 'call', call: { id: 'call_abc', name: 'get_weather', arguments: '{"city":"Seoul"}' } }],
   }, 'an assistant turn carrying tool_calls carries them as structure');
   assert.deepEqual(tool.tool, {
-    parts: [{ kind: 'result', result: { callId: 'call_abc', output: 'sunny' } }],
+    parts: [{ kind: 'result', result: {
+      callId: 'call_abc',
+      output: 'sunny',
+      // The result's own blocks, in the order it carried them. `output` is a
+      // rendering of this; a result whose content is `[text, image, text]` has
+      // nowhere else to say that the second sentence FOLLOWED the picture.
+      parts: [{ kind: 'text', text: 'sunny' }],
+    } }],
   }, 'a tool result carries its call id and output as structure');
   assert.ok(tool.content.includes('call_abc'), 'the call id has to survive the flattening');
 });
@@ -97,7 +104,11 @@ test('the Anthropic shape flags what it flattened, and only that', () => {
     parts: [{ kind: 'call', call: { id: 'tu_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } }],
   }, 'a tool_use block is recorded as a call');
   assert.deepEqual(toolResult.tool, {
-    parts: [{ kind: 'result', result: { callId: 'tu_1', output: 'sunny' } }],
+    parts: [{ kind: 'result', result: {
+      callId: 'tu_1',
+      output: 'sunny',
+      parts: [{ kind: 'text', text: 'sunny' }],
+    } }],
   }, 'a tool_result block is recorded as a result');
   assert.ok(toolResult.content.includes('tu_1'), 'the call id survives');
 });
