@@ -284,12 +284,20 @@ const ORDER_REQUEST = {
   tools: [{ name: 'get_weather', description: 'w', parameters: {} }], toolChoice: { type: 'auto' }, raw: {},
 };
 const CALL = '{"id":"c1","name":"get_weather","arguments":"{}"}';
+const CALLS = (n) => Array.from({ length: n }, (_, i) => `{"id":"c${i + 1}","name":"get_weather","arguments":"{}"}`).join(',');
 
 for (const [label, raw, expected] of [
   ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`, 0],
   ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`, 1],
   ['toolCalls with no text at all', `{"status":"tool_calls","toolCalls":[${CALL}]}`, 1],
   ['text with no calls', '{"status":"message","text":"just talking"}', 0],
+  // Above one call, "the number of calls that came first" and the constant 1
+  // stop being the same number — and every fixture here used to carry exactly
+  // one call, so nothing could tell them apart.
+  ['TWO calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(2)}],"text":"checking"}`, 2],
+  ['THREE calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(3)}],"text":"checking"}`, 3],
+  ['THREE calls after text', `{"status":"tool_calls","text":"checking","toolCalls":[${CALLS(3)}]}`, 0],
+  ['THREE calls and no text at all', `{"status":"tool_calls","toolCalls":[${CALLS(3)}]}`, 3],
 ]) {
   test(`the wrapper's key order decides production order: ${label}`, () => {
     const parsed = parseBackendOutput(ORDER_REQUEST, raw);
@@ -297,20 +305,69 @@ for (const [label, raw, expected] of [
   });
 }
 
-test('the extractor emits in the order the flag reports', async () => {
-  // The flag is only worth anything if the STREAM agrees with it, so drive the
-  // shipped extractor over the same two wrappers and compare.
-  const { ToolCallDeltaExtractor } = await import('../dist/proxy/tool-call-stream.js');
-  const firstKinds = (raw) => {
-    const extractor = new ToolCallDeltaExtractor();
-    const kinds = [];
-    for (const chunk of raw.match(/.{1,8}/g) ?? []) {
-      for (const event of extractor.push(chunk)) {
-        if (kinds[kinds.length - 1] !== event.type) kinds.push(event.type);
+test('the ordinal is the CALL COUNT, not a fixed one', () => {
+  // The ordinal says how many calls came before the narration, so on a
+  // calls-first wrapper it has to track the array's length. Read as a constant
+  // it puts the text after the FIRST call, which is an order the turn never
+  // had — and no single-call fixture can see the difference.
+  const ordinals = [];
+  for (let count = 1; count <= 4; count += 1) {
+    const parsed = parseBackendOutput(
+      ORDER_REQUEST,
+      `{"status":"tool_calls","toolCalls":[${CALLS(count)}],"text":"checking"}`,
+    );
+    assert.equal(parsed.toolCalls.length, count, 'the wrapper carried the calls it claims');
+    assert.equal(parsed.textOrdinal ?? 0, count, `${count} calls came before the narration`);
+    ordinals.push(parsed.textOrdinal ?? 0);
+  }
+  assert.deepEqual(ordinals, [1, 2, 3, 4]);
+  // CONTROL: a constant would satisfy the count-1 case alone, so the values
+  // must actually differ across the four.
+  assert.equal(new Set(ordinals).size, 4, 'the ordinal moved with the call count');
+});
+
+// The flag is only worth anything if the STREAM agrees with it. This drove the
+// shipped extractor at ONE chunk size — eight characters — and passed while a
+// backend that delivered the same wrapper in a single delta streamed the turn
+// in the opposite order from the buffered body this file measures above. A
+// fixed arrangement cannot establish a property that holds for any arrangement,
+// so the comparison runs at every chunk size the wrapper admits.
+for (const [label, raw] of [
+  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`],
+  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`],
+]) {
+  test(`the extractor emits in the order the flag reports, at every chunking: ${label}`, async () => {
+    const { ToolCallDeltaExtractor } = await import('../dist/proxy/tool-call-stream.js');
+    const firstKind = (chunkSize) => {
+      const extractor = new ToolCallDeltaExtractor();
+      for (let at = 0; at < raw.length; at += chunkSize) {
+        for (const event of extractor.push(raw.slice(at, at + chunkSize))) return event.type;
       }
+      return null;
+    };
+    // What the buffered body says came first, read off the very flag under test.
+    const buffered = (parseBackendOutput(ORDER_REQUEST, raw).textOrdinal ?? 0) > 0
+      ? 'tool_call_delta'
+      : 'text_delta';
+    const disagreed = [];
+    for (let size = 1; size <= raw.length; size += 1) {
+      if (firstKind(size) !== buffered) disagreed.push(size);
     }
-    return kinds;
-  };
-  assert.equal(firstKinds(`{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`)[0], 'text_delta');
-  assert.equal(firstKinds(`{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`)[0], 'tool_call_delta');
+    assert.deepEqual(
+      disagreed,
+      [],
+      `chunk sizes where the stream contradicted the buffered body (of ${raw.length}): ${disagreed.join(',')}`,
+    );
+    assert.equal(firstKind(raw.length), buffered, 'the whole wrapper in ONE delta');
+  });
+}
+
+test('CONTROL: the two key orders report opposite flags', () => {
+  // The sweep above compares the stream against the flag, so a flag stuck on
+  // one answer would satisfy it twice over. These are the same parts in the
+  // opposite key order, and they must not read alike.
+  const textFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`);
+  const callsFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`);
+  assert.equal(textFirst.textOrdinal ?? 0, 0);
+  assert.equal(callsFirst.textOrdinal ?? 0, 1);
 });

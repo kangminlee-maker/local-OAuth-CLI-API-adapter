@@ -6,6 +6,7 @@ import type {
   NormalizedRequest,
 } from './types.js';
 import { estimateTokens } from './types.js';
+import { wrapperCallsPrecedeText } from './tool-call-stream.js';
 
 interface BuildPromptOptions {
   readonly includeInstructionMessages?: boolean;
@@ -93,14 +94,13 @@ export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
  * The wrapper's own key order is the artifact both paths see — the streamed
  * extractor decodes it left to right, and the buffered parse has the whole
  * string — so it is what decides, rather than one path's incidental timing.
- * The wrapper holds its calls in one array and its narration in one field, so
- * it can only say all-before or all-after; a backend that can genuinely
- * interleave reports the count itself.
+ * Both readings go through `wrapperCallsPrecedeText`, the single rule: while
+ * the extractor kept a rule of its own — emit whatever the incremental decoder
+ * produced first — the two agreed only for some chunkings of the wrapper, and
+ * a backend that delivered it in one delta made them contradict each other.
  */
 function wrapperTextOrdinal(raw: string, callCount: number): number {
-  const calls = raw.indexOf('"toolCalls"');
-  const narration = raw.indexOf('"text"');
-  return calls !== -1 && (narration === -1 || calls < narration) ? callCount : 0;
+  return wrapperCallsPrecedeText(raw) ? callCount : 0;
 }
 
 export function parseBackendOutput(
