@@ -2069,9 +2069,9 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
         images: flattened.images,
         ...(flattened.tool ? { tool: flattened.tool } : {}),
       },
-      // Emptiness is measured ONCE, on the content the client sent, by the
-      // function the shape validator measures it with.
-      empty: contributesNothing(msg.content),
+      // Emptiness is what the item gives a BACKEND, judged after flattening:
+      // no text, no picture, no tool part.
+      empty: contributesNothing(flattened),
     };
   });
   return items
@@ -2085,20 +2085,27 @@ interface AnthropicTurnItem {
 }
 
 /**
- * Nothing for a backend to say — judged the way `refuseAnthropicMessageShape`
- * judges it, from the CONTENT THE CLIENT SENT.
+ * Nothing for a backend to say: no text, no picture, no tool part.
  *
- * It used to be `content.trim() === ''` on the flattened TEXT, and the two
- * disagreed: `anthropicContentLength('   ')` is 3, so the validator accepts
- * `[user:'   ', user:'PING']` as a run with content — and the merge then erased
- * the three spaces as if the item were empty, dropping a body the validator had
- * just called non-empty. One question, one answer: whatever the validator
- * counts as content is content here too. The images and the tool turn no longer
- * need a clause of their own — a block carrying either is a block, and the
- * length counts it.
+ * This is deliberately NOT the validator's measure. The validator counts the
+ * client's blocks to decide REFUSAL, and by that count `'   '` is three
+ * characters of content — which is right, and why `[user:'   ', user:'PING']`
+ * is accepted. This asks a different question: does the item give a backend
+ * anything to say? Whitespace does, so it survives; a `[{type:'text',text:''}]`
+ * item, or a lone `thinking` block, does not.
+ *
+ * It used to be `content.trim() === ''`, which answered THIS question but threw
+ * the whitespace away with it. Then it became the validator's length, which
+ * kept the whitespace but stopped absorbing the genuinely empty items — and put
+ * back the leading turn the client never sent that `isAbsorbedEmptyItem` exists
+ * to remove. The rule is the flattened message without the `trim()`.
  */
-function contributesNothing(content: unknown): boolean {
-  return anthropicContentLength(content) === 0;
+function contributesNothing(flattened: {
+  readonly text: string;
+  readonly images: readonly unknown[];
+  readonly tool?: unknown;
+}): boolean {
+  return flattened.text === '' && flattened.images.length === 0 && flattened.tool === undefined;
 }
 
 /**

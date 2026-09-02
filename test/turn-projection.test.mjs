@@ -238,6 +238,20 @@ const EMPTINESS_ROWS = [
     { role: 'user', content: 'ONE' },
     { role: 'user', content: 'TWO' },
   ], ['ONE', 'TWO']],
+  // The other half of the same question. Keeping the whitespace by adopting
+  // the VALIDATOR's measure went too wide: the validator counts blocks to
+  // decide refusal, so a `[{text:''}]` item counts as one block and stopped
+  // being absorbed — putting back the leading turn the client never sent that
+  // this merge exists to remove. Emptiness here is what the item gives a
+  // BACKEND, which whitespace does and an empty block does not.
+  ['an item whose only block is empty text is absorbed', [
+    { role: 'user', content: [{ type: 'text', text: '' }] },
+    { role: 'user', content: 'PING' },
+  ], ['PING']],
+  ['an item whose only block is thinking is absorbed', [
+    { role: 'assistant', content: [{ type: 'thinking', thinking: 'hmm', signature: 's' }] },
+    { role: 'assistant', content: 'ANSWER' },
+  ], ['ANSWER']],
 ];
 
 for (const [label, messages, expected] of EMPTINESS_ROWS) {
