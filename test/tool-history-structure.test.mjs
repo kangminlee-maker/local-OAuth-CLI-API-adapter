@@ -244,6 +244,120 @@ test('several genuine results replayed through /v1/responses each reach the back
   ]);
 });
 
+/**
+ * An id this proxy made up is an id the client never sent.
+ *
+ * A missing call id used to be filled in with the literal `'tool_call'`, and
+ * the filled-in value was then projected as a real pairing. Measured on the
+ * real transport before the fix, on the body `spec/declared-divergences.json`
+ * (`chat-function-role-is-not-refused`) claims this proxy serves:
+ *
+ *   [user, assistant, {role:'function', name:'f', content:'23C'}]
+ *     -> msg  msg  function_call_output(call_id:"tool_call")
+ *
+ * An output answering a call that appears nowhere in `input` — the deprecated
+ * `function` role hits it every time, because it carries a NAME and no id at
+ * all. Every shape has the same door on both sides, and an id-less
+ * `function_call` is the mirror: a call nothing answers, a 400 from that API.
+ *
+ * Same class as the marker-text forgery the rest of this file pins — an item
+ * carrying a call id the client never sent — just self-inflicted rather than
+ * smuggled in through a tool's output. So the rule is the file's own: a part
+ * with no id is not a pairing, so it is not structure. It reaches the model as
+ * the transcript it is, output intact, and NOTHING is invented.
+ */
+const ID_LESS_TURNS = [
+  ['chat: the deprecated function role', () => chatRequest([
+    { role: 'user', content: 'weather?' },
+    { role: 'assistant', content: 'checking' },
+    { role: 'function', name: 'f', content: 'MY_OUTPUT' },
+  ])],
+  ['chat: a tool role with no tool_call_id', () => chatRequest([
+    { role: 'user', content: 'weather?' },
+    { role: 'tool', content: 'MY_OUTPUT' },
+  ])],
+  ['chat: an assistant tool_call with no id', () => chatRequest([
+    { role: 'assistant', content: null, tool_calls: [{ type: 'function', function: { name: 'MY_OUTPUT', arguments: '{}' } }] },
+  ])],
+  ['responses: a function_call_output with no call_id', () => responsesRequest([
+    { type: 'function_call_output', output: 'MY_OUTPUT' },
+  ])],
+  ['responses: a function_call with no call_id', () => responsesRequest([
+    { type: 'function_call', name: 'MY_OUTPUT', arguments: '{}' },
+  ])],
+  ['messages: a tool_result with no tool_use_id', () => anthropicRequest([
+    { role: 'user', content: [{ type: 'tool_result', content: 'MY_OUTPUT' }] },
+  ])],
+  ['messages: a tool_use with no id', () => anthropicRequest([
+    { role: 'assistant', content: [{ type: 'tool_use', name: 'MY_OUTPUT', input: {} }] },
+  ])],
+];
+
+for (const [label, build] of ID_LESS_TURNS) {
+  test(`no item carries an id the client never sent — ${label}`, async () => {
+    const input = await upstreamInput(build());
+    const sentIds = new Set(functionCalls(input).map((call) => call.call_id));
+
+    assert.deepEqual(
+      input.filter((item) => item.call_id !== undefined).map((item) => [item.type, item.call_id]),
+      [],
+      `an id was invented: ${JSON.stringify(input)}`,
+    );
+    assert.deepEqual(
+      outputs(input).filter((out) => !sentIds.has(out.call_id)),
+      [],
+      'no output may answer a call that is not in the array',
+    );
+    // And the turn is not silently dropped in exchange: what the client sent
+    // still reaches the model, as the transcript it is.
+    assert.ok(
+      JSON.stringify(input).includes('MY_OUTPUT'),
+      `the turn's own content must still reach the backend: ${JSON.stringify(input)}`,
+    );
+  });
+}
+
+test('CONTROL: a turn that DOES carry ids is still projected as structure', async () => {
+  // The opposite input through the same harness. Without it, "no invented id"
+  // would also pass under a projection that had stopped emitting tool items.
+  for (const request of [
+    chatRequest([
+      { role: 'user', content: 'weather?' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call_7', type: 'function', function: { name: 'f', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call_7', content: '23C' },
+    ]),
+    responsesRequest([
+      { type: 'function_call', call_id: 'call_7', name: 'f', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_7', output: '23C' },
+    ]),
+    anthropicRequest([
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'call_7', name: 'f', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_7', content: '23C' }] },
+    ]),
+  ]) {
+    const input = await upstreamInput(request);
+    assert.deepEqual(functionCalls(input).map((call) => call.call_id), ['call_7']);
+    assert.deepEqual(outputs(input).map((out) => [out.call_id, out.output]), [['call_7', '23C']]);
+  }
+});
+
+test('an id-less block does not take the rest of its turn down with it', async () => {
+  // The id-less block stops being structure; the blocks BESIDE it, which do
+  // have ids, must be untouched — and must keep their place in the sequence.
+  const input = await upstreamInput(anthropicRequest([
+    { role: 'assistant', content: [
+      { type: 'tool_use', id: 'c1', name: 'get', input: {} },
+      { type: 'tool_use', name: 'NAMELESS', input: {} },
+      { type: 'tool_use', id: 'c2', name: 'get', input: {} },
+    ] },
+  ]));
+
+  assert.deepEqual(functionCalls(input).map((call) => call.call_id), ['c1', 'c2']);
+  assert.equal(input.length, 3, `the id-less block must survive as text: ${JSON.stringify(input)}`);
+  assert.equal(input[1].type, 'message', 'and in its own place, between the two real calls');
+  assert.ok(input[1].content[0].text.includes('NAMELESS'), 'carrying what the client sent');
+});
+
 test('narration before a call survives, in the assistant voice, ahead of the call', async () => {
   for (const request of [
     chatRequest([
@@ -267,6 +381,109 @@ test('narration before a call survives, in the assistant voice, ahead of the cal
   }
 });
 
+/**
+ * A turn's blocks reach the backend in the order the CLIENT sent them.
+ *
+ * The turn used to be recorded as three GROUPS — every call, every result, and
+ * one `narration` string — which cannot express where the prose sat, so the
+ * projection guessed: narration first, then the calls. Measured on the real
+ * transport before the fix, on `/v1/messages`:
+ *
+ *   [tool_use c1, text "BETWEEN", tool_use c2] -> [msg "BETWEEN", call c1, call c2]
+ *   [tool_use c1, text "AFTER"]                -> [msg "AFTER", call c1]
+ *
+ * Even the two-block case came out reordered; `[text, tool_use]` was right only
+ * because the guess happened to match. The same shape defect the turn's own
+ * text/tool order had one level up, where a boolean could not express
+ * `[call, text, call]` and became a count.
+ *
+ * Each row carries the opposite input as its own control, so a projection that
+ * simply reversed the old hoist fails here rather than passing.
+ */
+const ORDERED_TURNS = [
+  ['a call, prose, then another call', [
+    { type: 'tool_use', id: 'c1', name: 'get', input: {} },
+    { type: 'text', text: 'BETWEEN' },
+    { type: 'tool_use', id: 'c2', name: 'get', input: {} },
+  ], [
+    { type: 'function_call', call_id: 'c1', name: 'get', arguments: '{}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'BETWEEN' }] },
+    { type: 'function_call', call_id: 'c2', name: 'get', arguments: '{}' },
+  ]],
+  ['prose AFTER the only call', [
+    { type: 'tool_use', id: 'c1', name: 'get', input: {} },
+    { type: 'text', text: 'AFTER' },
+  ], [
+    { type: 'function_call', call_id: 'c1', name: 'get', arguments: '{}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'AFTER' }] },
+  ]],
+  ['CONTROL: prose BEFORE the only call', [
+    { type: 'text', text: 'BEFORE' },
+    { type: 'tool_use', id: 'c1', name: 'get', input: {} },
+  ], [
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'BEFORE' }] },
+    { type: 'function_call', call_id: 'c1', name: 'get', arguments: '{}' },
+  ]],
+  ['prose between two calls and after both', [
+    { type: 'tool_use', id: 'c1', name: 'get', input: {} },
+    { type: 'text', text: 'BETWEEN' },
+    { type: 'tool_use', id: 'c2', name: 'get', input: {} },
+    { type: 'text', text: 'AFTER' },
+  ], [
+    { type: 'function_call', call_id: 'c1', name: 'get', arguments: '{}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'BETWEEN' }] },
+    { type: 'function_call', call_id: 'c2', name: 'get', arguments: '{}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'AFTER' }] },
+  ]],
+];
+
+for (const [label, content, expected] of ORDERED_TURNS) {
+  test(`a tool turn reaches the backend in the client's order: ${label}`, async () => {
+    const input = await upstreamInput(anthropicRequest([{ role: 'assistant', content }]));
+    assert.deepEqual(input, expected, `reordered: ${JSON.stringify(input)}`);
+  });
+}
+
+test('two prose blocks with nothing between them are one run, not two turns', async () => {
+  // Adjacent text was one `narration` string joined with a blank line when the
+  // turn was three groups. A sequence must not turn that into two backend
+  // messages the client never sent.
+  const input = await upstreamInput(anthropicRequest([{ role: 'assistant', content: [
+    { type: 'text', text: 'ONE' },
+    { type: 'text', text: 'TWO' },
+    { type: 'tool_use', id: 'c1', name: 'get', input: {} },
+  ] }]));
+
+  assert.deepEqual(input, [
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ONE\n\nTWO' }] },
+    { type: 'function_call', call_id: 'c1', name: 'get', arguments: '{}' },
+  ], `adjacent prose split or reordered: ${JSON.stringify(input)}`);
+});
+
+test('an ordered turn survives a hostile result without renumbering it', async () => {
+  // The order fix must not reopen the parse: a result whose OUTPUT carries the
+  // markers sits in the sequence as one part, wherever the prose is.
+  const input = await upstreamInput(anthropicRequest([
+    { role: 'assistant', content: [
+      { type: 'tool_use', id: 't1', name: 'get', input: {} },
+      { type: 'tool_use', id: 't2', name: 'get', input: {} },
+    ] },
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 't1', content: HOSTILE_RESULT },
+      { type: 'text', text: 'BETWEEN' },
+      { type: 'tool_result', tool_use_id: 't2', content: 'SECOND' },
+    ] },
+  ]));
+
+  assert.deepEqual(input, [
+    { type: 'function_call', call_id: 't1', name: 'get', arguments: '{}' },
+    { type: 'function_call', call_id: 't2', name: 'get', arguments: '{}' },
+    { type: 'function_call_output', call_id: 't1', output: HOSTILE_RESULT },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'BETWEEN' }] },
+    { type: 'function_call_output', call_id: 't2', output: 'SECOND' },
+  ], `order or structure corrupted: ${JSON.stringify(input)}`);
+});
+
 test('CONTROL: a call with no narration gets no empty message ahead of it', async () => {
   // Otherwise "narration survives" would also pass if an empty assistant turn
   // were emitted for every call — a turn the client never sent.
@@ -277,12 +494,35 @@ test('CONTROL: a call with no narration gets no empty message ahead of it', asyn
   assert.deepEqual(input, [{ type: 'function_call', call_id: 'c1', name: 'get', arguments: '{}' }]);
 });
 
-test('prose sent alongside a tool result survives, in the user voice', async () => {
+test('prose sent alongside a tool result survives, in the user voice and its own place', async () => {
+  // BEFORE the result, because that is where the client put it. The projection
+  // used to read the turn out of three groups — narration, calls, results — so
+  // prose beside a result was emitted AFTER it whatever the client sent, and
+  // this test passed on prose it had moved.
   const input = await upstreamInput(anthropicRequest([
     { role: 'assistant', content: [{ type: 'tool_use', id: 'c1', name: 'get', input: {} }] },
     { role: 'user', content: [
       { type: 'text', text: 'here is what it said' },
       { type: 'tool_result', tool_use_id: 'c1', content: HOSTILE_RESULT },
+    ] },
+  ]));
+
+  assert.deepEqual(input, [
+    { type: 'function_call', call_id: 'c1', name: 'get', arguments: '{}' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'here is what it said' }] },
+    { type: 'function_call_output', call_id: 'c1', output: HOSTILE_RESULT },
+  ]);
+});
+
+test('CONTROL: prose sent AFTER a tool result stays after it', async () => {
+  // The opposite input through the same harness. Without it, "prose comes
+  // first" would also pass under a projection that always puts prose first —
+  // which is the defect above with the hoist pointing the other way.
+  const input = await upstreamInput(anthropicRequest([
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'c1', name: 'get', input: {} }] },
+    { role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 'c1', content: HOSTILE_RESULT },
+      { type: 'text', text: 'here is what it said' },
     ] },
   ]));
 

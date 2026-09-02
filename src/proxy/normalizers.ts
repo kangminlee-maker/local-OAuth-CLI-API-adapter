@@ -1,4 +1,4 @@
-import { ASSISTANT_TOOL_CALL_MARKER, TOOL_RESULT_MARKER } from './tool-history-markers.js';
+import { TOOL_RESULT_MARKER } from './tool-history-markers.js';
 import { fileURLToPath } from 'node:url';
 import type {
   LocalToolCall,
@@ -11,6 +11,7 @@ import type {
   NormalizedThinking,
   NormalizedTool,
   NormalizedToolChoice,
+  NormalizedToolPart,
   NormalizedToolResult,
   NormalizedToolTurn,
   NormalizedVerbosity,
@@ -29,15 +30,22 @@ interface NormalizedContent {
 }
 
 /**
- * How a replayed Responses item that is not a message, a `function_call`, a
- * `function_call_output` or a `reasoning` item is written into the prompt.
+ * The two prompt literals this module is the only writer of.
  *
- * Deliberately NOT in `tool-history-markers.ts`. That module holds the two
- * literals that TWO writers have to agree on — this normalizer and the image
- * labeller in `multimodal.ts`. This one has exactly one writer, so it stays
- * here. Nothing parses any of them back, which is what keeps a record's own
- * text from forging a tool-result boundary.
+ * `tool-history-markers.ts` holds the one literal that TWO writers have to
+ * agree on — this normalizer and the image labeller in `multimodal.ts` both
+ * write `[tool result]`. These have exactly one writer each, so they live with
+ * that writer. `ASSISTANT_TOOL_CALL_MARKER` moved here when the last reader of
+ * the grammar was removed and `multimodal.ts` turned out never to have written
+ * it; a shared module for a literal nobody else writes is a shared name for a
+ * private thing.
+ *
+ * `ASSISTANT_TOOL_CALL_MARKER` opens a turn's tool CALL; `REPLAYED_ITEM_LABEL`
+ * opens a replayed Responses item that is not a message, a `function_call`, a
+ * `function_call_output` or a `reasoning` item. Nothing parses either back,
+ * which is what keeps a record's own text from forging a tool-result boundary.
  */
+const ASSISTANT_TOOL_CALL_MARKER = '[assistant tool_call]';
 const REPLAYED_ITEM_LABEL = '[replayed item]';
 
 // The top-level keys the direct Chat Completions API knows, measured
@@ -2055,20 +2063,42 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
     const msg = asRecord(item) as Record<string, unknown>;
     const flattened = flattenAnthropicMessage(msg);
     return {
-      role: msg.role as NormalizedMessage['role'],
-      content: flattened.text,
-      images: flattened.images,
-      ...(flattened.tool ? { tool: flattened.tool } : {}),
+      message: {
+        role: msg.role as NormalizedMessage['role'],
+        content: flattened.text,
+        images: flattened.images,
+        ...(flattened.tool ? { tool: flattened.tool } : {}),
+      },
+      // Emptiness is measured ONCE, on the content the client sent, by the
+      // function the shape validator measures it with.
+      empty: contributesNothing(msg.content),
     };
   });
-  return items.filter((item, index) => !isAbsorbedEmptyItem(items, index));
+  return items
+    .filter((_item, index) => !isAbsorbedEmptyItem(items, index))
+    .map((item) => item.message);
 }
 
-/** Nothing for a backend to say: no text, no image, no tool turn. */
-function contributesNothing(message: NormalizedMessage): boolean {
-  return message.content.trim() === ''
-    && message.images.length === 0
-    && message.tool === undefined;
+interface AnthropicTurnItem {
+  readonly message: NormalizedMessage;
+  readonly empty: boolean;
+}
+
+/**
+ * Nothing for a backend to say — judged the way `refuseAnthropicMessageShape`
+ * judges it, from the CONTENT THE CLIENT SENT.
+ *
+ * It used to be `content.trim() === ''` on the flattened TEXT, and the two
+ * disagreed: `anthropicContentLength('   ')` is 3, so the validator accepts
+ * `[user:'   ', user:'PING']` as a run with content — and the merge then erased
+ * the three spaces as if the item were empty, dropping a body the validator had
+ * just called non-empty. One question, one answer: whatever the validator
+ * counts as content is content here too. The images and the tool turn no longer
+ * need a clause of their own — a block carrying either is a block, and the
+ * length counts it.
+ */
+function contributesNothing(content: unknown): boolean {
+  return anthropicContentLength(content) === 0;
 }
 
 /**
@@ -2087,14 +2117,14 @@ function contributesNothing(message: NormalizedMessage): boolean {
  * too (an empty trailing `assistant` item is a prefill the direct API accepts —
  * matrix §5.5.7 `assistant` 빈 턴).
  */
-function isAbsorbedEmptyItem(items: readonly NormalizedMessage[], index: number): boolean {
-  if (!contributesNothing(items[index])) return false;
-  const { role } = items[index];
+function isAbsorbedEmptyItem(items: readonly AnthropicTurnItem[], index: number): boolean {
+  if (!items[index].empty) return false;
+  const { role } = items[index].message;
   let start = index;
-  while (start > 0 && items[start - 1].role === role) start -= 1;
+  while (start > 0 && items[start - 1].message.role === role) start -= 1;
   let end = index;
-  while (end + 1 < items.length && items[end + 1].role === role) end += 1;
-  return items.slice(start, end + 1).some((sibling) => !contributesNothing(sibling));
+  while (end + 1 < items.length && items[end + 1].message.role === role) end += 1;
+  return items.slice(start, end + 1).some((sibling) => !sibling.empty);
 }
 
 function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMessage['role']): NormalizedContent {
@@ -2103,32 +2133,129 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
   // rather than the place it lives. The two used to be the same thing, so a
   // backend had to parse the rendering back — and could not tell this module's
   // markers from the same characters inside a tool's own output.
-  const calls: LocalToolCall[] = Array.isArray(msg.tool_calls)
-    ? msg.tool_calls.map((toolCall) => {
-        const call = asRecord(toolCall);
-        const fn = asRecord(call?.function);
-        return {
-          id: readString(call?.id, 'tool_call'),
-          name: readString(fn?.name, 'tool'),
-          arguments: typeof fn?.arguments === 'string' ? fn.arguments : JSON.stringify(fn?.arguments ?? {}),
-        };
-      })
-    : [];
-  const toolCalls = calls.map((call) => renderToolCall(call)).join('\n');
   if (role === 'tool') {
-    const toolCallId = typeof msg.tool_call_id === 'string' ? msg.tool_call_id : 'tool_call';
-    const result: NormalizedToolResult = { callId: toolCallId, output: content.text };
+    const callId = toolCallId(msg.tool_call_id);
+    // The deprecated `function` role lands here — it is a tool result, and it
+    // carries a function NAME and no call id at all. There is nothing to pair
+    // with, so it is not structure; see `unpairedToolResultText`.
+    if (callId === null) {
+      return {
+        text: unpairedToolResultText(content.text, readOptionalString(msg.name)),
+        images: content.images,
+      };
+    }
+    const result: NormalizedToolResult = {
+      callId,
+      output: content.text,
+      ...(content.images.length > 0 ? { images: content.images } : {}),
+    };
     return {
       text: renderToolResult(result),
       images: content.images,
-      tool: { calls: [], results: [result], narration: '' },
+      tool: { parts: [{ kind: 'result', result }] },
     };
   }
+  // This shape holds the prose and the calls in two separate MEMBERS, so their
+  // order is the schema's rather than the client's: `content` first, then
+  // `tool_calls`. That is the sequence recorded.
+  const parts: NormalizedToolPart[] = [];
+  appendToolText(parts, content.text);
+  const rendered: string[] = [];
+  for (const toolCall of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+    const raw = asRecord(toolCall);
+    const fn = asRecord(raw?.function);
+    const name = readString(fn?.name, 'tool');
+    const args = typeof fn?.arguments === 'string' ? fn.arguments : JSON.stringify(fn?.arguments ?? {});
+    const id = toolCallId(raw?.id);
+    if (id === null) {
+      // Into the SEQUENCE, not only into `text`. A backend that has items
+      // projects the sequence and never reads `content`, so a block left out of
+      // it vanishes on that path — silently, and only when the turn also had a
+      // block that DID have an id, which is why it takes a mixed turn to see.
+      const unpaired = unpairedToolCallText(name, args);
+      appendToolText(parts, unpaired);
+      rendered.push(unpaired);
+      continue;
+    }
+    const call: LocalToolCall = { id, name, arguments: args };
+    parts.push({ kind: 'call', call });
+    rendered.push(renderToolCall(call));
+  }
   return {
-    text: [content.text, toolCalls].filter(Boolean).join('\n\n'),
+    text: [content.text, rendered.join('\n')].filter(Boolean).join('\n\n'),
     images: content.images,
-    ...(calls.length > 0 ? { tool: { calls, results: [], narration: content.text } } : {}),
+    ...toolTurnOf(parts),
   };
+}
+
+/**
+ * A tool part's own call id, or `null` where the client sent none.
+ *
+ * A missing id used to be filled in with the literal `'tool_call'`, and the
+ * filled-in value was then treated as structure — so an id NOBODY SENT reached
+ * the backend as a real pairing. Measured on the real transport:
+ * `[user, assistant, {role:'function', name:'f', content:'23C'}]` arrived as a
+ * `function_call_output` with `call_id: "tool_call"` answering a call that
+ * appears nowhere in `input`. The deprecated `function` role hits this every
+ * time, because it carries a NAME and no id at all — but every shape has the
+ * same door, on both sides: an id-less `function_call` is a call nothing
+ * answers, which is a 400 from that API.
+ *
+ * It is the same fault as the marker-text forgery this module already closed —
+ * an item carrying a call id the client never sent — arriving by a different
+ * door, and self-inflicted rather than smuggled in. Nothing may be invented
+ * here: a part with no id is not a pairing, so it is not structure.
+ */
+function toolCallId(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null;
+}
+
+/**
+ * A tool call or result with no id to pair it with, written as TEXT and nothing
+ * else — no `tool` field, so no backend builds an item from it.
+ *
+ * The turn still reaches the model whole, in the tool's own voice and under the
+ * marker that says whose output it is; what it no longer carries is a call id
+ * this proxy made up. The alternatives both invent MORE: fabricating a matching
+ * `function_call` invents an assistant turn the model never took, and refusing
+ * the body would take back what the `chat-function-role-is-not-refused`
+ * divergence exists for — the backends can serve this turn.
+ */
+function unpairedToolCallText(name: string, args: string): string {
+  return [ASSISTANT_TOOL_CALL_MARKER, `name: ${name}`, `arguments: ${args}`].join('\n');
+}
+
+function unpairedToolResultText(output: string, name?: string): string {
+  return [TOOL_RESULT_MARKER, ...(name ? [`name: ${name}`] : []), output].join('\n');
+}
+
+/**
+ * The turn, or nothing — presence is the provenance signal.
+ *
+ * A sequence of pure text is not a tool turn: the field would tell the codex
+ * transport to rebuild ordinary prose as tool items, which is the defect the
+ * field exists to prevent, pointing the other way.
+ */
+function toolTurnOf(parts: readonly NormalizedToolPart[]): { tool?: NormalizedToolTurn } {
+  return parts.some((part) => part.kind !== 'text') ? { tool: { parts } } : {};
+}
+
+/**
+ * Adds a run of prose, joining it to the run before it.
+ *
+ * Adjacent text blocks were one `narration` string joined with a blank line
+ * when the turn was three groups; keeping them one part keeps that rendering
+ * and keeps "a text part is a RUN" true, so a projection never has to decide
+ * how to space two neighbours.
+ */
+function appendToolText(parts: NormalizedToolPart[], text: string): void {
+  if (!text) return;
+  const last = parts[parts.length - 1];
+  if (last?.kind === 'text') {
+    parts[parts.length - 1] = { kind: 'text', text: `${last.text}\n\n${text}` };
+    return;
+  }
+  parts.push({ kind: 'text', text });
 }
 
 /** The one place a call is written as text; nothing reads it back. */
@@ -2182,26 +2309,30 @@ function renderToolResult(result: NormalizedToolResult): string {
 function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedContent | null {
   if (msg.type === 'function_call_output') {
     const output = flattenOpenAiContent(msg.output);
+    const text = output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? ''));
+    const callId = toolCallId(msg.call_id);
+    if (callId === null) return { text: unpairedToolResultText(text), images: output.images };
     const result: NormalizedToolResult = {
-      callId: readString(msg.call_id, 'tool_call'),
-      output: output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? '')),
+      callId,
+      output: text,
+      ...(output.images.length > 0 ? { images: output.images } : {}),
     };
     return {
       text: renderToolResult(result),
       images: output.images,
-      tool: { calls: [], results: [result], narration: '' },
+      tool: { parts: [{ kind: 'result', result }] },
     };
   }
   if (msg.type === 'function_call') {
-    const call: LocalToolCall = {
-      id: readString(msg.call_id, 'tool_call'),
-      name: readString(msg.name, 'tool'),
-      arguments: typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {}),
-    };
+    const name = readString(msg.name, 'tool');
+    const args = typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {});
+    const id = toolCallId(msg.call_id);
+    if (id === null) return { text: unpairedToolCallText(name, args), images: [] };
+    const call: LocalToolCall = { id, name, arguments: args };
     return {
       text: renderToolCall(call),
       images: [],
-      tool: { calls: [call], results: [], narration: '' },
+      tool: { parts: [{ kind: 'call', call }] },
     };
   }
   // Keyed on the item's KIND, never on whether it happens to carry a `content`
@@ -2222,18 +2353,19 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
   const value = msg.content;
   if (!Array.isArray(value)) return flattenAnthropicContent(value);
   const images: NormalizedImage[] = [];
-  const calls: LocalToolCall[] = [];
-  const results: NormalizedToolResult[] = [];
-  const narration: string[] = [];
+  // This shape lists its blocks in ONE array, so the client's own order is
+  // readable — and is what the turn records. Bucketing the blocks by kind threw
+  // it away: `[tool_use, text, tool_use]` came out as text-then-both-calls.
+  const parts: NormalizedToolPart[] = [];
   const text = value.map((part) => {
     const block = asRecord(part);
     if (!block) {
       const rest = String(part ?? '');
-      if (rest) narration.push(rest);
+      appendToolText(parts, rest);
       return rest;
     }
     if (block.type === 'text' && typeof block.text === 'string') {
-      if (block.text) narration.push(block.text);
+      appendToolText(parts, block.text);
       return block.text;
     }
     if (block.type === 'image') {
@@ -2242,22 +2374,35 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
       return '';
     }
     if (block.type === 'tool_use') {
-      const call: LocalToolCall = {
-        id: readString(block.id, 'tool_call'),
-        name: readString(block.name, 'tool'),
-        arguments: JSON.stringify(block.input ?? {}),
-      };
-      calls.push(call);
+      const name = readString(block.name, 'tool');
+      const args = JSON.stringify(block.input ?? {});
+      const id = toolCallId(block.id);
+      if (id === null) {
+        const unpaired = unpairedToolCallText(name, args);
+        appendToolText(parts, unpaired);
+        return unpaired;
+      }
+      const call: LocalToolCall = { id, name, arguments: args };
+      parts.push({ kind: 'call', call });
       return renderToolCall(call);
     }
     if (block.type === 'tool_result') {
       const resultContent = flattenAnthropicContent(block.content);
       images.push(...resultContent.images);
+      const callId = toolCallId(block.tool_use_id);
+      if (callId === null) {
+        const unpaired = unpairedToolResultText(resultContent.text);
+        appendToolText(parts, unpaired);
+        return unpaired;
+      }
       const result: NormalizedToolResult = {
-        callId: readString(block.tool_use_id, 'tool_call'),
+        callId,
         output: resultContent.text,
+        // The very same image objects the message-level list holds, so a
+        // consumer that walks either one is looking at one picture, not a copy.
+        ...(resultContent.images.length > 0 ? { images: resultContent.images } : {}),
       };
-      results.push(result);
+      parts.push({ kind: 'result', result });
       return renderToolResult(result);
     }
     return '';
@@ -2266,13 +2411,7 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
   // function read, so a caller who types the same characters into a text block
   // is never mistaken for a tool turn — and neither is a tool whose own output
   // contains them, because that output is one result's `output`, not a boundary.
-  return {
-    text,
-    images,
-    ...(calls.length > 0 || results.length > 0
-      ? { tool: { calls, results, narration: narration.join('\n\n') } }
-      : {}),
-  };
+  return { text, images, ...toolTurnOf(parts) };
 }
 
 function flattenOpenAiContent(value: unknown): NormalizedContent {
