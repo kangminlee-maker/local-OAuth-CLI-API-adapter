@@ -24,13 +24,28 @@ export function buildPrompt(
   options: BuildPromptOptions = {},
 ): string {
   const includeInstructionMessages = options.includeInstructionMessages ?? true;
-  const messages = request.messages
-    .filter((message) => includeInstructionMessages || !isInstructionMessage(message))
-    .map((message) => [
-    `<${message.role}>`,
-    renderMessageContent(message),
-    `</${message.role}>`,
-  ].join('\n')).join('\n\n');
+  // `[image N]` is counted over the WHOLE request, because the array it names
+  // is: every backend that renders this prompt hoists the pictures with one
+  // flat walk of `request.messages`. Numbered per message instead, two turns
+  // carrying one picture each both said `[image 1]` — two different pictures,
+  // one name, and a model told `[image 1]` twice cannot tell which sentence is
+  // about which. The count runs over every message, including the instruction
+  // turns a caller may drop from the text: they carry no pictures, so dropping
+  // them cannot shift a number, and counting them keeps this walk and the
+  // hoisting walk the same walk.
+  let imageOrdinal = 0;
+  const rendered: string[] = [];
+  for (const message of request.messages) {
+    const firstImage = imageOrdinal;
+    imageOrdinal += (message.images ?? []).length;
+    if (!includeInstructionMessages && isInstructionMessage(message)) continue;
+    rendered.push([
+      `<${message.role}>`,
+      renderMessageContent(message, firstImage),
+      `</${message.role}>`,
+    ].join('\n'));
+  }
+  const messages = rendered.join('\n\n');
   return [
     modeInstructions(request),
     maxTokenInstruction(request),
@@ -359,9 +374,47 @@ function normalizeToolArgumentsText(value: string): string {
   }
 }
 
-function renderMessageContent(message: NormalizedMessage): string {
-  const imageReferences = (message.images ?? []).map(formatImageReference).join('\n');
-  return [imageReferences, message.content].filter(Boolean).join('\n');
+/**
+ * One message as prompt text, with each picture named WHERE it was sent.
+ *
+ * This runtime cannot interleave pictures with prose — every picture is hoisted
+ * ahead of the whole prompt and only a reference line can say where it sat — so
+ * every reference used to sit at the head of the message, ahead of all of its
+ * text. A caption written before its picture arrived after it, and two captions
+ * for two pictures arrived merged with both references in front of them.
+ *
+ * `firstImage` is where this message's pictures start in the REQUEST's flat
+ * list — the one the runtime is actually handed — so `[image N]` names the Nth
+ * picture the runtime received rather than the Nth of this message.
+ *
+ * A tool turn keeps the old shape. Its parts are calls and results whose text
+ * rendering lives in `content` and not in the sequence, so walking the sequence
+ * here would drop the turn's own words; its pictures are named by the tool-result
+ * labels instead, which say which call each one answers.
+ */
+function renderMessageContent(message: NormalizedMessage, firstImage: number): string {
+  const images = message.images ?? [];
+  if (images.length === 0) return message.content;
+  if (message.tool || !message.parts) {
+    const imageReferences = images
+      .map((image, index) => formatImageReference(image, firstImage + index))
+      .join('\n');
+    return [imageReferences, message.content].filter(Boolean).join('\n');
+  }
+  const positions = new Map<NormalizedImage, number>();
+  images.forEach((image, index) => positions.set(image, firstImage + index));
+  const lines: string[] = [];
+  for (const part of message.parts) {
+    if (part.kind === 'text') {
+      if (part.text) lines.push(part.text);
+    } else if (part.kind === 'image') {
+      const index = positions.get(part.image);
+      // A picture the message's own list does not hold has no number to give,
+      // and inventing one would name a picture the runtime never receives.
+      if (index !== undefined) lines.push(formatImageReference(part.image, index));
+    }
+  }
+  return lines.join('\n');
 }
 
 function isInstructionMessage(message: NormalizedMessage): boolean {
