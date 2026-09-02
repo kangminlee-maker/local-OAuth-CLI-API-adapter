@@ -268,17 +268,23 @@ test('narration that comes with a tool call survives the wrapper', () => {
     {
       text: '날씨를 확인하겠습니다.',
       toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"서울"}' }],
+      // The wrapper put its `text` key first, so the narration is one run
+      // before the call — stated, not left to a reader's default.
+      textRuns: [{ text: '날씨를 확인하겠습니다.', afterCalls: 0 }],
     },
   );
 });
 
 // Both ordered surfaces report a turn's parts in production order and read it
-// from `textOrdinal` — how many calls came before the narration. Only
+// from `textRuns` — where each run of the narration sits among the calls. Only
 // `CodexBackendTransport` ever set it, so the two backends that go through
 // `ToolCallDeltaExtractor` streamed `[call, text]` while their buffered body
 // said `[text, call]`. The wrapper's own key order is the artifact BOTH paths
 // see, so it is what decides. The wrapper holds one array and one text field,
-// so it can only say all-before (the call count) or all-after (0).
+// so the turn it describes has at most ONE run: all-before (the call count) or
+// all-after (0). A wrapper with no narration has no run at all — there is
+// nothing to place, and inventing one would put an empty block on a surface
+// that reports none.
 const ORDER_REQUEST = {
   shape: 'openai-responses', model: 'm', messages: [], stream: false, streamOptions: {},
   tools: [{ name: 'get_weather', description: 'w', parameters: {} }], toolChoice: { type: 'auto' }, raw: {},
@@ -286,22 +292,28 @@ const ORDER_REQUEST = {
 const CALL = '{"id":"c1","name":"get_weather","arguments":"{}"}';
 const CALLS = (n) => Array.from({ length: n }, (_, i) => `{"id":"c${i + 1}","name":"get_weather","arguments":"{}"}`).join(',');
 
+/** Where each run of the parsed turn's narration sits among its calls. */
+const runPositions = (parsed) => (parsed.textRuns ?? []).map((run) => run.afterCalls);
+
 for (const [label, raw, expected] of [
-  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`, 0],
-  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`, 1],
-  ['toolCalls with no text at all', `{"status":"tool_calls","toolCalls":[${CALL}]}`, 1],
-  ['text with no calls', '{"status":"message","text":"just talking"}', 0],
+  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`, [0]],
+  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`, [1]],
+  ['toolCalls with no text at all', `{"status":"tool_calls","toolCalls":[${CALL}]}`, []],
+  ['text with no calls', '{"status":"message","text":"just talking"}', []],
   // Above one call, "the number of calls that came first" and the constant 1
   // stop being the same number — and every fixture here used to carry exactly
   // one call, so nothing could tell them apart.
-  ['TWO calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(2)}],"text":"checking"}`, 2],
-  ['THREE calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(3)}],"text":"checking"}`, 3],
-  ['THREE calls after text', `{"status":"tool_calls","text":"checking","toolCalls":[${CALLS(3)}]}`, 0],
-  ['THREE calls and no text at all', `{"status":"tool_calls","toolCalls":[${CALLS(3)}]}`, 3],
+  ['TWO calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(2)}],"text":"checking"}`, [2]],
+  ['THREE calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(3)}],"text":"checking"}`, [3]],
+  ['THREE calls after text', `{"status":"tool_calls","text":"checking","toolCalls":[${CALLS(3)}]}`, [0]],
+  ['THREE calls and no text at all', `{"status":"tool_calls","toolCalls":[${CALLS(3)}]}`, []],
 ]) {
   test(`the wrapper's key order decides production order: ${label}`, () => {
     const parsed = parseBackendOutput(ORDER_REQUEST, raw);
-    assert.equal(parsed.textOrdinal ?? 0, expected);
+    assert.deepEqual(runPositions(parsed), expected);
+    // One run at most, and it carries the whole narration: the wrapper has one
+    // `text` field, so a parse that split it would be inventing structure.
+    assert.equal((parsed.textRuns ?? []).map((run) => run.text).join(''), parsed.textRuns ? parsed.text : '');
   });
 }
 
@@ -317,8 +329,8 @@ test('the ordinal is the CALL COUNT, not a fixed one', () => {
       `{"status":"tool_calls","toolCalls":[${CALLS(count)}],"text":"checking"}`,
     );
     assert.equal(parsed.toolCalls.length, count, 'the wrapper carried the calls it claims');
-    assert.equal(parsed.textOrdinal ?? 0, count, `${count} calls came before the narration`);
-    ordinals.push(parsed.textOrdinal ?? 0);
+    assert.deepEqual(runPositions(parsed), [count], `${count} calls came before the narration`);
+    ordinals.push(runPositions(parsed)[0]);
   }
   assert.deepEqual(ordinals, [1, 2, 3, 4]);
   // CONTROL: a constant would satisfy the count-1 case alone, so the values
@@ -346,7 +358,7 @@ for (const [label, raw] of [
       return null;
     };
     // What the buffered body says came first, read off the very flag under test.
-    const buffered = (parseBackendOutput(ORDER_REQUEST, raw).textOrdinal ?? 0) > 0
+    const buffered = (runPositions(parseBackendOutput(ORDER_REQUEST, raw))[0] ?? 0) > 0
       ? 'tool_call_delta'
       : 'text_delta';
     const disagreed = [];
@@ -368,6 +380,6 @@ test('CONTROL: the two key orders report opposite flags', () => {
   // opposite key order, and they must not read alike.
   const textFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`);
   const callsFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`);
-  assert.equal(textFirst.textOrdinal ?? 0, 0);
-  assert.equal(callsFirst.textOrdinal ?? 0, 1);
+  assert.deepEqual(runPositions(textFirst), [0]);
+  assert.deepEqual(runPositions(callsFirst), [1]);
 });

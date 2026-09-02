@@ -227,7 +227,7 @@ test('a tool-first turn streams its blocks in production order, not text first',
   const result = {
     id: 'x', model: 'configured-model', text: 'AAZZBB',
     toolCalls: [{ id: 'c1', name: 'f', arguments: '{"a":1}' }],
-    textOrdinal: 1,
+    textRuns: [{ text: 'AAZZBB', afterCalls: 1 }],
     usage: { inputTokens: 20, outputTokens: 4, source: 'provider' }, latencyMs: 1,
   };
   const be = {

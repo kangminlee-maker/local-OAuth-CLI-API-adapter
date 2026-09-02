@@ -1806,11 +1806,12 @@ test('text.verbosity is sent only when someone actually asked for it', async () 
   assert.deepEqual(sent.text, { format: { type: 'json_object' } }, 'json mode still carries its format, with no verbosity added');
 });
 
-// `textOrdinal` is DERIVED here, from the upstream's own event order, and this
-// is the only backend that can produce a turn the old boolean could not
-// describe: a call, then narration, then another call. A surface test that
-// hands the field to a stub proves the surfaces read it; only this proves
-// anything writes it.
+// `textRuns` is DERIVED here, from the upstream's own event order, and this is
+// the only backend that can produce a turn one position could not describe: a
+// call, then narration, then another call — and narration on BOTH SIDES of a
+// call, which a count could not carry either. A surface test that hands the
+// field to a stub proves the surfaces read it; only this proves anything
+// writes it.
 async function turnFor(events) {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse(events), { status: 200 });
@@ -1835,6 +1836,9 @@ const callDone = (outputIndex, n) => ({
   item: { type: 'function_call', id: `fc${n}`, call_id: `c${n}`, name: 'get_weather', arguments: '{}' },
 });
 
+/** The runs the transport recorded, as [text, calls before it] pairs. */
+const runsOf = (turn) => (turn.textRuns ?? []).map((run) => [run.text, run.afterCalls]);
+
 test('the transport reports the text position for a call/text/call turn', async () => {
   const turn = await turnFor([
     CREATED, callAdded(0, 1), callDone(0, 1),
@@ -1842,7 +1846,7 @@ test('the transport reports the text position for a call/text/call turn', async 
     callAdded(2, 2), callDone(2, 2), DONE,
   ]);
   assert.equal(turn.toolCalls.length, 2);
-  assert.equal(turn.textOrdinal, 1, 'one call came before the narration');
+  assert.deepEqual(runsOf(turn), [['BETWEEN', 1]], 'one call came before the narration');
 });
 
 test('the transport reports every call before the text as the full count', async () => {
@@ -1850,7 +1854,7 @@ test('the transport reports every call before the text as the full count', async
     CREATED, callAdded(0, 1), callDone(0, 1), callAdded(1, 2), callDone(1, 2),
     { type: 'response.output_text.delta', delta: 'AFTER' }, DONE,
   ]);
-  assert.equal(turn.textOrdinal, 2);
+  assert.deepEqual(runsOf(turn), [['AFTER', 2]]);
 });
 
 test('the transport reports text-first as no calls before it', async () => {
@@ -1858,5 +1862,44 @@ test('the transport reports text-first as no calls before it', async () => {
     CREATED, { type: 'response.output_text.delta', delta: 'FIRST' },
     callAdded(1, 1), callDone(1, 1), DONE,
   ]);
-  assert.equal(turn.textOrdinal ?? 0, 0);
+  assert.deepEqual(runsOf(turn), [['FIRST', 0]]);
+});
+
+test('the transport reports narration on BOTH SIDES of a call as two runs', async () => {
+  // The shape a COUNT could not carry: "how many calls precede THE text" names
+  // one position, and this turn's text has two. Read as a count the turn came
+  // back as `[text, tool_use]` buffered against a streamed
+  // `[text, tool_use, text]` — one turn, two orders, measured on this backend.
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'BEFORE ' },
+    callAdded(1, 1), callDone(1, 1),
+    { type: 'response.output_text.delta', delta: 'AFTER' }, DONE,
+  ]);
+  assert.equal(turn.toolCalls.length, 1);
+  assert.deepEqual(runsOf(turn), [['BEFORE ', 0], ['AFTER', 1]]);
+  assert.equal(turn.text, 'BEFORE AFTER', 'and the flat text is still every byte, in order');
+});
+
+test('the transport reports several runs among several calls', async () => {
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'A' },
+    callAdded(1, 1), callDone(1, 1),
+    { type: 'response.output_text.delta', delta: 'B' },
+    callAdded(3, 2), callDone(3, 2),
+    { type: 'response.output_text.delta', delta: 'C' }, DONE,
+  ]);
+  assert.deepEqual(runsOf(turn), [['A', 0], ['B', 1], ['C', 2]]);
+});
+
+test('deltas with no call between them are ONE run, not one per delta', async () => {
+  // They open one block on the wire, so they are one block in the body: a run
+  // per delta would report as many text blocks as the backend chose to chunk.
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'A' },
+    { type: 'response.output_text.delta', delta: 'B' },
+    callAdded(1, 1), callDone(1, 1),
+    { type: 'response.output_text.delta', delta: 'C' },
+    { type: 'response.output_text.delta', delta: 'D' }, DONE,
+  ]);
+  assert.deepEqual(runsOf(turn), [['AB', 0], ['CD', 1]]);
 });

@@ -41,7 +41,7 @@ function wrapperBackend(raw, chunkSize) {
       model: 'm',
       text: parsed.text,
       toolCalls: parsed.toolCalls,
-      ...(parsed.textOrdinal ? { textOrdinal: parsed.textOrdinal } : {}),
+      ...(parsed.textRuns ? { textRuns: parsed.textRuns } : {}),
       usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' },
       latencyMs: 1,
     };
@@ -140,9 +140,10 @@ test('the same wrapper reads identically however the backend chunks it', async (
   assert.deepEqual(JSON.parse(readings[0])[0], ['function_call', 'message']);
 });
 
-// A turn with SEVERAL calls before its narration is where the ordinal stops
-// being a boolean in disguise. `textOrdinal` is how many calls came first, and
-// with one call in the wrapper that number and the constant 1 are the same —
+// A turn with SEVERAL calls before its narration is where the run's position
+// stops being a boolean in disguise. `afterCalls` is how many calls came
+// first, and with one call in the wrapper that number and the constant 1 are
+// the same —
 // so a rule that reported 1 for every turn was indistinguishable from the
 // correct one on every fixture this repo had. On a two-call turn it is not:
 // the buffered body splits the calls around the text and reports

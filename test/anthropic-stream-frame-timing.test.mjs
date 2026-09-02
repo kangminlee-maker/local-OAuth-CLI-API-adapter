@@ -29,7 +29,7 @@ const PARTIAL = '{"city":';
 const TOOLS = [{ name: 'get_weather', description: 'w', input_schema: PARAMS }];
 const HEADERS = { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' };
 const USAGE = { inputTokens: 1, outputTokens: 1, source: 'estimated' };
-const result = (over) => ({ id: 'r', model: 'm', text: '', toolCalls: [], textOrdinal: 0, usage: USAGE, latencyMs: 1, ...over });
+const result = (over) => ({ id: 'r', model: 'm', text: '', toolCalls: [], usage: USAGE, latencyMs: 1, ...over });
 
 // The call whose arguments the backend starts and never declares finished: its
 // block is open, and only something else can close it.
@@ -284,7 +284,7 @@ async function atTheBarrier(steps, run) {
       // Read by the tests: the frames they assert on were on the wire while
       // this was still false.
       turn.advanced = true;
-      yield { type: 'completed', result: result({ text: 'narration', toolCalls: [CALL_A], textOrdinal: 1 }) };
+      yield { type: 'completed', result: result({ text: 'narration', toolCalls: [CALL_A], textRuns: [{ text: 'narration', afterCalls: 1 }] }) };
     },
     async close() {},
   };

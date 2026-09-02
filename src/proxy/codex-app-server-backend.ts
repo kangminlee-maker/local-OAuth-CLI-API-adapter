@@ -565,7 +565,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
         model: request.model,
         text: parsed.text,
         toolCalls: parsed.toolCalls,
-        ...(parsed.textOrdinal ? { textOrdinal: parsed.textOrdinal } : {}),
+        ...(parsed.textRuns ? { textRuns: parsed.textRuns } : {}),
         usage,
         latencyMs: totalMs,
       };

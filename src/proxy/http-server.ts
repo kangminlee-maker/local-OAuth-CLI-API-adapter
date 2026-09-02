@@ -9,6 +9,7 @@ import type { AddressInfo } from 'node:net';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
+  LocalTextRun,
   LocalStreamEvent,
   LocalToolCall,
   LocalUsage,
@@ -1976,10 +1977,11 @@ function openAiResponsesResponse(
   const output = result.toolCalls.length > 0
     ? [
         ...reasoning,
-        ...orderedByEmission(result, {
-          text: result.text ? [openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)] : [],
-          toolCalls: result.toolCalls.map(openAiResponseToolCall),
-        }),
+        ...orderedByEmission(
+          mergedTextRun(textRunsFor(result, result.toolCalls.length)),
+          result.toolCalls.map(openAiResponseToolCall),
+          (run) => openAiResponseMessageItem(`msg_${randomUUID()}`, run.text),
+        ),
       ]
     : [
         ...reasoning,
@@ -1997,32 +1999,106 @@ function openAiResponsesResponse(
 }
 
 /**
- * The turn's parts in the order they were produced. A tool call that arrived
- * before any text is streamed as the first block, so the completed body has to
- * report it as the first block too — the two surfaces describe one turn.
+ * The turn's parts in the order they were produced: every text run at the
+ * point among the calls where the backend produced it. A tool call that
+ * arrived before any text is streamed as the first block, so the completed
+ * body has to report it as the first block too — the two surfaces describe one
+ * turn.
  *
- * The text goes in at `textOrdinal`, splitting the calls around it, because a
- * turn can run a call, say something, then run another call. Choosing between
- * two whole groups here is what made the buffered body contradict the stream
- * on exactly that shape.
+ * An interleaving, not a split. A turn can narrate, call a tool, and narrate
+ * again, so there is no single place "the text" goes: choosing between two
+ * whole groups could not express [call, text, call], and splitting the calls
+ * around one position could not express [text, call, text].
  */
 function orderedByEmission(
-  result: LocalCompletionResult,
-  parts: { readonly text: readonly unknown[]; readonly toolCalls: readonly unknown[] },
+  runs: readonly LocalTextRun[],
+  toolCalls: readonly unknown[],
+  renderRun: (run: LocalTextRun) => unknown,
 ): unknown[] {
-  const at = textOrdinalOf(result, parts.toolCalls.length);
-  return [...parts.toolCalls.slice(0, at), ...parts.text, ...parts.toolCalls.slice(at)];
+  const out: unknown[] = [];
+  let placed = 0;
+  for (const run of runs) {
+    for (; placed < run.afterCalls; placed += 1) out.push(toolCalls[placed]);
+    out.push(renderRun(run));
+  }
+  for (; placed < toolCalls.length; placed += 1) out.push(toolCalls[placed]);
+  return out;
 }
 
 /**
- * The turn's text position, clamped to the calls actually being rendered. A
- * backend that reports an ordinal past its own call count would otherwise move
- * the text somewhere the stream never put it.
+ * The turn's text runs, positioned by the result and filled from its `text`.
+ *
+ * `text` carries the bytes and `textRuns` carries the positions, so anything
+ * that rewrites the text — `stop_sequences` cuts it, and the streamed gate
+ * reports only what reached the wire — gets runs that match it without having
+ * to know the runs exist. The text is redistributed over the run lengths in
+ * order: a cut therefore shortens the last surviving run and drops the ones
+ * past it, exactly as a turn that stopped there would have produced them.
+ *
+ * Positions are clamped to the calls actually being rendered and forced
+ * non-decreasing. A backend that reports a run past its own call count would
+ * otherwise put text somewhere the stream never did.
  */
-function textOrdinalOf(result: LocalCompletionResult, callCount: number): number {
-  const raw = result.textOrdinal;
-  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return 0;
-  return Math.min(Math.floor(raw), callCount);
+function textRunsFor(result: LocalCompletionResult, callCount: number): readonly LocalTextRun[] {
+  const runs: LocalTextRun[] = [];
+  let rest = result.text;
+  let floor = 0;
+  // Absent means one run before every call — what a backend that cannot
+  // interleave the two always produces.
+  const declared = result.textRuns ?? [{ text: result.text, afterCalls: 0 }];
+  for (const [index, run] of declared.entries()) {
+    if (!rest) break;
+    const afterCalls = Math.min(Math.max(floor, Math.floor(run.afterCalls) || 0), callCount);
+    floor = afterCalls;
+    // The last declared run takes whatever is left, so text the runs do not
+    // account for still reaches the client rather than being cut here.
+    const take = index === declared.length - 1 ? rest.length : Math.min(run.text.length, rest.length);
+    const text = rest.slice(0, take);
+    rest = rest.slice(take);
+    if (!text) continue;
+    const open = runs[runs.length - 1];
+    // Runs at the same position are one block: nothing came between them.
+    if (open && open.afterCalls === afterCalls) runs[runs.length - 1] = { text: open.text + text, afterCalls };
+    else runs.push({ text, afterCalls });
+  }
+  return runs;
+}
+
+/**
+ * The turn's text as ONE run, at the point the first of them was produced.
+ *
+ * The Responses surface reports a turn's text as a single `message` item — one
+ * item id, one content part — and its STREAM opens exactly one, however many
+ * runs the turn produced. So both readings merge, and they merge the same way:
+ * the buffered body follows the wire here as it does on the other surface.
+ *
+ * There is no vendor shape being mirrored either way. Measured 2026-09-02 on
+ * the direct Anthropic API, a turn told to narrate, call a tool, then narrate
+ * again answers `content: [text, tool_use]` with `stop_reason: tool_use` and
+ * streams the same two blocks: the vendor ENDS the turn at the call and never
+ * emits text after a `tool_use` block. A backend behind this proxy does emit
+ * it, so what governs is not parity but the two rules that survive its
+ * absence — keep what the backend produced, and let the two readings agree.
+ */
+function mergedTextRun(runs: readonly LocalTextRun[]): readonly LocalTextRun[] {
+  if (runs.length === 0) return [];
+  return [{ text: runs.map((run) => run.text).join(''), afterCalls: runs[0].afterCalls }];
+}
+
+/**
+ * The runs the wire has not carried yet, given how much of the turn's text it
+ * already holds. What went out went out where it was produced; this is what is
+ * left to place.
+ */
+function runsPending(runs: readonly LocalTextRun[], delivered: number): readonly LocalTextRun[] {
+  const out: LocalTextRun[] = [];
+  let skip = delivered;
+  for (const run of runs) {
+    if (skip >= run.text.length) { skip -= run.text.length; continue; }
+    out.push({ text: run.text.slice(skip), afterCalls: run.afterCalls });
+    skip = 0;
+  }
+  return out;
 }
 
 /**
@@ -2092,10 +2168,23 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
   const content = stopReason === 'refusal'
     ? (result.text ? [{ type: 'text', text: result.text }] : [])
     : hasToolCalls
-    ? orderedByEmission(result, {
-        text: result.text ? [{ type: 'text', text: result.text }] : [],
-        toolCalls: result.toolCalls.map(anthropicToolUse),
-      })
+    // Every run gets its OWN block, where it was produced. This surface's
+    // stream opens one block per run — a tool call stops the open text block,
+    // so text that resumes after it is a new block — and merging them here
+    // reported [text, tool_use] against a streamed [text, tool_use, text].
+    //
+    // The vendor never has to answer this question: measured 2026-09-02, the
+    // direct API ends the turn at the tool call and emits no text after a
+    // `tool_use` block, on either reading. A backend here does produce that
+    // turn, and the text it produced is the client's — dropping it to look
+    // more like the vendor would discard work the backend really did, which is
+    // its own defect. It is reported where the backend put it. How such a turn
+    // STOPS is a separate question, and this changes nothing about it.
+    ? orderedByEmission(
+        textRunsFor(result, result.toolCalls.length),
+        result.toolCalls.map(anthropicToolUse),
+        (run) => ({ type: 'text', text: run.text }),
+      )
     // Empty text is NO block, the same rule the two branches above already
     // apply. Measured on the direct API 2026-09-02, a turn stopped at its very
     // first token by a stop sequence: `content: []` buffered, and no
@@ -2883,7 +2972,7 @@ async function writeOpenAiResponsesStream(
         // For a turn that announced NOTHING until it completed — every tool
         // call on the claude native-schema channel — this call is where both
         // positions are allocated, so production order decides, through the
-        // same `textOrdinal` knob the buffered body reads.
+        // same `textRuns` the buffered body reads.
         if (messageOutputIndex !== -1) {
           // The message already holds a position, so there is nothing left to
           // decide: one walk closes every item where it actually sits.
@@ -2895,13 +2984,14 @@ async function writeOpenAiResponsesStream(
           }
         } else {
           // Nothing holds a position yet, so this is where every one of them is
-          // allocated — and the text goes at `textOrdinal`, splitting the calls
-          // around it exactly as `orderedByEmission` splits them for the
-          // buffered body. Choosing between two whole groups here — message
-          // first, or every call first — cannot express narration BETWEEN two
-          // calls, so a turn delivered whole at `completed` read
-          // [call, text, call] buffered and [call, call, text] streamed.
-          const at = textOrdinalOf(result, result.toolCalls.length);
+          // allocated — and the one message item goes where the turn's FIRST
+          // text run did, exactly as `mergedTextRun` places it for the buffered
+          // body. Choosing between two whole groups here — message first, or
+          // every call first — cannot express narration BETWEEN two calls, so a
+          // turn delivered whole at `completed` read [call, text, call]
+          // buffered and [call, call, text] streamed.
+          const [merged] = mergedTextRun(textRunsFor(result, result.toolCalls.length));
+          const at = merged?.afterCalls ?? 0;
           await finishCalls(0, at);
           await finishMessage();
           await finishCalls(at, result.toolCalls.length);
@@ -3159,7 +3249,12 @@ function openAiResponsesCompletedResponse(
 type PendingOutput =
   | { readonly kind: 'text'; readonly text: string }
   | { readonly kind: 'tool'; readonly event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }> }
-  | { readonly kind: 'gate' };
+  // How many of the characters the gate is holding were produced HERE. There
+  // is one such slot per RUN, not one per turn: a turn that narrated, called a
+  // tool, then narrated again while the gate was still holding produced two
+  // runs, and releasing both at the first slot merged them into one block that
+  // the buffered body — which reports the runs — could not agree with.
+  | { kind: 'gate'; chars: number };
 
 async function writeAnthropicMessagesStream(
   res: ServerResponse,
@@ -3219,8 +3314,8 @@ async function writeAnthropicMessagesStream(
   // to make room — and then the queue moves.
   const pending: PendingOutput[] = [];
   // How many tool blocks the drain may still open. The completed handler lowers
-  // it to put the turn's text AT `textOrdinal`: the calls below the ordinal go
-  // out, then the text, then the rest.
+  // it to place each remaining run of text: the calls below the run go out,
+  // then the run, then the next one's calls.
   let announceLimit = Number.POSITIVE_INFINITY;
 
   const ensureTextStarted = async (): Promise<void> => {
@@ -3311,23 +3406,57 @@ async function writeAnthropicMessagesStream(
     await drainPending();
   };
 
-  /** Where the gate is holding text, if it is holding any. */
-  const gateSlot = (): number => pending.findIndex((item) => item.kind === 'gate');
-
-  /** Records that the gate is holding text produced at this point in the turn. */
-  const holdGate = (): void => {
-    if (gateSlot() < 0) pending.push({ kind: 'gate' });
+  /**
+   * Records that the gate has taken `chars` more characters, produced HERE.
+   * They extend the slot at the tail of the queue when nothing has been
+   * produced since — that is the same run — and open a new one when something
+   * has, because what follows a tool call is a different run.
+   */
+  const holdGate = (chars: number): void => {
+    if (chars <= 0) return;
+    const last = pending[pending.length - 1];
+    if (last && last.kind === 'gate') last.chars += chars;
+    else pending.push({ kind: 'gate', chars });
   };
 
   /**
-   * The gate resolved: what it was holding takes the slot it held — ahead of
-   * everything produced while it held — and releasing nothing means a sequence
-   * ate it, so the slot simply stops blocking.
+   * The gate let go: what it released goes back to the slots that were holding
+   * it, oldest first, so each run lands where the turn produced it rather than
+   * where the gate happened to resolve. Text with no slot to its name — the
+   * gate is inactive, or this is the turn's own tail — goes at the end, which
+   * is where it was produced.
+   *
+   * Whatever the gate is still holding stays in its slots; anything left over
+   * a sequence ate, and an eaten run leaves nothing behind, not an empty block.
    */
   const releaseGate = async (text: string): Promise<void> => {
-    const at = gateSlot();
-    if (at >= 0) pending.splice(at, 1);
-    await writeText(text, at >= 0 ? at : pending.length);
+    let rest = text;
+    for (let index = 0; index < pending.length && rest; index += 1) {
+      const item = pending[index];
+      if (item.kind !== 'gate') continue;
+      const chunk = rest.slice(0, Math.min(item.chars, rest.length));
+      rest = rest.slice(chunk.length);
+      item.chars -= chunk.length;
+      streamedText += chunk;
+      if (item.chars === 0) pending.splice(index, 1, { kind: 'text', text: chunk });
+      else pending.splice(index, 0, { kind: 'text', text: chunk });
+    }
+    // The slots hold exactly what the gate holds. Trimming from the front is
+    // what a release is, and what a match is: both take the oldest characters.
+    let held = stopGate.pending.length;
+    for (let index = 0; index < pending.length; ) {
+      const item = pending[index];
+      if (item.kind !== 'gate') { index += 1; continue; }
+      item.chars = Math.min(item.chars, held);
+      held -= item.chars;
+      if (item.chars === 0) { pending.splice(index, 1); continue; }
+      index += 1;
+    }
+    if (rest) {
+      streamedText += rest;
+      pending.push({ kind: 'text', text: rest });
+    }
+    await drainPending();
   };
 
   /**
@@ -3385,11 +3514,12 @@ async function writeAnthropicMessagesStream(
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
-        const released = stopGate.push(event.delta);
-        // The gate let go — what it held is on the wire or gone for good — so
-        // its slot is settled and what waited behind it can take a position.
-        if (released || !stopGate.pending) await releaseGate(released);
-        if (stopGate.pending) holdGate();
+        // Booked at the tail of the queue FIRST — where the turn produced it —
+        // and only then fed to the gate, so the release below knows which run
+        // each character belongs to. An inactive gate releases it all at once
+        // and the slot is consumed in the same breath.
+        holdGate(event.delta.length);
+        await releaseGate(stopGate.push(event.delta));
         continue;
       }
       if (event.type === 'tool_call_delta') {
@@ -3421,47 +3551,63 @@ async function writeAnthropicMessagesStream(
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
       if (result.toolCalls.length > 0) {
         // Blocks follow production order, which is what the non-streamed body
-        // reports through `orderedByEmission`: the text goes after `textOrdinal`
-        // calls. The calls ALREADY on the wire are exactly the ones that
-        // preceded it, so only a turn whose text belongs behind calls that were
-        // never announced has to announce them first. Comparing the ordinal
-        // against 0 instead sent the text last whenever the gate had withheld
-        // it — a turn that called, narrated, then called again streamed both
-        // calls before its text while the buffered body split them around it.
+        // reports through `orderedByEmission`: each run of the turn's text sits
+        // where the backend produced it among the calls. The runs ALREADY on
+        // the wire went out there; only a run that belongs behind calls this
+        // stream never announced has to announce them first.
         //
-        // The text goes AT the ordinal, not merely behind every call: a turn
-        // delivered whole at `completed` announced nothing, so the calls below
-        // the ordinal close first, the text opens its block, and the calls
-        // above it open behind — the same splice `orderedByEmission` makes.
-        // Closing them all first read [tool_use, tool_use, text] against a
-        // buffered [tool_use, text, tool_use].
-        const textAt = textOrdinalOf(result, result.toolCalls.length);
-        if (textAt > toolState.announcedCount && !streamedText) {
-          // Only the calls BELOW the ordinal go out first: the drain stops
-          // there, the text takes the head of the queue, and the calls above it
-          // open behind. Draining all of them first read [tool_use, tool_use,
-          // text] against a buffered [tool_use, text, tool_use] — so the limit
-          // goes up BEFORE anything that drains, the gate's release included.
-          announceLimit = textAt;
-          try {
-            // `textOrdinal` decides where this text goes, not the gate, so the
-            // slot stops blocking and the text is placed by the ordinal below.
-            await releaseGate('');
+        // One position for "the text" is what this replaced, twice over. A
+        // boolean could not put a run BETWEEN two calls, and a count could not
+        // put runs on BOTH SIDES of one: a turn delivered whole at `completed`
+        // read [call, text, call] buffered against [call, call, text] streamed,
+        // and then [text, call, text] streamed against [text, call] buffered.
+        // Everything the wire has not carried yet, placed by `textRuns` — the
+        // same positions the buffered body reads. The gate's slots say where
+        // its text was RELEASED, which is a different question and not this
+        // one: a turn whose narration the gate held from before the first call
+        // until after it would otherwise stream the text first while the body,
+        // reading the runs, put it between the calls.
+        const remaining = runsPending(
+          textRunsFor(result, result.toolCalls.length),
+          streamedText.length,
+        );
+        // The limit goes up BEFORE anything drains, the gate's release
+        // included: a call that belongs behind the next run must not take a
+        // block ahead of it.
+        const firstAt = remaining.length > 0
+          ? Math.max(remaining[0].afterCalls, toolState.announcedCount)
+          : result.toolCalls.length;
+        try {
+          announceLimit = firstAt;
+          // The slots stop blocking: what they were holding is in `remaining`,
+          // and the runs below place it.
+          await releaseGate('');
+          for (const run of remaining) {
+            // Never backwards: a run cannot precede a call the wire has already
+            // announced, whatever the backend reports about it.
+            const at = Math.max(run.afterCalls, toolState.announcedCount);
+            announceLimit = at;
             await settlePending(result.toolCalls);
-            await toolState.finish(result.toolCalls.slice(0, textAt));
-            await writeText(gated.tail, 0);
-            await closeOpenTextBlock();
-          } finally {
-            announceLimit = Number.POSITIVE_INFINITY;
+            if (at > toolState.announcedCount) {
+              // The calls BELOW this run go out first, so the run opens its own
+              // block behind them rather than extending the one before them.
+              // From the START of the turn, not from the first unannounced
+              // call: a call still taking arguments holds an open block, and
+              // opening the next one over it nests two blocks on a wire that
+              // has none. `finish` reconciles that one and stops it first, and
+              // skips every call it already closed.
+              await closeOpenTextBlock();
+              await toolState.finish(result.toolCalls.slice(0, at));
+            }
+            // At the head: everything still queued was produced after this run.
+            await writeText(run.text, 0);
           }
-          await settlePending(result.toolCalls);
-          await toolState.finish(result.toolCalls.slice(textAt), textAt);
-        } else {
-          await releaseGate(gated.tail);
-          await settlePending(result.toolCalls);
-          await closeOpenTextBlock();
-          await toolState.finish(result.toolCalls);
+        } finally {
+          announceLimit = Number.POSITIVE_INFINITY;
         }
+        await settlePending(result.toolCalls);
+        await closeOpenTextBlock();
+        await toolState.finish(result.toolCalls);
       } else {
         // Flush any final text not already streamed (covers schema/refusal results
         // where no live text_delta was emitted), then close the block. A truly empty
@@ -3581,10 +3727,10 @@ class AnthropicToolUseStreamState {
   constructor(private readonly res: ServerResponse, private readonly allocateBlockIndex: () => number) {}
 
   /**
-   * How many calls have already taken a position on the wire. The turn's text
-   * goes after `textOrdinal` calls, so this is what says whether the calls that
-   * precede it have been announced yet — the buffered body's own ordinal,
-   * measured against the stream.
+   * How many calls have already taken a position on the wire. A run of the
+   * turn's text goes after `afterCalls` calls, so this is what says whether the
+   * calls that precede it have been announced yet — the buffered body's own
+   * positions, measured against the stream.
    */
   get announcedCount(): number {
     return this.states.size;

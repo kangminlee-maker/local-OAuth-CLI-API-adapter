@@ -282,29 +282,47 @@ export interface LocalReasoningItem {
   readonly id?: string;
 }
 
+/**
+ * One contiguous run of a turn's text, at the point among the turn's tool
+ * calls where the backend produced it.
+ */
+export interface LocalTextRun {
+  readonly text: string;
+  /** How many of the turn's `toolCalls` were produced before this run. */
+  readonly afterCalls: number;
+}
+
 export interface LocalCompletionResult {
   readonly id: string;
   readonly model: string;
   readonly text: string;
   readonly toolCalls: readonly LocalToolCall[];
   /**
-   * How many of `toolCalls` the backend produced BEFORE this turn's text.
-   * `text` is one flattened string, so this is the only ordering a
-   * non-streaming client cannot reconstruct — and the Responses `output` array
-   * and the Anthropic `content` array are ordered surfaces, so without it the
-   * body contradicts the stream that carried the same turn.
+   * The turn's text as the SEQUENCE it was produced in: one entry per run,
+   * each carrying how many of `toolCalls` came before it. `text` is the same
+   * bytes flattened, which is all an unordered surface needs; the Responses
+   * `output` array and the Anthropic `content` array are ordered, so without
+   * this they contradict the stream that carried the same turn.
    *
-   * A COUNT rather than the boolean this used to be. The boolean could say
-   * only "all calls before the text" or "all calls after it", and a turn that
-   * ran a call, said something, then ran another call is neither: the stream
-   * announced [call, text, call] while the buffered body claimed
-   * [call, call, text]. One turn, two orders, on both ordered surfaces.
+   * A SEQUENCE rather than the count this used to be, which was itself a
+   * widening of a boolean. The boolean could say only "all calls before the
+   * text" or "all calls after it", so [call, text, call] streamed one way and
+   * buffered another. The count said how many calls preceded THE text — one
+   * position, so [text, call, text] streamed as three blocks and buffered as
+   * two. Both times the representation could hold exactly the case that had
+   * just failed. A turn's layout is an interleaving, so the field is one.
    *
-   * 0 (or absent) means the text came first, which is what a backend that
-   * cannot interleave the two always produces; `toolCalls.length` means every
-   * call came first.
+   * Runs are in production order, `afterCalls` never decreases, and
+   * concatenating them gives `text` — a reader that rebuilds the runs from
+   * `text` therefore never invents bytes.
+   *
+   * Absent means one run before every call. That is a DEFAULT for a backend
+   * with no order to report, not a licence to omit one: a backend whose stream
+   * announced a call before its text, and whose result then says nothing here,
+   * has its buffered body read [text, call] against a streamed [call, text].
+   * Every backend that reports text alongside calls reports the runs with it.
    */
-  readonly textOrdinal?: number;
+  readonly textRuns?: readonly LocalTextRun[];
   /**
    * The reasoning item the backend reported for this turn, when it reported
    * one. Its presence is the fact — a turn that did not reason has no such

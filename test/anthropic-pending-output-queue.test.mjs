@@ -53,10 +53,11 @@ const resume = (index, call, chars = 8) => ({
 });
 const say = (delta) => ({ type: 'text_delta', delta });
 
-function backendFor({ steps, text = '', toolCalls = [], textOrdinal, ends = 'completed' }) {
+function backendFor({ steps, text = '', toolCalls = [], afterCalls, textRuns, ends = 'completed' }) {
+  const runs = textRuns ?? (afterCalls === undefined ? undefined : [{ text, afterCalls }]);
   const result = {
     id: 'x', model: 'configured-model', text, toolCalls,
-    ...(textOrdinal === undefined ? {} : { textOrdinal }),
+    ...(runs === undefined ? {} : { textRuns: runs }),
     usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1,
   };
   return {
@@ -183,7 +184,7 @@ test('a call interrupted by narration still carries the input the turn made', as
   // `{"city":` as a whole tool input.
   const r = await readings(backendFor({
     steps: [partial(0, CALL_A), say('narration'), whole(1, CALL_B)],
-    toolCalls: [CALL_A, CALL_B], text: 'narration', textOrdinal: 1,
+    toolCalls: [CALL_A, CALL_B], text: 'narration', afterCalls: 1,
   }));
   assertWireShape(r, ['tool_use', 'text', 'tool_use'], 'unfinished call, narration, second call');
   assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments], 'both calls carry their whole input');
@@ -198,7 +199,7 @@ test('CONTROL: the same turn with the first call declared final', async () => {
   // open, so nothing is reconciled and one delta carries each value.
   const r = await readings(backendFor({
     steps: [whole(0, CALL_A), say('narration'), whole(1, CALL_B)],
-    toolCalls: [CALL_A, CALL_B], text: 'narration', textOrdinal: 1,
+    toolCalls: [CALL_A, CALL_B], text: 'narration', afterCalls: 1,
   }));
   assertWireShape(r, ['tool_use', 'text', 'tool_use'], 'finished call, narration, finished call');
   assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments]);
@@ -214,7 +215,7 @@ test('the rest of an interrupted call\'s arguments still reach its open block', 
   const rest = { type: 'tool_call_delta', index: 0, id: CALL_A.id, name: CALL_A.name, argumentsDelta: CALL_A.arguments.slice(8), argumentsDone: true };
   const r = await readings(backendFor({
     steps: [partial(0, CALL_A), say('narration'), rest],
-    toolCalls: [CALL_A], text: 'narration', textOrdinal: 1,
+    toolCalls: [CALL_A], text: 'narration', afterCalls: 1,
   }));
   assertWireShape(r, ['tool_use', 'text'], 'unfinished call, narration, the rest of the same call');
   assert.deepEqual(r.toolArguments, [CALL_A.arguments], 'the whole input, in one block');
@@ -227,7 +228,7 @@ test('CONTROL: narration after a call that already declared its arguments final'
   // The opposite expected answer: nothing is open, so the narration never
   // waits and the block is never extended.
   const r = await readings(backendFor({
-    steps: [whole(0, CALL_A), say('narration')], toolCalls: [CALL_A], text: 'narration', textOrdinal: 1,
+    steps: [whole(0, CALL_A), say('narration')], toolCalls: [CALL_A], text: 'narration', afterCalls: 1,
   }));
   assertWireShape(r, ['tool_use', 'text'], 'finished call, then narration');
   assert.deepEqual(r.argumentDeltas, [1], 'one delta carried the whole value');
@@ -283,7 +284,7 @@ test('CONTROL: three calls the backend declared final', async () => {
 // until a later delta rules the sequence out. Two holders on one turn.
 const GATED_TURN = {
   steps: [partial(0, CALL_A), say('Do'), say('gs')],
-  toolCalls: [CALL_A], text: 'Dogs', textOrdinal: 1,
+  toolCalls: [CALL_A], text: 'Dogs', afterCalls: 1,
 };
 
 test('a stop-gated release still waits for the call that was taking arguments', async () => {
@@ -313,11 +314,11 @@ test('CONTROL: the same turn with no stop sequence at all', async () => {
 });
 
 test('a call the stream announced and one only the result carries split around the text', async () => {
-  // `textOrdinal` on a turn that is half streamed and half delivered at
+  // `textRuns` on a turn that is half streamed and half delivered at
   // `completed`: the announced call is reconciled and closed, the text takes
   // the ordinal, and the call that was never announced opens behind it.
   const r = await readings(backendFor({
-    steps: [partial(0, CALL_A)], toolCalls: [CALL_A, CALL_B], text: 'narration', textOrdinal: 1,
+    steps: [partial(0, CALL_A)], toolCalls: [CALL_A, CALL_B], text: 'narration', afterCalls: 1,
   }));
   assertWireShape(r, ['tool_use', 'text', 'tool_use'], 'announced call, text at ordinal 1, completion-only call');
   assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments]);
@@ -327,7 +328,7 @@ test('a call the stream announced and one only the result carries split around t
 
 test('CONTROL: the same turn with the text reported after both calls', async () => {
   const r = await readings(backendFor({
-    steps: [partial(0, CALL_A)], toolCalls: [CALL_A, CALL_B], text: 'narration', textOrdinal: 2,
+    steps: [partial(0, CALL_A)], toolCalls: [CALL_A, CALL_B], text: 'narration', afterCalls: 2,
   }));
   assertWireShape(r, ['tool_use', 'tool_use', 'text'], 'announced call, completion-only call, text last');
   assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments]);
@@ -338,7 +339,7 @@ test('CONTROL: the same turn with the text reported after both calls', async () 
 // result arrives — and the result puts the text between them.
 const QUEUED_PAIR = {
   steps: [say('BETWEEN'), whole(0, CALL_A), whole(1, CALL_B)],
-  toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', textOrdinal: 1,
+  toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', afterCalls: 1,
 };
 
 test('the text still lands AT its ordinal when the calls around it were all queued', async () => {
@@ -355,7 +356,7 @@ test('the text still lands AT its ordinal when the calls around it were all queu
 test('CONTROL: the same queued pair with the text reported before both calls', async () => {
   // The opposite expected answer for the same queue: ordinal 0 puts the text
   // first, so nothing may be released ahead of it.
-  const r = await readings(backendFor({ ...QUEUED_PAIR, textOrdinal: 0 }), ['BETWEENZ']);
+  const r = await readings(backendFor({ ...QUEUED_PAIR, afterCalls: 0 }), ['BETWEENZ']);
   assertWireShape(r, ['text', 'tool_use', 'tool_use'], "two queued calls, text at ordinal 0, held by ['BETWEENZ']");
   assert.deepEqual(r.text, ['BETWEEN']);
   assertReadingsAgree(r, "two queued calls, text at ordinal 0, held by ['BETWEENZ']");
@@ -380,7 +381,7 @@ test('CONTROL: the same turn that reaches `completed` completes that call', asyn
   // a value rather than a truncation.
   const r = await readings(backendFor({
     steps: [partial(0, CALL_A), say('narration'), whole(1, CALL_B)],
-    toolCalls: [CALL_A, CALL_B], text: 'narration', textOrdinal: 1,
+    toolCalls: [CALL_A, CALL_B], text: 'narration', afterCalls: 1,
   }));
   assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments]);
 });

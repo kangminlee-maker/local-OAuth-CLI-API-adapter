@@ -12,8 +12,9 @@
 //
 // and `response.output_item.done` arrived [0,2,1] — a client told that a later
 // item finished before an earlier one, which is the exact promise the ordering
-// work claims to keep. The order is carried as a COUNT instead: how many of the
-// turn's tool calls came before its text.
+// work claims to keep. The order is carried as `textRuns` instead: the turn's
+// text as the SEQUENCE it was produced in, each run against the calls before
+// it. Every turn here has one run — `afterCalls` is where it sits.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
@@ -22,10 +23,10 @@ const PARAMS = { type: 'object', properties: { city: { type: 'string' } }, requi
 const CALL_A = { id: 'fc_1', name: 'get_weather', arguments: '{"city":"A"}' };
 const CALL_B = { id: 'fc_2', name: 'get_weather', arguments: '{"city":"B"}' };
 
-function backendFor({ toolCalls, text, textOrdinal, order }) {
+function backendFor({ toolCalls, text, afterCalls, order }) {
   const result = {
     id: 'x', model: 'm', text, toolCalls,
-    ...(textOrdinal === undefined ? {} : { textOrdinal }),
+    ...(afterCalls === undefined ? {} : { textRuns: [{ text, afterCalls }] }),
     usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1,
   };
   return {
@@ -76,7 +77,7 @@ const messagesBlockStarts = (events) => events.filter((e) => e.type === 'content
 
 test('a call/text/call turn reads the same on the buffered and streamed Responses surface', async () => {
   const s = await surfaces(backendFor({
-    toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', textOrdinal: 1, order: [0, 'text', 1],
+    toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', afterCalls: 1, order: [0, 'text', 1],
   }));
   const announced = ['function_call', 'message', 'function_call'];
   assert.deepEqual(s.responsesAdded, announced, 'the stream announces the turn in emission order');
@@ -86,7 +87,7 @@ test('a call/text/call turn reads the same on the buffered and streamed Response
 
 test('a call/text/call turn closes Responses items in ascending announced index', async () => {
   const s = await surfaces(backendFor({
-    toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', textOrdinal: 1, order: [0, 'text', 1],
+    toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', afterCalls: 1, order: [0, 'text', 1],
   }));
   assert.deepEqual(s.responsesDoneIndices, [0, 1, 2],
     'a client must never be told a later item finished before an earlier one');
@@ -94,7 +95,7 @@ test('a call/text/call turn closes Responses items in ascending announced index'
 
 test('a call/text/call turn reads the same on the buffered and streamed Messages surface', async () => {
   const s = await surfaces(backendFor({
-    toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', textOrdinal: 1, order: [0, 'text', 1],
+    toolCalls: [CALL_A, CALL_B], text: 'BETWEEN', afterCalls: 1, order: [0, 'text', 1],
   }));
   const announced = ['tool_use', 'text', 'tool_use'];
   assert.deepEqual(s.messagesStarts, announced, 'the stream announces the turn in emission order');
@@ -104,7 +105,7 @@ test('a call/text/call turn reads the same on the buffered and streamed Messages
 // The two shapes the boolean COULD express must not regress.
 test('text first still reads text first on both surfaces', async () => {
   const s = await surfaces(backendFor({
-    toolCalls: [CALL_A], text: 'FIRST', textOrdinal: 0, order: ['text', 0],
+    toolCalls: [CALL_A], text: 'FIRST', afterCalls: 0, order: ['text', 0],
   }));
   assert.deepEqual(s.responsesBuffered, ['message', 'function_call']);
   assert.deepEqual(s.responsesAdded, ['message', 'function_call']);
@@ -115,7 +116,7 @@ test('text first still reads text first on both surfaces', async () => {
 
 test('every call before the text still reads that way on both surfaces', async () => {
   const s = await surfaces(backendFor({
-    toolCalls: [CALL_A, CALL_B], text: 'AFTER', textOrdinal: 2, order: [0, 1, 'text'],
+    toolCalls: [CALL_A, CALL_B], text: 'AFTER', afterCalls: 2, order: [0, 1, 'text'],
   }));
   assert.deepEqual(s.responsesBuffered, ['function_call', 'function_call', 'message']);
   assert.deepEqual(s.responsesAdded, ['function_call', 'function_call', 'message']);

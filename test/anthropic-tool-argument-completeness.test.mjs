@@ -34,10 +34,10 @@ const unfinishedCall = { type: 'tool_call_delta', index: 0, id: CALL.id, name: C
 const finishedCall = { ...unfinishedCall, argumentsDelta: FULL, argumentsDone: true };
 const narrate = { type: 'text_delta', delta: 'narration' };
 
-function backendFor({ steps, text = 'narration', toolCalls = [CALL], textOrdinal }) {
+function backendFor({ steps, text = 'narration', toolCalls = [CALL], afterCalls }) {
   const result = {
     id: 'x', model: 'configured-model', text, toolCalls,
-    ...(textOrdinal === undefined ? {} : { textOrdinal }),
+    ...(afterCalls === undefined ? {} : { textRuns: [{ text, afterCalls }] }),
     usage: { inputTokens: 1, outputTokens: 1, source: 'estimated' }, latencyMs: 1,
   };
   return {
@@ -117,7 +117,7 @@ function assertArgumentsComplete(r, label) {
 }
 
 test('narration does not truncate a tool input the backend never declared final', async () => {
-  const r = await readings(backendFor({ steps: [unfinishedCall, narrate], textOrdinal: 1 }));
+  const r = await readings(backendFor({ steps: [unfinishedCall, narrate], afterCalls: 1 }));
   assertArgumentsComplete(r, 'unfinished call, then live narration');
   assert.deepEqual(
     r.messagesBlocks.map((b) => b.type), ['tool_use', 'text'],
@@ -130,7 +130,7 @@ test('the completed result\'s own tail text does not truncate it either', async 
   // No live text delta at all: the completed handler writes the turn's text,
   // and THAT opened the block that stopped the call. Same defect, a path a
   // test built only on live narration never reaches.
-  const r = await readings(backendFor({ steps: [unfinishedCall], textOrdinal: 1 }));
+  const r = await readings(backendFor({ steps: [unfinishedCall], afterCalls: 1 }));
   assertArgumentsComplete(r, 'unfinished call, text only at completed');
   assert.deepEqual(textBlocks(r).map((b) => b.accumulated), ['narration']);
 });
@@ -144,14 +144,14 @@ test('a turn with no text at all reconciles the same arguments', async () => {
 test('CONTROL: a call the backend declared final is not rewritten', async () => {
   // The opposite expected answer for the reconciliation: there is nothing to
   // add, so exactly one delta carries the value and nothing follows it.
-  const r = await readings(backendFor({ steps: [finishedCall, narrate], textOrdinal: 1 }));
+  const r = await readings(backendFor({ steps: [finishedCall, narrate], afterCalls: 1 }));
   assertArgumentsComplete(r, 'finished call, then narration');
   assert.equal(r.messagesDeltaCount, 1, 'a finished call takes exactly one arguments delta');
   assert.deepEqual(r.messagesBlocks.map((b) => b.type), ['tool_use', 'text']);
 });
 
 test('CONTROL: an unfinished call takes a second delta to complete it', async () => {
-  const r = await readings(backendFor({ steps: [unfinishedCall, narrate], textOrdinal: 1 }));
+  const r = await readings(backendFor({ steps: [unfinishedCall, narrate], afterCalls: 1 }));
   assert.equal(r.messagesDeltaCount, 2, 'the streamed prefix plus the reconciled tail');
 });
 
@@ -200,7 +200,7 @@ test('a second call may not open its block inside one still taking arguments', a
   // `{"city":"Seoul"}`. Both rules hold now — the narration and the next call
   // wait, and `completed` reconciles the open call before it closes.
   const r = await readings(backendFor({
-    steps: [unfinishedCall, narrate, secondCall], toolCalls: [CALL, CALL_B], textOrdinal: 1,
+    steps: [unfinishedCall, narrate, secondCall], toolCalls: [CALL, CALL_B], afterCalls: 1,
   }));
   assert.equal(r.messagesMaxOpen, 1,
     `two content blocks open at once: ${JSON.stringify(r.messagesBlocks.map((b) => [b.index, b.type]))}`);
@@ -222,7 +222,7 @@ test('CONTROL: two calls around narration, the first declared final', async () =
   // The same three-part turn with nothing held open — the reconciliation path
   // is never entered, and both calls carry their whole input.
   const r = await readings(backendFor({
-    steps: [finishedCall, narrate, secondCall], toolCalls: [CALL, CALL_B], textOrdinal: 1,
+    steps: [finishedCall, narrate, secondCall], toolCalls: [CALL, CALL_B], afterCalls: 1,
   }));
   assert.equal(r.messagesMaxOpen, 1);
   assert.deepEqual(r.messagesBlocks.map((b) => b.type), ['tool_use', 'text', 'tool_use']);

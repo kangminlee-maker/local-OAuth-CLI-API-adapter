@@ -771,6 +771,80 @@ for (const [label, events, expected] of SEQUENTIAL_BLOCK_CASES) {
   });
 }
 
+// The same turn, read BOTH ways, driven by the real transport.
+//
+// `narrateCallNarrateEvents` is a genuine upstream [text, call, text] turn, and
+// the cases above assert only the STREAM. The stream was never the half that
+// was wrong: the transport recorded one position for "the text", so the
+// buffered body merged the two runs and reported ['text','tool_use'] against
+// the wire's ['text','tool_use','text'] — a disagreement no streamed-only
+// assertion can see. Nothing here is a stub: the transport derives the runs and
+// both writers project them.
+test('a text/call/text turn from the real transport reads the same both ways', async () => {
+  await withProxy(narrateCallNarrateEvents(), async (url) => {
+    const messagesBody = (extra) => JSON.stringify({
+      model: 'gpt-5.5', max_tokens: 128, messages: [{ role: 'user', content: 'w' }],
+      tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }], ...extra,
+    });
+    const headers = { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' };
+    const buffered = await (await realFetch(`${url}/v1/messages`, { method: 'POST', headers, body: messagesBody({}) })).json();
+    const streamed = sseEvents(await (await realFetch(`${url}/v1/messages`, {
+      method: 'POST', headers, body: messagesBody({ stream: true }),
+    })).text());
+
+    const streamedBlocks = streamed.filter((e) => e.type === 'content_block_start').map((e) => e.content_block?.type);
+    const bufferedBlocks = buffered.content?.map((block) => block.type);
+    assert.deepEqual(streamedBlocks, ['text', 'tool_use', 'text'], 'the wire announces the turn the backend produced');
+    assert.deepEqual(bufferedBlocks, streamedBlocks, 'and the buffered body reports the same blocks');
+
+    const texts = new Map();
+    const order = [];
+    for (const event of streamed) {
+      if (event.type === 'content_block_start' && event.content_block?.type === 'text') { order.push(event.index); texts.set(event.index, ''); }
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') texts.set(event.index, `${texts.get(event.index) ?? ''}${event.delta.text}`);
+    }
+    assert.deepEqual(order.map((index) => texts.get(index)), ['Let me check. ', 'One moment.'], 'each run on its own block');
+    assert.deepEqual(
+      buffered.content?.filter((block) => block.type === 'text').map((block) => block.text),
+      ['Let me check. ', 'One moment.'],
+      'and the body carries the same two runs, not one merged block',
+    );
+  });
+});
+
+test('the same turn merges into ONE message item on /v1/responses, both ways', async () => {
+  // The other surface's own shape, held to the same standard: `output` reports
+  // a turn's text as one `message` item — its stream opens exactly one — so
+  // both of ITS readings merge the runs, at the same place. No vendor shape is
+  // being copied on either surface: measured 2026-09-02, the direct Anthropic
+  // API ends such a turn at the tool call and never emits text after it. What
+  // is pinned here is that the two readings agree and that the whole narration
+  // still reaches the client exactly once.
+  await withProxy(narrateCallNarrateEvents(), async (url) => {
+    const body = (extra) => JSON.stringify({
+      model: 'gpt-5.5', input: 'w',
+      tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }], ...extra,
+    });
+    const headers = { 'content-type': 'application/json' };
+    const buffered = await (await realFetch(`${url}/v1/responses`, { method: 'POST', headers, body: body({}) })).json();
+    const streamed = sseEvents(await (await realFetch(`${url}/v1/responses`, {
+      method: 'POST', headers, body: body({ stream: true }),
+    })).text());
+    const added = streamed.filter((e) => e.type === 'response.output_item.added').map((e) => e.item?.type);
+    assert.deepEqual(buffered.output?.map((item) => item.type), added, 'one turn, two readings of /v1/responses');
+    assert.deepEqual(
+      buffered.output?.filter((item) => item.type === 'message').flatMap((item) => item.content ?? []).map((part) => part.text),
+      ['Let me check. One moment.'],
+      'one message item, carrying the whole turn once',
+    );
+    assert.equal(
+      streamed.filter((e) => e.type === 'response.output_text.delta').map((e) => e.delta).join(''),
+      'Let me check. One moment.',
+      'and the deltas carry it once too',
+    );
+  });
+});
+
 /**
  * The backend closes the item but names no arguments there, and only the
  * completed output carries the finished value — the partial the stream sent is
@@ -1384,11 +1458,11 @@ test('items complete in the order the stream announced them', async () => {
 // text delta, no tool item — and the entire answer first exists at `completed`.
 // Both output positions are then allocated inside that terminal branch, so
 // nothing has been "announced" to order them by and PRODUCTION order is the
-// only thing left, read from `textOrdinal` exactly as the buffered body reads
-// it. The narration tests above use this shape with the text first only; with a
+// only thing left, read from `textRuns` exactly as the buffered body reads it.
+// The narration tests above use this shape with the text first only; with a
 // call ahead of it the branch was unprotected, and a mutant pinning it to
 // message-first left every ordering suite green.
-function completionOnlyBackend(textOrdinal) {
+function completionOnlyBackend(afterCalls) {
   const result = {
     id: 'x',
     model: 'configured-model',
@@ -1396,7 +1470,7 @@ function completionOnlyBackend(textOrdinal) {
     toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
     usage: { inputTokens: 20, outputTokens: 8, source: 'provider' },
     latencyMs: 1,
-    ...(textOrdinal ? { textOrdinal } : {}),
+    textRuns: [{ text: 'Checking the weather.', afterCalls }],
   };
   return {
     name: 'test',
@@ -1412,10 +1486,10 @@ const COMPLETION_ONLY_ORDERS = [
   ['the turn called before it narrated', 1, ['function_call', 'message']],
 ];
 
-for (const [label, textOrdinal, expected] of COMPLETION_ONLY_ORDERS) {
+for (const [label, afterCalls, expected] of COMPLETION_ONLY_ORDERS) {
   test(`a responses stream that announced nothing orders its items by production when ${label}`, async () => {
     const server = await startLocalApiProxy({
-      backend: completionOnlyBackend(textOrdinal),
+      backend: completionOnlyBackend(afterCalls),
       host: '127.0.0.1',
       port: 0,
       requestTimeoutMs: 30_000,

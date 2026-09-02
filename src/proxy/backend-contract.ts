@@ -1,4 +1,5 @@
 import type {
+  LocalTextRun,
   LocalToolCall,
   LocalUsage,
   NormalizedImage,
@@ -104,7 +105,7 @@ export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
  * Where the wrapper's narration sits among its calls.
  *
  * Both ordered surfaces report a turn's parts in production order, and they
- * read it from `textOrdinal` — which only `CodexBackendTransport` ever set.
+ * read it from `textRuns` — which only `CodexBackendTransport` ever set.
  * The backends that go through `ToolCallDeltaExtractor` emit `tool_call_delta`
  * before `text_delta` whenever the model writes `toolCalls` first, so their
  * STREAM said `[call, text]` while their buffered body, with the field absent,
@@ -117,15 +118,20 @@ export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
  * the extractor kept a rule of its own — emit whatever the incremental decoder
  * produced first — the two agreed only for some chunkings of the wrapper, and
  * a backend that delivered it in one delta made them contradict each other.
+ *
+ * The wrapper has ONE `text` field, so a turn it describes has at most one run:
+ * either the whole narration precedes every call or it follows every call.
+ * That is the wrapper's own limit, not the representation's — a backend that
+ * can interleave reports the runs it produced.
  */
-function wrapperTextOrdinal(raw: string, callCount: number): number {
-  return wrapperCallsPrecedeText(raw) ? callCount : 0;
+function wrapperTextRuns(raw: string, text: string, callCount: number): readonly LocalTextRun[] {
+  return [{ text, afterCalls: wrapperCallsPrecedeText(raw) ? callCount : 0 }];
 }
 
 export function parseBackendOutput(
   request: NormalizedRequest,
   text: string,
-): { text: string; toolCalls: readonly LocalToolCall[]; textOrdinal?: number } {
+): { text: string; toolCalls: readonly LocalToolCall[]; textRuns?: readonly LocalTextRun[] } {
   if (!hasToolDecisionSchema(request)) {
     return { text, toolCalls: [] };
   }
@@ -152,10 +158,11 @@ export function parseBackendOutput(
       // surface reports text alongside tool calls, and dropping it here made
       // this runtime the one that silently did not. The wrapper has a `text`
       // field for exactly this.
+      const narration = typeof obj.text === 'string' ? obj.text : '';
       return {
-        text: typeof obj.text === 'string' ? obj.text : '',
+        text: narration,
         toolCalls: calls,
-        ...(calls.length > 0 && wrapperTextOrdinal(text, calls.length) > 0 ? { textOrdinal: calls.length } : {}),
+        ...(calls.length > 0 && narration ? { textRuns: wrapperTextRuns(text, narration, calls.length) } : {}),
       };
     }
     // Only a wrapper this backend produced may be unwrapped. A json-mode client

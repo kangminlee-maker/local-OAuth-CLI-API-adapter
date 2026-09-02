@@ -197,12 +197,13 @@ class CodexBackendStreamState {
   private settled = false;
   private stopReason?: string;
   /**
-   * How many tool calls this turn had ANNOUNCED when its text began. Recorded
-   * here because this is the one backend that can genuinely interleave the
-   * two, so it is the only one that can produce a turn the old boolean could
-   * not describe: a call, then narration, then another call.
+   * The turn's text, in the runs it was produced in, each recorded against the
+   * tool calls announced before it. Recorded here because this is the one
+   * backend that can genuinely interleave the two, so it is the only one that
+   * can produce a turn a single position cannot describe: narration, a call,
+   * then narration again.
    */
-  private textOrdinal?: number;
+  private readonly textRuns: { text: string; afterCalls: number }[] = [];
   private announcedCalls = 0;
   private reasoning?: LocalReasoningItem;
 
@@ -297,10 +298,15 @@ class CodexBackendStreamState {
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
-      // Fixed at the first text the client is actually told about, against the
-      // calls announced so far — the same instant, and the same counter, the
-      // stream itself used to place the message item.
-      if (this.textOrdinal === undefined && event.delta !== '') this.textOrdinal = this.announcedCalls;
+      // Recorded against the calls announced so far — the same instant, and the
+      // same counter, the stream itself uses to place its items. Deltas that
+      // arrive with no call between them are ONE run: they open one block on
+      // the wire, so they are one block in the body too.
+      if (event.delta !== '') {
+        const open = this.textRuns[this.textRuns.length - 1];
+        if (open && open.afterCalls === this.announcedCalls) open.text += event.delta;
+        else this.textRuns.push({ text: event.delta, afterCalls: this.announcedCalls });
+      }
       this.text += event.delta;
       out.push({ type: 'text_delta', delta: event.delta });
       return out;
@@ -566,9 +572,16 @@ class CodexBackendStreamState {
       ...(this.stopReason ? { stopReason: this.stopReason } : {}),
       // The completed result flattens the turn's text into one string, so this
       // is the one ordering a non-streaming client cannot reconstruct — and
-      // both ordered surfaces need it to agree with the stream.
-      ...(toolCalls.length > 0 && this.textOrdinal !== undefined && this.textOrdinal > 0
-        ? { textOrdinal: Math.min(this.textOrdinal, toolCalls.length) }
+      // both ordered surfaces need it to agree with the stream. Clamped to the
+      // calls the turn actually reports: a run recorded against a call the
+      // final output does not list would otherwise address nothing.
+      ...(toolCalls.length > 0 && this.textRuns.length > 0
+        ? {
+            textRuns: this.textRuns.map((run) => ({
+              text: run.text,
+              afterCalls: Math.min(run.afterCalls, toolCalls.length),
+            })),
+          }
         : {}),
       ...(this.reasoning ? { reasoning: this.reasoning } : {}),
       toolCalls,
