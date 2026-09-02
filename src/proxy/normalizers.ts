@@ -16,7 +16,7 @@ import type {
   NormalizedToolTurn,
   NormalizedVerbosity,
 } from './types.js';
-import { ProxyRequestError } from './types.js';
+import { ProxyRequestError, toolResultImages } from './types.js';
 
 interface NormalizedContent {
   readonly text: string;
@@ -2172,7 +2172,10 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
     const result: NormalizedToolResult = {
       callId,
       output: content.text,
-      ...(content.images.length > 0 ? { images: content.images } : {}),
+      // The result's OWN blocks, in the order it carried them — the sequence
+      // `output` is a rendering of. Bucketing them into a string and a pile of
+      // pictures is what moved the text after a picture ahead of it.
+      parts: content.parts ?? legacyParts(content.text, content.images),
     };
     // One array, two views: `parts` and `tool.parts` are the SAME sequence, so
     // a consumer reading either cannot see a different order from the other.
@@ -2340,8 +2343,14 @@ function prefixedParts(prefix: string, content: NormalizedContent, separator: st
   return parts;
 }
 
-/** The one place a call is written as text; nothing reads it back. */
-function renderToolCall(call: LocalToolCall): string {
+/**
+ * The one place a call is written as text; nothing reads it back.
+ *
+ * Exported because `buildPrompt` renders a tool turn part by part now, and a
+ * prompt that wrote this grammar itself would be a SECOND writer of it — the
+ * drift this module's marker comment describes. One writer, called twice.
+ */
+export function renderToolCall(call: LocalToolCall): string {
   return [
     ASSISTANT_TOOL_CALL_MARKER,
     `id: ${call.id}`,
@@ -2350,9 +2359,45 @@ function renderToolCall(call: LocalToolCall): string {
   ].join('\n');
 }
 
-/** The one place a result is written as text; nothing reads it back. */
-function renderToolResult(result: NormalizedToolResult): string {
-  return [TOOL_RESULT_MARKER, `tool_call_id: ${result.callId}`, result.output].join('\n');
+/**
+ * The one place a result is written as text; nothing reads it back.
+ *
+ * `imageReference` is how a caller that cannot deliver a picture inline NAMES
+ * one — the flattened-prompt backends hoist every picture ahead of the prompt,
+ * so a reference line is all that can say where inside the result a picture
+ * sat. Given one, the body is the result's own sequence with each picture
+ * named in its place; without one, it is `output`, which is that sequence's
+ * text and the only thing a caller with nowhere to put a picture can say.
+ *
+ * `output` rather than the text of `parts` when there is no picture to place:
+ * the two are the same bytes wherever the blocks were read, and where they were
+ * not — a Responses `output` this module stringified — `output` is the whole of
+ * it and re-deriving would be a second, differently-written rendering.
+ */
+export function renderToolResult(
+  result: NormalizedToolResult,
+  imageReference?: (image: NormalizedImage) => string | null,
+): string {
+  return [TOOL_RESULT_MARKER, `tool_call_id: ${result.callId}`, renderToolResultBody(result, imageReference)].join('\n');
+}
+
+function renderToolResultBody(
+  result: NormalizedToolResult,
+  imageReference?: (image: NormalizedImage) => string | null,
+): string {
+  if (!imageReference || toolResultImages(result).length === 0) return result.output;
+  const lines: string[] = [];
+  for (const part of result.parts) {
+    if (part.kind === 'text') {
+      if (part.text) lines.push(part.text);
+    } else if (part.kind === 'image') {
+      const reference = imageReference(part.image);
+      // A picture the caller has no number for gets no line: inventing one
+      // would name a picture the runtime never receives.
+      if (reference) lines.push(reference);
+    }
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -2406,7 +2451,13 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
     const result: NormalizedToolResult = {
       callId,
       output: text,
-      ...(output.images.length > 0 ? { images: output.images } : {}),
+      // The blocks read, when `text` came FROM them. Where it did not — an
+      // output this function stringified rather than read as blocks — the
+      // sequence is that string and then the pictures, so the two views still
+      // say the same thing rather than one of them dropping the output.
+      parts: output.text
+        ? output.parts ?? legacyParts(output.text, output.images)
+        : legacyParts(text, output.images),
     };
     const parts: NormalizedPart[] = [{ kind: 'result', result }];
     return {
@@ -2506,9 +2557,10 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
       const result: NormalizedToolResult = {
         callId,
         output: resultContent.text,
-        // The very same image objects the message-level list holds, so a
-        // consumer that walks either one is looking at one picture, not a copy.
-        ...(resultContent.images.length > 0 ? { images: resultContent.images } : {}),
+        // The result's own blocks in the client's order, carrying the very same
+        // image objects the message-level list holds — so a consumer that walks
+        // either one is looking at one picture, not a copy.
+        parts: resultContent.parts ?? legacyParts(resultContent.text, resultContent.images),
       };
       parts.push({ kind: 'result', result });
       return renderToolResult(result);

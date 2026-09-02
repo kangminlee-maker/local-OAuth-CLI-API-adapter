@@ -23,17 +23,45 @@ export interface NormalizedThinking {
 /** One result of a tool turn the normalizer flattened. */
 export interface NormalizedToolResult {
   readonly callId: string;
+  /**
+   * The result's own text as ONE STRING — a rendering of `parts`, not the
+   * place its content lives. `function_call_output` carries a string and the
+   * flattened prompt is a string, so the rendering stays.
+   */
   readonly output: string;
   /**
-   * The pictures THIS result returned, in the order it carried them.
+   * The blocks THIS result carried, in the order it carried them.
    *
-   * `NormalizedMessage.images` is every image of the message, and a turn
-   * answering two parallel calls has two results in it — so the message-level
-   * list cannot say which call a picture answers. Reading the FIRST result's
-   * call id for all of them labelled both of a turn's pictures with the first
-   * call, which is the position-matching the labels exist to end.
+   * A SEQUENCE, not two buckets. It used to be `output` plus an `images` list,
+   * which cannot say where inside the result a picture sat: a result whose own
+   * content was `[text, image, text]` was reduced to one joined string and a
+   * pile of pictures, so the second sentence arrived ahead of the picture it
+   * followed. The same shape defect the message had one level up, arriving one
+   * level down — grouping loses order; a sequence is the order.
+   *
+   * Only `text` and `image` parts occur: a result's content is blocks of those
+   * two kinds, and a call or a result never nests inside one.
+   *
+   * The picture objects are the very ones `NormalizedMessage.images` holds, so
+   * a consumer that walks either one is looking at one picture, not a copy —
+   * which is what lets the image labeller say WHICH call a picture answers. The
+   * message-level list cannot: a turn answering two parallel calls has two
+   * results in it, and reading the FIRST result's call id for all of them
+   * labelled both of a turn's pictures with the first call.
    */
-  readonly images?: readonly NormalizedImage[];
+  readonly parts: readonly NormalizedPart[];
+}
+
+/**
+ * The pictures one result returned, in the order it carried them.
+ *
+ * Derived from the sequence rather than stored beside it: a stored list and a
+ * sequence holding the same pictures are two views that can disagree, and the
+ * consumers here — the image labeller, the transport's "which pictures did the
+ * sequence already place" check — must see exactly what the projection places.
+ */
+export function toolResultImages(result: NormalizedToolResult): readonly NormalizedImage[] {
+  return (result.parts ?? []).flatMap((part) => (part.kind === 'image' ? [part.image] : []));
 }
 
 /**

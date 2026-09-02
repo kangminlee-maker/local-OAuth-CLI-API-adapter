@@ -2,7 +2,7 @@ import { TOOL_RESULT_MARKER } from './tool-history-markers.js';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { extname, join } from 'node:path';
-import { ProxyRequestError } from './types.js';
+import { ProxyRequestError, toolResultImages } from './types.js';
 import type {
   NormalizedImage,
   NormalizedImageDetail,
@@ -111,7 +111,7 @@ export function toolResultImageLabels(message: NormalizedMessage): Map<Normalize
   const labels = new Map<NormalizedImage, string>();
   for (const part of message.tool?.parts ?? []) {
     if (part.kind !== 'result') continue;
-    const images = part.result.images ?? [];
+    const images = toolResultImages(part.result);
     for (const [index, image] of images.entries()) {
       const which = images.length > 1 ? ` (${index + 1} of ${images.length})` : '';
       labels.set(image, `${TOOL_RESULT_MARKER} image for tool_call_id: ${part.result.callId}${which}`);
