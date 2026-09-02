@@ -2167,6 +2167,10 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
   // `tool_calls`. That is the sequence recorded.
   const parts: NormalizedToolPart[] = [];
   appendToolText(parts, content.text);
+  // Same order the prose above got, and for the same reason: `content` is the
+  // member BEFORE `tool_calls`, so a picture in it precedes the calls. Appended
+  // after the sequence instead, it arrived behind every call in the turn.
+  for (const image of content.images) parts.push({ kind: 'image', image });
   const rendered: string[] = [];
   for (const toolCall of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
     const raw = asRecord(toolCall);
@@ -2241,10 +2245,16 @@ function unpairedToolResultText(output: string, name?: string): string {
  *
  * A sequence of pure text is not a tool turn: the field would tell the codex
  * transport to rebuild ordinary prose as tool items, which is the defect the
- * field exists to prevent, pointing the other way.
+ * field exists to prevent, pointing the other way. Nor is a sequence of
+ * pictures, which is why this asks for a CALL or a RESULT by name rather than
+ * for anything that is not text: an ordinary `[text, image]` message records
+ * parts too, and reading their mere presence as provenance would have handed
+ * every such message to the tool-history projection.
  */
 function toolTurnOf(parts: readonly NormalizedToolPart[]): { tool?: NormalizedToolTurn } {
-  return parts.some((part) => part.kind !== 'text') ? { tool: { parts } } : {};
+  return parts.some((part) => part.kind === 'call' || part.kind === 'result')
+    ? { tool: { parts } }
+    : {};
 }
 
 /**
@@ -2377,7 +2387,14 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
     }
     if (block.type === 'image') {
       const image = readAnthropicImage(block);
-      if (image) images.push(image);
+      if (image) {
+        images.push(image);
+        // Into the SEQUENCE as well, because a block of the turn in its own
+        // right has a POSITION and only a part can carry one. Recorded here it
+        // costs an ordinary message nothing — `toolTurnOf` still asks for a
+        // call or a result before this is tool history at all.
+        parts.push({ kind: 'image', image });
+      }
       return '';
     }
     if (block.type === 'tool_use') {

@@ -1681,12 +1681,15 @@ async function responseInputItemsForMessage(message: NormalizedMessage): Promise
   const labels = toolResultImageLabels(message);
   const toolItems = await responseToolHistoryItems(message, labels);
   if (toolItems) {
-    // Whatever a RESULT returned has already left with that result, at its own
-    // position in the sequence. What can be left over is the MESSAGE's own
-    // images — blocks the client sent outside every tool block, which the turn
-    // records no part for and so has no position to give them. Those still
-    // arrive after the sequence, which is where they have always arrived.
-    const messageImages = message.images.filter((image) => !labels.has(image));
+    // Whatever the SEQUENCE placed has already left at its own position — what
+    // a result returned, beside that result, and a block of the turn's own, at
+    // the point the client wrote it. What can be left over is a picture no part
+    // claims, which the normalizer no longer produces: it is a request built by
+    // hand, with images on the message and none of them in the turn. Nothing is
+    // dropped on that path either — it arrives after the sequence, which is
+    // where every message image used to arrive.
+    const placed = toolTurnImages(message);
+    const messageImages = message.images.filter((image) => !placed.has(image));
     if (messageImages.length === 0) return toolItems;
     return [
       ...toolItems,
@@ -1702,6 +1705,19 @@ async function responseInputItemsForMessage(message: NormalizedMessage): Promise
     role: responseRole(message.role),
     content: await responseContent(message),
   }];
+}
+
+/** Every picture the turn's own sequence places, by identity, not by index. */
+function toolTurnImages(message: NormalizedMessage): Set<NormalizedImage> {
+  const placed = new Set<NormalizedImage>();
+  for (const part of message.tool?.parts ?? []) {
+    if (part.kind === 'result') {
+      for (const image of part.result.images ?? []) placed.add(image);
+    } else if (part.kind === 'image') {
+      placed.add(part.image);
+    }
+  }
+  return placed;
 }
 
 async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
@@ -1783,6 +1799,14 @@ async function responseToolHistoryItems(
         }
         items.push({ type: 'message', role: 'user', content });
       }
+    } else if (part.kind === 'image') {
+      // A picture the turn carried as a block of its own. It answers no call,
+      // so it gets no caption — attributing it to one would be the invention
+      // the labels exist to prevent — but it does have a POSITION, and this is
+      // it. Appended after the sequence instead, the picture a client put
+      // between the first result and the prose after it arrived behind the LAST
+      // result, in an order the client never wrote.
+      items.push({ type: 'message', role: 'user', content: [await responseImagePart(part.image)] });
     } else if (part.text) {
       // In the voice of the turn it belongs to: prose beside a call is the
       // assistant's, prose beside a result is the user's — which is the
