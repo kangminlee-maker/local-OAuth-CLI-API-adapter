@@ -3621,6 +3621,21 @@ class AnthropicToolUseStreamState {
       event.id ?? `call_${event.index + 1}`,
       event.name ?? 'tool',
     );
+    // A stopped block takes no more frames, so the block's own value is the
+    // answer: it was stopped either on the completed result's arguments, which
+    // is every character the call has, or — where no result reports the call —
+    // on exactly what the backend streamed for it. Anything written for it now
+    // would land PAST its `content_block_stop`, which this wire has no shape
+    // for, so it is refused once here rather than at each caller.
+    //
+    // No shipped backend produces either order that would arrive here. The
+    // codex transport already refuses to forward a delta for a call it declared
+    // finished (`emitArgumentExtension`), and measured upstream streams open one
+    // `function_call` item at a time, so no call's deltas resume after another's
+    // block opened. A `LocalStreamEvent` sequence can express both, and the
+    // queue above states this invariant about itself — this is what holds it to
+    // that, not a shape a client is receiving.
+    if (state.closed) return;
     if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
     // A backend that says where a call's arguments end closes the block there,
     // so the narration that resumes after it — or the next call — opens while

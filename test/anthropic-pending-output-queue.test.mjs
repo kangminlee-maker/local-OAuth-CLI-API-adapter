@@ -46,6 +46,11 @@ const whole = (index, call) => ({
   type: 'tool_call_delta', index, id: call.id, name: call.name,
   argumentsDelta: call.arguments, argumentsDone: true,
 });
+/** The REST of a call's arguments, declared final — an interrupted call resuming. */
+const resume = (index, call, chars = 8) => ({
+  type: 'tool_call_delta', index, id: call.id, name: call.name,
+  argumentsDelta: call.arguments.slice(chars), argumentsDone: true,
+});
 const say = (delta) => ({ type: 'text_delta', delta });
 
 function backendFor({ steps, text = '', toolCalls = [], textOrdinal, ends = 'completed' }) {
@@ -84,6 +89,8 @@ const sseEvents = (wire) => wire.split('\n')
 function blockReading(events) {
   const blocks = new Map();
   const order = [];
+  const stopped = new Set();
+  const deltasAfterStop = [];
   let open = 0;
   let maxOpen = 0;
   for (const event of events) {
@@ -93,8 +100,12 @@ function blockReading(events) {
       blocks.set(event.index, { index: event.index, type: event.content_block?.type, accumulated: '', deltas: 0 });
       order.push(event.index);
     }
-    if (event.type === 'content_block_stop') open -= 1;
+    if (event.type === 'content_block_stop') { open -= 1; stopped.add(event.index); }
     if (event.type === 'content_block_delta') {
+      // A block a client has already finalized. What lands here does not
+      // extend anything — it appends to a value the client closed, which is
+      // how an accumulator came to hold JSON that no longer parses.
+      if (stopped.has(event.index)) deltasAfterStop.push(event.index);
       const block = blocks.get(event.index);
       if (!block) continue;
       block.accumulated += event.delta?.partial_json ?? event.delta?.text ?? '';
@@ -105,6 +116,7 @@ function blockReading(events) {
   return {
     maxOpen,
     leftOpen: open,
+    deltasAfterStop,
     blocks: list,
     types: list.map((b) => b.type),
     toolArguments: list.filter((b) => b.type === 'tool_use').map((b) => b.accumulated),
@@ -150,6 +162,7 @@ async function streamOnly(backend) {
 function assertWireShape(r, types, label) {
   assert.equal(r.maxOpen, 1, `${label}: two content blocks open at once — ${JSON.stringify(r.blocks.map((b) => [b.index, b.type]))}`);
   assert.equal(r.leftOpen, 0, `${label}: a block was left open`);
+  assert.deepEqual(r.deltasAfterStop, [], `${label}: a delta was written past a block's content_block_stop`);
   assert.deepEqual(r.types, types, `${label}: production order`);
 }
 
@@ -386,4 +399,133 @@ test('CONTROL: a failure with nothing queued writes the error frame alone', asyn
   const r = await streamOnly(backendFor({ steps: [], ends: 'throw' }));
   assert.deepEqual(r.frames, ['message_start', 'error'], 'nothing was produced, so nothing is released');
   assert.deepEqual(r.types, [], 'and no content block is opened');
+});
+
+// The writer refuses to extend a block that already closed.
+//
+// These turns are hand-built and no shipped backend emits one. The codex
+// transport already refuses to forward a delta for a call it declared finished,
+// and upstream streams measured for this repo open one `function_call` item at
+// a time, so no call's deltas resume after another call's block has opened. A
+// `LocalStreamEvent` sequence can express both orders, and the queue states the
+// invariant about itself — a stopped block takes no more deltas — so these
+// cases hold it to that rather than reproducing a failure clients are seeing.
+//
+// The queue advances by CLOSING the open call: a call still taking arguments
+// blocks everything behind it, so settling reconciles it from the result and
+// stops its block to let the queue move. A delta for that same call sitting
+// further back in the queue therefore reaches the front addressing a block the
+// wire has already stopped — its value long since reconciled in. Extending it
+// there would append past the `content_block_stop`:
+//
+//   three calls opened with partial arguments, then the middle one resumes
+//     streamed args ['{"city":"Seoul"}', '{"city":"B"}"B"}', '{"city":"C"}']
+//     buffered args ['{"city":"Seoul"}', '{"city":"B"}',     '{"city":"C"}']
+//
+// What a client makes of that depends on how it accumulates: one that sums
+// every `input_json_delta` holds JSON that no longer parses, while one that
+// finalizes the block at `content_block_stop` ignores the extra delta and reads
+// correctly. On a turn with no completed result the two swap — the summing
+// client assembles the whole value from the late delta, the finalizing one
+// keeps the prefix the block closed on. Refusing the write is what gives both
+// the same value, and the case below the controls says what that costs.
+//
+// Every case here reads the turn twice, so the streamed accumulation is pinned
+// against the value the body reports.
+const RESUMED = [
+  ['[P0 P1 P2 R1] three partial calls, the middle one resumes',
+   [partial(0, CALL_A), partial(1, CALL_B), partial(2, CALL_C), resume(1, CALL_B)], [2, 2, 2]],
+  ['[P0 P1 W2 R1] the last call is declared final before the middle one resumes',
+   [partial(0, CALL_A), partial(1, CALL_B), whole(2, CALL_C), resume(1, CALL_B)], [2, 2, 1]],
+  ['[P0 W1 P2 R1] the middle call is declared final and then resumes anyway',
+   [partial(0, CALL_A), whole(1, CALL_B), partial(2, CALL_C), resume(1, CALL_B)], [2, 1, 2]],
+];
+
+for (const [label, steps, argumentDeltas] of RESUMED) {
+  test(`the writer refuses to extend a block that already closed: ${label}`, async () => {
+    const r = await readings(backendFor({ steps, toolCalls: [CALL_A, CALL_B, CALL_C] }));
+    assertWireShape(r, ['tool_use', 'tool_use', 'tool_use'], label);
+    assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments, CALL_C.arguments],
+      `${label}: every call carries exactly its input`);
+    assert.deepEqual(r.argumentDeltas, argumentDeltas,
+      `${label}: the resumed delta added nothing to an already-reconciled block`);
+    assertReadingsAgree(r, label);
+  });
+}
+
+test('CONTROL: a call resumes while its own block is still OPEN', async () => {
+  // The opposite expected answer: this delta is the one legitimate way the
+  // rest of an interrupted call reaches a client, and dropping it is the
+  // over-broad fix. Nothing was closed in between — the second call is still
+  // queued behind it — so it extends the block it was streamed for.
+  const label = '[P0 P1 R0] the FIRST call resumes, before anything closed it';
+  const r = await readings(backendFor({
+    steps: [partial(0, CALL_A), partial(1, CALL_B), resume(0, CALL_A)],
+    toolCalls: [CALL_A, CALL_B],
+  }));
+  assertWireShape(r, ['tool_use', 'tool_use'], label);
+  assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments]);
+  assert.deepEqual(r.argumentDeltas, [2, 2], `${label}: the resume landed in the open block`);
+  assertReadingsAgree(r, label);
+});
+
+test('CONTROL: the same resume is the ONLY source of that value when no result arrives', async () => {
+  // The control above cannot tell a delivered resume from a dropped one that
+  // `completed` reconciled back in. This turn has no result to reconcile from,
+  // so the first call's whole input exists on the wire only if its resume was
+  // really written into the open block.
+  const r = await streamOnly(backendFor({
+    steps: [partial(0, CALL_A), partial(1, CALL_B), resume(0, CALL_A)], ends: 'return',
+  }));
+  assertWireShape(r, ['tool_use', 'tool_use'], '[P0 P1 R0] then EOF');
+  assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments.slice(0, 8)],
+    'the resumed call is whole from its own deltas; the one that never resumed is not');
+  assert.deepEqual(r.argumentDeltas, [2, 1], 'two deltas reached the first block, one the second');
+});
+
+test('CONTROL: three partial calls where the FIRST one resumes', async () => {
+  // The same three-call queue as the defect cases, resuming the call whose
+  // block is open rather than one already closed behind it.
+  const label = '[P0 P1 P2 R0] three partial calls, the first one resumes';
+  const r = await readings(backendFor({
+    steps: [partial(0, CALL_A), partial(1, CALL_B), partial(2, CALL_C), resume(0, CALL_A)],
+    toolCalls: [CALL_A, CALL_B, CALL_C],
+  }));
+  assertWireShape(r, ['tool_use', 'tool_use', 'tool_use'], label);
+  assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments, CALL_C.arguments]);
+  assert.deepEqual(r.argumentDeltas, [2, 2, 2], `${label}: each block took its prefix and one tail`);
+  assertReadingsAgree(r, label);
+});
+
+test('CONTROL: three partial calls and no resume at all', async () => {
+  // Nothing resumes, so nothing can be dropped: the baseline the three defect
+  // cases are measured against.
+  const label = '[P0 P1 P2] three partial calls, none of them resumes';
+  const r = await readings(backendFor({
+    steps: [partial(0, CALL_A), partial(1, CALL_B), partial(2, CALL_C)],
+    toolCalls: [CALL_A, CALL_B, CALL_C],
+  }));
+  assertWireShape(r, ['tool_use', 'tool_use', 'tool_use'], label);
+  assert.deepEqual(r.toolArguments, [CALL_A.arguments, CALL_B.arguments, CALL_C.arguments]);
+  assert.deepEqual(r.argumentDeltas, [2, 2, 2]);
+  assertReadingsAgree(r, label);
+});
+
+test('what refusing costs: a block closed with nothing to reconcile from keeps its prefix', async () => {
+  // The same three-call interleave on a turn that never reaches `completed`.
+  // Nothing reconciles the closed blocks, so the resumed delta was the only
+  // copy of the rest of that call's arguments — and it is refused anyway,
+  // because the block it addresses is closed and this wire cannot reopen one.
+  // The client keeps the prefix the block closed on. That is the whole cost,
+  // and it is a truncation the client can see rather than a value it cannot
+  // parse; the turns that DO reach `completed` lose nothing at all.
+  const r = await streamOnly(backendFor({
+    steps: [partial(0, CALL_A), partial(1, CALL_B), partial(2, CALL_C), resume(1, CALL_B)],
+    ends: 'return',
+  }));
+  assertWireShape(r, ['tool_use', 'tool_use', 'tool_use'], '[P0 P1 P2 R1] then EOF');
+  assert.deepEqual(r.toolArguments,
+    [CALL_A.arguments.slice(0, 8), CALL_B.arguments.slice(0, 8), CALL_C.arguments.slice(0, 8)],
+    'every block carries what it streamed before it was closed, and nothing after');
+  assert.deepEqual(r.argumentDeltas, [1, 1, 1], 'the resumed delta reached no block');
 });
