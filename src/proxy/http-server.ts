@@ -2096,12 +2096,15 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
         text: result.text ? [{ type: 'text', text: result.text }] : [],
         toolCalls: result.toolCalls.map(anthropicToolUse),
       })
-    : [
-        {
-          type: 'text',
-          text: result.text,
-        },
-      ];
+    // Empty text is NO block, the same rule the two branches above already
+    // apply. Measured on the direct API 2026-09-02, a turn stopped at its very
+    // first token by a stop sequence: `content: []` buffered, and no
+    // `content_block_start` streamed. This branch alone emitted a text block
+    // carrying `''`, so one turn read as `[text]` buffered and as nothing
+    // streamed — and the buffered half was the one the vendor does not send.
+    : result.text
+    ? [{ type: 'text', text: result.text }]
+    : [];
   return {
     id: `msg_${result.id}`,
     type: 'message',
