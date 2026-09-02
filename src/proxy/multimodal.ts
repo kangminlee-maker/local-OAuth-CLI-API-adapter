@@ -66,7 +66,7 @@ export async function claudeMessageContentFor(
     const labels = toolResultImageLabels(message);
     for (const image of images) {
       const label = labels.get(image);
-      if (label) content.push({ type: 'text', text: `${TOOL_RESULT_MARKER} image for tool_call_id: ${label}` });
+      if (label) content.push({ type: 'text', text: label });
       content.push(await claudeImageBlock(image));
     }
   }
@@ -76,6 +76,11 @@ export async function claudeMessageContentFor(
 
 /**
  * What each image is called, keyed on the image itself.
+ *
+ * The value is the whole caption LINE, not the bare call id: two backends now
+ * write a caption from this map — the claude runtime into its prompt content,
+ * the codex transport beside the `function_call_output` the picture answers —
+ * and a grammar with two writers is a grammar that drifts. One writer, here.
  *
  * An image that answers a tool call says so. Every image used to be hoisted
  * ahead of one flattened prompt with nothing naming its origin, so a turn whose
@@ -93,14 +98,14 @@ export async function claudeMessageContentFor(
  * From the turn's structure, not from its text: reading the flattened prompt
  * back is what let a tool's own output forge a result boundary.
  */
-function toolResultImageLabels(message: NormalizedMessage): Map<NormalizedImage, string> {
+export function toolResultImageLabels(message: NormalizedMessage): Map<NormalizedImage, string> {
   const labels = new Map<NormalizedImage, string>();
   for (const part of message.tool?.parts ?? []) {
     if (part.kind !== 'result') continue;
     const images = part.result.images ?? [];
     for (const [index, image] of images.entries()) {
       const which = images.length > 1 ? ` (${index + 1} of ${images.length})` : '';
-      labels.set(image, `${part.result.callId}${which}`);
+      labels.set(image, `${TOOL_RESULT_MARKER} image for tool_call_id: ${part.result.callId}${which}`);
     }
   }
   return labels;

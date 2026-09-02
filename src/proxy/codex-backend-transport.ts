@@ -15,6 +15,7 @@ import {
 } from './image2-via-gpt55.js';
 import { postprocessFlatGraphicImageIfNeeded } from './flat-image-postprocess.js';
 import { prepareRequestedSize, realizeRequestedSize } from './image-realize.js';
+import { toolResultImageLabels } from './multimodal.js';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
@@ -1677,20 +1678,22 @@ async function responseInputItems(request: NormalizedRequest): Promise<unknown[]
 }
 
 async function responseInputItemsForMessage(message: NormalizedMessage): Promise<unknown[]> {
-  const toolItems = responseToolHistoryItems(message);
+  const labels = toolResultImageLabels(message);
+  const toolItems = await responseToolHistoryItems(message, labels);
   if (toolItems) {
-    if (message.images.length === 0) return toolItems;
-    // The call still has to be answered — an unanswered `function_call` is a
-    // 400 from this API — and the picture the tool returned still has to
-    // arrive. `function_call_output` carries a string, so the image travels
-    // beside it as its own user message rather than being dropped with the
-    // answer.
+    // Whatever a RESULT returned has already left with that result, at its own
+    // position in the sequence. What can be left over is the MESSAGE's own
+    // images — blocks the client sent outside every tool block, which the turn
+    // records no part for and so has no position to give them. Those still
+    // arrive after the sequence, which is where they have always arrived.
+    const messageImages = message.images.filter((image) => !labels.has(image));
+    if (messageImages.length === 0) return toolItems;
     return [
       ...toolItems,
       {
         type: 'message',
         role: 'user',
-        content: await Promise.all(message.images.map((image) => responseImagePart(image))),
+        content: await Promise.all(messageImages.map((image) => responseImagePart(image))),
       },
     ];
   }
@@ -1731,7 +1734,10 @@ async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
  * saying `[tool result]` in the prompt if it got through. The images come back
  * beside these items instead; see `responseInputItemsForMessage`.
  */
-function responseToolHistoryItems(message: NormalizedMessage): unknown[] | null {
+async function responseToolHistoryItems(
+  message: NormalizedMessage,
+  labels: Map<NormalizedImage, string>,
+): Promise<unknown[] | null> {
   const { tool } = message;
   if (!tool) return null;
   // The turn's own sequence, projected position for position. It used to be
@@ -1759,6 +1765,24 @@ function responseToolHistoryItems(message: NormalizedMessage): unknown[] | null 
       });
     } else if (part.kind === 'result') {
       items.push({ type: 'function_call_output', call_id: part.result.callId, output: part.result.output });
+      // Beside THIS result, not after the whole turn. `function_call_output`
+      // carries a string, so a picture cannot ride inside the answer — it comes
+      // as a companion message in the very next position. Appending every one of
+      // the message's images after the last part instead put the picture a
+      // parallel turn's FIRST call returned behind the SECOND call's output,
+      // with nothing saying which call it answered: the position-guessing the
+      // per-result `images` list exists to end, reintroduced one level down.
+      // The caption is the labeller's, not a second grammar written here.
+      const images = part.result.images ?? [];
+      if (images.length > 0) {
+        const content: unknown[] = [];
+        for (const image of images) {
+          const label = labels.get(image);
+          if (label) content.push({ type: 'input_text', text: label });
+          content.push(await responseImagePart(image));
+        }
+        items.push({ type: 'message', role: 'user', content });
+      }
     } else if (part.text) {
       // In the voice of the turn it belongs to: prose beside a call is the
       // assistant's, prose beside a result is the user's — which is the
