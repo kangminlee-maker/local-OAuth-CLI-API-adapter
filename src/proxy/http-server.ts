@@ -2990,17 +2990,6 @@ class OpenAiResponsesToolStreamState {
   }
 
   /**
-   * The lowest position any call has been announced at, or `Infinity` when none
-   * has. The terminal frames go out in announced order, and only an item that
-   * is already announced has a position to compare.
-   */
-  get firstAnnouncedIndex(): number {
-    let lowest = Infinity;
-    for (const state of this.items.values()) lowest = Math.min(lowest, state.outputIndex);
-    return lowest;
-  }
-
-  /**
    * The finished items with the output position each was announced at.
    *
    * `message` is the turn's message item and how to close it, when it already
@@ -3163,6 +3152,18 @@ async function writeAnthropicMessagesStream(
   // stop it mid-turn and still report the turn's usage — so the stream simply
   // stops carrying its output.
   const stopGate = new StopSequenceGate(request.stopSequences ?? []);
+  // A tool call cannot take a wire position while the gate is still holding
+  // text, because that text was produced FIRST and its block therefore comes
+  // first — unless a stop sequence eats it, in which case it gets no block at
+  // all. Announcing the call now would settle the question by RELEASE timing:
+  // `writeText('')` opens nothing, the call took block 0, and the released text
+  // opened a new block behind it, so one turn read [text, tool_use] buffered and
+  // [tool_use, text] streamed. Reserving the position by opening an empty text
+  // block instead would strand one on every turn the sequence really matched,
+  // where the buffered body reports content:[tool_use]. So the call's events
+  // wait here until the gate resolves — released or matched — and then take
+  // whatever position production order leaves them.
+  const heldToolEvents: Array<Extract<LocalStreamEvent, { type: 'tool_call_delta' }>> = [];
 
   try {
     await writeSseEvent(res, 'message_start', {
@@ -3223,13 +3224,28 @@ async function writeAnthropicMessagesStream(
       });
     };
 
+    /** The calls that waited behind the gate, written where they now belong. */
+    const flushHeldToolEvents = async (): Promise<void> => {
+      if (heldToolEvents.length === 0) return;
+      const held = heldToolEvents.splice(0, heldToolEvents.length);
+      await closeOpenTextBlock();
+      for (const call of held) await toolState.write(call);
+    };
+
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
         await writeText(stopGate.push(event.delta));
+        // The gate let go — what it held is on the wire or gone for good — so
+        // the text's position is settled and the calls behind it can take theirs.
+        if (!stopGate.pending) await flushHeldToolEvents();
         continue;
       }
       if (event.type === 'tool_call_delta') {
+        if (stopGate.pending) {
+          heldToolEvents.push(event);
+          continue;
+        }
         await closeOpenTextBlock();
         await toolState.write(event);
         continue;
@@ -3246,15 +3262,21 @@ async function writeAnthropicMessagesStream(
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
       if (result.toolCalls.length > 0) {
         // Blocks follow production order, which is what the non-streamed body
-        // reports through `orderedByEmission`. A turn whose tools came before
-        // any text was answered here in the other order — the same turn read
-        // as [text, tool_use] streamed and [tool_use, text] buffered.
-        if (textOrdinalOf(result, result.toolCalls.length) > 0 && !streamedText) {
+        // reports through `orderedByEmission`: the text goes after `textOrdinal`
+        // calls. The calls ALREADY on the wire are exactly the ones that
+        // preceded it, so only a turn whose text belongs behind calls that were
+        // never announced has to announce them first. Comparing the ordinal
+        // against 0 instead sent the text last whenever the gate had withheld
+        // it — a turn that called, narrated, then called again streamed both
+        // calls before its text while the buffered body split them around it.
+        if (textOrdinalOf(result, result.toolCalls.length) > toolState.announcedCount && !streamedText) {
+          await flushHeldToolEvents();
           await toolState.finish(result.toolCalls);
           for (const chunk of chunkText(gated.tail)) await writeText(chunk);
           await closeOpenTextBlock();
         } else {
           await writeText(gated.tail);
+          await flushHeldToolEvents();
           await closeOpenTextBlock();
           await toolState.finish(result.toolCalls);
         }
@@ -3264,6 +3286,7 @@ async function writeAnthropicMessagesStream(
         // result opens no content block, matching the non-streaming content:[] mapping
         // — so streaming and non-streaming refusals carry the same content.
         for (const chunk of chunkText(gated.tail)) await writeText(chunk);
+        await flushHeldToolEvents();
         await closeOpenTextBlock();
       }
 
@@ -3284,6 +3307,10 @@ async function writeAnthropicMessagesStream(
         type: 'message_stop',
       });
     }
+    // A stream that ended without a `completed` event never resolved the gate,
+    // so a call waiting behind it would be dropped rather than merely delayed.
+    // A delta that reached this writer reaches the wire.
+    await flushHeldToolEvents();
   } catch (err) {
     // Map the provider error the way every other surface does. Hard-coding
     // `api_error` and serializing the raw throw loses the runtime's status and
@@ -3333,6 +3360,16 @@ class AnthropicToolUseStreamState {
    * index that was never started — which the Anthropic SDK rejects outright.
    */
   constructor(private readonly res: ServerResponse, private readonly allocateBlockIndex: () => number) {}
+
+  /**
+   * How many calls have already taken a position on the wire. The turn's text
+   * goes after `textOrdinal` calls, so this is what says whether the calls that
+   * precede it have been announced yet — the buffered body's own ordinal,
+   * measured against the stream.
+   */
+  get announcedCount(): number {
+    return this.states.size;
+  }
 
   async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
     const state = await this.ensureStarted(

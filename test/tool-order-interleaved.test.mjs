@@ -68,11 +68,11 @@ async function surfaces(backend) {
       responsesDoneIndices: rStr.filter((e) => e.type === 'response.output_item.done').map((e) => e.output_index),
       responsesCompleted: rStr.find((e) => e.type === 'response.completed')?.response?.output?.map((o) => o.type),
       messagesBuffered: mBuf.content?.map((c) => c.type),
-      messagesStarts: rStrBlocks(mStr),
+      messagesStarts: messagesBlockStarts(mStr),
     };
   } finally { await server.close(); }
 }
-const rStrBlocks = (events) => events.filter((e) => e.type === 'content_block_start').map((e) => e.content_block?.type);
+const messagesBlockStarts = (events) => events.filter((e) => e.type === 'content_block_start').map((e) => e.content_block?.type);
 
 test('a call/text/call turn reads the same on the buffered and streamed Responses surface', async () => {
   const s = await surfaces(backendFor({
@@ -109,6 +109,7 @@ test('text first still reads text first on both surfaces', async () => {
   assert.deepEqual(s.responsesBuffered, ['message', 'function_call']);
   assert.deepEqual(s.responsesAdded, ['message', 'function_call']);
   assert.deepEqual(s.messagesBuffered, ['text', 'tool_use']);
+  assert.deepEqual(s.messagesStarts, ['text', 'tool_use'], 'the Messages STREAM is half of "both surfaces"');
   assert.deepEqual(s.responsesDoneIndices, [0, 1]);
 });
 
@@ -119,5 +120,6 @@ test('every call before the text still reads that way on both surfaces', async (
   assert.deepEqual(s.responsesBuffered, ['function_call', 'function_call', 'message']);
   assert.deepEqual(s.responsesAdded, ['function_call', 'function_call', 'message']);
   assert.deepEqual(s.messagesBuffered, ['tool_use', 'tool_use', 'text']);
+  assert.deepEqual(s.messagesStarts, ['tool_use', 'tool_use', 'text'], 'the Messages STREAM is half of "both surfaces"');
   assert.deepEqual(s.responsesDoneIndices, [0, 1, 2]);
 });

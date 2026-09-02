@@ -2489,3 +2489,92 @@ for (const [route, fail] of [
     assert.equal(error.type, 'rate_limit_error', 'the other discriminator is untouched');
   });
 }
+
+// ── Images, the fourth writer behind the same exit ──────────────────────────
+// `streamErrorPayload` is documented as the single exit for every OpenAI-shape
+// SSE error frame — chat, responses, images and the native surface — and the
+// loops above cover three of the four. Mutating ONLY the images catch to the
+// unbounded `rawStreamErrorPayload` published a `code` of 4096 characters in a
+// committed image stream and the whole suite stayed green, because no test had
+// ever driven an image stream PAST its commit into a failure.
+
+function failingImageBackend(fail) {
+  const image = { b64Json: 'iVBORw0KGgo=', revisedPrompt: null };
+  return {
+    name: 'test', model: 'configured-model',
+    async generate() { return { created: 0, images: [image] }; },
+    async *stream() {
+      // The commit has to happen on a real event: a stream that fails before
+      // one answers with an HTTP status, which is a different contract.
+      yield { type: 'completed', created: 0, image };
+      throw fail();
+    },
+    async close() {},
+  };
+}
+
+test('/v1/images/generations: a transport error\'s oversized type and code are bounded in the SSE frame', async () => {
+  assert.equal(TRANSPORT_TYPE.length, 4096, 'the fixture must be oversized');
+  assert.equal(TRANSPORT_CODE.length, 4096, 'the fixture must be oversized');
+  const backend = failingImageBackend(TRANSPORT_FLOOD);
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/images/generations`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot', stream: true }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, `a committed stream answers 200: ${text.slice(0, 200)}`);
+    assert.ok(
+      (res.headers.get('content-type') ?? '').startsWith('text/event-stream'),
+      `expected a stream, got ${res.headers.get('content-type')}`,
+    );
+    // The commit is what puts the failure in-band; without it this would be a
+    // JSON 400 and the frame under test would never be written.
+    assert.ok(text.includes('event: image_generation.completed'), `the stream must have committed: ${text.slice(0, 200)}`);
+    const frames = text.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6).trim())
+      .filter((data) => data && data !== '[DONE]')
+      .map((data) => JSON.parse(data));
+    const error = inBandError(frames);
+    assert.equal(error.type, 'invalid_request_error', `type was ${String(error.type ?? '').length} chars`);
+    assert.equal(error.code ?? null, null, `code was ${String(error.code ?? '').length} chars`);
+    assert.ok(String(error.type ?? '').length <= MAX_ERROR_MESSAGE_CHARS);
+    assert.ok(String(error.code ?? '').length <= MAX_ERROR_MESSAGE_CHARS);
+    assert.equal(error.message, 'upstream said no', 'the diagnostic itself is untouched');
+  } finally {
+    await started.close();
+  }
+});
+
+test('/v1/images/generations: a discriminator that FITS still reaches the SSE frame whole', async () => {
+  // The opposite answer, so the assertion above cannot be satisfied by a writer
+  // that simply drops both fields.
+  const backend = failingImageBackend(
+    () => new ProxyRequestError('upstream said no', 429, 'openai', 'rate_limit_error', 'p', 'slow_down'),
+  );
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/images/generations`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot', stream: true }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200);
+    const frames = text.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6).trim())
+      .filter((data) => data && data !== '[DONE]')
+      .map((data) => JSON.parse(data));
+    const error = inBandError(frames);
+    assert.equal(error.type, 'rate_limit_error');
+    assert.equal(error.code, 'slow_down');
+  } finally {
+    await started.close();
+  }
+});
