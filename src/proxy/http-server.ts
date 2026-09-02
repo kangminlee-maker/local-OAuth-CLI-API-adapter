@@ -3148,6 +3148,16 @@ function openAiResponsesCompletedResponse(
   });
 }
 
+/**
+ * One piece of output waiting for the wire, or the slot the stop-sequence gate
+ * is holding. The queue keeps production order, which is the order the buffered
+ * body reports the same turn in.
+ */
+type PendingOutput =
+  | { readonly kind: 'text'; readonly text: string }
+  | { readonly kind: 'tool'; readonly event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }> }
+  | { readonly kind: 'gate' };
+
 async function writeAnthropicMessagesStream(
   res: ServerResponse,
   events: AsyncIterable<LocalStreamEvent>,
@@ -3173,6 +3183,10 @@ async function writeAnthropicMessagesStream(
   // stop it mid-turn and still report the turn's usage — so the stream simply
   // stops carrying its output.
   const stopGate = new StopSequenceGate(request.stopSequences ?? []);
+  // Output the wire cannot take yet, in the order the turn produced it. Two
+  // things hold the wire, and NEITHER may be resolved by writing something
+  // else past it.
+  //
   // A tool call cannot take a wire position while the gate is still holding
   // text, because that text was produced FIRST and its block therefore comes
   // first — unless a stop sequence eats it, in which case it gets no block at
@@ -3181,25 +3195,34 @@ async function writeAnthropicMessagesStream(
   // opened a new block behind it, so one turn read [text, tool_use] buffered and
   // [tool_use, text] streamed. Reserving the position by opening an empty text
   // block instead would strand one on every turn the sequence really matched,
-  // where the buffered body reports content:[tool_use]. So the call's events
-  // wait here until the gate resolves — released or matched — and then take
-  // whatever position production order leaves them.
-  const heldToolEvents: Array<Extract<LocalStreamEvent, { type: 'tool_call_delta' }>> = [];
-  // The mirror image: narration produced while a call's arguments are still
+  // where the buffered body reports content:[tool_use]. The gate keeps a SLOT
+  // in this queue instead: what it releases goes exactly there, and a match
+  // leaves nothing behind.
+  //
+  // The mirror image: anything produced while a call's arguments are still
   // streaming cannot open its block yet. Opening one stops the call's block,
   // and a stopped block takes no more `input_json_delta` — so the arguments the
   // completed result reconciles would never reach the wire and a client
   // accumulating the deltas would finalize `{"city":` as the whole tool input,
   // while this surface's own buffered body and both OpenAI surfaces carried
-  // `{"city":"Seoul"}`. The text waits for the call to settle instead; the call
-  // was produced first either way, so its block still comes first.
-  let heldText = '';
+  // `{"city":"Seoul"}`. Narration is not the only thing that arrives there: a
+  // SECOND call still taking arguments opened its block INSIDE the first, a
+  // shape this wire cannot express at all. So both wait here, the open call
+  // settles — completed from the result where there is one, never closed early
+  // to make room — and then the queue moves.
+  const pending: PendingOutput[] = [];
+  // How many tool blocks the drain may still open. The completed handler lowers
+  // it to put the turn's text AT `textOrdinal`: the calls below the ordinal go
+  // out, then the text, then the rest.
+  let announceLimit = Number.POSITIVE_INFINITY;
 
   const ensureTextStarted = async (): Promise<void> => {
     if (textStarted && !textBlockClosed) return;
-    // A tool block whose arguments the backend never declared finished is
-    // still open. Opening a text block inside it nests two blocks on a wire
-    // that has no nesting, and a client assembling by index cannot read it.
+    // Text reaches the wire only through the queue, which never releases it
+    // while a call is open — this is the invariant, not the mechanism. A tool
+    // block whose arguments the backend never declared finished is still open,
+    // and a text block inside it nests two blocks on a wire that has no
+    // nesting, which a client assembling by index cannot read.
     await toolState.closeOpen();
     // Two content blocks are never open at once on this wire, so a tool call
     // stops the text block — and text that resumes afterwards is a NEW block.
@@ -3229,60 +3252,109 @@ async function writeAnthropicMessagesStream(
   const emitText = async (text: string): Promise<void> => {
     if (!text) return;
     await ensureTextStarted();
-    await writeSseEvent(res, 'content_block_delta', {
-      type: 'content_block_delta',
-      index: textBlockIndex,
-      delta: { type: 'text_delta', text },
-    });
+    for (const chunk of chunkText(text)) {
+      await writeSseEvent(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: textBlockIndex,
+        delta: { type: 'text_delta', text: chunk },
+      });
+    }
   };
 
   /**
-   * Accepts text for delivery. `streamedText` counts it either way — held text
-   * is delayed, never dropped, so counting it is what stops the completed
-   * result from writing it a second time as a missing tail.
+   * Writes as much of the queue as the wire can take, head first, and stops at
+   * the first item that still has to wait: everything behind it was produced
+   * later, so nothing may pass it.
    */
-  const writeText = async (text: string): Promise<void> => {
-    if (!text) return;
-    streamedText += text;
-    if (toolState.hasOpenBlock) { heldText += text; return; }
-    await emitText(text);
+  const drainPending = async (): Promise<void> => {
+    while (pending.length > 0) {
+      const next = pending[0];
+      // The gate's slot. What it holds was produced HERE, so nothing produced
+      // after it moves until the gate resolves.
+      if (next.kind === 'gate') return;
+      if (next.kind === 'text') {
+        if (toolState.hasOpenBlock) return;
+        pending.shift();
+        await emitText(next.text);
+        continue;
+      }
+      // A delta for the call that is already open extends a block the wire is
+      // holding open for it; anything else needs a block of its own.
+      if (!toolState.isOpen(next.event.index)) {
+        if (toolState.hasOpenBlock) return;
+        if (!toolState.hasStarted(next.event.index) && toolState.announcedCount >= announceLimit) return;
+      }
+      pending.shift();
+      await closeOpenTextBlock();
+      await toolState.write(next.event);
+    }
   };
 
   /**
-   * The narration that waited for a call's block, written now. Callers that
-   * must not disturb an open call check `toolState.hasOpenBlock` first — this
-   * opens a text block, which stops whatever is open.
+   * Accepts text for delivery, at the place in the turn it was produced.
+   * `streamedText` counts it either way — queued text is delayed, never
+   * dropped, so counting it is what stops the completed result from writing it
+   * a second time as a missing tail.
    */
-  const flushHeldText = async (): Promise<void> => {
-    if (!heldText) return;
-    const text = heldText;
-    heldText = '';
-    await emitText(text);
+  const writeText = async (text: string, at = pending.length): Promise<void> => {
+    if (text) {
+      streamedText += text;
+      pending.splice(at, 0, { kind: 'text', text });
+    }
+    await drainPending();
   };
 
-  /** The calls that waited behind the gate, written where they now belong. */
-  const flushHeldToolEvents = async (): Promise<void> => {
-    if (heldToolEvents.length === 0) return;
-    const held = heldToolEvents.splice(0, heldToolEvents.length);
-    await closeOpenTextBlock();
-    for (const call of held) await toolState.write(call);
+  /** Where the gate is holding text, if it is holding any. */
+  const gateSlot = (): number => pending.findIndex((item) => item.kind === 'gate');
+
+  /** Records that the gate is holding text produced at this point in the turn. */
+  const holdGate = (): void => {
+    if (gateSlot() < 0) pending.push({ kind: 'gate' });
+  };
+
+  /**
+   * The gate resolved: what it was holding takes the slot it held — ahead of
+   * everything produced while it held — and releasing nothing means a sequence
+   * ate it, so the slot simply stops blocking.
+   */
+  const releaseGate = async (text: string): Promise<void> => {
+    const at = gateSlot();
+    if (at >= 0) pending.splice(at, 1);
+    await writeText(text, at >= 0 ? at : pending.length);
+  };
+
+  /**
+   * Everything the stream already produced, written out. A call still taking
+   * arguments blocks the queue behind it, so it settles first — completed from
+   * `toolCalls` when the turn has a result to complete it from, closed where it
+   * is when it does not — and what waited takes its own block. It repeats
+   * because what waited may be another call that never finished.
+   */
+  const settlePending = async (toolCalls: readonly LocalToolCall[]): Promise<void> => {
+    await drainPending();
+    while (pending.length > 0 && toolState.hasOpenBlock) {
+      const before = pending.length;
+      await toolState.closeOpen(toolCalls);
+      await drainPending();
+      // Nothing moved, so nothing will: what is left is waiting on something
+      // closing an open call cannot resolve — the announce limit, or the
+      // gate's own slot — and only the caller that set it can lift it.
+      if (pending.length === before) return;
+    }
   };
 
   /**
    * The turn is over without a `completed` event — it ended or it failed —
    * so nothing more can arrive to beat a half-matched sequence: the gate
-   * resolves, and whatever it was holding is the answer. Text first, then the
-   * calls that were waiting on it, because that is the order they were
-   * produced in.
+   * resolves, and whatever it was holding is the answer. No completed result
+   * is coming either, so a call whose arguments never settled cannot be
+   * completed from one: it closes on what it streamed, and what waited behind
+   * it takes its own block rather than vanishing with it.
    */
   const releaseHeldOutput = async (): Promise<void> => {
-    await writeText(stopGate.flush());
-    await flushHeldToolEvents();
-    // No completed result is coming, so a call whose arguments never settled
-    // cannot be completed from one: close it where it is, and let the narration
-    // that was waiting on it take its own block rather than vanish with it.
+    await releaseGate(stopGate.flush());
+    await settlePending([]);
     await toolState.closeOpen();
-    await flushHeldText();
   };
 
   try {
@@ -3306,27 +3378,27 @@ async function writeAnthropicMessagesStream(
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
-        await writeText(stopGate.push(event.delta));
+        const released = stopGate.push(event.delta);
         // The gate let go — what it held is on the wire or gone for good — so
-        // the text's position is settled and the calls behind it can take theirs.
-        if (!stopGate.pending) await flushHeldToolEvents();
+        // its slot is settled and what waited behind it can take a position.
+        if (released || !stopGate.pending) await releaseGate(released);
+        if (stopGate.pending) holdGate();
         continue;
       }
       if (event.type === 'tool_call_delta') {
-        if (stopGate.pending) {
-          heldToolEvents.push(event);
+        // A delta for the call whose block is OPEN extends a block already on
+        // the wire, and that block precedes everything waiting — so it never
+        // queues. This is the only way the rest of an interrupted call's
+        // arguments can still reach a client: a stopped block takes none.
+        if (toolState.isOpen(event.index)) {
+          await toolState.write(event);
+          // `argumentsDone` may have just closed the block the queue waited on.
+          await drainPending();
           continue;
         }
-        // Narration produced before this call cannot be written after it, and a
-        // NEW call may not open a block inside one that is still taking
-        // arguments. So the held text goes out first, which stops the open
-        // block — the one case where its arguments cannot be reconciled,
-        // because the completed result has not arrived yet.
-        if (heldText && !toolState.hasStarted(event.index)) await flushHeldText();
-        await closeOpenTextBlock();
-        await toolState.write(event);
-        // `argumentsDone` may have just closed the block the text was waiting on.
-        if (!toolState.hasOpenBlock) await flushHeldText();
+        // Anything else needs a block of its own, so it waits its turn.
+        pending.push({ kind: 'tool', event });
+        await drainPending();
         continue;
       }
       // No content block corresponds to it on this wire — a `thinking` block
@@ -3357,14 +3429,28 @@ async function writeAnthropicMessagesStream(
         // buffered [tool_use, text, tool_use].
         const textAt = textOrdinalOf(result, result.toolCalls.length);
         if (textAt > toolState.announcedCount && !streamedText) {
-          await flushHeldToolEvents();
-          await toolState.finish(result.toolCalls.slice(0, textAt));
-          for (const chunk of chunkText(gated.tail)) await writeText(chunk);
-          await closeOpenTextBlock();
+          // Only the calls BELOW the ordinal go out first: the drain stops
+          // there, the text takes the head of the queue, and the calls above it
+          // open behind. Draining all of them first read [tool_use, tool_use,
+          // text] against a buffered [tool_use, text, tool_use] — so the limit
+          // goes up BEFORE anything that drains, the gate's release included.
+          announceLimit = textAt;
+          try {
+            // `textOrdinal` decides where this text goes, not the gate, so the
+            // slot stops blocking and the text is placed by the ordinal below.
+            await releaseGate('');
+            await settlePending(result.toolCalls);
+            await toolState.finish(result.toolCalls.slice(0, textAt));
+            await writeText(gated.tail, 0);
+            await closeOpenTextBlock();
+          } finally {
+            announceLimit = Number.POSITIVE_INFINITY;
+          }
+          await settlePending(result.toolCalls);
           await toolState.finish(result.toolCalls.slice(textAt), textAt);
         } else {
-          await writeText(gated.tail);
-          await flushHeldToolEvents();
+          await releaseGate(gated.tail);
+          await settlePending(result.toolCalls);
           await closeOpenTextBlock();
           await toolState.finish(result.toolCalls);
         }
@@ -3373,15 +3459,15 @@ async function writeAnthropicMessagesStream(
         // where no live text_delta was emitted), then close the block. A truly empty
         // result opens no content block, matching the non-streaming content:[] mapping
         // — so streaming and non-streaming refusals carry the same content.
-        for (const chunk of chunkText(gated.tail)) await writeText(chunk);
-        await flushHeldToolEvents();
+        await releaseGate(gated.tail);
+        await settlePending(result.toolCalls);
         await closeOpenTextBlock();
       }
 
-      // Every block the branches above opened has been closed, so narration
-      // that waited on a call can finally take one of its own — after the call
-      // it waited for, which is where it was produced.
-      await flushHeldText();
+      // Every block the branches above opened has been closed, so anything
+      // still queued can finally take one of its own — after the call it waited
+      // for, which is where it was produced.
+      await settlePending(result.toolCalls);
       await closeOpenTextBlock();
 
       await writeSseEvent(res, 'message_delta', {
@@ -3496,6 +3582,15 @@ class AnthropicToolUseStreamState {
     return this.states.has(index);
   }
 
+  /**
+   * Whether THIS call's block is the open one — the only block a delta may
+   * still extend, and the reason a delta for it never has to wait its turn.
+   */
+  isOpen(index: number): boolean {
+    const state = this.states.get(index);
+    return state !== undefined && !state.closed;
+  }
+
   async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
     const state = await this.ensureStarted(
       event.index,
@@ -3510,9 +3605,21 @@ class AnthropicToolUseStreamState {
     if (event.argumentsDone) await this.stop(state);
   }
 
-  /** Closes any block still open, so nothing else can open inside one. */
-  async closeOpen(): Promise<void> {
-    for (const state of this.states.values()) await this.stop(state);
+  /**
+   * Closes any block still open, so nothing else can open inside one — with
+   * the turn's completed calls when the caller has them. A block stopped
+   * without them keeps only what was streamed, which is how a client came to
+   * finalize `{"city":` as a whole tool input; the rest of the value goes in
+   * BEFORE the stop, because a stopped block takes no more deltas.
+   */
+  async closeOpen(toolCalls: readonly LocalToolCall[] = []): Promise<void> {
+    for (const [index, state] of this.states) {
+      if (state.closed) continue;
+      const call = toolCalls[index];
+      const rest = call ? missingToolCallArgumentDelta(state.arguments, call) : '';
+      if (rest) await this.writeArgumentsDelta(index, state, rest);
+      await this.stop(state);
+    }
   }
 
   /**
@@ -3534,8 +3641,9 @@ class AnthropicToolUseStreamState {
       // A block this writer stopped to make room for something else is NOT
       // that, and skipping it streamed `{"city":` as a client's whole tool
       // input. Nothing can be written into a stopped block, so the fix is not
-      // here: narration now waits for the call to settle rather than stopping
-      // its block, which leaves this line reachable only for the first fact.
+      // here: whatever needs a block of its own queues until the call settles
+      // rather than stopping it, which leaves this line reachable only for the
+      // first fact.
       if (state.closed) continue;
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);

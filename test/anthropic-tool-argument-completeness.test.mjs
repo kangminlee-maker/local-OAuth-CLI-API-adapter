@@ -13,9 +13,11 @@
 //   /v1/messages        streamed args {"city":           INVALID JSON
 //   /v1/messages        buffered input {"city":"Seoul"}
 //
-// The narration waits for the call to settle now. The call was produced first
+// The narration waits for the call to settle now, in a queue that holds
+// everything needing a block of its own until the open call reaches
+// `argumentsDone` or `completed` reconciles it. The call was produced first
 // either way, so its block still comes first — nothing about the order moves,
-// only when the text block is allowed to open.
+// only when the next block is allowed to open.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
@@ -191,14 +193,12 @@ const secondCall = { type: 'tool_call_delta', index: 1, id: CALL_B.id, name: CAL
 test('a second call may not open its block inside one still taking arguments', async () => {
   // Holding the narration keeps the first call's block OPEN, so a call
   // produced after it would nest a second block inside — a shape this wire has
-  // no way to express and a client assembling by index cannot read. The held
-  // text goes out first instead, which closes the unfinished block.
-  //
-  // KNOWN HOLE, deliberately not asserted as contract: closing that block is
-  // the one case where its arguments cannot be reconciled, because no completed
-  // result has arrived — so block 0 still carries only what was streamed. What
-  // is asserted here is what the wire owes regardless: one block at a time, in
-  // production order.
+  // no way to express and a client assembling by index cannot read. Writing
+  // the held text out first was the other way to keep the shape, and it cost
+  // the first call's arguments: nothing can be written into a stopped block,
+  // so block 0 carried `{"city":` for good while the buffered body carried
+  // `{"city":"Seoul"}`. Both rules hold now — the narration and the next call
+  // wait, and `completed` reconciles the open call before it closes.
   const r = await readings(backendFor({
     steps: [unfinishedCall, narrate, secondCall], toolCalls: [CALL, CALL_B], textOrdinal: 1,
   }));
@@ -209,7 +209,12 @@ test('a second call may not open its block inside one still taking arguments', a
     r.messagesBlocks.map((b) => b.type), ['tool_use', 'text', 'tool_use'],
     'production order: the call, the narration it interrupted, then the next call',
   );
-  assert.equal(toolBlocks(r)[1].accumulated, CALL_B.arguments, 'the second call carries its whole input');
+  assert.deepEqual(
+    toolBlocks(r).map((b) => b.accumulated), [FULL, CALL_B.arguments],
+    'EVERY call carries its whole input, the interrupted one included',
+  );
+  assert.deepEqual(JSON.parse(toolBlocks(r)[0].accumulated), { city: 'Seoul' }, 'and the first one parses');
+  assert.deepEqual(r.bufferedInput, { city: 'Seoul' }, 'which is what the buffered body reports for it');
   assert.deepEqual(textBlocks(r).map((b) => b.accumulated), ['narration'], 'and the narration is written once');
 });
 
