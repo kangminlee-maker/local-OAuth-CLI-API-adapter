@@ -39,7 +39,11 @@ function backendThatEndsWithout({ steps, fail }) {
         if (typeof step === 'string') { yield { type: 'text_delta', delta: step }; continue; }
         yield {
           type: 'tool_call_delta', index: 0, id: step.id, name: step.name,
-          argumentsDelta: step.arguments, argumentsDone: true,
+          argumentsDelta: step.arguments,
+          // A backend that never says where the arguments end leaves the block
+          // OPEN — the shape every `argumentsDone: true` step above closes for
+          // itself, and the only one the release has anything left to close.
+          ...(step.unfinished ? {} : { argumentsDone: true }),
         };
       }
       if (fail) throw new Error('mid-stream boom');
@@ -162,4 +166,56 @@ test('CONTROL: a stream that just ends after a sequence matched writes no text b
 test('CONTROL: a stream that just ends with nothing held writes nothing extra', async () => {
   const s = await streamOnce(backendThatEndsWithout({ steps: [], fail: false }), ['Done']);
   assert.deepEqual(s.frames, ['message_start'], 'an empty turn stays empty');
+});
+
+// The call the backend never finished.
+//
+// Every step above declares `argumentsDone`, so each call stops its own block
+// and the release finds nothing open. That is why deleting `toolState.closeOpen()`
+// from `releaseHeldOutput` changed no test: the one turn it answers for — a call
+// still taking arguments when the stream simply ends — was not in the suite.
+// Without it the block stays open past the last frame, and a client assembling
+// by index waits for a `content_block_stop` that never comes.
+const PARTIAL_A = { id: 'call_a', name: 'get_weather', arguments: '{"city":', unfinished: true };
+
+test('a stream that just ends closes a call whose arguments never finished', async () => {
+  const s = await streamOnce(backendThatEndsWithout({ steps: [PARTIAL_A], fail: false }), null);
+  // The denominator first: an assertion about closing blocks says nothing at
+  // all if no block was ever opened.
+  assert.deepEqual(s.blocks, ['tool_use'], `the call must take a block: ${s.frames.join(',')}`);
+  assert.equal(s.toolArguments, PARTIAL_A.arguments, 'and the partial arguments really reached the wire');
+  assert.deepEqual(s.stops, s.blockIndices, `the open block is closed by the release: ${s.frames.join(',')}`);
+  assert.ok(!s.frames.includes('error'), `a clean end is not a failure: ${s.frames.join(',')}`);
+});
+
+test('a mid-stream failure closes a call whose arguments never finished', async () => {
+  // The other exit, same shape: the error frame is last, and nothing is left
+  // open behind it.
+  const s = await streamOnce(backendThatEndsWithout({ steps: [PARTIAL_A], fail: true }), null);
+  assert.deepEqual(s.blocks, ['tool_use'], `the call must take a block: ${s.frames.join(',')}`);
+  assert.equal(s.toolArguments, PARTIAL_A.arguments);
+  assert.deepEqual(s.stops, s.blockIndices, `the open block is closed before the error: ${s.frames.join(',')}`);
+  assert.deepEqual(s.frames.at(-1), 'error');
+});
+
+test('a stream that just ends closes an unfinished call behind the text the gate held', async () => {
+  // Both halves of the release at once: the gate's text takes the position it
+  // was produced at, and the call that waited behind it opens a block the
+  // backend never closed.
+  const s = await streamOnce(backendThatEndsWithout({ steps: ['Do', PARTIAL_A], fail: false }), ['Done']);
+  assert.equal(s.text, 'Do', 'the withheld text never matched, so it is the caller\'s');
+  assert.deepEqual(s.blocks, ['text', 'tool_use'], 'text first: it was produced first');
+  assert.equal(s.toolArguments, PARTIAL_A.arguments);
+  assert.deepEqual(s.stops, s.blockIndices, `both blocks are closed: ${s.frames.join(',')}`);
+});
+
+test('CONTROL: a call the backend DID finish is closed on its whole arguments', async () => {
+  // The opposite answer on the same reading: a finished call stops its own
+  // block at the delta that declared it final, and carries the whole value —
+  // so a run that reports the partial bytes here is reading the wrong turn.
+  const s = await streamOnce(backendThatEndsWithout({ steps: [CALL_A], fail: false }), null);
+  assert.deepEqual(s.blocks, ['tool_use']);
+  assert.equal(s.toolArguments, CALL_A.arguments, 'the whole value, not a prefix');
+  assert.notEqual(s.toolArguments, PARTIAL_A.arguments);
+  assert.deepEqual(s.stops, s.blockIndices);
 });
