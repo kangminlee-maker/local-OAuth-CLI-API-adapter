@@ -14,8 +14,9 @@
 // loud where a decision gets made — never in a file that goes green.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdir, readFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const testDir = dirname(fileURLToPath(import.meta.url));
@@ -42,26 +43,67 @@ async function filesUnder(dir) {
   return out;
 }
 
-test('no file declares a gap it leaves unasserted', async () => {
-  const files = [...await filesUnder(testDir), ...await filesUnder(srcDir)];
+/**
+ * The scan itself, as a function the control can run.
+ *
+ * It used to be inlined in the test, and the "can it find a marker" control
+ * checked the marker LIST and the directory walk without ever passing a line
+ * through the matching — so disabling the match entirely left both tests green.
+ * A control that cannot fail is the whole thing this file exists to catch, and
+ * it was in this file.
+ */
+async function markersIn(files, self) {
   const found = [];
   for (const file of files) {
-    if (file === fileURLToPath(import.meta.url)) continue;
+    if (file === self) continue;
     const text = await readFile(file, 'utf8');
     for (const [index, line] of text.split('\n').entries()) {
       for (const marker of MARKERS) {
-        if (line.includes(marker)) found.push(`${file.slice(testDir.length - 4)}:${index + 1}: ${line.trim().slice(0, 100)}`);
+        if (line.includes(marker)) found.push({ file, line: index + 1, text: line.trim().slice(0, 100) });
       }
     }
   }
-  assert.deepEqual(found, [], `a gap is recorded in a comment instead of being closed or raised:\n${found.join('\n')}`);
+  return found;
+}
+
+const self = fileURLToPath(import.meta.url);
+
+test('no file declares a gap it leaves unasserted', async () => {
+  const files = [...await filesUnder(testDir), ...await filesUnder(srcDir)];
+  const found = await markersIn(files, self);
+  assert.deepEqual(found.map((f) => `${f.file}:${f.line}: ${f.text}`), [],
+    'a gap is recorded in a comment instead of being closed or raised');
 });
 
-test('the marker scan can actually find a marker', async () => {
-  // The check above passes trivially if the scan is broken — and a scan that
-  // silently matches nothing is exactly the failure this file exists to catch.
-  const planted = `// ${MARKERS[0]}: a planted line`;
-  assert.ok(MARKERS.some((marker) => planted.includes(marker)), 'the marker list must match a known-bad line');
-  assert.equal((await filesUnder(testDir)).length > 0, true, 'the walk must reach the test directory');
-  assert.equal((await filesUnder(srcDir)).length > 0, true, 'and the source directory');
+test('the scan finds a marker in a real file, and reports where', async () => {
+  // Through the SAME function the check above uses, against a real file on
+  // disk — so breaking the match breaks this too.
+  const dir = await mkdtemp(join(tmpdir(), 'marker-scan-'));
+  try {
+    const planted = join(dir, 'planted.mjs');
+    await writeFile(planted, `// fine\n// ${MARKERS[0]}: a planted line\n// also fine\n`);
+    const clean = join(dir, 'clean.mjs');
+    await writeFile(clean, '// nothing to see here\n');
+
+    const hits = await markersIn(await filesUnder(dir), self);
+    assert.equal(hits.length, 1, 'exactly the planted line is reported');
+    assert.equal(hits[0].file, planted, 'and it names the file it was in');
+    assert.equal(hits[0].line, 2, 'and the line it was on');
+
+    // The other direction: a tree with no marker reports nothing, so the scan
+    // is not simply returning everything it walks.
+    assert.deepEqual(await markersIn([clean], self), []);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('every marker in the list is one the scan would catch', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'marker-each-'));
+  try {
+    for (const [index, marker] of MARKERS.entries()) {
+      const file = join(dir, `m${index}.mjs`);
+      await writeFile(file, `// ${marker} here\n`);
+      const hits = await markersIn([file], self);
+      assert.equal(hits.length, 1, `the list entry ${JSON.stringify(marker)} is never matched by the scan`);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
