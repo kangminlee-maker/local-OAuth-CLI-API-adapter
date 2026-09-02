@@ -37,14 +37,23 @@ export async function prepareCodexInput(
   const tempDirs: string[] = [];
   const input: unknown[] = [];
 
-  for (const image of requestImages(request)) {
-    input.push(await codexImageInput(image, tempDirs));
+  // An image that answers a tool call says so here too. This was the third
+  // writer of a hoisted picture and the only one left without the caption: the
+  // claude runtime and the codex transport both name the call a picture answers,
+  // while this path put every picture ahead of one flattened prompt with nothing
+  // saying where any of them came from — the position-matching described above
+  // this file's labeller, still happening on this route. The label is that
+  // labeller's, not a fourth grammar written here.
+  for (const message of request.messages) {
+    const labels = toolResultImageLabels(message);
+    // `images` is optional on the shape callers build by hand.
+    for (const image of message.images ?? []) {
+      const label = labels.get(image);
+      if (label) input.push(codexTextInput(label));
+      input.push(await codexImageInput(image, tempDirs));
+    }
   }
-  input.push({
-    type: 'text',
-    text: prompt,
-    text_elements: [],
-  });
+  input.push(codexTextInput(prompt));
 
   return {
     input,
@@ -109,6 +118,14 @@ export function toolResultImageLabels(message: NormalizedMessage): Map<Normalize
     }
   }
   return labels;
+}
+
+function codexTextInput(text: string): unknown {
+  return {
+    type: 'text',
+    text,
+    text_elements: [],
+  };
 }
 
 async function codexImageInput(

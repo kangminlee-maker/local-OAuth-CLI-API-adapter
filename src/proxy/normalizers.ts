@@ -6,12 +6,12 @@ import type {
   NormalizedImage,
   NormalizedImageDetail,
   NormalizedMessage,
+  NormalizedPart,
   NormalizedRequest,
   NormalizedReasoningEffort,
   NormalizedThinking,
   NormalizedTool,
   NormalizedToolChoice,
-  NormalizedToolPart,
   NormalizedToolResult,
   NormalizedToolTurn,
   NormalizedVerbosity,
@@ -21,6 +21,12 @@ import { ProxyRequestError } from './types.js';
 interface NormalizedContent {
   readonly text: string;
   readonly images: readonly NormalizedImage[];
+  /**
+   * The blocks this function read, in the client's own order — the sequence
+   * `text` is a rendering OF. Present wherever a block list was read; absent
+   * where there was nothing to order.
+   */
+  readonly parts?: readonly NormalizedPart[];
   /**
    * The tool turn this normalizer flattened into `text`, as structure. Present
    * only where THIS module wrote the markers, and carrying the calls and
@@ -1775,6 +1781,7 @@ function readOpenAiMessages(value: unknown): NormalizedMessage[] {
       role,
       content: content.text,
       images: content.images,
+      ...(content.parts ? { parts: content.parts } : {}),
       ...(content.tool ? { tool: content.tool } : {}),
     };
   });
@@ -1879,6 +1886,7 @@ function readResponsesInput(value: unknown): NormalizedMessage[] {
       role: readResponsesRole(msg, index),
       content: content.text,
       images: content.images,
+      ...(content.parts ? { parts: content.parts } : {}),
       ...(content.tool ? { tool: content.tool } : {}),
     }];
   });
@@ -2067,6 +2075,7 @@ function readAnthropicMessages(value: unknown): NormalizedMessage[] {
         role: msg.role as NormalizedMessage['role'],
         content: flattened.text,
         images: flattened.images,
+        ...(flattened.parts ? { parts: flattened.parts } : {}),
         ...(flattened.tool ? { tool: flattened.tool } : {}),
       },
       // Emptiness is what the item gives a BACKEND, judged after flattening:
@@ -2146,9 +2155,18 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
     // carries a function NAME and no call id at all. There is nothing to pair
     // with, so it is not structure; see `unpairedToolResultText`.
     if (callId === null) {
+      const name = readOptionalString(msg.name);
+      const unpaired = unpairedToolResultText(content.text, name);
       return {
-        text: unpairedToolResultText(content.text, readOptionalString(msg.name)),
+        text: unpaired,
         images: content.images,
+        parts: content.text
+          ? prefixedParts(
+            [TOOL_RESULT_MARKER, ...(name ? [`name: ${name}`] : [])].join('\n'),
+            content,
+            '\n',
+          )
+          : legacyParts(unpaired, content.images),
       };
     }
     const result: NormalizedToolResult = {
@@ -2156,21 +2174,25 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
       output: content.text,
       ...(content.images.length > 0 ? { images: content.images } : {}),
     };
+    // One array, two views: `parts` and `tool.parts` are the SAME sequence, so
+    // a consumer reading either cannot see a different order from the other.
+    const parts: NormalizedPart[] = [{ kind: 'result', result }];
     return {
       text: renderToolResult(result),
       images: content.images,
-      tool: { parts: [{ kind: 'result', result }] },
+      parts,
+      ...toolTurnOf(parts),
     };
   }
   // This shape holds the prose and the calls in two separate MEMBERS, so their
   // order is the schema's rather than the client's: `content` first, then
   // `tool_calls`. That is the sequence recorded.
-  const parts: NormalizedToolPart[] = [];
-  appendToolText(parts, content.text);
-  // Same order the prose above got, and for the same reason: `content` is the
-  // member BEFORE `tool_calls`, so a picture in it precedes the calls. Appended
-  // after the sequence instead, it arrived behind every call in the turn.
-  for (const image of content.images) parts.push({ kind: 'image', image });
+  // The content array's OWN sequence, text runs and pictures alike, at the head
+  // of the turn: `content` is the member BEFORE `tool_calls`, so everything in
+  // it precedes the calls. It used to be flattened first — all the text, then
+  // all the pictures — so `[picture, "what is this"]` recorded the question
+  // ahead of the picture it asks about.
+  const parts: NormalizedPart[] = [...(content.parts ?? [])];
   const rendered: string[] = [];
   for (const toolCall of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
     const raw = asRecord(toolCall);
@@ -2195,6 +2217,7 @@ function flattenOpenAiMessage(msg: Record<string, unknown>, role: NormalizedMess
   return {
     text: [content.text, rendered.join('\n')].filter(Boolean).join('\n\n'),
     images: content.images,
+    parts,
     ...toolTurnOf(parts),
   };
 }
@@ -2251,7 +2274,7 @@ function unpairedToolResultText(output: string, name?: string): string {
  * parts too, and reading their mere presence as provenance would have handed
  * every such message to the tool-history projection.
  */
-function toolTurnOf(parts: readonly NormalizedToolPart[]): { tool?: NormalizedToolTurn } {
+function toolTurnOf(parts: readonly NormalizedPart[]): { tool?: NormalizedToolTurn } {
   return parts.some((part) => part.kind === 'call' || part.kind === 'result')
     ? { tool: { parts } }
     : {};
@@ -2265,14 +2288,56 @@ function toolTurnOf(parts: readonly NormalizedToolPart[]): { tool?: NormalizedTo
  * and keeps "a text part is a RUN" true, so a projection never has to decide
  * how to space two neighbours.
  */
-function appendToolText(parts: NormalizedToolPart[], text: string): void {
+function appendToolText(parts: NormalizedPart[], text: string): void {
+  appendText(parts, text, '\n\n');
+}
+
+/**
+ * Adds a run of prose, joined to the run before it by the SEPARATOR this shape
+ * renders with — `\n` inside an OpenAI content array, `\n\n` between the blocks
+ * of an Anthropic message. It is the same separator `content` is joined with,
+ * which is what makes the two views of a text-only message the same bytes: a
+ * projection that walked the parts of `[text "A", text "B"]` and joined them
+ * its own way would rewrite a message that has no pictures in it at all.
+ */
+function appendText(parts: NormalizedPart[], text: string, separator: string): void {
   if (!text) return;
   const last = parts[parts.length - 1];
   if (last?.kind === 'text') {
-    parts[parts.length - 1] = { kind: 'text', text: `${last.text}\n\n${text}` };
+    parts[parts.length - 1] = { kind: 'text', text: `${last.text}${separator}${text}` };
     return;
   }
   parts.push({ kind: 'text', text });
+}
+
+/**
+ * The order a message had before it carried a sequence: the text, then the
+ * pictures. Used where the rendered text does NOT come from blocks this module
+ * read — an output the item stringified rather than said in text — so there is
+ * no client order to preserve and claiming one would invent it.
+ */
+function legacyParts(text: string, images: readonly NormalizedImage[]): NormalizedPart[] {
+  const parts: NormalizedPart[] = [];
+  if (text) parts.push({ kind: 'text', text });
+  for (const image of images) parts.push({ kind: 'image', image });
+  return parts;
+}
+
+/**
+ * A marker line, then the content's own parts behind it — the marker joined
+ * into the FIRST run rather than standing as a part of its own, because
+ * `unpairedToolResultText` renders it that way and the two must be the same
+ * bytes. Only the pictures move: they keep the positions the client gave them
+ * instead of being appended after the whole message.
+ */
+function prefixedParts(prefix: string, content: NormalizedContent, separator: string): NormalizedPart[] {
+  const parts: NormalizedPart[] = [];
+  appendText(parts, prefix, separator);
+  for (const part of content.parts ?? []) {
+    if (part.kind === 'text') appendText(parts, part.text, separator);
+    else parts.push(part);
+  }
+  return parts;
 }
 
 /** The one place a call is written as text; nothing reads it back. */
@@ -2328,28 +2393,44 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
     const output = flattenOpenAiContent(msg.output);
     const text = output.text || (typeof msg.output === 'string' ? msg.output : JSON.stringify(msg.output ?? ''));
     const callId = toolCallId(msg.call_id);
-    if (callId === null) return { text: unpairedToolResultText(text), images: output.images };
+    if (callId === null) {
+      const unpaired = unpairedToolResultText(text);
+      return {
+        text: unpaired,
+        images: output.images,
+        parts: output.text
+          ? prefixedParts(TOOL_RESULT_MARKER, output, '\n')
+          : legacyParts(unpaired, output.images),
+      };
+    }
     const result: NormalizedToolResult = {
       callId,
       output: text,
       ...(output.images.length > 0 ? { images: output.images } : {}),
     };
+    const parts: NormalizedPart[] = [{ kind: 'result', result }];
     return {
       text: renderToolResult(result),
       images: output.images,
-      tool: { parts: [{ kind: 'result', result }] },
+      parts,
+      ...toolTurnOf(parts),
     };
   }
   if (msg.type === 'function_call') {
     const name = readString(msg.name, 'tool');
     const args = typeof msg.arguments === 'string' ? msg.arguments : JSON.stringify(msg.arguments ?? {});
     const id = toolCallId(msg.call_id);
-    if (id === null) return { text: unpairedToolCallText(name, args), images: [] };
+    if (id === null) {
+      const unpaired = unpairedToolCallText(name, args);
+      return { text: unpaired, images: [], parts: [{ kind: 'text', text: unpaired }] };
+    }
     const call: LocalToolCall = { id, name, arguments: args };
+    const parts: NormalizedPart[] = [{ kind: 'call', call }];
     return {
       text: renderToolCall(call),
       images: [],
-      tool: { parts: [{ kind: 'call', call }] },
+      parts,
+      ...toolTurnOf(parts),
     };
   }
   // Keyed on the item's KIND, never on whether it happens to carry a `content`
@@ -2360,10 +2441,8 @@ function flattenResponsesMessage(msg: Record<string, unknown>): NormalizedConten
   // had the model's chain of thought put in front of it in the USER's voice.
   if (msg.type === undefined || msg.type === 'message') return flattenOpenAiContent(msg.content);
   if (msg.type === 'reasoning') return null;
-  return {
-    text: [REPLAYED_ITEM_LABEL, `type: ${readString(msg.type, 'item')}`, JSON.stringify(msg)].join('\n'),
-    images: [],
-  };
+  const record = [REPLAYED_ITEM_LABEL, `type: ${readString(msg.type, 'item')}`, JSON.stringify(msg)].join('\n');
+  return { text: record, images: [], parts: [{ kind: 'text', text: record }] };
 }
 
 function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedContent {
@@ -2373,7 +2452,7 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
   // This shape lists its blocks in ONE array, so the client's own order is
   // readable — and is what the turn records. Bucketing the blocks by kind threw
   // it away: `[tool_use, text, tool_use]` came out as text-then-both-calls.
-  const parts: NormalizedToolPart[] = [];
+  const parts: NormalizedPart[] = [];
   const text = value.map((part) => {
     const block = asRecord(part);
     if (!block) {
@@ -2416,7 +2495,12 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
       const callId = toolCallId(block.tool_use_id);
       if (callId === null) {
         const unpaired = unpairedToolResultText(resultContent.text);
-        appendToolText(parts, unpaired);
+        for (const part of resultContent.text
+          ? prefixedParts(TOOL_RESULT_MARKER, resultContent, '\n')
+          : legacyParts(unpaired, resultContent.images)) {
+          if (part.kind === 'text') appendToolText(parts, part.text);
+          else parts.push(part);
+        }
         return unpaired;
       }
       const result: NormalizedToolResult = {
@@ -2435,34 +2519,52 @@ function flattenAnthropicMessage(msg: Record<string, unknown>): NormalizedConten
   // function read, so a caller who types the same characters into a text block
   // is never mistaken for a tool turn — and neither is a tool whose own output
   // contains them, because that output is one result's `output`, not a boundary.
-  return { text, images, ...toolTurnOf(parts) };
+  return { text, images, parts, ...toolTurnOf(parts) };
 }
 
 function flattenOpenAiContent(value: unknown): NormalizedContent {
-  if (typeof value === 'string') return { text: value, images: [] };
+  if (typeof value === 'string') return { text: value, images: [], parts: legacyParts(value, []) };
   if (!Array.isArray(value)) {
     const block = asRecord(value);
     if (block) {
       const image = readOpenAiImage(block);
-      if (image) return { text: '', images: [image] };
-      if (typeof block.text === 'string') return { text: block.text, images: [] };
-      if (typeof block.input_text === 'string') return { text: block.input_text, images: [] };
-      if (typeof block.content === 'string') return { text: block.content, images: [] };
+      if (image) return { text: '', images: [image], parts: [{ kind: 'image', image }] };
+      if (typeof block.text === 'string') return textContent(block.text);
+      if (typeof block.input_text === 'string') return textContent(block.input_text);
+      if (typeof block.content === 'string') return textContent(block.content);
     }
-    return { text: value == null ? '' : JSON.stringify(value), images: [] };
+    return textContent(value == null ? '' : JSON.stringify(value));
   }
   const images: NormalizedImage[] = [];
+  // The blocks in the order they were written, not two piles. `text` is still
+  // every text block joined the same way it always was — the SAME separator the
+  // runs are joined with, so a content array with no picture in it flattens to
+  // one part holding exactly these bytes.
+  const parts: NormalizedPart[] = [];
   const text = value.map((part) => {
     const block = asRecord(part);
-    if (!block) return String(part ?? '');
-    if (typeof block.text === 'string') return block.text;
-    if (typeof block.input_text === 'string') return block.input_text;
-    if (typeof block.content === 'string') return block.content;
+    if (!block) return appendedText(parts, String(part ?? ''));
+    if (typeof block.text === 'string') return appendedText(parts, block.text);
+    if (typeof block.input_text === 'string') return appendedText(parts, block.input_text);
+    if (typeof block.content === 'string') return appendedText(parts, block.content);
     const image = readOpenAiImage(block);
-    if (image) images.push(image);
+    if (image) {
+      images.push(image);
+      parts.push({ kind: 'image', image });
+    }
     return '';
   }).filter(Boolean).join('\n');
-  return { text, images };
+  return { text, images, parts };
+}
+
+/** Records a text block in the sequence and hands it back for the join. */
+function appendedText(parts: NormalizedPart[], text: string): string {
+  appendText(parts, text, '\n');
+  return text;
+}
+
+function textContent(text: string): NormalizedContent {
+  return { text, images: [], parts: legacyParts(text, []) };
 }
 
 function flattenAnthropicSystem(value: unknown): string {
@@ -2471,22 +2573,26 @@ function flattenAnthropicSystem(value: unknown): string {
 }
 
 function flattenAnthropicContent(value: unknown): NormalizedContent {
-  if (typeof value === 'string') return { text: value, images: [] };
+  if (typeof value === 'string') return textContent(value);
   if (!Array.isArray(value)) {
-    return { text: value == null ? '' : JSON.stringify(value), images: [] };
+    return textContent(value == null ? '' : JSON.stringify(value));
   }
   const images: NormalizedImage[] = [];
+  const parts: NormalizedPart[] = [];
   const text = value.map((part) => {
     const block = asRecord(part);
-    if (!block) return String(part ?? '');
-    if (block.type === 'text' && typeof block.text === 'string') return block.text;
+    if (!block) return appendedText(parts, String(part ?? ''));
+    if (block.type === 'text' && typeof block.text === 'string') return appendedText(parts, block.text);
     if (block.type === 'image') {
       const image = readAnthropicImage(block);
-      if (image) images.push(image);
+      if (image) {
+        images.push(image);
+        parts.push({ kind: 'image', image });
+      }
     }
     return '';
   }).filter(Boolean).join('\n');
-  return { text, images };
+  return { text, images, parts };
 }
 
 function readOpenAiImage(block: Record<string, unknown>): NormalizedImage | null {

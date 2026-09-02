@@ -37,15 +37,17 @@ export interface NormalizedToolResult {
 }
 
 /**
- * One part of a tool turn, in the position the client put it.
+ * One part of a message, in the position the client put it.
  *
- * A `text` part is a run of prose the turn carried outside its tool blocks;
+ * A `text` part is a run of prose the message carried outside its other blocks;
  * adjacent runs are joined, so no two text parts are ever neighbours.
  *
- * A turn is only a TOOL turn when a call or a result is in it — text and
- * pictures alone are an ordinary message, and `tool` stays unset there.
+ * A message is only a TOOL turn when a call or a result is in it — text and
+ * pictures alone are an ordinary message, and `tool` stays unset there. The
+ * parts are recorded either way: order between a caption and the picture it
+ * captions is the client's, whether or not a tool ran.
  */
-export type NormalizedToolPart =
+export type NormalizedPart =
   /** `LocalToolCall` is already this shape — one name for one thing. */
   | { readonly kind: 'call'; readonly call: LocalToolCall }
   | { readonly kind: 'result'; readonly result: NormalizedToolResult }
@@ -79,13 +81,45 @@ export type NormalizedToolPart =
  * and became a count. Grouping loses order; a sequence is the order.
  */
 export interface NormalizedToolTurn {
-  readonly parts: readonly NormalizedToolPart[];
+  readonly parts: readonly NormalizedPart[];
 }
 
 export interface NormalizedMessage {
   readonly role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
+  /**
+   * The message as ONE STRING — a rendering of `parts`, not the place its
+   * content lives. Every runtime that has no items of its own puts this in a
+   * prompt verbatim, so it stays; what it cannot say is where a picture sat.
+   */
   readonly content: string;
+  /**
+   * Every picture of the message, in the order it carried them — the same
+   * objects `parts` places, so a consumer that walks either one is looking at
+   * one picture, not a copy. Backends that can only hoist pictures ahead of a
+   * prompt read this; backends with an ordered input read `parts`.
+   */
   readonly images: readonly NormalizedImage[];
+  /**
+   * The message's content as the SEQUENCE the client sent, when the normalizer
+   * read one.
+   *
+   * `content` is "all the text, joined" and `images` is "the pictures,
+   * collected", and between the two of them the order a client wrote is gone:
+   * `[picture, "what is this"]` reached the model as the question ahead of the
+   * picture, and `["THIS_IS_A", <red>, "THIS_IS_B", <blue>]` reached it as one
+   * merged caption with both pictures behind it — nothing saying which caption
+   * belonged to which picture, so the model could only match them by position.
+   * That is the position-matching the tool-result labels exist to end, arriving
+   * one level up.
+   *
+   * The same sequence a tool turn already records — one concept, not two: when
+   * `tool` is set it holds THIS ARRAY, so the two views cannot disagree.
+   *
+   * Absent on a message built by hand rather than read from a client body.
+   * `messageParts` derives the legacy order for those, so a consumer never has
+   * two code paths.
+   */
+  readonly parts?: readonly NormalizedPart[];
   /**
    * Set only when the normalizer itself flattened a tool turn into this text,
    * and carrying that turn's own parts in the order the client sent them.
@@ -107,6 +141,23 @@ export interface NormalizedMessage {
    * inviting one.
    */
   readonly tool?: NormalizedToolTurn;
+}
+
+/**
+ * The message's parts, for every consumer that projects a message.
+ *
+ * A message the normalizer read carries its own sequence. A message built by
+ * hand — an instructions turn this proxy synthesizes, a request assembled in a
+ * test — carries none, and gets the order those messages have always had:
+ * the text, then the pictures. One function, so the fallback is written once
+ * and the two shapes never grow separate projections.
+ */
+export function messageParts(message: NormalizedMessage): readonly NormalizedPart[] {
+  if (message.parts) return message.parts;
+  const derived: NormalizedPart[] = [];
+  if (message.content) derived.push({ kind: 'text', text: message.content });
+  for (const image of message.images ?? []) derived.push({ kind: 'image', image });
+  return derived;
 }
 
 export type NormalizedImageDetail = 'low' | 'high' | 'auto' | 'original';

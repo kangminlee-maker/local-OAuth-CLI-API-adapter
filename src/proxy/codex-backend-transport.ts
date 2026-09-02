@@ -35,7 +35,7 @@ import type {
   OpenAiImageGenerationResult,
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
-import { ProxyRequestError } from './types.js';
+import { messageParts, ProxyRequestError } from './types.js';
 
 const CHATGPT_CODEX_BACKEND_URL = 'https://chatgpt.com/backend-api/codex';
 const CODEX_REFRESH_TOKEN_URL = 'https://auth.openai.com/oauth/token';
@@ -1720,12 +1720,30 @@ function toolTurnImages(message: NormalizedMessage): Set<NormalizedImage> {
   return placed;
 }
 
+/**
+ * An ordinary message as this API's content array — the client's own sequence.
+ *
+ * It used to be the flattened text, then every picture: all the text joined
+ * into one block and the pictures collected behind it. A client who showed a
+ * picture and then asked about it had the question delivered ahead of the
+ * picture, and `["THIS_IS_A", <red>, "THIS_IS_B", <blue>]` arrived as one
+ * merged caption with both pictures after it — nothing saying which caption
+ * named which picture, so the model could only match them by position. This
+ * surface is an ORDERED array; the order in it is now the client's.
+ *
+ * Call and result parts cannot reach here: a message carrying either is a tool
+ * turn, and `responseInputItemsForMessage` sends those to the item projection
+ * before this function is reached.
+ */
 async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
   const content: unknown[] = [];
   const textType = message.role === 'assistant' ? 'output_text' : 'input_text';
-  if (message.content) content.push({ type: textType, text: message.content });
-  for (const image of message.images) {
-    content.push(await responseImagePart(image));
+  for (const part of messageParts(message)) {
+    if (part.kind === 'text') {
+      if (part.text) content.push({ type: textType, text: part.text });
+    } else if (part.kind === 'image') {
+      content.push(await responseImagePart(part.image));
+    }
   }
   return content.length > 0 ? content : [{ type: textType, text: '' }];
 }
