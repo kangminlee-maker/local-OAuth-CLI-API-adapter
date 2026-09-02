@@ -500,9 +500,9 @@ test('the suggester measures the pre-filter\'s candidates and no other key', asy
     // the counter an instrument rather than a constant zero.
     const near = await countFor('temperatur');
     assert.ok(near.expected > 0, 'the control must have candidates, or it proves nothing');
-    assert.ok(
-      near.calls >= near.expected,
-      `every candidate is measured: ${near.calls} calls for ${near.expected} candidates`,
+    assert.equal(
+      near.calls, near.expected,
+      `the pre-filter's candidates AND NO OTHER KEY: ${near.calls} calls for ${near.expected} candidates`,
     );
     assert.equal(near.payload.error.message, "Unknown parameter: 'temperatur'. Did you mean 'temperature'?");
 
@@ -510,9 +510,9 @@ test('the suggester measures the pre-filter\'s candidates and no other key', asy
     // happened to match one number cannot match both.
     const other = await countFor('stor');
     assert.ok(other.expected > 0 && other.expected !== near.expected, 'the two controls must differ in size');
-    assert.ok(
-      other.calls >= other.expected,
-      `every candidate is measured: ${other.calls} calls for ${other.expected} candidates`,
+    assert.equal(
+      other.calls, other.expected,
+      `the pre-filter's candidates AND NO OTHER KEY: ${other.calls} calls for ${other.expected} candidates`,
     );
 
     // And the far side, which is the cost promise itself: a key no known key
