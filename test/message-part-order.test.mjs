@@ -24,7 +24,7 @@
 // was already right — a fix that only moved pictures to the front would pass
 // every "the picture arrives" assertion and break this one.
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
@@ -310,18 +310,37 @@ const conversation = (msgs, extra = {}) => normalizeAnthropicMessagesRequest({
 /** The placeholder lines the prompt carries, in prompt order. */
 const promptLabels = (prompt) => [...prompt.matchAll(/\[image \d+\]/g)].map((match) => match[0]);
 
+/**
+ * The picture a prepared item actually carries, read back off the file the
+ * runtime is handed. `type === 'localImage'` says a picture is there; only its
+ * bytes say WHICH, and the placeholders number pictures, not occurrences —
+ * counting them let a walk that reversed one message's pictures hand the
+ * runtime [blue, red] under a prompt that said `[image 1]`, `[image 2]`.
+ */
+async function codexPicture(item) {
+  assert.equal(item.type, 'localImage', `a base64 picture reaches this runtime as a file: ${JSON.stringify(item)}`);
+  const bytes = (await readFile(item.path)).toString('base64');
+  if (bytes === RED) return 'IMG(red)';
+  if (bytes === BLUE) return 'IMG(blue)';
+  return `IMG(?${bytes.slice(0, 16)})`;
+}
+
 /** What the codex runtime is actually handed, one readable token per item. */
 async function codexItems(request, options) {
   const prepared = await prepareCodexInput(request, buildPrompt(request, options));
   try {
-    return prepared.input.map((item) => {
-      if (item.type !== 'text') return `${item.type}`;
+    // Inside the `try`: the pictures are files, and `cleanup` deletes them.
+    return await Promise.all(prepared.input.map(async (item) => {
+      if (item.type !== 'text') return codexPicture(item);
       return `text(${item.text.split('\n')[0].slice(0, 40)})`;
-    });
+    }));
   } finally {
     await prepared.cleanup();
   }
 }
+
+/** Just the pictures of `codexItems`, in the order the runtime gets them. */
+const codexPictures = (items) => items.filter((item) => item.startsWith('IMG('));
 
 test('two turns with one picture each do not both call it "[image 1]"', async () => {
   const request = conversation([
@@ -341,25 +360,35 @@ test('two turns with one picture each do not both call it "[image 1]"', async ()
     [RED, BLUE],
     'the claude runtime receives them in the order the placeholders number',
   );
-  const prepared = await prepareCodexInput(request, buildPrompt(request));
-  try {
-    assert.equal(
-      prepared.input.filter((item) => item.type !== 'text').length,
-      2,
-      'and the codex runtime receives exactly the two the prompt names',
-    );
-  } finally {
-    await prepared.cleanup();
-  }
+  const items = await codexItems(request);
+  assert.deepEqual(
+    codexPictures(items),
+    ['IMG(red)', 'IMG(blue)'],
+    `and the codex runtime receives the two the prompt names, in the order it names them: ${JSON.stringify(items)}`,
+  );
 });
 
 test('CONTROL: two pictures in ONE turn are still 1 and 2', async () => {
   // The case that was already right. A fix that made the number global by
   // restarting it somewhere else would break this without touching the row above.
-  const labels = promptLabels(buildPrompt(conversation([
+  const request = conversation([
     { role: 'user', content: [{ type: 'text', text: 'A' }, anthImage(RED), { type: 'text', text: 'B' }, anthImage(BLUE)] },
-  ])));
+  ]);
+  const labels = promptLabels(buildPrompt(request));
   assert.deepEqual(labels, ['[image 1]', '[image 2]'], JSON.stringify(labels));
+
+  // And the numbers still name POSITIONS in the list the runtime is handed —
+  // this is the walk they are counted over, so it is read back picture by
+  // picture. `[image 1]` naming the second picture is the whole failure the
+  // labels exist to prevent, and it is invisible to a count.
+  const items = await codexItems(request);
+  assert.deepEqual(codexPictures(items), ['IMG(red)', 'IMG(blue)'], JSON.stringify(items));
+  const content = await claudeMessageContentFor(request, buildPrompt(request));
+  assert.deepEqual(
+    content.filter((block) => block.type === 'image').map((block) => (block.source.data === RED ? 'IMG(red)' : 'IMG(blue)')),
+    ['IMG(red)', 'IMG(blue)'],
+    'the other hoisting walk numbers them the same way round',
+  );
 });
 
 test('CONTROL: a single picture is "[image 1]", wherever its turn sits', async () => {
@@ -409,7 +438,7 @@ test('a tool-result picture names its call on the codex input path too', async (
     },
   ], { tools: [anthTool] }));
   assert.equal(items[0], 'text([tool result] image for tool_call_id: c1)', JSON.stringify(items));
-  assert.equal(items[1], 'localImage', `the caption comes immediately before its picture: ${JSON.stringify(items)}`);
+  assert.equal(items[1], 'IMG(red)', `the caption comes immediately before its picture: ${JSON.stringify(items)}`);
 });
 
 test('two results each returning a picture caption them apart on the codex path', async () => {
@@ -425,9 +454,9 @@ test('two results each returning a picture caption them apart on the codex path'
     },
   ], { tools: [anthTool] }));
   assert.equal(items[0], 'text([tool result] image for tool_call_id: c1)', JSON.stringify(items));
-  assert.equal(items[1], 'localImage', JSON.stringify(items));
+  assert.equal(items[1], 'IMG(red)', JSON.stringify(items));
   assert.equal(items[2], 'text([tool result] image for tool_call_id: c2)', JSON.stringify(items));
-  assert.equal(items[3], 'localImage', JSON.stringify(items));
+  assert.equal(items[3], 'IMG(blue)', `each result's OWN picture, not the other one: ${JSON.stringify(items)}`);
 });
 
 test('CONTROL: a picture that answers no call is captioned by nobody', async () => {
@@ -437,7 +466,8 @@ test('CONTROL: a picture that answers no call is captioned by nobody', async () 
   const items = await codexItems(conversation([
     { role: 'user', content: [{ type: 'text', text: 'LOOK' }, anthImage(RED)] },
   ]));
-  assert.deepEqual(items.map((item) => (item === 'localImage' ? 'IMG' : 'TEXT')), ['IMG', 'TEXT'], JSON.stringify(items));
+  assert.deepEqual(items.map((item) => (item.startsWith('IMG(') ? 'IMG' : 'TEXT')), ['IMG', 'TEXT'], JSON.stringify(items));
+  assert.equal(items[0], 'IMG(red)', `and it is the picture that was sent: ${JSON.stringify(items)}`);
   assert.ok(!items.some((item) => item.includes('tool_call_id')), `no call is named: ${JSON.stringify(items)}`);
 });
 

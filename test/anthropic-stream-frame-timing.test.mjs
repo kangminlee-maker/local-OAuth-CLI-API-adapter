@@ -153,7 +153,31 @@ test('CONTROL: a call the completed result DOES report is completed from it', as
   );
 });
 
+
 // --- 2. held output is delivered as soon as the block frees -------------------
+//
+// A CAUSAL question, and it used to be asked with a clock: the test sampled the
+// wire for up to 3s and called the sample "during the pause", so a runner busy
+// enough to be judged before the frame was even scheduled turned correct code
+// red, and the control burned its whole window on every green run. A red that
+// means "the machine was busy" teaches people to re-run reds.
+//
+// Nothing below waits for a duration. The backend stops at a barrier only the
+// test lifts, so every frame the client has before the lift arrived with no
+// further backend event to carry it — which is the property itself. Each wait
+// resolves on the bytes, so a slow machine makes this file slower and never
+// redder.
+
+const textOf = (events) => events
+  .filter((e) => e.type === 'content_block_delta' && e.delta?.type === 'text_delta')
+  .map((e) => e.delta.text).join('');
+const argumentsOf = (events) => events
+  .filter((e) => e.type === 'content_block_delta' && e.delta?.type === 'input_json_delta')
+  .map((e) => e.delta.partial_json).join('');
+const firstTextDeltaAt = (events) => events
+  .findIndex((e) => e.type === 'content_block_delta' && e.delta?.type === 'text_delta');
+const lastArgumentsDeltaAt = (events) => events
+  .reduce((at, e, i) => (e.type === 'content_block_delta' && e.delta?.type === 'input_json_delta' ? i : at), -1);
 
 /**
  * What a client has assembled from the bytes it has so far: whole SSE events
@@ -161,63 +185,120 @@ test('CONTROL: a call the completed result DOES report is completed from it', as
  * instead put an escaped `partial_json` past a substring check that was looking
  * for the raw arguments — an instrument that answers "no" for the wrong reason.
  */
-function partOfTheWire(wire) {
-  const events = wire.split('\n')
-    .filter((line) => line.startsWith('data: '))
-    .map((line) => line.slice(6).trim())
-    .filter((data) => data && data !== '[DONE]')
-    .flatMap((data) => { try { return [JSON.parse(data)]; } catch { return []; } });
+const received = (events) => ({
+  events: [...events],
+  types: events.map((e) => e.type),
+  toolBlocks: events.filter((e) => e.type === 'content_block_start' && e.content_block?.type === 'tool_use').length,
+  toolArguments: argumentsOf(events),
+  text: textOf(events),
+});
+
+/**
+ * The only deadline in this file, and it judges nothing: every wait below ends
+ * on the bytes themselves, so this exists so that a stream which will NEVER
+ * deliver fails with a sentence instead of hanging until the runner is killed.
+ * A run that reaches it has found a real delivery failure — the backend is
+ * parked at the barrier, so there is nothing else the client could be waiting
+ * for, however loaded the machine is.
+ */
+const HANG_GUARD_MS = 15_000;
+
+async function guarded(work, what) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(
+        `HANG GUARD (${HANG_GUARD_MS}ms): ${what} never reached the client while the backend sat at the barrier. `
+        + 'Nothing further was coming, so this is a delivery failure, not a slow machine.',
+      )),
+      HANG_GUARD_MS,
+    );
+  });
+  try {
+    return await Promise.race([work, guard]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * The client's side of a live stream: every whole event it has received, and a
+ * wait that ends the moment those events answer a question — never after a
+ * duration. `read()` resolves when bytes arrive, so no assertion here can be
+ * decided by how long anything took.
+ */
+function liveWire(res) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const events = [];
+  let buffer = '';
+  let ended = false;
+  const readMore = async () => {
+    const { value, done } = await reader.read();
+    if (done) { ended = true; return; }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    // The last line may still be arriving. A whole event never spans two lines:
+    // JSON escapes every newline inside it.
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (!data || data === '[DONE]') continue;
+      events.push(JSON.parse(data));
+    }
+  };
   return {
-    types: events.map((e) => e.type),
-    toolBlocks: events.filter((e) => e.type === 'content_block_start' && e.content_block?.type === 'tool_use').length,
-    toolArguments: events
-      .filter((e) => e.type === 'content_block_delta' && e.delta?.type === 'input_json_delta')
-      .map((e) => e.delta.partial_json).join(''),
-    text: events
-      .filter((e) => e.type === 'content_block_delta' && e.delta?.type === 'text_delta')
-      .map((e) => e.delta.text).join(''),
+    /** Reads until the events answer `answered` — or the stream ends without it. */
+    async until(answered, what) {
+      while (!answered(events)) {
+        assert.ok(!ended, `the stream ENDED before ${what}: ${events.map((e) => e.type).join(',')}`);
+        await guarded(readMore(), what);
+      }
+      return received(events);
+    },
+    async toEnd() {
+      while (!ended) await guarded(readMore(), 'the rest of the turn');
+      return received(events);
+    },
   };
 }
 
 /**
- * Runs a turn whose backend PAUSES after `steps`, and reports what the client
- * has received by then. The pause is the point: it is the window in which the
- * queue's own drain is the only thing that can deliver anything, because no
- * further event will arrive to drain it.
+ * A turn whose backend produces `steps` and then STOPS, at a barrier only the
+ * test lifts. Everything the client holds before the lift reached it with no
+ * further backend event to carry it, which is exactly what "delivered when the
+ * block frees, not at the end of the turn" means — and it is decided by the
+ * barrier, not by elapsed time.
  */
-async function receivedWhilePaused(steps, windowMs) {
-  let release;
-  const paused = new Promise((resolve) => { release = resolve; });
+async function atTheBarrier(steps, run) {
+  let lift;
+  const barrier = new Promise((resolve) => { lift = resolve; });
+  const turn = { advanced: false, release: () => { lift(); } };
   const backend = {
     name: 'test', model: 'configured-model',
     async generate() { return result({}); },
     async *stream() {
       for (const step of steps) yield step;
-      await paused;
+      await barrier;
+      // Read by the tests: the frames they assert on were on the wire while
+      // this was still false.
+      turn.advanced = true;
       yield { type: 'completed', result: result({ text: 'narration', toolCalls: [CALL_A], textOrdinal: 1 }) };
     },
     async close() {},
   };
   return withProxy(backend, async (server) => {
     const res = await fetch(`${server.url}/v1/messages`, { method: 'POST', headers: HEADERS, body: body({ stream: true }) });
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let wire = '';
-    const pump = (async () => {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        wire += decoder.decode(value, { stream: true });
-      }
-    })().catch(() => {});
-    const deadline = Date.now() + windowMs;
-    while (Date.now() < deadline && !wire.includes('narration')) {
-      await new Promise((resolve) => { setTimeout(resolve, 5); });
+    const wire = liveWire(res);
+    try {
+      return await run(wire, turn);
+    } finally {
+      // A failed assertion must not leave the generator parked and the socket
+      // open behind it: the turn is let go and read out either way.
+      turn.release();
+      await wire.toEnd().catch(() => {});
     }
-    const duringPause = wire;
-    release();
-    await pump;
-    return { duringPause: partOfTheWire(duringPause), whole: partOfTheWire(wire) };
   });
 }
 
@@ -226,27 +307,57 @@ test('narration held behind an open call is delivered when the call closes, not 
   // delta carrying `argumentsDone` closes that block, and the drain that
   // follows it is what puts the text on the wire — while the backend is still
   // working, which is the whole difference between streaming and buffering.
-  // The window only elapses on failure.
-  const { duringPause, whole } = await receivedWhilePaused([OPENS_A_CALL, NARRATES, FINISHES_A_CALL], 3_000);
-  // The denominator: the reader is live and the wire is flowing.
-  assert.equal(duringPause.toolBlocks, 1, `the client is reading a live stream: ${duringPause.types.join(',')}`);
-  assert.equal(duringPause.toolArguments, CALL_A.arguments, 'the call\'s own arguments arrived and finished');
-  assert.equal(
-    duringPause.text,
-    'narration',
-    `the held text must reach the client when its block frees, not at the end of the turn: ${duringPause.types.join(',')}`,
-  );
-  assert.ok(whole.types.includes('message_stop'), 'and the turn still completes normally');
+  // The backend is parked, so the client can only be holding text that the
+  // block closing delivered.
+  await atTheBarrier([OPENS_A_CALL, NARRATES, FINISHES_A_CALL], async (wire, turn) => {
+    const held = await wire.until((events) => textOf(events).includes('narration'), 'the held narration');
+    // The denominator: the reader is live and the wire is flowing.
+    assert.equal(held.toolBlocks, 1, `the client is reading a live stream: ${held.types.join(',')}`);
+    assert.equal(held.toolArguments, CALL_A.arguments, 'the call\'s own arguments arrived and finished');
+    assert.equal(
+      held.text,
+      'narration',
+      `the held text must reach the client when its block frees, not at the end of the turn: ${held.types.join(',')}`,
+    );
+    // And it was the block closing that delivered it: the backend has produced
+    // nothing since, and the turn has not ended.
+    assert.equal(turn.advanced, false, `the backend is still parked at the barrier: ${held.types.join(',')}`);
+    assert.ok(
+      !held.types.includes('message_stop'),
+      `so this is mid-turn delivery, not the end of the turn: ${held.types.join(',')}`,
+    );
+
+    turn.release();
+    const whole = await wire.toEnd();
+    assert.ok(whole.types.includes('message_stop'), 'and the turn still completes normally');
+    assert.equal(whole.text, 'narration', `written once, not again as a missing tail: ${whole.types.join(',')}`);
+  });
 });
 
 test('CONTROL: narration behind a call that is STILL open is not delivered early', async () => {
   // The opposite answer through the same instrument: nothing closed the call,
-  // so the text is still held — one block open at a time. A run that reports
-  // the narration here is reading a wire that broke the queue's invariant, and
-  // a run that reports nothing at all is not reading a live stream.
-  const { duringPause, whole } = await receivedWhilePaused([OPENS_A_CALL, NARRATES], 400);
-  assert.equal(duringPause.toolBlocks, 1, `the client is reading a live stream: ${duringPause.types.join(',')}`);
-  assert.equal(duringPause.toolArguments, PARTIAL, 'the open call\'s arguments arrived');
-  assert.equal(duringPause.text, '', `the text waits for the call to settle: ${duringPause.types.join(',')}`);
-  assert.equal(whole.text, 'narration', 'and it is delivered by the end of the turn, never dropped');
+  // so the text is still held — one block open at a time. Nothing CAN close it
+  // while the barrier holds, so a client that has the text here is reading a
+  // wire that let held output past an open block; no longer wait would make
+  // that answer truer, and a run that reports nothing at all is not reading a
+  // live stream.
+  await atTheBarrier([OPENS_A_CALL, NARRATES], async (wire, turn) => {
+    const held = await wire.until((events) => argumentsOf(events) === PARTIAL, 'the open call\'s arguments');
+    assert.equal(held.toolBlocks, 1, `the client is reading a live stream: ${held.types.join(',')}`);
+    assert.equal(held.toolArguments, PARTIAL, 'the open call\'s arguments arrived');
+    assert.equal(held.text, '', `the text waits for the call to settle: ${held.types.join(',')}`);
+    assert.equal(turn.advanced, false, `and the backend has produced nothing further: ${held.types.join(',')}`);
+
+    turn.release();
+    const whole = await wire.toEnd();
+    assert.equal(whole.text, 'narration', 'and it is delivered by the end of the turn, never dropped');
+    // The same answer once more, read off the finished wire, where nothing at
+    // all depends on when anything was sampled: the narration sits behind the
+    // arguments that settled the call it was waiting for.
+    assert.equal(whole.toolArguments, CALL_A.arguments, `the result finished the call: ${whole.types.join(',')}`);
+    assert.ok(
+      firstTextDeltaAt(whole.events) > lastArgumentsDeltaAt(whole.events),
+      `the narration follows the call it was held behind: ${whole.types.join(',')}`,
+    );
+  });
 });
