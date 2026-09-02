@@ -2813,8 +2813,15 @@ async function writeOpenAiResponsesStream(
 
       const result = event.result;
       if (result.toolCalls.length > 0) {
-        const finishTools = async (): Promise<void> => {
-          for (const { outputIndex, item } of await toolState.finish(result.toolCalls)) {
+        // The turn's calls `[from, to)`, each taking the next free output
+        // position as it is closed.
+        const finishCalls = async (from: number, to: number): Promise<void> => {
+          if (from >= to) return;
+          for (const { outputIndex, item } of await toolState.finish(
+            result.toolCalls.slice(from, to),
+            undefined,
+            from,
+          )) {
             finalItems.set(outputIndex, item);
           }
         };
@@ -2883,12 +2890,18 @@ async function writeOpenAiResponsesStream(
           )) {
             finalItems.set(outputIndex, item);
           }
-        } else if (textOrdinalOf(result, result.toolCalls.length) === 0) {
-          await finishMessage();
-          await finishTools();
         } else {
-          await finishTools();
+          // Nothing holds a position yet, so this is where every one of them is
+          // allocated — and the text goes at `textOrdinal`, splitting the calls
+          // around it exactly as `orderedByEmission` splits them for the
+          // buffered body. Choosing between two whole groups here — message
+          // first, or every call first — cannot express narration BETWEEN two
+          // calls, so a turn delivered whole at `completed` read
+          // [call, text, call] buffered and [call, call, text] streamed.
+          const at = textOrdinalOf(result, result.toolCalls.length);
+          await finishCalls(0, at);
           await finishMessage();
+          await finishCalls(at, result.toolCalls.length);
         }
       } else {
         await ensureTextStarted();
@@ -2998,14 +3011,22 @@ class OpenAiResponsesToolStreamState {
    * tools as one group and the message as another could not express a turn
    * that called, narrated, then called again, and told the client that item 2
    * had finished before item 1.
+   *
+   * `firstIndex` is where `toolCalls` starts in the turn, so a caller holding a
+   * message the stream never announced can walk the calls BELOW its ordinal,
+   * emit it, then walk the rest — every position still allocated in the order
+   * the items go out. The tool index is the turn's, not the slice's, or the
+   * second walk would reopen the first walk's calls.
    */
   async finish(
     toolCalls: readonly LocalToolCall[],
     message?: { readonly outputIndex: number; readonly emit: () => Promise<void> },
+    firstIndex = 0,
   ): Promise<ReadonlyArray<{ readonly outputIndex: number; readonly item: unknown }>> {
     const output: Array<{ outputIndex: number; item: unknown }> = [];
     let pendingMessage = message;
-    for (const [index, call] of toolCalls.entries()) {
+    for (const [offset, call] of toolCalls.entries()) {
+      const index = firstIndex + offset;
       const state = await this.ensureStarted(index, call.id, call.name);
       if (pendingMessage && pendingMessage.outputIndex < state.outputIndex) {
         const emit = pendingMessage.emit;
@@ -3164,6 +3185,105 @@ async function writeAnthropicMessagesStream(
   // wait here until the gate resolves — released or matched — and then take
   // whatever position production order leaves them.
   const heldToolEvents: Array<Extract<LocalStreamEvent, { type: 'tool_call_delta' }>> = [];
+  // The mirror image: narration produced while a call's arguments are still
+  // streaming cannot open its block yet. Opening one stops the call's block,
+  // and a stopped block takes no more `input_json_delta` — so the arguments the
+  // completed result reconciles would never reach the wire and a client
+  // accumulating the deltas would finalize `{"city":` as the whole tool input,
+  // while this surface's own buffered body and both OpenAI surfaces carried
+  // `{"city":"Seoul"}`. The text waits for the call to settle instead; the call
+  // was produced first either way, so its block still comes first.
+  let heldText = '';
+
+  const ensureTextStarted = async (): Promise<void> => {
+    if (textStarted && !textBlockClosed) return;
+    // A tool block whose arguments the backend never declared finished is
+    // still open. Opening a text block inside it nests two blocks on a wire
+    // that has no nesting, and a client assembling by index cannot read it.
+    await toolState.closeOpen();
+    // Two content blocks are never open at once on this wire, so a tool call
+    // stops the text block — and text that resumes afterwards is a NEW block.
+    // Continuing to write at the stopped index left an SDK accumulator, which
+    // finalizes a block on `content_block_stop`, dropping the trailing
+    // narration or rejecting the stream outright.
+    textStarted = true;
+    textBlockClosed = false;
+    textBlockIndex = allocateBlockIndex();
+    await writeSseEvent(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: textBlockIndex,
+      content_block: { type: 'text', text: '' },
+    });
+  };
+
+  // A backend that streams text and then also returns tool calls (e.g. the codex
+  // backend transport) would otherwise open tool_use blocks at the index already
+  // held by the open text block. Close the text block and shift tool indices.
+  const closeOpenTextBlock = async (): Promise<void> => {
+    if (!textStarted || textBlockClosed) return;
+    textBlockClosed = true;
+    await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+  };
+
+  /** Puts text on the wire, opening a text block for it if none is open. */
+  const emitText = async (text: string): Promise<void> => {
+    if (!text) return;
+    await ensureTextStarted();
+    await writeSseEvent(res, 'content_block_delta', {
+      type: 'content_block_delta',
+      index: textBlockIndex,
+      delta: { type: 'text_delta', text },
+    });
+  };
+
+  /**
+   * Accepts text for delivery. `streamedText` counts it either way — held text
+   * is delayed, never dropped, so counting it is what stops the completed
+   * result from writing it a second time as a missing tail.
+   */
+  const writeText = async (text: string): Promise<void> => {
+    if (!text) return;
+    streamedText += text;
+    if (toolState.hasOpenBlock) { heldText += text; return; }
+    await emitText(text);
+  };
+
+  /**
+   * The narration that waited for a call's block, written now. Callers that
+   * must not disturb an open call check `toolState.hasOpenBlock` first — this
+   * opens a text block, which stops whatever is open.
+   */
+  const flushHeldText = async (): Promise<void> => {
+    if (!heldText) return;
+    const text = heldText;
+    heldText = '';
+    await emitText(text);
+  };
+
+  /** The calls that waited behind the gate, written where they now belong. */
+  const flushHeldToolEvents = async (): Promise<void> => {
+    if (heldToolEvents.length === 0) return;
+    const held = heldToolEvents.splice(0, heldToolEvents.length);
+    await closeOpenTextBlock();
+    for (const call of held) await toolState.write(call);
+  };
+
+  /**
+   * The turn is over without a `completed` event — it ended or it failed —
+   * so nothing more can arrive to beat a half-matched sequence: the gate
+   * resolves, and whatever it was holding is the answer. Text first, then the
+   * calls that were waiting on it, because that is the order they were
+   * produced in.
+   */
+  const releaseHeldOutput = async (): Promise<void> => {
+    await writeText(stopGate.flush());
+    await flushHeldToolEvents();
+    // No completed result is coming, so a call whose arguments never settled
+    // cannot be completed from one: close it where it is, and let the narration
+    // that was waiting on it take its own block rather than vanish with it.
+    await toolState.closeOpen();
+    await flushHeldText();
+  };
 
   try {
     await writeSseEvent(res, 'message_start', {
@@ -3183,55 +3303,6 @@ async function writeAnthropicMessagesStream(
       },
     });
 
-    const ensureTextStarted = async (): Promise<void> => {
-      if (textStarted && !textBlockClosed) return;
-      // A tool block whose arguments the backend never declared finished is
-      // still open. Opening a text block inside it nests two blocks on a wire
-      // that has no nesting, and a client assembling by index cannot read it.
-      await toolState.closeOpen();
-      // Two content blocks are never open at once on this wire, so a tool call
-      // stops the text block — and text that resumes afterwards is a NEW block.
-      // Continuing to write at the stopped index left an SDK accumulator, which
-      // finalizes a block on `content_block_stop`, dropping the trailing
-      // narration or rejecting the stream outright.
-      textStarted = true;
-      textBlockClosed = false;
-      textBlockIndex = allocateBlockIndex();
-      await writeSseEvent(res, 'content_block_start', {
-        type: 'content_block_start',
-        index: textBlockIndex,
-        content_block: { type: 'text', text: '' },
-      });
-    };
-
-    // A backend that streams text and then also returns tool calls (e.g. the codex
-    // backend transport) would otherwise open tool_use blocks at the index already
-    // held by the open text block. Close the text block and shift tool indices.
-    const closeOpenTextBlock = async (): Promise<void> => {
-      if (!textStarted || textBlockClosed) return;
-      textBlockClosed = true;
-      await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
-    };
-
-    const writeText = async (text: string): Promise<void> => {
-      if (!text) return;
-      await ensureTextStarted();
-      streamedText += text;
-      await writeSseEvent(res, 'content_block_delta', {
-        type: 'content_block_delta',
-        index: textBlockIndex,
-        delta: { type: 'text_delta', text },
-      });
-    };
-
-    /** The calls that waited behind the gate, written where they now belong. */
-    const flushHeldToolEvents = async (): Promise<void> => {
-      if (heldToolEvents.length === 0) return;
-      const held = heldToolEvents.splice(0, heldToolEvents.length);
-      await closeOpenTextBlock();
-      for (const call of held) await toolState.write(call);
-    };
-
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
@@ -3246,8 +3317,16 @@ async function writeAnthropicMessagesStream(
           heldToolEvents.push(event);
           continue;
         }
+        // Narration produced before this call cannot be written after it, and a
+        // NEW call may not open a block inside one that is still taking
+        // arguments. So the held text goes out first, which stops the open
+        // block — the one case where its arguments cannot be reconciled,
+        // because the completed result has not arrived yet.
+        if (heldText && !toolState.hasStarted(event.index)) await flushHeldText();
         await closeOpenTextBlock();
         await toolState.write(event);
+        // `argumentsDone` may have just closed the block the text was waiting on.
+        if (!toolState.hasOpenBlock) await flushHeldText();
         continue;
       }
       // No content block corresponds to it on this wire — a `thinking` block
@@ -3269,11 +3348,20 @@ async function writeAnthropicMessagesStream(
         // against 0 instead sent the text last whenever the gate had withheld
         // it — a turn that called, narrated, then called again streamed both
         // calls before its text while the buffered body split them around it.
-        if (textOrdinalOf(result, result.toolCalls.length) > toolState.announcedCount && !streamedText) {
+        //
+        // The text goes AT the ordinal, not merely behind every call: a turn
+        // delivered whole at `completed` announced nothing, so the calls below
+        // the ordinal close first, the text opens its block, and the calls
+        // above it open behind — the same splice `orderedByEmission` makes.
+        // Closing them all first read [tool_use, tool_use, text] against a
+        // buffered [tool_use, text, tool_use].
+        const textAt = textOrdinalOf(result, result.toolCalls.length);
+        if (textAt > toolState.announcedCount && !streamedText) {
           await flushHeldToolEvents();
-          await toolState.finish(result.toolCalls);
+          await toolState.finish(result.toolCalls.slice(0, textAt));
           for (const chunk of chunkText(gated.tail)) await writeText(chunk);
           await closeOpenTextBlock();
+          await toolState.finish(result.toolCalls.slice(textAt), textAt);
         } else {
           await writeText(gated.tail);
           await flushHeldToolEvents();
@@ -3289,6 +3377,12 @@ async function writeAnthropicMessagesStream(
         await flushHeldToolEvents();
         await closeOpenTextBlock();
       }
+
+      // Every block the branches above opened has been closed, so narration
+      // that waited on a call can finally take one of its own — after the call
+      // it waited for, which is where it was produced.
+      await flushHeldText();
+      await closeOpenTextBlock();
 
       await writeSseEvent(res, 'message_delta', {
         type: 'message_delta',
@@ -3308,10 +3402,25 @@ async function writeAnthropicMessagesStream(
       });
     }
     // A stream that ended without a `completed` event never resolved the gate,
-    // so a call waiting behind it would be dropped rather than merely delayed.
-    // A delta that reached this writer reaches the wire.
-    await flushHeldToolEvents();
+    // so the text it holds and a call waiting behind it would be dropped rather
+    // than merely delayed. A delta that reached this writer reaches the wire.
+    await releaseHeldOutput();
   } catch (err) {
+    // The turn failed, but the work it had already done is still the client's:
+    // the gate resolves, what it releases goes out, the calls that waited
+    // behind it take their positions, and nothing is left open — then the
+    // error. Writing the error frame straight away told a client nothing at
+    // all about text and tool calls the backend really produced.
+    //
+    // Writing that out must not cost the error frame, which is the one thing
+    // this path owes the client.
+    try {
+      await releaseHeldOutput();
+      await closeOpenTextBlock();
+      await toolState.closeOpen();
+    } catch {
+      // The wire is already unusable; the error frame below says so.
+    }
     // Map the provider error the way every other surface does. Hard-coding
     // `api_error` and serializing the raw throw loses the runtime's status and
     // type, and — because the JSON travels inside the message — hands the client
@@ -3371,6 +3480,22 @@ class AnthropicToolUseStreamState {
     return this.states.size;
   }
 
+  /**
+   * Whether a call still holds an open block. A block is stopped the moment the
+   * backend declares its arguments final, so an open one is always a call whose
+   * value the completed result still has to reconcile — and nothing else may
+   * open a block until it has.
+   */
+  get hasOpenBlock(): boolean {
+    for (const state of this.states.values()) if (!state.closed) return true;
+    return false;
+  }
+
+  /** Whether this call already holds a wire position. */
+  hasStarted(index: number): boolean {
+    return this.states.has(index);
+  }
+
   async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
     const state = await this.ensureStarted(
       event.index,
@@ -3390,16 +3515,27 @@ class AnthropicToolUseStreamState {
     for (const state of this.states.values()) await this.stop(state);
   }
 
-  async finish(toolCalls: readonly LocalToolCall[]): Promise<void> {
-    for (const [index, call] of toolCalls.entries()) {
+  /**
+   * `firstIndex` is where `toolCalls` starts in the turn, so a caller can close
+   * the calls below the text's ordinal, write the text, and close the rest —
+   * each block still opening in the order it goes out. The tool index is the
+   * turn's, not the slice's, or the second walk would reopen the first's.
+   */
+  async finish(toolCalls: readonly LocalToolCall[], firstIndex = 0): Promise<void> {
+    for (const [offset, call] of toolCalls.entries()) {
+      const index = firstIndex + offset;
       const state = await this.ensureStarted(index, call.id, call.name);
-      // A call the backend announced as finished carries the arguments the
-      // completed result reports: the transport only sends that signal once the
-      // stream holds the value in full, and refuses to let the completed output
-      // rewrite it afterwards. So there is nothing left to reconcile and
-      // nothing left to stop — and nothing could be sent into a stopped block
-      // anyway, which is why the signal is withheld whenever that invariant
-      // cannot be met.
+      // Two different facts used to reach this line. A call the backend
+      // announced as finished carries the arguments the completed result
+      // reports — the transport only sends that signal once the stream holds
+      // the value in full, and refuses to let the completed output rewrite it
+      // afterwards — so there is nothing to reconcile and nothing to stop.
+      //
+      // A block this writer stopped to make room for something else is NOT
+      // that, and skipping it streamed `{"city":` as a client's whole tool
+      // input. Nothing can be written into a stopped block, so the fix is not
+      // here: narration now waits for the call to settle rather than stopping
+      // its block, which leaves this line reachable only for the first fact.
       if (state.closed) continue;
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);
