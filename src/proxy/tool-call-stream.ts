@@ -89,7 +89,7 @@ export class ToolCallDeltaExtractor {
    * not sent again.
    */
   private textDeltas(): LocalStreamEvent[] {
-    const text = readStringProperty(this.raw, 'text');
+    const text = readStringProperty(this.raw, 'text')?.value;
     if (text === undefined || text === this.streamedText) return [];
     if (!text.startsWith(this.streamedText)) return [];
     const delta = text.slice(this.streamedText.length);
@@ -203,10 +203,27 @@ function readToolCallSnapshots(raw: string): ToolCallSnapshot[] {
   if (arrayStart === -1) return [];
   return readArrayObjectSegments(raw, arrayStart).map((segment, index) => ({
     index,
-    id: readStringProperty(segment, 'id'),
-    name: readStringProperty(segment, 'name'),
-    arguments: readStringProperty(segment, 'arguments') ?? '',
+    // `id` and `name` are the call's IDENTITY: the client dispatches on the
+    // name and echoes the id back with the tool result, and the announcement
+    // carrying them is latched — every writer returns early for an index it
+    // already holds, so a later delta cannot correct them. A value read out of
+    // a string literal the delta boundary has not closed yet is a PREFIX of
+    // the identity, not the identity, so it is withheld until the closing
+    // quote arrives. `arguments` is the opposite: a prefix of it IS the answer
+    // so far, and the client is meant to watch it grow.
+    id: readClosedStringProperty(segment, 'id'),
+    name: readClosedStringProperty(segment, 'name'),
+    arguments: readStringProperty(segment, 'arguments')?.value ?? '',
   }));
+}
+
+/** A string property whose closing quote has arrived, or undefined. */
+function readClosedStringProperty(
+  raw: string,
+  property: string,
+): string | undefined {
+  const parsed = readStringProperty(raw, property);
+  return parsed?.closed ? parsed.value : undefined;
 }
 
 function findToolCallsArray(raw: string): number {
@@ -271,7 +288,17 @@ function readArrayObjectSegments(raw: string, arrayStart: number): string[] {
   return segments;
 }
 
-function readStringProperty(raw: string, property: string): string | undefined {
+/**
+ * The property's string value AND whether its closing quote has arrived. The
+ * two are reported together because a partial read is the right answer for
+ * some fields and the wrong one for others: `closed` is what lets each caller
+ * say which it is, and reading the value without it is how a prefix came to
+ * pass for a whole value.
+ */
+function readStringProperty(
+  raw: string,
+  property: string,
+): { value: string; closed: boolean } | undefined {
   for (let index = 0; index < raw.length; index += 1) {
     if (raw[index] !== '"') continue;
     const parsedKey = readJsonString(raw, index);
@@ -284,7 +311,8 @@ function readStringProperty(raw: string, property: string): string | undefined {
     cursor = skipWhitespace(raw, cursor + 1);
     if (parsedKey.value === property) {
       if (raw[cursor] !== '"') return undefined;
-      return readJsonString(raw, cursor).value;
+      const parsedValue = readJsonString(raw, cursor);
+      return { value: parsedValue.value, closed: parsedValue.closed };
     }
     if (raw[cursor] === '"') {
       const parsedValue = readJsonString(raw, cursor);
