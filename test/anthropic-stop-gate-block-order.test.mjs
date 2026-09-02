@@ -87,8 +87,34 @@ async function bothReadings(backend, stopSequences) {
       streamedStopReason: messageDelta?.delta?.stop_reason,
       bufferedStopSequence: buffered.stop_sequence ?? null,
       streamedStopSequence: messageDelta?.delta?.stop_sequence ?? null,
+      ...blockNesting(events),
     };
   } finally { await started.close(); }
+}
+
+/**
+ * How deep the wire ever nested. This surface has no nesting: a block opens
+ * only while nothing else is open, which is what lets a client assemble content
+ * by index. The suite read `content_block_start` and never counted a single
+ * stop, so `flushHeldToolEvents` could write a tool call INSIDE the text block
+ * it was supposed to close first and every case here stayed green.
+ */
+function blockNesting(events) {
+  let open = 0;
+  let maxOpen = 0;
+  const trace = [];
+  for (const event of events) {
+    if (event.type === 'content_block_start') {
+      open += 1;
+      maxOpen = Math.max(maxOpen, open);
+      trace.push(`start#${event.index}:${event.content_block?.type}`);
+    }
+    if (event.type === 'content_block_stop') {
+      open -= 1;
+      trace.push(`stop#${event.index}`);
+    }
+  }
+  return { streamedMaxOpen: maxOpen, streamedLeftOpen: open, streamedTrace: trace.join(' | ') };
 }
 
 /** The two readings of ONE turn, held against each other and against `blocks`. */
@@ -101,6 +127,13 @@ function assertAgree(s, blocks, label) {
   assert.equal(s.streamedText, s.bufferedText, `${label}: both readings carry the same text`);
   assert.equal(s.streamedStopReason, s.bufferedStopReason, `${label}: both readings report the same stop`);
   assert.equal(s.streamedStopSequence, s.bufferedStopSequence, `${label}: and the same stop_sequence`);
+  assert.equal(s.streamedMaxOpen <= 1, true, `${label}: two blocks open at once — ${s.streamedTrace}`);
+  assert.equal(s.streamedLeftOpen, 0, `${label}: a block was left open — ${s.streamedTrace}`);
+  assert.equal(
+    s.streamedTrace.split(' | ').filter((f) => f.startsWith('stop#')).length,
+    blocks.length,
+    `${label}: every block opened is closed — ${s.streamedTrace}`,
+  );
 }
 
 test('a stop sequence the text is still a live prefix of does not move the text behind the call', async () => {
