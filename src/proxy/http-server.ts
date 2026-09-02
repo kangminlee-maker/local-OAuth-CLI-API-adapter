@@ -3167,6 +3167,10 @@ async function writeAnthropicMessagesStream(
   let textStarted = false;
   let textBlockClosed = false;
   let streamedText = '';
+  // Whether the turn reported a `completed` result. It decides which of the two
+  // exits below owes the release: the completed handler already writes the
+  // turn's terminal frames, and nothing may follow them.
+  let completedSeen = false;
   // Content block indices are wire positions: whichever block opens next takes
   // the next one, whether that is the text block or a tool_use block.
   let nextBlockIndex = 0;
@@ -3405,6 +3409,7 @@ async function writeAnthropicMessagesStream(
       // would need the reasoning TEXT, which the backends do not hand over.
       if (event.type === 'reasoning_item') continue;
 
+      completedSeen = true;
       // The gated text is what the caller received, so the turn is reported
       // against it: a match makes this a `stop_sequence` stop, and the tail the
       // runtime produced after it is never written.
@@ -3469,6 +3474,17 @@ async function writeAnthropicMessagesStream(
       // for, which is where it was produced.
       await settlePending(result.toolCalls);
       await closeOpenTextBlock();
+      // A call this stream announced that the completed result does not report
+      // is the one block nothing above closes: `settlePending` stops an open
+      // block only to let something waiting through, and nothing is waiting.
+      // The result is the turn's authority on which calls it made, so the wire
+      // cannot complete that call from one — but the block is already on the
+      // wire and belongs to THIS turn, so it is stopped here, on exactly the
+      // arguments the backend streamed. Leaving it to the release after the
+      // loop wrote a `content_block_stop` PAST `message_stop`, which an SDK
+      // that finalizes the message there reads as a frame for a message that
+      // no longer exists.
+      await toolState.closeOpen(result.toolCalls);
 
       await writeSseEvent(res, 'message_delta', {
         type: 'message_delta',
@@ -3490,7 +3506,12 @@ async function writeAnthropicMessagesStream(
     // A stream that ended without a `completed` event never resolved the gate,
     // so the text it holds and a call waiting behind it would be dropped rather
     // than merely delayed. A delta that reached this writer reaches the wire.
-    await releaseHeldOutput();
+    //
+    // Only that exit. A turn that DID complete resolved the gate, drained the
+    // queue and closed its blocks before `message_delta`, so there is nothing
+    // left to release — and releasing unconditionally could only write a frame
+    // after `message_stop`, which is not a sequence this wire may produce.
+    if (!completedSeen) await releaseHeldOutput();
   } catch (err) {
     // The turn failed, but the work it had already done is still the client's:
     // the gate resolves, what it releases goes out, the calls that waited
