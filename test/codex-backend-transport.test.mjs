@@ -1722,7 +1722,8 @@ function tinyPngBase64() {
 
 // The two tool turns below carry a `tool` field because that is what the
 // normalizer records when it flattens them — this fixture simulates its output,
-// so it has to match it. `content` is the same turn rendered as text, which is
+// so it has to match it: a turn is an ORDERED sequence of parts, because three
+// buckets could not say where the turn's prose sat among its calls. `content` is the same turn rendered as text, which is
 // what the claude runtime reads; the codex transport builds its items from the
 // field. Dropping the field makes the transport read these as ordinary prose,
 // which is the correct behaviour for text a CALLER wrote and the wrong behaviour
@@ -1743,9 +1744,7 @@ function chatToolResultRequest() {
         ].join('\n'),
         images: [],
         tool: {
-          calls: [{ id: 'call_weather', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
-          results: [],
-          narration: '',
+          parts: [{ kind: 'call', call: { id: 'call_weather', name: 'get_weather', arguments: '{"city":"Seoul"}' } }],
         },
       },
       {
@@ -1757,9 +1756,7 @@ function chatToolResultRequest() {
         ].join('\n'),
         images: [],
         tool: {
-          calls: [],
-          results: [{ callId: 'call_weather', output: '{"city":"Seoul","temperature_c":23,"condition":"clear"}' }],
-          narration: '',
+          parts: [{ kind: 'result', result: { callId: 'call_weather', output: '{"city":"Seoul","temperature_c":23,"condition":"clear"}' } }],
         },
       },
     ],

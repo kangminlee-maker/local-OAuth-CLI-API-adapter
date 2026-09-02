@@ -1,10 +1,14 @@
 /**
- * How a tool turn is WRITTEN into a flattened prompt. Nothing reads it back.
+ * How a tool RESULT is WRITTEN into a flattened prompt. Nothing reads it back.
  *
- * The normalizer renders a turn's calls and results with these markers, and
- * `multimodal.ts` labels the images a tool result returned with the same
- * `[tool result]` literal — two writers of one literal, which is why it lives
- * here rather than in either of them.
+ * The normalizer renders a turn's results with this marker, and `multimodal.ts`
+ * labels the images a tool result returned with the same literal — two writers
+ * of one literal, which is why it lives here rather than in either of them.
+ *
+ * The assistant-call marker used to live here too. It does not any more: after
+ * the readers were removed it had exactly ONE writer, in `normalizers.ts`,
+ * which is where a literal with one writer belongs — the rule that module
+ * already states for `REPLAYED_ITEM_LABEL` a few lines from it.
  *
  * There used to be readers: the codex transport re-parsed the rendered text
  * into this API's own tool items, and the image labeller found a call id by
@@ -15,5 +19,4 @@
  * the client never sent. Backends build their items from `NormalizedMessage.tool`
  * instead, and the rendering stayed text.
  */
-export const ASSISTANT_TOOL_CALL_MARKER = '[assistant tool_call]';
 export const TOOL_RESULT_MARKER = '[tool result]';

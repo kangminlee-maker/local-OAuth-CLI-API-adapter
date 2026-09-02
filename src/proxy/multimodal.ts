@@ -6,6 +6,7 @@ import { ProxyRequestError } from './types.js';
 import type {
   NormalizedImage,
   NormalizedImageDetail,
+  NormalizedMessage,
   NormalizedRequest,
 } from './types.js';
 
@@ -62,25 +63,47 @@ export async function claudeMessageContentFor(
     // `images` is optional on the shape callers build by hand.
     const images = message.images ?? [];
     if (images.length === 0) continue;
-    // An image that answers a tool call says so. Every image used to be hoisted
-    // ahead of one flattened prompt with nothing naming its origin, so a turn
-    // whose two tool results each returned a picture left the model to match
-    // them by position — and "what colour was the second one" was answered by
-    // ordering luck. Now that tools stay available for a whole conversation,
-    // that shape is ordinary rather than exotic.
-    // From the turn's structure, not from its text: reading the flattened
-    // prompt back is what let a tool's own output forge a result boundary.
-    const callId = message.tool?.results[0]?.callId ?? null;
-    for (const [index, image] of images.entries()) {
-      if (callId) {
-        const which = images.length > 1 ? ` (${index + 1} of ${images.length})` : '';
-        content.push({ type: 'text', text: `${TOOL_RESULT_MARKER} image for tool_call_id: ${callId}${which}` });
-      }
+    const labels = toolResultImageLabels(message);
+    for (const image of images) {
+      const label = labels.get(image);
+      if (label) content.push({ type: 'text', text: `${TOOL_RESULT_MARKER} image for tool_call_id: ${label}` });
       content.push(await claudeImageBlock(image));
     }
   }
   content.push({ type: 'text', text: prompt });
   return content;
+}
+
+/**
+ * What each image is called, keyed on the image itself.
+ *
+ * An image that answers a tool call says so. Every image used to be hoisted
+ * ahead of one flattened prompt with nothing naming its origin, so a turn whose
+ * two tool results each returned a picture left the model to match them by
+ * position — and "what colour was the second one" was answered by ordering
+ * luck. Now that tools stay available for a whole conversation, that shape is
+ * ordinary rather than exotic.
+ *
+ * Which is why the label comes from the image's OWN result. Reading the first
+ * result's call id for every image in the message put both of a parallel turn's
+ * pictures under the first call: the same position-matching, restored by the
+ * fix meant to end it. And the count is within that result too — "1 of 2" means
+ * the second of the two pictures THIS call returned.
+ *
+ * From the turn's structure, not from its text: reading the flattened prompt
+ * back is what let a tool's own output forge a result boundary.
+ */
+function toolResultImageLabels(message: NormalizedMessage): Map<NormalizedImage, string> {
+  const labels = new Map<NormalizedImage, string>();
+  for (const part of message.tool?.parts ?? []) {
+    if (part.kind !== 'result') continue;
+    const images = part.result.images ?? [];
+    for (const [index, image] of images.entries()) {
+      const which = images.length > 1 ? ` (${index + 1} of ${images.length})` : '';
+      labels.set(image, `${part.result.callId}${which}`);
+    }
+  }
+  return labels;
 }
 
 async function codexImageInput(

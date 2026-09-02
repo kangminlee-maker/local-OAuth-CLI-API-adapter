@@ -24,7 +24,29 @@ export interface NormalizedThinking {
 export interface NormalizedToolResult {
   readonly callId: string;
   readonly output: string;
+  /**
+   * The pictures THIS result returned, in the order it carried them.
+   *
+   * `NormalizedMessage.images` is every image of the message, and a turn
+   * answering two parallel calls has two results in it — so the message-level
+   * list cannot say which call a picture answers. Reading the FIRST result's
+   * call id for all of them labelled both of a turn's pictures with the first
+   * call, which is the position-matching the labels exist to end.
+   */
+  readonly images?: readonly NormalizedImage[];
 }
+
+/**
+ * One part of a tool turn, in the position the client put it.
+ *
+ * A `text` part is a run of prose the turn carried outside its tool blocks;
+ * adjacent runs are joined, so no two text parts are ever neighbours.
+ */
+export type NormalizedToolPart =
+  /** `LocalToolCall` is already this shape — one name for one thing. */
+  | { readonly kind: 'call'; readonly call: LocalToolCall }
+  | { readonly kind: 'result'; readonly result: NormalizedToolResult }
+  | { readonly kind: 'text'; readonly text: string };
 
 /**
  * A tool turn as STRUCTURE, recorded where the normalizer already knew it.
@@ -32,13 +54,17 @@ export interface NormalizedToolResult {
  * `content` still renders the same turn as text, because the claude runtime
  * puts `content` in its prompt verbatim and has no items to build. Backends
  * that DO have items build them from here.
+ *
+ * A SEQUENCE, not groups. It used to be `{calls, results, narration}` — three
+ * buckets and one string — which cannot say where the prose sat: the projection
+ * had to guess (before the calls, after the results), so a client sending
+ * `[call, text, call]` had its text hoisted to the front and `[call, text]` was
+ * reordered outright. The same shape defect the turn's own text/tool order had
+ * one level up, where a boolean could not express `[call, text, call]` either
+ * and became a count. Grouping loses order; a sequence is the order.
  */
 export interface NormalizedToolTurn {
-  /** `LocalToolCall` is already this shape — one name for one thing. */
-  readonly calls: readonly LocalToolCall[];
-  readonly results: readonly NormalizedToolResult[];
-  /** The prose the same turn carried outside its tool blocks. */
-  readonly narration: string;
+  readonly parts: readonly NormalizedToolPart[];
 }
 
 export interface NormalizedMessage {
@@ -47,7 +73,12 @@ export interface NormalizedMessage {
   readonly images: readonly NormalizedImage[];
   /**
    * Set only when the normalizer itself flattened a tool turn into this text,
-   * and carrying that turn's own calls and results.
+   * and carrying that turn's own parts in the order the client sent them.
+   *
+   * PRESENCE is the provenance signal, and it means the same thing under the
+   * sequence as it did under the groups: a turn with at least one call or one
+   * result in it. Prose alone never sets the field, so an ordinary message is
+   * never mistaken for tool history.
    *
    * It began as a boolean saying "this proxy wrote the grammar", because
    * downstream readers used to decide by looking for the marker in the text —

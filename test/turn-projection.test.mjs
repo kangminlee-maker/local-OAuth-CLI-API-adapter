@@ -200,6 +200,57 @@ test('an empty item at the END of a same-role run is not a turn either', async (
   ]);
 });
 
+/**
+ * Whitespace is content, because that is what the VALIDATOR says.
+ *
+ * `refuseAnthropicMessageShape` measures emptiness with
+ * `anthropicContentLength`, which counts `'   '` as three — so it accepts
+ * `[user:'   ', user:'PING']` as a run WITH content. The merge then judged the
+ * same item by `content.trim() === ''` on the FLATTENED text and erased it.
+ * Measured at the backend boundary before the fix:
+ *
+ *   [{user:'   '}, {user:'PING'}] -> ["PING"]   <- the three spaces vanish
+ *
+ * Two answers to one question, and the body the validator had just called
+ * non-empty lost its content on the way to the model.
+ */
+const EMPTINESS_ROWS = [
+  ['whitespace-only text is kept beside a sibling', [
+    { role: 'user', content: '   ' },
+    { role: 'user', content: 'PING' },
+  ], ['   ', 'PING']],
+  ['a whitespace-only text BLOCK is kept too', [
+    { role: 'user', content: [{ type: 'text', text: '  ' }] },
+    { role: 'user', content: 'PING' },
+  ], ['  ', 'PING']],
+  ['whitespace-only text is kept when it is the whole run', [
+    { role: 'user', content: '   ' },
+  ], ['   ']],
+  ['CONTROL: an item with NO blocks is still absorbed', [
+    { role: 'user', content: [] },
+    { role: 'user', content: 'PING' },
+  ], ['PING']],
+  ['CONTROL: an empty STRING is absorbed the same way', [
+    { role: 'user', content: 'PING' },
+    { role: 'user', content: '' },
+  ], ['PING']],
+  ['CONTROL: two non-empty items are two turns', [
+    { role: 'user', content: 'ONE' },
+    { role: 'user', content: 'TWO' },
+  ], ['ONE', 'TWO']],
+];
+
+for (const [label, messages, expected] of EMPTINESS_ROWS) {
+  test(`the merge and the validator agree about "empty": ${label}`, async () => {
+    const input = await upstreamInput(anthropicRequest(messages));
+    assert.deepEqual(
+      input.map((item) => item.content[0].text),
+      expected,
+      `content erased or invented: ${JSON.stringify(input)}`,
+    );
+  });
+}
+
 test('CONTROL: two NON-empty same-role turns both stay', async () => {
   // Both are real turns. A merge that joined them would pass the two tests
   // above and quietly rewrite every conversation that repeats a role.

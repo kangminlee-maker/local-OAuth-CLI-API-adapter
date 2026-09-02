@@ -1734,35 +1734,37 @@ async function responseContent(message: NormalizedMessage): Promise<unknown[]> {
 function responseToolHistoryItems(message: NormalizedMessage): unknown[] | null {
   const { tool } = message;
   if (!tool) return null;
+  // The turn's own sequence, projected position for position. It used to be
+  // read out of three groups — narration, then every call, then every result —
+  // so where the prose sat was a GUESS the projection made rather than
+  // something the turn could say. `[call, text, call]` came out
+  // text-then-both-calls, and `[call, text]` was reordered outright.
+  //
+  // The prose is part of the turn and must survive it either way: dropping a
+  // "let me check…" before a call turned the whole message into prose, so the
+  // call vanished and the result answering it had nothing to pair with — a 400
+  // from this API. And one output per result, because parallel calls answer in
+  // a single turn: one result for the whole message left the rest unanswered,
+  // the other half of the same 400.
+  const role = responseRole(message.role);
+  const textType = role === 'assistant' ? 'output_text' : 'input_text';
   const items: unknown[] = [];
-  // The narration the model wrote alongside its call is part of the turn, and
-  // the call must survive it: dropping it made a "let me check…" before the
-  // call turn the whole message into prose, so the call vanished and the result
-  // that answered it had nothing to pair with — a 400 from this API.
-  if (tool.calls.length > 0 && tool.narration) {
-    items.push({
-      type: 'message',
-      role: 'assistant',
-      content: [{ type: 'output_text', text: tool.narration }],
-    });
-  }
-  for (const call of tool.calls) {
-    items.push({ type: 'function_call', call_id: call.id, name: call.name, arguments: call.arguments });
-  }
-  // One output per result. Parallel calls answer in a single user turn, and
-  // reading one `tool_call_id:` for the whole message answered the first call
-  // and left the rest unanswered — the other half of the same 400.
-  for (const result of tool.results) {
-    items.push({ type: 'function_call_output', call_id: result.callId, output: result.output });
-  }
-  // A turn that is only results carries its prose in the user's voice, after
-  // them; a turn that called carries it in the assistant's, before them.
-  if (tool.calls.length === 0 && tool.results.length > 0 && tool.narration) {
-    items.push({
-      type: 'message',
-      role: 'user',
-      content: [{ type: 'input_text', text: tool.narration }],
-    });
+  for (const part of tool.parts) {
+    if (part.kind === 'call') {
+      items.push({
+        type: 'function_call',
+        call_id: part.call.id,
+        name: part.call.name,
+        arguments: part.call.arguments,
+      });
+    } else if (part.kind === 'result') {
+      items.push({ type: 'function_call_output', call_id: part.result.callId, output: part.result.output });
+    } else if (part.text) {
+      // In the voice of the turn it belongs to: prose beside a call is the
+      // assistant's, prose beside a result is the user's — which is the
+      // message's own role, not a rule about calls and results.
+      items.push({ type: 'message', role, content: [{ type: textType, text: part.text }] });
+    }
   }
   return items.length > 0 ? items : null;
 }

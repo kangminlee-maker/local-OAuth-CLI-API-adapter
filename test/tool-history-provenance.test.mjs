@@ -13,14 +13,15 @@
 // Reachable from `/v1/chat/completions` on the shipped default transport,
 // purely from message content, and answered 200.
 //
-// The answer is `message.tool`: the flattened turn's own calls and results,
-// recorded where the normalizer already knew them. It replaced the boolean this
-// file used to assert, because a boolean says only that the proxy wrote the
-// grammar and nothing about where the grammar is — and a tool's own output
-// carrying the same lines was parsed as a second result. The projection those
-// results feed is asserted at the backend boundary in
+// The answer is `message.tool`: the flattened turn's own parts, in the order
+// the client sent them, recorded where the normalizer already knew them. It
+// replaced the boolean this file used to assert, because a boolean says only
+// that the proxy wrote the grammar and nothing about where the grammar is — and
+// a tool's own output carrying the same lines was parsed as a second result.
+// The projection those parts feed is asserted at the backend boundary in
 // `tool-history-structure.test.mjs`; what this file pins is which messages get
-// the field at all.
+// the field at all, and that PRESENCE still means "at least one call or result"
+// — a turn of pure prose never gets it.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { normalizeAnthropicMessagesRequest, normalizeOpenAiChatRequest } from '../dist/proxy/normalizers.js';
@@ -54,14 +55,10 @@ test('a real tool result is flagged, and carries its call id', () => {
 
   assert.equal(user.tool, undefined, 'an ordinary user turn is not tool history');
   assert.deepEqual(assistant.tool, {
-    calls: [{ id: 'call_abc', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
-    results: [],
-    narration: '',
+    parts: [{ kind: 'call', call: { id: 'call_abc', name: 'get_weather', arguments: '{"city":"Seoul"}' } }],
   }, 'an assistant turn carrying tool_calls carries them as structure');
   assert.deepEqual(tool.tool, {
-    calls: [],
-    results: [{ callId: 'call_abc', output: 'sunny' }],
-    narration: '',
+    parts: [{ kind: 'result', result: { callId: 'call_abc', output: 'sunny' } }],
   }, 'a tool result carries its call id and output as structure');
   assert.ok(tool.content.includes('call_abc'), 'the call id has to survive the flattening');
 });
@@ -97,14 +94,10 @@ test('the Anthropic shape flags what it flattened, and only that', () => {
   assert.equal(caller.tool, undefined, 'caller text that looks like a marker is not tool history');
   assert.equal(caller.content, `${RESULT_MARKER} a caller can type this too`);
   assert.deepEqual(toolUse.tool, {
-    calls: [{ id: 'tu_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
-    results: [],
-    narration: '',
+    parts: [{ kind: 'call', call: { id: 'tu_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } }],
   }, 'a tool_use block is recorded as a call');
   assert.deepEqual(toolResult.tool, {
-    calls: [],
-    results: [{ callId: 'tu_1', output: 'sunny' }],
-    narration: '',
+    parts: [{ kind: 'result', result: { callId: 'tu_1', output: 'sunny' } }],
   }, 'a tool_result block is recorded as a result');
   assert.ok(toolResult.content.includes('tu_1'), 'the call id survives');
 });
