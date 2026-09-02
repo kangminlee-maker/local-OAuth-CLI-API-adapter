@@ -41,11 +41,26 @@ export interface NormalizedToolResult {
  *
  * A `text` part is a run of prose the turn carried outside its tool blocks;
  * adjacent runs are joined, so no two text parts are ever neighbours.
+ *
+ * A turn is only a TOOL turn when a call or a result is in it — text and
+ * pictures alone are an ordinary message, and `tool` stays unset there.
  */
 export type NormalizedToolPart =
   /** `LocalToolCall` is already this shape — one name for one thing. */
   | { readonly kind: 'call'; readonly call: LocalToolCall }
   | { readonly kind: 'result'; readonly result: NormalizedToolResult }
+  /**
+   * A picture the turn carried as a block of its OWN — not inside any result,
+   * so `NormalizedToolResult.images` cannot hold it and nothing captions it.
+   *
+   * It is here because a part is what gives a block a POSITION. While the turn
+   * recorded nothing for it, every such image was appended after the whole
+   * sequence: a client sending `[result c1, image, text, result c2]` had its
+   * picture arrive behind c2's output, in an order it never wrote. The image
+   * object is the very one `NormalizedMessage.images` holds, so a consumer that
+   * walks either one is looking at one picture, not a copy.
+   */
+  | { readonly kind: 'image'; readonly image: NormalizedImage }
   | { readonly kind: 'text'; readonly text: string };
 
 /**

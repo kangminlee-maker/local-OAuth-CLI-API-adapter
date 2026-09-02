@@ -20,13 +20,30 @@
 // body. A test that stopped at `NormalizedRequest` saw nothing wrong: the
 // normalizer's parts were already in order, and the reordering happened where
 // they were read back.
+//
+// A picture inside a RESULT was the first half. The second is a picture that is
+// a BLOCK OF THE MESSAGE in its own right — inside no result, so no result's
+// list can carry it. The turn recorded no part for one, so the sequence had no
+// position to give it and it was appended after every item: this body
+//
+//   user [tool_result c1 ("ONE"), picture, text "BETWEEN", tool_result c2]
+//
+// reached the model as `output c1, "BETWEEN", output c2, <picture>` — the
+// picture the client wrote BEFORE "BETWEEN" arriving after the last result. The
+// turn records a part for it now, and the projection emits it there.
+//
+// Both halves are asserted as WHOLE ITEMS, not as "an image is in here
+// somewhere": the companion's `role` decides whose voice the picture arrives
+// in, and while every assertion here stopped at presence, mutating that role to
+// `assistant` changed the real upstream body with all 64 of these tests still
+// green.
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, test } from 'node:test';
 import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js';
-import { normalizeAnthropicMessagesRequest } from '../dist/proxy/normalizers.js';
+import { normalizeAnthropicMessagesRequest, normalizeOpenAiChatRequest } from '../dist/proxy/normalizers.js';
 
 const RED_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 const BLUE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -111,6 +128,9 @@ function imagesWithIndex(input) {
   }
   return found;
 }
+
+/** The URL a base64 picture is sent as, so a WHOLE item can be written down. */
+const dataUrl = (data) => `data:image/png;base64,${data}`;
 
 const captionsOf = (item) => (item.content ?? [])
   .filter((block) => block.type === 'input_text')
@@ -223,6 +243,20 @@ test('CONTROL: a message-level picture with no tool parts is still an ordinary m
   assert.ok(images[0].url.includes(RED_PIXEL_PNG), 'and it is the one that was sent');
   assert.equal(input.filter((item) => item.type === 'function_call_output').length, 0, JSON.stringify(lines));
   assert.ok(!JSON.stringify(input).includes('tool_call_id'), `and it names no call: ${JSON.stringify(lines)}`);
+
+  // ONE item, text then picture, exactly as the client wrote the blocks — the
+  // message is not tool history, so nothing may split it into items. The turn
+  // records parts for this message now (a text run and a picture), and reading
+  // their mere PRESENCE as "this is a tool turn" would hand every ordinary
+  // picture message to the projection: the same item, arriving as two.
+  assert.deepEqual(input, [{
+    type: 'message',
+    role: 'user',
+    content: [
+      { type: 'input_text', text: 'LOOK' },
+      { type: 'input_image', image_url: dataUrl(RED_PIXEL_PNG) },
+    ],
+  }], `an ordinary message, whole: ${JSON.stringify(lines)}`);
 });
 
 test("CONTROL: a lone result's picture is beside it, and one picture is sent once", async () => {
@@ -243,10 +277,11 @@ test("CONTROL: a lone result's picture is beside it, and one picture is sent onc
   assert.ok(captionsOf(input[images[0].index]).includes('tool_call_id: c1'), JSON.stringify(lines));
 });
 
-test("a picture the MESSAGE carried, not a result, still arrives after the turn", async () => {
-  // The turn records no part for a bare image block, so the sequence has no
-  // position to give it — it keeps the one it has always had, after the tool
-  // items, and stays anonymous because no result returned it.
+test("a picture the MESSAGE carried, not a result, arrives where the client put it", async () => {
+  // Last in the blocks, so last on the wire — the position the old
+  // append-everything-at-the-end behaviour happened to agree with, which is why
+  // this case is the one that proves the fix did not simply move every picture.
+  // It stays anonymous because no result returned it.
   const input = await upstreamInput(anthropicRequest([
     { role: 'user', content: '하나만.' },
     { role: 'assistant', content: [toolUse('c1')] },
@@ -264,7 +299,190 @@ test("a picture the MESSAGE carried, not a result, still arrives after the turn"
   const blue = images.find((image) => image.url.includes(BLUE_PIXEL_PNG));
   assert.ok(red && blue, JSON.stringify(lines));
   assert.equal(red.index, lines.indexOf('output:c1') + 1, `the result's own picture sits with it: ${JSON.stringify(lines)}`);
-  assert.equal(blue.index, input.length - 1, `the message's own picture follows the turn: ${JSON.stringify(lines)}`);
+  assert.equal(blue.index, input.length - 1, `the message's own picture keeps its last place: ${JSON.stringify(lines)}`);
   assert.ok(captionsOf(input[red.index]).includes('tool_call_id: c1'), JSON.stringify(lines));
   assert.equal(captionsOf(input[blue.index]), '', `and the unowned one claims no call: ${JSON.stringify(lines)}`);
+
+  // Whole items: a caption belongs to the picture its own result returned, and
+  // the unowned one carries nothing but itself.
+  assert.deepEqual(input[red.index], {
+    type: 'message',
+    role: 'user',
+    content: [
+      { type: 'input_text', text: '[tool result] image for tool_call_id: c1' },
+      { type: 'input_image', image_url: dataUrl(RED_PIXEL_PNG) },
+    ],
+  }, JSON.stringify(lines));
+  assert.deepEqual(input[blue.index], {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_image', image_url: dataUrl(BLUE_PIXEL_PNG) }],
+  }, JSON.stringify(lines));
+});
+
+test('a standalone picture inside a tool turn lands at ITS position, not after the sequence', async () => {
+  // The measured defect: the picture is a block of the MESSAGE, written between
+  // c1's result and the prose after it. It used to arrive past c2's output.
+  const input = await upstreamInput(anthropicRequest([
+    { role: 'user', content: '두 장을 가져와줘.' },
+    { role: 'assistant', content: [toolUse('c1'), toolUse('c2')] },
+    {
+      role: 'user',
+      content: [
+        toolResult('c1', { type: 'text', text: 'ONE' }),
+        imageBlock(RED_PIXEL_PNG),
+        { type: 'text', text: 'BETWEEN' },
+        toolResult('c2', { type: 'text', text: 'TWO' }),
+      ],
+    },
+  ]));
+
+  const lines = shape(input);
+  // The WHOLE sequence, because "the picture is before BETWEEN" is also true of
+  // an order that moved BETWEEN.
+  assert.deepEqual(lines, [
+    'message:user[text(두 장을 가져와줘.)]',
+    'call:c1',
+    'call:c2',
+    'output:c1',
+    'message:user[IMAGE]',
+    'message:user[text(BETWEEN)]',
+    'output:c2',
+  ], `position for position, as the client wrote it: ${JSON.stringify(lines)}`);
+
+  const images = imagesWithIndex(input);
+  assert.equal(images.length, 1, `sent once: ${JSON.stringify(lines)}`);
+  assert.deepEqual(input[images[0].index], {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_image', image_url: dataUrl(RED_PIXEL_PNG) }],
+  }, `the whole companion — a user message, the picture, no caption it has not earned: ${JSON.stringify(lines)}`);
+});
+
+test('two standalone pictures keep two different positions', async () => {
+  // Appending them after the sequence put BOTH in one trailing message, so
+  // their order survived and every position was lost — which a test that only
+  // compared the two pictures to each other would have called correct.
+  const input = await upstreamInput(anthropicRequest([
+    { role: 'user', content: '두 장을 가져와줘.' },
+    { role: 'assistant', content: [toolUse('c1'), toolUse('c2')] },
+    {
+      role: 'user',
+      content: [
+        imageBlock(RED_PIXEL_PNG),
+        toolResult('c1', { type: 'text', text: 'ONE' }),
+        imageBlock(BLUE_PIXEL_PNG),
+        toolResult('c2', { type: 'text', text: 'TWO' }),
+      ],
+    },
+  ]));
+
+  const lines = shape(input);
+  assert.deepEqual(lines, [
+    'message:user[text(두 장을 가져와줘.)]',
+    'call:c1',
+    'call:c2',
+    'message:user[IMAGE]',
+    'output:c1',
+    'message:user[IMAGE]',
+    'output:c2',
+  ], `each picture at its own place: ${JSON.stringify(lines)}`);
+
+  const images = imagesWithIndex(input);
+  assert.equal(images.length, 2, `both sent, once each: ${JSON.stringify(lines)}`);
+  assert.ok(images[0].url.includes(RED_PIXEL_PNG), `red came first, as it was written: ${JSON.stringify(lines)}`);
+  assert.ok(images[1].url.includes(BLUE_PIXEL_PNG), `blue second: ${JSON.stringify(lines)}`);
+  assert.equal(images[0].index, lines.indexOf('output:c1') - 1, `red is BEFORE c1's output: ${JSON.stringify(lines)}`);
+  assert.equal(images[1].index, lines.indexOf('output:c2') - 1, `blue is between the two outputs: ${JSON.stringify(lines)}`);
+  assert.equal(captionsOf(input[images[0].index]), '', 'neither claims a call');
+  assert.equal(captionsOf(input[images[1].index]), '', 'neither claims a call');
+});
+
+test("the companion a result's picture rides in is a USER message: caption, then picture", async () => {
+  // The role is what says whose voice the picture arrives in, and it was the
+  // one thing nothing here looked at: `role: 'user'` mutated to `'assistant'`
+  // changed the real upstream body with every test in this file still green.
+  const input = await upstreamInput(anthropicRequest([
+    { role: 'user', content: '하나만.' },
+    { role: 'assistant', content: [toolUse('c1')] },
+    { role: 'user', content: [toolResult('c1', { type: 'text', text: 'ONE' }, imageBlock(RED_PIXEL_PNG))] },
+  ]));
+
+  const lines = shape(input);
+  const images = imagesWithIndex(input);
+  assert.equal(images.length, 1, JSON.stringify(lines));
+  assert.deepEqual(input[images[0].index], {
+    type: 'message',
+    role: 'user',
+    content: [
+      { type: 'input_text', text: '[tool result] image for tool_call_id: c1' },
+      { type: 'input_image', image_url: dataUrl(RED_PIXEL_PNG) },
+    ],
+  }, `the whole companion item: ${JSON.stringify(lines)}`);
+});
+
+test('a result that returned two pictures captions each one, in place', async () => {
+  const input = await upstreamInput(anthropicRequest([
+    { role: 'user', content: '두 장을 한 번에.' },
+    { role: 'assistant', content: [toolUse('c1')] },
+    {
+      role: 'user',
+      content: [toolResult('c1', { type: 'text', text: 'ONE' }, imageBlock(RED_PIXEL_PNG), imageBlock(BLUE_PIXEL_PNG))],
+    },
+  ]));
+
+  const lines = shape(input);
+  const images = imagesWithIndex(input);
+  assert.equal(images.length, 2, JSON.stringify(lines));
+  // One companion, four blocks: caption, picture, caption, picture. A caption
+  // that drifted onto the other picture is a wrong answer to "which one is
+  // this", and only the ordered whole can catch it.
+  assert.deepEqual(input[images[0].index], {
+    type: 'message',
+    role: 'user',
+    content: [
+      { type: 'input_text', text: '[tool result] image for tool_call_id: c1 (1 of 2)' },
+      { type: 'input_image', image_url: dataUrl(RED_PIXEL_PNG) },
+      { type: 'input_text', text: '[tool result] image for tool_call_id: c1 (2 of 2)' },
+      { type: 'input_image', image_url: dataUrl(BLUE_PIXEL_PNG) },
+    ],
+  }, `the whole companion item: ${JSON.stringify(lines)}`);
+  assert.equal(images[0].index, images[1].index, 'one result, one companion');
+});
+
+test('the openai chat shape has the same door, and it is shut too', async () => {
+  // `content` is the member BEFORE `tool_calls`, so a picture in it precedes
+  // the calls. Appended after the sequence, it arrived behind every call the
+  // turn made. The picture still travels in the USER's voice — `input_image` is
+  // an input block, and the assistant turn beside it keeps its own.
+  const input = await upstreamInput(normalizeOpenAiChatRequest({
+    model: 'gpt-5.5',
+    messages: [
+      { role: 'user', content: 'go' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'HERE' },
+          { type: 'image_url', image_url: { url: dataUrl(RED_PIXEL_PNG) } },
+        ],
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_image', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'c1', content: 'ONE' },
+    ],
+    tools: [{ type: 'function', function: { name: 'get_image', parameters: { type: 'object', properties: {} } } }],
+  }));
+
+  const lines = shape(input);
+  assert.deepEqual(lines, [
+    'message:user[text(go)]',
+    'message:assistant[text(HERE)]',
+    'message:user[IMAGE]',
+    'call:c1',
+    'output:c1',
+  ], `the picture precedes the call its message made: ${JSON.stringify(lines)}`);
+  assert.deepEqual(input[2], {
+    type: 'message',
+    role: 'user',
+    content: [{ type: 'input_image', image_url: dataUrl(RED_PIXEL_PNG) }],
+  }, JSON.stringify(lines));
 });
