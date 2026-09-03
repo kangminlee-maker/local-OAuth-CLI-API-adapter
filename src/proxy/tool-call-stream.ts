@@ -26,12 +26,8 @@ export class ToolCallDeltaExtractor {
    * same condition the backstop tests: `{"status":"tool_calls","toolCalls":[]}`
    * passed this gate and was refused anyway, delivering the whole answer first.
    *
-   * `jsonMode`: the client asked for JSON, so on an ANSWER turn the wrapper's
-   * `json` member is the answer and its `text` is not — the body returns
-   * `{"verdict":"True"}` where the stream was sending `Here is the verdict.`
-   * On a tool_calls turn `text` is narration and still streams.
    */
-  constructor(private readonly policy: { requiresCall?: boolean; jsonMode?: boolean } = {}) {}
+  constructor(private readonly policy: { requiresCall?: boolean } = {}) {}
 
   /** Whether the wrapper has committed to at least one tool call. */
   private carriesAClosedCall(): boolean {
@@ -73,9 +69,11 @@ export class ToolCallDeltaExtractor {
     // A required turn is refused unless it actually carries a call, which is
     // the condition the backstop tests — not merely what `status` claims.
     if (this.policy.requiresCall && (status !== 'tool_calls' || !this.carriesAClosedCall())) return [];
-    // In JSON mode the answer turn's answer is `json`, delivered whole by the
-    // completed result; `text` there is not the answer and must not be sent.
-    const textEvents = this.policy.jsonMode && status !== 'tool_calls' ? [] : this.textDeltas();
+    // The wrapper's `text` IS the answer on an answer turn — `parseToolDecision`
+    // returns exactly it. A gate here held it back for the wrapper's `json`
+    // member, which no longer exists, so a turn with `tools` and a JSON format
+    // streamed nothing and arrived in one frame at the end.
+    const textEvents = this.textDeltas();
     const callEvents = status === 'tool_calls' ? this.toolCallDeltas() : [];
     // Which of the two came first is the wrapper's to say, not this decoder's.
     // Emitting text first unconditionally made the answer depend on where the

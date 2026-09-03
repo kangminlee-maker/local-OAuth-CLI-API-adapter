@@ -17,6 +17,7 @@ import {
   developerInstructions,
   forcedSingleToolCall,
   hasToolDecisionSchema,
+  textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
   toolChoiceRequiresCall,
@@ -253,10 +254,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     const toolExtractor = forcedTool
       ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
       : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor({
-          requiresCall: toolChoiceRequiresCall(request),
-          jsonMode: request.jsonMode,
-        })
+      ? new ToolCallDeltaExtractor({ requiresCall: toolChoiceRequiresCall(request) })
       : null;
     let firstToolCallDeltaMs: number | undefined;
     let firstToolArgumentDeltaMs: number | undefined;
@@ -276,12 +274,13 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
             }
             queue.push(event);
           }
-        } else if (!request.jsonMode) {
-          // A json-mode turn's text is not known to be deliverable until it is
-          // complete: `parseBackendOutput` refuses output that is not JSON, and
-          // this branch had no gate at all, so the refused answer went out in
-          // full and the error frame arrived after it. The completed result
-          // still carries the text, so nothing is lost — only held.
+        } else if (!textMayBeRefused(request)) {
+          // A turn whose text the response path may refuse is not known to be
+          // deliverable until it is complete: this branch had no gate at all,
+          // so the refused answer went out in full and the error frame arrived
+          // after it. The completed result still carries the text, so nothing
+          // is lost — only held. Spelled `!request.jsonMode`, it also held back
+          // every explicit client schema, which `parseBackendOutput` exempts.
           queue.push({ type: 'text_delta', delta });
         }
       },

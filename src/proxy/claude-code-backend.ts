@@ -8,6 +8,7 @@ import {
   claudeSystemPrompt,
   forcedSingleToolCall,
   hasToolDecisionSchema,
+  textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
   toolChoiceRequiresCall,
@@ -223,10 +224,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     const toolExtractor = forcedTool
       ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
       : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor({
-          requiresCall: toolChoiceRequiresCall(request),
-          jsonMode: request.jsonMode,
-        })
+      ? new ToolCallDeltaExtractor({ requiresCall: toolChoiceRequiresCall(request) })
       : null;
     const shouldStreamText = !toolExtractor && this.canStreamTextDeltas(request);
     const run = this.runRequest(
@@ -318,15 +316,15 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   /**
    * Whether this turn's text may be streamed as it is produced.
    *
-   * `jsonMode`, not `jsonSchema`: `json_object` sets the former and not the
-   * latter, so a json-object turn used to stream its answer live and then have
-   * `parseBackendOutput` refuse it for not being an object — the whole
-   * non-JSON sentence delivered, followed by an error frame. A turn whose
-   * output the response path may reject is a turn whose output is not known to
-   * be deliverable until it is complete.
+   * A turn whose output the response path may reject is a turn whose output
+   * is not known to be deliverable until it is complete: a `json_object` turn
+   * used to stream its answer live and then have `parseBackendOutput` refuse
+   * it for not being an object — the whole non-JSON sentence delivered,
+   * followed by an error frame. Only what CAN be refused is withheld, so an
+   * explicit client schema still streams.
    */
   private canStreamTextDeltas(request: NormalizedRequest): boolean {
-    return !hasToolDecisionSchema(request) && !request.jsonMode;
+    return !hasToolDecisionSchema(request) && !textMayBeRefused(request);
   }
 
   private canUsePersistentTurn(request: NormalizedRequest): boolean {
@@ -652,7 +650,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       } else if (message.subtype === 'success' && message.is_error !== true) {
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
-          structuredOutput: message.structured_output ?? waiter.structuredOutput,
+          structuredOutput: ownStructuredOutput(message, waiter.structuredOutput),
           rawStructuredOutput: rawTopLevelValue(line, 'structured_output') ?? waiter.rawStructuredOutput,
           usage: message.usage ?? waiter.usage,
           stopReason: readClaudeStopReason(message),
@@ -772,6 +770,21 @@ function claudeTuningArgs(request: NormalizedRequest, model?: string): string[] 
 function requiresOneShotClaudeArgs(request: NormalizedRequest, model?: string): boolean {
   return outputSchemaFor(request) !== null || claudeTuningArgs(request, model).length > 0;
 }
+/**
+ * The result record's OWN `structured_output`, present-or-absent.
+ *
+ * `??` cannot express this. A client schema of `{"type":"null"}` makes `null`
+ * the answer it asked for, and coalescing a present `null` away selected the
+ * empty fallback text instead: the client got `""` for a schema its own
+ * runtime had satisfied.
+ */
+function ownStructuredOutput(
+  message: { structured_output?: unknown },
+  fallback: unknown,
+): unknown {
+  return 'structured_output' in message ? message.structured_output : fallback;
+}
+
 
 function readClaudeStopReason(message: JsonObject): string | undefined {
   return typeof message.stop_reason === 'string' ? message.stop_reason : undefined;
@@ -920,7 +933,7 @@ function runClaudeProcess(
         } else if (message.subtype === 'success' && message.is_error !== true) {
           finish(undefined, {
             text: typeof message.result === 'string' ? message.result : waiter.text,
-            structuredOutput: message.structured_output ?? waiter.structuredOutput,
+            structuredOutput: ownStructuredOutput(message, waiter.structuredOutput),
             rawStructuredOutput: rawTopLevelValue(line, 'structured_output') ?? waiter.rawStructuredOutput,
             usage: message.usage ?? waiter.usage,
             stopReason: readClaudeStopReason(message),

@@ -958,6 +958,48 @@ Standing rules for every probe: minimal token spend (`max_tokens`/`max_completio
 
 ---
 
+## 7. Known design gap — the tool wrapper has two readers that disagree
+
+**Status: declared, not fixed.** Round 14 (2026-09-04, two independent reviewers on private copies,
+neither calling a live API) reproduced ten defects. Two were separable and are fixed; the other
+eight are one design problem wearing eight faces, and patching them one at a time is what produced
+the last four rounds.
+
+The problem: a turn with `tools` is answered inside a private JSON wrapper
+(`{status, text, toolCalls}`). The **buffered** reader is `JSON.parse`. The **streamed** reader is a
+hand-written incremental walk that must decide what to release before the wrapper is complete —
+and a released byte cannot be retracted. Two implementations of one grammar disagree on every axis
+nobody has enumerated yet, and each round enumerates a few more.
+
+| # | axis they disagree on | what a client sees | introduced by round 13's fixes? |
+|---|---|---|---|
+| 1 | root **end** is never found, so bytes after the wrapper are read as its members | under `tool_choice:"required"`, the stream delivers a complete executable call, then the frame refusing it | no |
+| 2 | the root may never **close** at all | stream announces a call; the buffered body returns the fragment as prose with no call | no |
+| 3 | duplicate keys: the walk is first-wins, `JSON.parse` is last-wins | one artefact, two block orders; raw `structured_output` picks a different value than the parsed one | **yes** |
+| 4 | whitespace class is JavaScript's `\s`, not JSON's four characters | a leading BOM or NBSP makes the stream read a wrapper the body rejects — an executed call the body denies | no |
+| 5 | argument normalization: buffered wraps invalid text as `{"input":…}`, the stream forwards it raw | the two clients receive different tool input; only the buffered one can execute the call | no |
+| 6 | the forced-tool path now passes `{`/`[`-opening payloads through unnormalized | truncated `{"city":"Seo` is published as `function.arguments` and fails `JSON.parse` | **yes** |
+| 7 | a call's **name** is constrained in the runtime schema but validated in neither reader | a required turn can publish a tool name the client never declared | no |
+| 8 | in JSON mode the wrapper shares a namespace with client-controlled keys | `{"status":"done","text":"…","toolCalls":[]}` is published verbatim — the proxy's internal grammar as the answer | no |
+
+Row 8 is the one that shows why this is design and not repair: with `tools` present the runtime is
+handed the wrapper schema and never the client's, so that object is *probably* a malformed wrapper —
+but it is also exactly what a client's own task-record schema would produce, and nothing in the
+bytes distinguishes them. Deciding it needs the client's data separated from the wrapper's own,
+which is the same separation rows 3, 5 and 6 need. A predicate cannot be written here.
+
+**What was fixed instead**, because it was separable rather than structural:
+- The `jsonMode` gates left behind when the wrapper's `json` member was reverted. They held back the
+  only answer there was, so a turn with `tools` and a JSON format streamed nothing and arrived in
+  one frame; spelled `!request.jsonMode`, they also withheld every explicit client schema against a
+  refusal that cannot happen. One predicate, `textMayBeRefused`, now serves the backstop and all
+  three gates.
+- A present `structured_output: null` was coalesced away by `??` and published as `""`, so a client
+  whose schema was `{"type":"null"}` never received the answer its runtime had produced.
+
+Until the separation is designed, rows 1–8 above are the honest statement of what this adapter does
+not guarantee when `tools` and a JSON format are combined.
+
 ## Appendix: evidence tally
 
 Counted mechanically over the four matrices by the value in the final column (a hand tally written first was wrong on two classes; these are the script's numbers).

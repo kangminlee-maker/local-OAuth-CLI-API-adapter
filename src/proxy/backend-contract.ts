@@ -262,14 +262,10 @@ function parseToolDecision(
         ...(calls.length > 0 && narration ? { textRuns: wrapperTextRuns(text, narration, calls.length) } : {}),
       };
     }
-    // Only a wrapper this backend produced may be unwrapped. A json-mode client
-    // gets its OWN object back from the runtime, and reading that as a wrapper
-    // with no `text` field returned an empty answer — the whole reply dropped
-    // on the floor. Anything that is not the wrapper is the answer itself.
-    // Only a wrapper this backend produced may be unwrapped. A json-mode client
-    // gets its OWN object back from the runtime, and reading that as a wrapper
-    // with no `text` field returned an empty answer — the whole reply dropped
-    // on the floor. Anything that is not the wrapper is the answer itself.
+    // Only a wrapper this backend produced may be unwrapped. Anything that is
+    // not the wrapper is the answer itself: reading a non-wrapper object as a
+    // wrapper found no `text` field and returned an empty answer — the whole
+    // reply dropped on the floor.
     if (typeof obj.text === 'string' && obj.status === 'message') {
       return { text: obj.text, toolCalls: [] };
     }
@@ -278,11 +274,18 @@ function parseToolDecision(
     // allows. Returning it as the answer handed the client this proxy's
     // internal grammar verbatim — the whole wrapper JSON as the assistant's
     // reply. There is nothing here to repair into an answer, so it is refused.
-    // Not in JSON mode. There, `toolCalls` is an ordinary property name the
-    // CLIENT controls, and an object carrying it is its answer — a request for
-    // literally `{"toolCalls":[]}` came back 502 as a "malformed wrapper".
-    // The client's answer has its own `json` member now, so anything at the
-    // top level with no usable status is the wrapper failing its schema.
+    // Outside JSON mode only. There, `toolCalls` is an ordinary property name
+    // the CLIENT controls, and an object carrying it is its answer — a request
+    // for literally `{"toolCalls":[]}` came back 502 as a "malformed wrapper".
+    //
+    // In JSON mode this cannot be decided here, and the exemption leaks: a
+    // turn answering `{"status":"done","text":"…","toolCalls":[]}` is
+    // published verbatim, handing a client that asked for JSON against its own
+    // schema this proxy's internal grammar. Telling the two apart needs the
+    // client's data separated from the wrapper's own, which is the design task
+    // the matrix declares — not a predicate that can be written here. Round 12
+    // wrote the opposite rationale into this comment while leaving the code as
+    // it is; the code is what shipped, and it is what this says now.
     if (!request.jsonMode && Array.isArray(obj.toolCalls)) {
       throw backendContractError(
         'The local runtime returned a tool wrapper with no usable status.',
@@ -302,8 +305,22 @@ function parseToolDecision(
  * enforce it cannot drift — the tool-decision path had no check at all.
  */
 function answersAsJsonObject(request: NormalizedRequest, text: string): boolean {
-  if (!request.jsonMode || request.jsonSchema !== undefined) return true;
+  if (!textMayBeRefused(request)) return true;
   return parsesAsJsonObject(text);
+}
+
+/**
+ * Whether the response path may refuse this turn's text once it is complete.
+ *
+ * Only the schemaless `json_object` format can be: a client that supplied its
+ * own `json_schema` gets whatever root that schema declares, and the check
+ * above exempts it. Three streaming gates had spelled this `!request.jsonMode`,
+ * which also held back every explicit client schema — those turns streamed
+ * nothing and arrived in one piece, withheld against a refusal that could not
+ * happen. One predicate, so a gate cannot drift from what actually refuses.
+ */
+export function textMayBeRefused(request: NormalizedRequest): boolean {
+  return request.jsonMode && request.jsonSchema === undefined;
 }
 
 function parsesAsJsonObject(text: string): boolean {
