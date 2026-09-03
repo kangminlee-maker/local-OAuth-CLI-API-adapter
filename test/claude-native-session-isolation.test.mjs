@@ -27,7 +27,7 @@ async function sessionArgv(options = {}) {
         text = typeof result.result === 'string' ? result.result : text;
       }
     }
-    return JSON.parse(text);
+    return JSON.parse(text).argv;
   } finally {
     await session.close();
   }

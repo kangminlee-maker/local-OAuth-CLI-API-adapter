@@ -316,6 +316,13 @@ rl.on('line', (line) => {
       setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(debugPayload())), 0);
       return;
     }
+    // A turn whose text the test chooses, so a decision wrapper can be driven
+    // through the REAL `CodexAppServerBackend`.
+    if (process.env.FAKE_CODEX_RAW_TEXT) {
+      result(payload.id, { turn: { id: turnId } });
+      setTimeout(() => emitTurn(threadId, turnId, process.env.FAKE_CODEX_RAW_TEXT), 0);
+      return;
+    }
     const effort = payload.params?.effort;
     const text = effort === 'minimal'
       ? 'MINIMAL_OK'

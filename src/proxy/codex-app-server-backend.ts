@@ -19,6 +19,7 @@ import {
   hasToolDecisionSchema,
   outputSchemaFor,
   parseBackendOutput,
+  toolChoiceRequiresCall,
   requestInstructionText,
   usageFor,
 } from './backend-contract.js';
@@ -252,7 +253,10 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     const toolExtractor = forcedTool
       ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
       : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor()
+      ? new ToolCallDeltaExtractor({
+          requiresCall: toolChoiceRequiresCall(request),
+          jsonMode: request.jsonMode,
+        })
       : null;
     let firstToolCallDeltaMs: number | undefined;
     let firstToolArgumentDeltaMs: number | undefined;
@@ -272,7 +276,12 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
             }
             queue.push(event);
           }
-        } else {
+        } else if (!request.jsonMode) {
+          // A json-mode turn's text is not known to be deliverable until it is
+          // complete: `parseBackendOutput` refuses output that is not JSON, and
+          // this branch had no gate at all, so the refused answer went out in
+          // full and the error frame arrived after it. The completed result
+          // still carries the text, so nothing is lost — only held.
           queue.push({ type: 'text_delta', delta });
         }
       },

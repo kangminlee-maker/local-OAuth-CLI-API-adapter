@@ -460,7 +460,7 @@ adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전�
 | `--setting-sources ""` | **사용자 설정이 로드된다.** host의 effort 설정이 `output_config.effort`로 실려 나간다 | 빈 값이면 어떤 source도 읽지 않는다. 같은 프롬프트에서 host 설정값과 격리 기본값이 서로 다르게 캡처되어 확인했다. 격리하면 `--output-format stream-json`이 `--verbose`를 추가로 요구하는 결합이 드러난다 | L5 양방향 |
 | `--effort` | isolated 기준 `high`, 그 외에는 host 설정값 | `output_config.effort`로 실린다. `off`나 `none`에 해당하는 수준은 없다 | L5 |
 | `MAX_THINKING_TOKENS` | `thinking`이 `adaptive`로 — **reasoning ON** | `=0`이면 `thinking`이 `disabled`로 바뀐다. 확인된 유일한 reasoning off 스위치이며 대응하는 flag는 없다 | L5 |
-| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `max_tokens: 64000` | 지정한 값이 그대로 `max_tokens`로 실린다. 대응하는 flag가 없어 이 변수만이 수단이다 | L5 양방향 |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `max_tokens: 64000` | 지정한 값이 그대로 `max_tokens`로 실린다. 대응하는 flag가 없어 이 변수만이 수단이다. **다만 그 상한에 걸린 턴은 잘리지 않고 오류가 된다** — 2026-09-02 재측정에서 16·32 모두 `is_error: true`, 결과 텍스트가 `API Error: Claude's response exceeded the N output token maximum`으로 바뀌고 **부분 출력은 버려졌다**. 직접 API는 부분 텍스트를 `stop_reason:"max_tokens"`와 함께 돌려주므로, 이 변수는 상한을 **API와 같은 방식으로** 구현하는 수단이 아니다 | L5 양방향 + 2026-09-02 상한 도달 동작 재측정 |
 | `--bare` | 전체 harness(CLAUDE.md, hook, plugin, auto-memory, keychain) 로드 | system 블록·첫 user 메시지·tool 수가 모두 크게 줄어든다. `CLAUDE_CODE_SIMPLE=1`을 설정한다 | L5 |
 | `--strict-mcp-config` | host MCP 서버가 로드된다 | `--mcp-config`로 준 서버만 남긴다 | L5 |
 | `--json-schema` | 없음 | schema를 그대로 담은 `StructuredOutput` tool 하나를 전송한다. **`tool_choice`가 실리지 않으므로 provider 강제가 아니다** — codex의 `strict: true`와 달리 conformance는 proxy가 검증해야 한다 | L5 |
@@ -487,7 +487,7 @@ Claude Code는 MCP 설정과 `allowedTools`로 서비스 tool 연결을 지원�
 - 사용자 설정 격리는 `--setting-sources`에 빈 값을 주는 것으로 한다. 생략은 `user`와 같아 host의 effort·hook·env가 매 턴 요청에 실린다.
 - 서비스 제공 tool에는 `--mcp-config` + `--strict-mcp-config` + 명시적 `--allowedTools`를 쓴다.
 - `--json-schema`는 구조화 최종 출력에만 쓰고, 기본 chat UI는 text stream + tool/action 이벤트를 우선한다. 이 flag는 schema를 tool로 제시할 뿐 강제하지 않으므로, 반환 JSON의 schema 적합성 검증은 proxy가 코드로 처리한다.
-- 출력 토큰 상한이 필요하면 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`를 쓴다. 대응 flag가 없고, 지정하지 않으면 호출자의 값과 무관하게 CLI 기본값이 실린다.
+- 출력 토큰 상한을 **wire에 싣는** 유일한 수단은 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`다. 대응 flag가 없고, 지정하지 않으면 호출자의 값과 무관하게 CLI 기본값이 실린다. **그러나 adapter의 `max_tokens` parity 경로에는 쓸 수 없다**: 상한에 걸리면 CLI가 잘린 답이 아니라 오류를 돌려주고 부분 출력을 버린다(위 표). adapter는 이 상한을 강제하지 않고 conformance matrix A-2·R-8 행에 미강제로 선언한다.
 - per-request tuning(`--effort`, `--thinking`, `--task-budget`)은 proxy에서 먼저 검증한다. `--effort`는 잘못된 값을 조용히 무시하고 hidden flag는 help에 없으므로, 상류 검증만이 결정적으로 잡아내는 지점이다.
 - hidden parity flag는 버전 고정 계약으로 취급한다. Claude Code 버전을 올릴 때마다 `pnpm catalog:runtime`의 parse probe를 재실행한다.
 - native chat에서는 `ANTHROPIC_API_KEY` 등 직접 provider 변수를 자식 env에서 제거한다.

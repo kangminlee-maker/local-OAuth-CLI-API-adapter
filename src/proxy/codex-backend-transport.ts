@@ -178,6 +178,13 @@ interface ToolState {
   anonymous: boolean;
   /** Whether the client has been told this call's arguments are complete. */
   argumentsDone: boolean;
+  /**
+   * Where this call sits in ANNOUNCEMENT order, set when the client is first
+   * told about it. The completed result has to list calls in the order the
+   * wire opened their blocks, and the map's own key is first-SEEN order — the
+   * two coincide only while every call is announced in the order it appeared.
+   */
+  announcedAt?: number;
 }
 
 class CodexBackendStreamState {
@@ -465,6 +472,7 @@ class CodexBackendStreamState {
       // creation claimed the tool came first on exactly that path — the
       // contradiction between stream and body this whole rule exists to remove.
       this.announcedCalls += 1;
+      state.announcedAt = this.announcedCalls;
       out.push({
         type: 'tool_call_delta',
         index,
@@ -590,9 +598,34 @@ class CodexBackendStreamState {
     };
   }
 
+  /**
+   * The turn's calls in the order the client was told about them.
+   *
+   * This used to sort by the map key — first-seen order — while
+   * `announcedCalls`, which `afterCalls` indexes into, counts announcements.
+   * A call whose `call_id` arrives late (or never) is announced after one
+   * that appeared later, and the two orders come apart: the same turn read
+   * `[call_a, text, call_b]` buffered and `[call_b, text, call_a]` streamed,
+   * and `response.output_item.done` went out as indices [1, 2, 0] — a client
+   * told a later item finished before an earlier one.
+   *
+   * A call that was never announced has no place in that order, so it goes
+   * after everything that was, keeping its own relative position.
+   */
   private toolCalls(): readonly LocalToolCall[] {
+    const byAnnouncement = (
+      [leftKey, left]: [number, ToolState],
+      [rightKey, right]: [number, ToolState],
+    ): number => {
+      if (left.announcedAt !== undefined && right.announcedAt !== undefined) {
+        return left.announcedAt - right.announcedAt;
+      }
+      if (left.announcedAt !== undefined) return -1;
+      if (right.announcedAt !== undefined) return 1;
+      return leftKey - rightKey;
+    };
     return [...this.toolStates.entries()]
-      .sort(([a], [b]) => a - b)
+      .sort(byAnnouncement)
       .map(([, state]) => ({
         id: state.id,
         name: state.name,

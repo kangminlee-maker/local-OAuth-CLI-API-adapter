@@ -3,12 +3,12 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "92d7fc1df89cf843bedabfc532610a2a7a2cf11d28aee21d967df5dbe0217d10",
+    "matrixDigest": "d3f6672fc56a7ee720068f8316cae054f5c96ed5200d677af0411694b51f1287",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
     "claims": 148,
-    "claimsOutsideLegendVocabulary": 97,
+    "claimsOutsideLegendVocabulary": 98,
     "claimsWithLiveParityRow": 134,
     "routes": 11,
     "surfaces": 6,
@@ -760,9 +760,9 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported for `json_object` + `json_schema` (`normalizers.ts:35-38`); `strict` and schema `name` parsed",
+      "claimedNote": "supported for `json_object` + `json_schema` (`normalizers.ts:35-38`); `strict` and schema `name` parsed. Both go through a **runtime schema**, not a prompt sentence: `json_schema` carries the client's schema and `json_object` carries `{\"type\":\"object\"}` — the direct API forces a top-level object here (asked for `[1,2,3]` it answered `{\"0\":1,\"1\":2,\"2\":3}`, measured 2026-09-02). Output that is not a JSON object is rejected at the response boundary rather than passed through — for `json_object` only, since a client `json_schema` declares its own root (a schema rooted at an array is handed to the runtime and its arrays are accepted back). **Sent together with `tools` the format is NOT enforced**: the one structured-output channel is carrying the tool wrapper, so the client's schema does not reach the runtime and the turn's `text` is returned as it stands. The direct API does serve the pair and honour the schema (measured 2026-09-03), so this is a divergence, declared here rather than faked — supporting it needs a second channel or a wrapper that isolates client data, which is a design change and not a bug fix. Numbers in a runtime-enforced answer are published as the bytes the runtime wrote — an id of `9007199254740993` is not rounded to `…992`",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (`openai.chat.json_schema.schema_exact`)",
+      "evidenceNote": "VERIFIED (`openai.chat.json_schema.schema_exact`, `option-is-a-promise`)",
       "liveParityRow": true
     },
     {
@@ -826,9 +826,9 @@
       },
       "claimedLead": "mirrored",
       "claimedLeadInLegend": false,
-      "claimedNote": "mirrored: the three modes and the `{type:'function', function:{name}}` object, with the direct API's `invalid_value` / `invalid_type` / `missing_required_parameter` envelopes for everything else. The silent `auto` fallback is gone",
+      "claimedNote": "mirrored: the three modes and the `{type:'function', function:{name}}` object, with the direct API's `invalid_value` / `invalid_type` / `missing_required_parameter` envelopes for everything else. The silent `auto` fallback is gone. `required` is enforced by the **runtime schema** for any number of tools — the status enum is locked to `tool_calls`, `toolCalls` has `minItems: 1`, and the call's `name` is limited to the declared tools; a turn that comes back without a call is rejected, never repaired. Matches the direct API, which calls a tool against a prompt begging it not to, and calls again on a continuation that already has the answer (measured 2026-09-02)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5)",
+      "evidenceNote": "VERIFIED (§5.5.5, `option-is-a-promise`)",
       "liveParityRow": true
     },
     {
@@ -1420,9 +1420,9 @@
       },
       "claimedLead": "parsed",
       "claimedLeadInLegend": false,
-      "claimedNote": "parsed but **not forwarded by `codex-backend`**; echoed in the body. **`incomplete_details` is hard `null` (`http-server.ts:2004`) and `status` never becomes `incomplete`** → a capped turn is reported `completed`",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "parsed but **not enforced**; echoed in the body. **`incomplete_details` is hard `null` and `status` never becomes `incomplete`** → a capped turn is reported `completed`, where the direct API reports `status:\"incomplete\"` + `incomplete_details.reason:\"max_output_tokens\"` with `usage.output_tokens` exactly at the cap (measured 2026-09-02). No runtime channel exists — see row A-2 for the two that were tried",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (measured 2026-09-02)",
       "liveParityRow": true
     },
     {
@@ -1596,9 +1596,9 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported (`normalizers.ts:65-68`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "supported (`normalizers.ts:65-68`), through the same runtime schema as chat row 28 — `json_object` carries `{\"type\":\"object\"}` and non-object output is rejected; a client `json_schema` keeps its own root and is published with its numbers verbatim. **Not enforced together with `tools`**, same as chat row 28",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`option-is-a-promise`, `wrapper-root-and-lexeme`)",
       "liveParityRow": true
     },
     {
@@ -1662,9 +1662,9 @@
       },
       "claimedLead": "mapped",
       "claimedLeadInLegend": false,
-      "claimedNote": "mapped; unknown values fall back to `auto` (same divergence as chat row 31); echoed via `responseToolChoice`",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "mapped; unknown values fall back to `auto` (same divergence as chat row 31); echoed via `responseToolChoice`. `required` is schema-enforced as in chat row 31",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`option-is-a-promise`)",
       "liveParityRow": true
     },
     {
@@ -2664,11 +2664,11 @@
         "observableEffect": "caps output; `stop_reason:\"max_tokens\"`",
         "invalidValue": "400 / `invalid_request_error`"
       },
-      "claimedLead": "supported",
-      "claimedLeadInLegend": true,
-      "claimedNote": "supported and required; **`0` accepted** on the claim that the direct API accepts it (contract `:316`) — an unverified claim about the provider",
-      "evidenceGrade": "DOC?",
-      "evidenceNote": "DOC?",
+      "claimedLead": "accepted",
+      "claimedLeadInLegend": false,
+      "claimedNote": "accepted and required, but **the cap is NOT enforced**: a turn longer than `max_tokens` is returned whole with `stop_reason:\"end_turn\"` and a `usage.output_tokens` above the cap, where the direct API truncates and reports `stop_reason:\"max_tokens\"`. Neither runtime has a channel for it — codex has no upstream cap, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` makes the CLI **error** and discard the partial text instead of truncating (measured 2026-09-02 at 16 and 32). Trimming in the response path would leave `usage.output_tokens` reporting tokens that were generated and billed, so the cap is declared unenforced rather than faked. **`0` accepted** on the claim that the direct API accepts it (contract `:316`) — an unverified claim about the provider",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (measured 2026-09-02)",
       "liveParityRow": true
     },
     {
@@ -3084,9 +3084,9 @@
       },
       "claimedLead": "none`/`any`/`tool",
       "claimedLeadInLegend": false,
-      "claimedNote": "`none`/`any`/`tool` mapped (contract `:312`); **`auto` and `disable_parallel_tool_use` handling UNKNOWN**",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "`none`/`any`/`tool` mapped (contract `:312`); `any` normalizes to `required` and is schema-enforced as in chat row 31, matching the direct API (`stop_reason:\"tool_use\"` against a prompt begging for no call, measured 2026-09-02); **`disable_parallel_tool_use` handling UNKNOWN**",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`option-is-a-promise`)",
       "liveParityRow": true
     },
     {
@@ -3150,9 +3150,9 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported; **rejected together with tools unless `tool_choice:\"none\"`** (`normalizers.ts:110-125`) — a restriction the provider does not impose",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "supported. It is no longer REFUSED together with tools — the provider serves that pair (measured 2026-09-03: `{\"verdict\": \"True\", \"score\": 0.95}` with tools present), so refusing a turn the backends can serve was itself a divergence — but it is **not enforced** there either, for the reason given in chat row 28. Accepted, echoed, and declared unenforced rather than silently dropped or falsely refused",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (measured 2026-09-03)",
       "liveParityRow": true
     },
     {

@@ -10,9 +10,11 @@ import {
   hasToolDecisionSchema,
   outputSchemaFor,
   parseBackendOutput,
+  toolChoiceRequiresCall,
   usageFor,
 } from './backend-contract.js';
 import { claudeMessageContentFor, hasImageInputs } from './multimodal.js';
+import { rawTopLevelValue } from './tool-call-stream.js';
 import { proxyChildProcessEnv } from './process-env.js';
 import type {
   LocalCliBackend,
@@ -51,6 +53,8 @@ interface ClaudeWaiter {
    */
   apiErrorKind?: string;
   structuredOutput: unknown;
+  /** The source text of `structured_output`, kept so numbers survive verbatim. */
+  rawStructuredOutput?: string;
   usage: unknown;
   resolve: (value: ClaudeTurnResult) => void;
   reject: (err: Error) => void;
@@ -59,6 +63,7 @@ interface ClaudeWaiter {
 interface ClaudeTurnResult {
   readonly text: string;
   readonly structuredOutput: unknown;
+  readonly rawStructuredOutput?: string;
   readonly usage: unknown;
   readonly stopReason?: string;
   readonly stopDetails?: unknown;
@@ -218,7 +223,10 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     const toolExtractor = forcedTool
       ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
       : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor()
+      ? new ToolCallDeltaExtractor({
+          requiresCall: toolChoiceRequiresCall(request),
+          jsonMode: request.jsonMode,
+        })
       : null;
     const shouldStreamText = !toolExtractor && this.canStreamTextDeltas(request);
     const run = this.runRequest(
@@ -307,8 +315,18 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     }
   }
 
+  /**
+   * Whether this turn's text may be streamed as it is produced.
+   *
+   * `jsonMode`, not `jsonSchema`: `json_object` sets the former and not the
+   * latter, so a json-object turn used to stream its answer live and then have
+   * `parseBackendOutput` refuse it for not being an object — the whole
+   * non-JSON sentence delivered, followed by an error frame. A turn whose
+   * output the response path may reject is a turn whose output is not known to
+   * be deliverable until it is complete.
+   */
   private canStreamTextDeltas(request: NormalizedRequest): boolean {
-    return !hasToolDecisionSchema(request) && !request.jsonSchema;
+    return !hasToolDecisionSchema(request) && !request.jsonMode;
   }
 
   private canUsePersistentTurn(request: NormalizedRequest): boolean {
@@ -459,9 +477,13 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     turn: ClaudeTurnResult,
     startedAt: number,
   ): LocalCompletionResult {
+    // The CLI's own bytes when there are any. Re-serializing the parsed value
+    // rounds every number through IEEE-754 first, so a client id of
+    // `9007199254740993` reached the client as `…992` — and it was lost here,
+    // before the response path could preserve anything.
     const rawText = turn.structuredOutput === undefined
       ? turn.text
-      : JSON.stringify(turn.structuredOutput);
+      : turn.rawStructuredOutput ?? JSON.stringify(turn.structuredOutput);
     const parsed = parseBackendOutput(request, rawText);
     const usage = usageFromClaude(turn.usage) ?? usageFor(request, parsed.text, parsed.toolCalls);
     return {
@@ -631,6 +653,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
           structuredOutput: message.structured_output ?? waiter.structuredOutput,
+          rawStructuredOutput: rawTopLevelValue(line, 'structured_output') ?? waiter.rawStructuredOutput,
           usage: message.usage ?? waiter.usage,
           stopReason: readClaudeStopReason(message),
           stopDetails: message.stop_details,
@@ -898,6 +921,7 @@ function runClaudeProcess(
           finish(undefined, {
             text: typeof message.result === 'string' ? message.result : waiter.text,
             structuredOutput: message.structured_output ?? waiter.structuredOutput,
+            rawStructuredOutput: rawTopLevelValue(line, 'structured_output') ?? waiter.rawStructuredOutput,
             usage: message.usage ?? waiter.usage,
             stopReason: readClaudeStopReason(message),
             stopDetails: message.stop_details,

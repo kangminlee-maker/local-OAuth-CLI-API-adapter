@@ -197,9 +197,11 @@ const received = (events) => ({
  * The only deadline in this file, and it judges nothing: every wait below ends
  * on the bytes themselves, so this exists so that a stream which will NEVER
  * deliver fails with a sentence instead of hanging until the runner is killed.
- * A run that reaches it has found a real delivery failure — the backend is
- * parked at the barrier, so there is nothing else the client could be waiting
- * for, however loaded the machine is.
+ *
+ * What it CANNOT do is tell a delivery failure from a machine slow enough to
+ * miss the deadline, and it used to claim it could. A timeout knows only that
+ * the bytes had not arrived yet, so a run that reaches it is inconclusive and
+ * says so — the verdicts in this file come from the barriers, never from here.
  */
 const HANG_GUARD_MS = 15_000;
 
@@ -208,8 +210,9 @@ async function guarded(work, what) {
   const guard = new Promise((_, reject) => {
     timer = setTimeout(
       () => reject(new Error(
-        `HANG GUARD (${HANG_GUARD_MS}ms): ${what} never reached the client while the backend sat at the barrier. `
-        + 'Nothing further was coming, so this is a delivery failure, not a slow machine.',
+        `HANG GUARD (${HANG_GUARD_MS}ms): ${what} had not reached the client while the backend sat at the barrier. `
+        + 'This deadline cannot tell a stalled stream from a machine that missed it, so treat this as '
+        + 'INCONCLUSIVE and re-run: only the barrier assertions below decide whether the behaviour is wrong.',
       )),
       HANG_GUARD_MS,
     );

@@ -327,7 +327,7 @@ async function spawnedArgv(request, model, options = {}) {
     // Non-tool turns echo argv in result.text; forced-tool turns route the echoed
     // CLI output into the tool call's arguments.
     const raw = result.text || result.toolCalls?.[0]?.arguments || '';
-    return JSON.parse(raw);
+    return JSON.parse(raw).argv;
   } finally {
     await backend.close();
   }

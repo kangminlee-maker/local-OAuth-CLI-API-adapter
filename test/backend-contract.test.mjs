@@ -117,20 +117,30 @@ test('a continuation keeps the requested JSON schema when the tools are off', ()
   assert.match(buildPrompt(request), /Valid JSON only/);
 });
 
-test('buildPrompt does not turn generous token caps into style instructions', () => {
-  const generous = buildPrompt(requestWithTools({
-    tools: [],
-    maxTokens: 640,
-    messages: [{ role: 'user', content: 'Write a detailed incident report.', images: [] }],
-  }));
-  assert.doesNotMatch(generous, /Max output tokens|Output token limit/);
+// The prompt is not a place to implement `max_tokens`. It used to be, for
+// values <= 128, which made the cap a request rather than a promise: the
+// option was accepted and echoed while a backend that ignored the sentence
+// returned a full-length answer. Neither runtime has a channel that caps
+// output the way the API does, so the cap is now declared unenforced instead
+// of being asked for. This test fails if the sentence comes back at any value.
+test('buildPrompt never asks the model for a token cap, at any value', () => {
+  for (const maxTokens of [1, 16, 64, 128, 129, 640, 64_000]) {
+    const prompt = buildPrompt(requestWithTools({
+      tools: [],
+      maxTokens,
+      messages: [{ role: 'user', content: 'Write a detailed incident report.', images: [] }],
+    }));
+    assert.doesNotMatch(
+      prompt,
+      /Max output tokens|Output token limit|token limit|max_tokens/i,
+      `maxTokens: ${maxTokens} put a cap instruction in the prompt`,
+    );
+  }
+});
 
-  const narrow = buildPrompt(requestWithTools({
-    tools: [],
-    maxTokens: 64,
-    messages: [{ role: 'user', content: 'Reply briefly.', images: [] }],
-  }));
-  assert.match(narrow, /Output token limit: 64/);
+// The guard above only means something if this string would be caught.
+test('CONTROL: the cap guard catches the sentence it is guarding against', () => {
+  assert.match('Output token limit: 64.', /Max output tokens|Output token limit|token limit|max_tokens/i);
 });
 
 test('buildPrompt can split API instruction messages from conversation input', () => {

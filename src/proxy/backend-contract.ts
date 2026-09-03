@@ -6,7 +6,7 @@ import type {
   NormalizedMessage,
   NormalizedRequest,
 } from './types.js';
-import { estimateTokens } from './types.js';
+import { estimateTokens, ProxyRequestError } from './types.js';
 // The tool grammar has ONE writer. A prompt that spelled `[tool result]` and
 // `[assistant tool_call]` itself would be a second, and a grammar with two
 // writers drifts.
@@ -53,7 +53,6 @@ export function buildPrompt(
   const messages = rendered.join('\n\n');
   return [
     modeInstructions(request),
-    maxTokenInstruction(request),
     imageInstructions(request),
     messages,
   ].filter(Boolean).join('\n');
@@ -74,11 +73,45 @@ export function requestInstructionText(request: NormalizedRequest): string {
   ].join('\n');
 }
 
+/**
+ * Whether this turn's `tool_choice` obliges the model to call something.
+ *
+ * Anthropic's `any` normalizes to `required`, so one predicate covers all
+ * three surfaces.
+ */
+export function toolChoiceRequiresCall(request: NormalizedRequest): boolean {
+  return request.tools.length > 0 && request.toolChoice.type === 'required';
+}
+
+/**
+ * The runtime schema for the turn — the channel that makes an accepted option
+ * actually happen, rather than a sentence asking for it.
+ *
+ * Two of these were missing, and both failures had the same shape: the option
+ * was accepted, a prompt sentence asked for it, and a backend that ignored the
+ * sentence produced a 200 that broke the promise.
+ *
+ * - `tool_choice: "required"` with ONE tool was already forced through
+ *   `toolArgumentsSchema`. With two or more it fell through to the plain
+ *   decision schema, which permits `status: "message"` — so `required` could
+ *   answer without calling anything.
+ * - `json_object` produced no schema at all (`jsonSchema` is undefined without
+ *   an explicit one), so only the prompt asked for JSON. `CodexBackendTransport`
+ *   has always sent the native `text.format: {type:"json_object"}`, so the two
+ *   other backends were the ones diverging.
+ */
 export function outputSchemaFor(request: NormalizedRequest): unknown {
   const forcedTool = forcedSingleToolCall(request);
   if (forcedTool) return toolArgumentsSchema(forcedTool);
-  if (hasToolDecisionSchema(request)) return toolDecisionSchema();
-  return request.jsonSchema ?? null;
+  if (hasToolDecisionSchema(request)) return toolDecisionSchema(request);
+  if (request.jsonSchema) return request.jsonSchema;
+  // `json_object` is "any JSON object", and that is exactly what the direct
+  // API enforces: asked for the array `[1,2,3]` under this format it answered
+  // `{"0":1,"1":2,"2":3}` (measured 2026-09-02). A bare object schema says the
+  // same thing, and the same probe through `claude --json-schema` reproduced
+  // the direct answer against a prompt begging for prose.
+  if (request.jsonMode) return { type: 'object' };
+  return null;
 }
 
 /**
@@ -128,11 +161,43 @@ function wrapperTextRuns(raw: string, text: string, callCount: number): readonly
   return [{ text, afterCalls: wrapperCallsPrecedeText(raw) ? callCount : 0 }];
 }
 
+/**
+ * The runtime schema is the enforcement; this is the backstop behind it.
+ *
+ * It rejects and never repairs. Under `tool_choice: "required"` the answer is
+ * a call, and if the backend returned none the only honest options are an
+ * error or an invented call — and inventing one would put a tool invocation
+ * the model never made in front of the client. Under a JSON format the answer
+ * is JSON, and text that does not parse is not it.
+ *
+ * A firing backstop means a backend ignored a schema it was handed, so this is
+ * an upstream fault (502), reported in the shape of the surface that was called.
+ */
+function backendContractError(message: string, shape: NormalizedRequest['shape']): ProxyRequestError {
+  return shape === 'anthropic-messages'
+    ? new ProxyRequestError(message, 502, 'anthropic', 'api_error')
+    : new ProxyRequestError(message, 502, 'openai', 'api_error');
+}
+
 export function parseBackendOutput(
   request: NormalizedRequest,
   text: string,
 ): { text: string; toolCalls: readonly LocalToolCall[]; textRuns?: readonly LocalTextRun[] } {
   if (!hasToolDecisionSchema(request)) {
+    // Only `json_object` means "any JSON OBJECT". A client that supplied its
+    // own `json_schema` gets whatever root that schema declares, and the
+    // measurement behind the object rule (asked for `[1,2,3]` under
+    // `json_object`, the direct API answered `{"0":1,…}`) was taken for the
+    // schemaless format alone. Enforcing it for both made a schema whose root
+    // is an array unanswerable: the runtime was handed `{"type":"array"}` and
+    // then every array it produced was refused, so the only replies that got
+    // through were the ones violating the client's schema.
+    if (!answersAsJsonObject(request, text)) {
+      throw backendContractError(
+        'The local runtime returned output that is not a JSON object for a request that asked for one.',
+        request.shape,
+      );
+    }
     return { text, toolCalls: [] };
   }
   const forcedTool = forcedSingleToolCall(request);
@@ -146,8 +211,40 @@ export function parseBackendOutput(
       }],
     };
   }
+  // Every path below that yields no call breaks `required`, so the check sits
+  // once at the end rather than at each `return`.
+  const decided = parseToolDecision(request, text);
+  if (toolChoiceRequiresCall(request) && decided.toolCalls.length === 0) {
+    throw backendContractError(
+      'The local runtime answered without calling a tool for a request that required one.',
+      request.shape,
+    );
+  }
+  // No object rule here, deliberately. The one structured-output channel is
+  // carrying the tool wrapper on this path, so the JSON format never reached
+  // the runtime and the model was never asked for it — rejecting the answer
+  // would refuse a turn nothing had required anything of. The combination is
+  // declared unenforced in the conformance matrix instead. Enforcement and the
+  // knob travel together; where there is no knob there is no enforcement, and
+  // the matrix says so rather than a check inventing one.
+  return decided;
+}
+
+function parseToolDecision(
+  request: NormalizedRequest,
+  text: string,
+): { text: string; toolCalls: readonly LocalToolCall[]; textRuns?: readonly LocalTextRun[] } {
+  // The catch belongs to `JSON.parse` and nothing else. It used to wrap the
+  // whole body, so a contract violation raised below was caught by it and
+  // turned back into "the answer is the raw text" — the exact leak the throw
+  // was added to stop.
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(text) as unknown;
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return { text, toolCalls: [] };
+  }
+  {
     const obj = asRecord(parsed);
     if (!obj) return { text, toolCalls: [] };
     if (obj.status === 'tool_calls') {
@@ -169,12 +266,51 @@ export function parseBackendOutput(
     // gets its OWN object back from the runtime, and reading that as a wrapper
     // with no `text` field returned an empty answer — the whole reply dropped
     // on the floor. Anything that is not the wrapper is the answer itself.
+    // Only a wrapper this backend produced may be unwrapped. A json-mode client
+    // gets its OWN object back from the runtime, and reading that as a wrapper
+    // with no `text` field returned an empty answer — the whole reply dropped
+    // on the floor. Anything that is not the wrapper is the answer itself.
     if (typeof obj.text === 'string' && obj.status === 'message') {
       return { text: obj.text, toolCalls: [] };
     }
+    // Wrapper-SHAPED but not a wrapper: it carries `toolCalls`, so it is not a
+    // client's own object, and its `status` is not one of the two the schema
+    // allows. Returning it as the answer handed the client this proxy's
+    // internal grammar verbatim — the whole wrapper JSON as the assistant's
+    // reply. There is nothing here to repair into an answer, so it is refused.
+    // Not in JSON mode. There, `toolCalls` is an ordinary property name the
+    // CLIENT controls, and an object carrying it is its answer — a request for
+    // literally `{"toolCalls":[]}` came back 502 as a "malformed wrapper".
+    // The client's answer has its own `json` member now, so anything at the
+    // top level with no usable status is the wrapper failing its schema.
+    if (!request.jsonMode && Array.isArray(obj.toolCalls)) {
+      throw backendContractError(
+        'The local runtime returned a tool wrapper with no usable status.',
+        request.shape,
+      );
+    }
     return { text, toolCalls: [] };
+  }
+}
+
+/**
+ * Whether this answer satisfies the turn's JSON format.
+ *
+ * Only `json_object` means "any JSON OBJECT"; a client that supplied its own
+ * `json_schema` gets whatever root that schema declares, and a turn with no
+ * JSON format has nothing to satisfy. One predicate, so the two places that
+ * enforce it cannot drift — the tool-decision path had no check at all.
+ */
+function answersAsJsonObject(request: NormalizedRequest, text: string): boolean {
+  if (!request.jsonMode || request.jsonSchema !== undefined) return true;
+  return parsesAsJsonObject(text);
+}
+
+function parsesAsJsonObject(text: string): boolean {
+  try {
+    return asRecord(JSON.parse(text) as unknown) !== null;
   } catch {
-    return { text, toolCalls: [] };
+    return false;
   }
 }
 
@@ -244,17 +380,44 @@ function modeInstructions(request: NormalizedRequest): string {
   return 'Return only the assistant response text.';
 }
 
-function maxTokenInstruction(request: NormalizedRequest): string {
-  if (!request.maxTokens || request.maxTokens > 128) return '';
-  return `Output token limit: ${request.maxTokens}.`;
-}
+/*
+ * `max_tokens` / `max_output_tokens` has no implementation here, deliberately.
+ *
+ * This used to append `Output token limit: N.` to the prompt for values <= 128
+ * and nothing at all above it. That is asking, and an option is a promise: the
+ * request was accepted, echoed back, and never enforced, so a capped turn came
+ * back whole with `stop_reason: "end_turn"` and a usage count far above the cap.
+ *
+ * Neither runtime has a channel for it, measured rather than assumed:
+ *   - codex: no upstream cap exists (runtime capability catalog, L2 + L5
+ *     negative).
+ *   - claude: `CLAUDE_CODE_MAX_OUTPUT_TOKENS` does reach the wire as
+ *     `max_tokens`, but the CLI turns hitting that cap into a hard error
+ *     ("API Error: Claude's response exceeded the N output token maximum") and
+ *     discards the partial text. The direct API returns the partial text with
+ *     `stop_reason: "max_tokens"`, so the variable produces an error where the
+ *     API produces an answer. Measured 2026-09-02 at 16 and 32.
+ *
+ * Trimming in the response path is not the third option it looks like: the
+ * tokens were generated and billed, so the honest `usage.output_tokens` is the
+ * full count, and reporting the cap instead would fabricate a billing number.
+ *
+ * So the cap is not enforced, and the conformance matrix says so on all three
+ * rows rather than claiming support. Anthropic requires the field, so it is
+ * still accepted and echoed — what changed is that nothing pretends it acted.
+ */
 
 function toolModeInstructions(request: NormalizedRequest): string {
   const choice = request.toolChoice;
   const choiceText = choice.type === 'tool'
     ? `Use tool "${choice.name}" if calling.`
     : choice.type === 'required'
-    ? 'Call a tool unless prior tool results answer.'
+    // Measured against both direct APIs on 2026-09-02: `required` / `any`
+    // forces a call even on a continuation that already carries the answer,
+    // and even when the prompt begs for no call. The old sentence here told
+    // the model the opposite ("unless prior tool results answer"). The schema
+    // is what enforces this now; this line only has to stop contradicting it.
+    ? 'Always call a tool.'
     : 'Call tools only when needed; otherwise answer.';
   return [
     'Schema JSON only.',
@@ -314,21 +477,28 @@ function imageInstructions(request: NormalizedRequest): string {
     : '';
 }
 
-function toolDecisionSchema(): Record<string, unknown> {
+function toolDecisionSchema(request: NormalizedRequest): Record<string, unknown> {
+  const mustCall = toolChoiceRequiresCall(request);
+  // A call the client never declared is not a call it can answer. Left
+  // unconstrained, a model handed a forced-call schema invents one: the
+  // 2026-09-02 probe answered `{"status":"tool_calls", ... "name":"NO_TOOL"}`
+  // for a tool list of `f1`/`f2`. The direct API picked `f1`.
+  const names = request.tools.map((tool) => tool.name);
   return {
     type: 'object',
     additionalProperties: false,
     properties: {
-      status: { enum: ['message', 'tool_calls'] },
+      status: { enum: mustCall ? ['tool_calls'] : ['message', 'tool_calls'] },
       text: { type: 'string' },
       toolCalls: {
         type: 'array',
+        ...(mustCall ? { minItems: 1 } : {}),
         items: {
           type: 'object',
           additionalProperties: false,
           properties: {
             id: { type: 'string' },
-            name: { type: 'string' },
+            ...(names.length > 0 ? { name: { enum: names } } : { name: { type: 'string' } }),
             arguments: { type: 'string' },
           },
           required: ['id', 'name', 'arguments'],
@@ -373,15 +543,36 @@ function ensureJsonString(value: string): string {
   }
 }
 
+/**
+ * The forced-tool path's whole answer IS the arguments, and this decides what
+ * shape it is reported in — by the OPENING CHARACTER, which is the only part
+ * of the decision the streaming reader can know before the answer is complete.
+ *
+ * It used to decide by whether `JSON.parse` succeeded, and the streamed reader
+ * approximated that from the outside with a first-character test. The two
+ * agreed on every well-formed payload and came apart on a `{`-opening one that
+ * does not parse — a truncated object, a trailing comma: the client
+ * accumulated the raw fragment while the body reported
+ * `{"input":"{\"city\":\"Seo"}`. Both are unusable, and the reconciler cannot
+ * bridge them, so what matters is that one turn reads the same either way.
+ *
+ * A payload that opens as an object or array is therefore reported as it
+ * stands, well-formed or not; only a JSON string (unwrapped) and an answer
+ * that is not JSON-shaped at all (wrapped) are rewritten.
+ */
 function normalizeToolArgumentsText(value: string): string {
-  const trimmed = value.trim();
+  // Leading whitespace only, because that is what the streaming reader drops
+  // (`KnownToolArgumentsDeltaExtractor.normalizeDelta`). Trimming the tail as
+  // well made `{"a":1}\n` stream with its newline and report without it — the
+  // same turn, two values, for no gain: both parse to the same object.
+  const trimmed = value.replace(/^\s+/, '');
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return trimmed;
+  const both = trimmed.trim();
   try {
-    const parsed = JSON.parse(trimmed) as unknown;
-    return typeof parsed === 'string'
-      ? ensureJsonString(parsed)
-      : trimmed;
+    const parsed = JSON.parse(both) as unknown;
+    return typeof parsed === 'string' ? ensureJsonString(parsed) : both;
   } catch {
-    return ensureJsonString(trimmed);
+    return ensureJsonString(both);
   }
 }
 

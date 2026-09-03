@@ -2904,6 +2904,43 @@ async function writeOpenAiResponsesStream(
       }
 
       const result = event.result;
+      /**
+       * The terminal frames for the message item, and the one place that
+       * decides what they say.
+       *
+       * They say `streamedText` — the bytes this stream actually delivered —
+       * never the result's own copy. A backend whose `completed` result
+       * disagrees with the deltas it already sent (`hello` on the wire,
+       * `hullo` at the end) would otherwise have the tail reconciler find no
+       * common prefix, add nothing, and then be announced as the final text
+       * anyway: four frames retracting bytes the client already has. The
+       * tool branch always read `streamedText` here; the no-tool branch read
+       * `result.text`, so only text-only turns could contradict themselves.
+       */
+      const emitMessageTerminal = async (): Promise<void> => {
+        const messageItem = openAiResponseMessageItem(itemId, streamedText);
+        await writeResponseEvent('response.output_text.done', {
+          type: 'response.output_text.done',
+          item_id: itemId,
+          output_index: messageOutputIndex,
+          content_index: 0,
+          logprobs: [],
+          text: streamedText,
+        });
+        await writeResponseEvent('response.content_part.done', {
+          type: 'response.content_part.done',
+          item_id: itemId,
+          output_index: messageOutputIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: streamedText, annotations: [], logprobs: [] },
+        });
+        finalItems.set(messageOutputIndex, messageItem);
+        await writeResponseEvent('response.output_item.done', {
+          type: 'response.output_item.done',
+          output_index: messageOutputIndex,
+          item: messageItem,
+        });
+      };
       if (result.toolCalls.length > 0) {
         // The turn's calls `[from, to)`, each taking the next free output
         // position as it is closed.
@@ -2936,28 +2973,7 @@ async function writeOpenAiResponsesStream(
               logprobs: [],
             });
           }
-          const messageItem = openAiResponseMessageItem(itemId, streamedText);
-          await writeResponseEvent('response.output_text.done', {
-            type: 'response.output_text.done',
-            item_id: itemId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            logprobs: [],
-            text: streamedText,
-          });
-          await writeResponseEvent('response.content_part.done', {
-            type: 'response.content_part.done',
-            item_id: itemId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            part: { type: 'output_text', text: streamedText, annotations: [], logprobs: [] },
-          });
-          finalItems.set(messageOutputIndex, messageItem);
-          await writeResponseEvent('response.output_item.done', {
-            type: 'response.output_item.done',
-            output_index: messageOutputIndex,
-            item: messageItem,
-          });
+          await emitMessageTerminal();
         };
         // Two different questions, and conflating them made
         // `response.output_item.done` non-monotonic.
@@ -3011,28 +3027,7 @@ async function writeOpenAiResponsesStream(
             });
           }
         }
-        await writeResponseEvent('response.output_text.done', {
-          type: 'response.output_text.done',
-          item_id: itemId,
-          output_index: messageOutputIndex,
-          content_index: 0,
-          logprobs: [],
-          text: result.text,
-        });
-        await writeResponseEvent('response.content_part.done', {
-          type: 'response.content_part.done',
-          item_id: itemId,
-          output_index: messageOutputIndex,
-          content_index: 0,
-          part: { type: 'output_text', text: result.text, annotations: [], logprobs: [] },
-        });
-        const item = openAiResponseMessageItem(itemId, result.text);
-        finalItems.set(messageOutputIndex, item);
-        await writeResponseEvent('response.output_item.done', {
-          type: 'response.output_item.done',
-          output_index: messageOutputIndex,
-          item,
-        });
+        await emitMessageTerminal();
       }
       const finalOutput = [...finalItems.entries()]
         .sort(([left], [right]) => left - right)

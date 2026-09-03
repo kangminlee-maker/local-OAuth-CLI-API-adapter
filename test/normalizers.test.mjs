@@ -242,22 +242,23 @@ test('Anthropic normalizer rejects json_schema format without a schema', () => {
   );
 });
 
-test('Anthropic normalizer rejects output_config.format combined with tools', () => {
-  assert.throws(
-    () => normalizeAnthropicMessagesRequest(anthropicBody({
-      output_config: { format: { type: 'json_schema', schema: { type: 'object' } } },
-      tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
-    })),
-    /not supported together with tools/,
-  );
+// This pair used to be a 400 here, on the reasoning that the single
+// structured-output channel was already carrying the tool wrapper. The wrapper
+// now carries the client's schema in its own `json` field, and the provider
+// serves the combination and honours the schema (measured 2026-09-03), so
+// refusing a turn the backends can serve was the divergence.
+test('Anthropic normalizer serves output_config.format combined with tools', () => {
+  const schema = { type: 'object', properties: { verdict: { type: 'string' } }, required: ['verdict'] };
+  const request = normalizeAnthropicMessagesRequest(anthropicBody({
+    output_config: { format: { type: 'json_schema', schema } },
+    tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+  }));
+  assert.deepEqual(request.jsonSchema, schema, "the client's schema must survive the pairing");
+  assert.equal(request.tools.length, 1);
 });
 
 
-test('taking the tools off a turn lets an Anthropic client keep its own format', () => {
-  // The contract tells a client to use `tool_choice: "none"` when it wants its
-  // own schema on a turn that carries tools. That was a 400 here — the check
-  // fired before the choice was read — so the documented way out did not exist
-  // on this surface.
+test('an Anthropic client keeps its own format whether or not tools are live', () => {
   const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false };
   const request = normalizeAnthropicMessagesRequest({
     model: 'claude-opus-5',
@@ -270,14 +271,17 @@ test('taking the tools off a turn lets an Anthropic client keep its own format',
   assert.deepEqual(request.jsonSchema, schema);
   assert.equal(request.toolChoice.type, 'none');
 
-  // With the tools live, the collision is still refused.
-  assert.throws(() => normalizeAnthropicMessagesRequest({
+  // And with the tools live the schema survives too — it rides in the
+  // wrapper's `json` field rather than competing for the channel.
+  const withTools = normalizeAnthropicMessagesRequest({
     model: 'claude-opus-5',
     max_tokens: 100,
     tools: [{ name: 'get_weather', description: 'd', input_schema: { type: 'object', properties: {}, additionalProperties: false } }],
     output_config: { format: { type: 'json_schema', schema } },
     messages: [{ role: 'user', content: 'hi' }],
-  }), /not supported together with tools/);
+  });
+  assert.deepEqual(withTools.jsonSchema, schema);
+  assert.equal(withTools.toolChoice.type, 'auto');
 });
 
 // `temperature` and `top_p` are applied by nothing behind the OpenAI surfaces,

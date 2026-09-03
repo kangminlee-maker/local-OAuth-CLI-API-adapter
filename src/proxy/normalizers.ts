@@ -571,9 +571,15 @@ function readRequiredOpenAiModel(value: unknown, shape: 'openai-chat' | 'openai-
   if (typeof value !== 'string') throw invalidType('model', 'a string', value);
   if (!value.trim()) {
     if (shape === 'openai-chat') missing();
+    // Re-measured 2026-09-03: Responses now answers an empty model exactly as
+    // it answers an unknown one — 404, `param: null`, and the "does not exist
+    // or you do not have access to it" sentence. On 2026-08-30 it was a 400
+    // naming `model`, which is what this mirrored until the row went red.
+    // Chat still treats `''` as an absent model (400, "you must provide a
+    // model parameter"), so the two surfaces stay different here.
     throw new ProxyRequestError(
-      `The requested model '${value}' does not exist.`,
-      400, 'openai', 'invalid_request_error', 'model', 'model_not_found',
+      `The model \`${value}\` does not exist or you do not have access to it.`,
+      404, 'openai', 'invalid_request_error', null, 'model_not_found',
     );
   }
   return value as string;
@@ -1455,16 +1461,13 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   // channel, so a tool schema and a format schema would collide — but with
   // `tool_choice: "none"` no tool schema is built, and refusing anyway left a
   // client that asked for its own format on such a turn with nowhere to go.
-  if (outputFormat !== undefined && tools.length > 0 && toolChoice.type !== 'none') {
-    // The proxy has a single structured-output channel (claude --json-schema); a
-    // forced/decision tool schema and output_config.format would collide, so the
-    // user's format schema would be silently dropped. Reject instead.
-    throw new ProxyRequestError(
-      'output_config.format is not supported together with tools.',
-      400,
-      'anthropic',
-    );
-  }
+  // `output_config.format` WITH tools used to be refused here, because the one
+  // structured-output channel was already carrying the tool wrapper and the
+  // client's format schema would have been dropped in silence. The wrapper now
+  // carries that schema in its own `json` field, so the collision is gone and
+  // the refusal with it — the provider serves this pair and honours the schema
+  // (measured 2026-09-03), so refusing a turn the backends can serve was the
+  // divergence, not the safeguard.
   const model = input.model as string;
   const effort = readAnthropicEffort(outputConfig?.effort);
   const taskBudgetTokens = readAnthropicTaskBudget(outputConfig?.task_budget);

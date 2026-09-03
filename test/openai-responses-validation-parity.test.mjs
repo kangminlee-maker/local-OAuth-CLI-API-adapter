@@ -66,7 +66,9 @@ const REJECTIONS = [
   // model — measured as a different sentence from Chat's.
   ["model absent", { ...OUT, model: DELETE }, { param: "model", code: "missing_required_parameter", message: "Missing required parameter: 'model'." }],
   ["model null", { ...OUT, model: null }, { param: "model", code: "invalid_type", message: "Invalid type for 'model': expected a string, but got an object instead." }],
-  ["model empty", { ...OUT, model: '' }, { param: "model", code: "model_not_found", message: "The requested model '' does not exist." }],
+  // Re-measured 2026-09-03: an empty model is answered exactly like an unknown
+  // one — 404, no `param`. It was a 400 naming `model` on 2026-08-30.
+  ["model empty", { ...OUT, model: '' }, { status: 404, param: null, code: "model_not_found", message: "The model `` does not exist or you do not have access to it." }],
   ["model as an integer", { ...OUT, model: 7 }, { param: "model", code: "invalid_type", message: "Invalid type for 'model': expected a string, but got an integer instead." }],
   // `input`, required. Absence outranks everything but `model`; present-but-empty
   // is a different sentence with no `param`, after the state phase and before
