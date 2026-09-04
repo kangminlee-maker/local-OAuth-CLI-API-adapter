@@ -408,13 +408,19 @@ root command가 광고하는 장문 flag는 72개다(수집기 `localHelpFlagCou
 
 | Flag | Accepts | Adapter use | 효과 (2026-09-04, `2.1.260`, 로컬 sink) |
 | --- | --- | --- | --- |
-| `--thinking` | `enabled`, `adaptive`, `disabled` | Anthropic `thinking.type` | **L5 양방향.** `disabled`는 `thinking:{"type":"disabled"}`를 싣는다. `enabled`와 `adaptive`는 서로도 대조군과도 **바이트 동일**한 `{"type":"adaptive","display":"omitted"}`이므로, 값 도메인은 셋이지만 wire 상태는 둘이다 |
+| `--thinking` | `enabled`, `adaptive`, `disabled` | Anthropic `thinking.type` | **L5 양방향.** `disabled`는 `thinking:{"type":"disabled"}`를 싣고 `display` 키 자체가 없다. `enabled`와 `adaptive`는 서로도 대조군과도 `metadata.session_id`와 `tools`를 뺀 **모든 필드가 같다** — 값 도메인은 셋이지만 wire 상태는 둘이다 |
 | `--thinking-display` | `summarized`, `omitted` | Anthropic `thinking.display` | **L5 양방향.** `thinking.display`가 값에 따라 움직인다. 미설정 기본값은 `omitted` |
-| `--task-budget` | 양의 정수 토큰 | Anthropic `output_config.task_budget.total` | **L5.** `output_config.task_budget`이 `{"type":"tokens","total":<값>}`으로 실린다. 대조군에는 이 키가 없다 |
+| `--task-budget` | 양의 정수 토큰 | Anthropic `output_config.task_budget.total` | **L5.** `output_config.task_budget`이 `{"type":"tokens","total":<값>}`으로 실린다. 대조군에 없는 것은 **`task_budget` 키뿐이고 `output_config` 자체는 `{"effort":…}`로 항상 실린다** — `output_config` 유무로 판정하면 오독한다 |
 
 `--thinking disabled`는 `MAX_THINKING_TOKENS=0`과 **같은 본문을 만든다**: 둘 다 `thinking:{"type":"disabled"}`를 싣고, 둘 다 `context_management`를 **함께 없앤다**. 0.149.1 시점의 "reasoning을 끄는 수단은 환경변수뿐이고 대응하는 flag는 없다"는 서술은 2.1.260에서 더 이상 맞지 않는다 — flag가 있고, 환경변수와 등가다.
 
-주의: 이 대조에서 `tools` 배열 길이는 같은 arm을 3회 반복해도 117·166·164로 흔들렸다. host-default에는 실행마다 변하는 필드가 있으므로 **tool 수를 짝 대조의 신호로 읽으면 안 된다.** 위 판정은 3회 반복에서 값이 고정된 `thinking`과 `context_management`에만 근거한다.
+**잡음 필드는 둘이고 원인이 밝혀져 있다.** 같은 arm을 반복해도 `tools`와 `metadata`만 흔들린다
+(2026-09-04 독립 재현: 39 arm). `tools`는 MCP tool 발견이 요청과 경합하는 것이고 — 흔들리는 이름
+28개 중 27개가 `mcp__*` — `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`로 **고정할 수
+있다**(12회 실행 내내 25개). `metadata`는 `user_id.session_id`가 실행마다 새로 생기는 것이라
+**서로 다른 두 실행의 본문은 결코 바이트 동일해질 수 없다.** 따라서 짝 대조 판정은 이 둘을 뺀
+정규화 본문으로 하고, "바이트 동일"이라는 표현은 이 실험이 만들 수 있는 결과가 아니다.
+`thinking`·`context_management`·`output_config`는 반복에서 고정이므로 판정에 쓸 수 있다.
 
 Risk: hidden이므로 `--help` diff 없이 rename/삭제될 수 있다. Claude Code 버전을 올릴 때마다 `pnpm catalog:runtime`의 parse probe로 세 flag의 등록을 확인한 뒤 parity 경로를 배포한다.
 
@@ -477,9 +483,9 @@ adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전�
 | `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `max_tokens: 64000` | 지정한 값이 그대로 `max_tokens`로 실린다. 대응하는 flag가 없어 이 변수만이 수단이다. **다만 그 상한에 걸린 턴은 잘리지 않고 오류가 된다** — 2026-09-02 재측정에서 16·32 모두 `is_error: true`, 결과 텍스트가 `API Error: Claude's response exceeded the N output token maximum`으로 바뀌고 **부분 출력은 버려졌다**. 직접 API는 부분 텍스트를 `stop_reason:"max_tokens"`와 함께 돌려주므로, 이 변수는 상한을 **API와 같은 방식으로** 구현하는 수단이 아니다 | L5 양방향 + 2026-09-02 상한 도달 동작 재측정 |
 | `--bare` | 전체 harness(CLAUDE.md, hook, plugin, auto-memory, keychain) 로드 | system 블록·첫 user 메시지·tool 수가 모두 크게 줄어든다. `CLAUDE_CODE_SIMPLE=1`을 설정한다 | L5 |
 | `--strict-mcp-config` | host MCP 서버가 로드된다 | `--mcp-config`로 준 서버만 남긴다 | L5 |
-| `--thinking` | 미설정 시 `{"type":"adaptive","display":"omitted"}` | `disabled`가 reasoning을 끄고 `context_management`도 함께 없앤다. `enabled`와 `adaptive`는 대조군과 바이트 동일 | L5 양방향 |
+| `--thinking` | 미설정 시 `{"type":"adaptive","display":"omitted"}` | `disabled`가 reasoning을 끄고 `context_management`도 함께 없앤다. `enabled`와 `adaptive`는 잡음 필드를 뺀 모든 필드가 대조군과 같다 | L5 양방향 |
 | `--thinking-display` | `omitted` | `thinking.display`를 값대로 바꾼다 | L5 양방향 |
-| `--task-budget` | 없음 | `output_config.task_budget`을 `{"type":"tokens","total":<값>}`으로 싣는다 | L5 |
+| `--task-budget` | `task_budget` 키 없음(`output_config` 자체는 `{"effort":…}`로 실린다) | `output_config.task_budget`을 `{"type":"tokens","total":<값>}`으로 싣는다 | L5 |
 | `--json-schema` | 없음 | schema를 그대로 담은 `StructuredOutput` tool 하나를 전송한다. **`tool_choice`가 실리지 않으므로 provider 강제가 아니다** — codex의 `strict: true`와 달리 conformance는 proxy가 검증해야 한다 | L5 |
 | `context_management` | `clear_thinking_20251015` edit이 매 요청 전송된다 | 호출자가 요청한 적 없는 context edit이다. **억제 수단이 있다**: reasoning을 끄면(`--thinking disabled` 또는 `MAX_THINKING_TOKENS=0`) 이 키가 본문에서 통째로 사라진다. 정리 대상이 thinking이므로 기전과도 맞는다. reasoning을 켠 채 이것만 끄는 수단은 여전히 못 찾았다 | L5 양방향(3회 반복에서 유무 고정) |
 

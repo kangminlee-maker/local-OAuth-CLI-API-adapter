@@ -117,11 +117,26 @@ live smoke 비용을 미리 제한하는 장치는 없다. report는 실제로 �
 6. Codex app-server method는 generated schema 기준으로 삭제/rename 여부를 먼저 확인한다.
 6-1. method는 각 request/notification union arm의 `properties.method.enum` discriminator에서만 수집한다.
    `openai/form`처럼 slash를 포함한 nested mode/값 enum은 method가 아니며, 이 반례를 negative control로 유지한다.
+5-3-1. **sink 격리로 말할 수 있는 것은 "추론 요청 없음·과금 없음"까지다.** `ANTHROPIC_BASE_URL`을
+   돌려도 CLI는 자기 용무로 provider에 접속한다(2026-09-04 Claude 2.1.260: CONNECT 로그에
+   `api.anthropic.com` 9건). "외부 요청이 전혀 없다"고 쓰지 않는다.
+5-3-2. **서로 다른 두 실행의 본문은 바이트 동일해질 수 없다.** 실행마다 새로 생기는 필드가 있다
+   (Claude는 `metadata.user_id.session_id`). 짝 대조 판정은 **반복에서 흔들린 필드를 뺀 정규화
+   본문의 해시**로 하고, "바이트 동일"이라는 표현은 쓰지 않는다.
+5-3-3. **잡음 필드는 무시하기 전에 원인을 찾고, 가능하면 억제한다.** Claude의 `tools` 흔들림은 MCP
+   tool 발견 경합이고 `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`로 고정된다. 억제하면
+   그 필드를 판정에 다시 쓸 수 있어 대조가 훨씬 날카로워진다.
+5-3-4. **효과의 원인을 값이 아니라 "설정했다는 사실"로 오귀속하지 않도록, 같은 knob의 비-트리거
+   값 arm을 넣는다.** `MAX_THINKING_TOKENS=0`이 `context_management`를 없애는 것을 확인할 때
+   `=2048` arm이 대조군 그룹에 남아야 "환경변수 설정"이 아니라 "reasoning off"가 원인임이 갈린다.
 6-2. **surface가 있느냐를 묻는 프로브는 native binary(`Scan target`)로 돌린다.** 동작 권위를 wrapper로
    두는 규칙은 wrapper가 통과층일 때의 것이고, PATH를 선점한 shim이 인자를 삼키면 살아 있는 hidden
    subcommand가 root help로 떨어져 `absent`로 읽힌다. 2026-09-04에 cmux shim이 `attach`·`logs`·
    `stop`·`kill` 넷을 그렇게 만들었고, 그대로 믿었으면 맞는 문서 네 줄을 지웠을 것이다. alias 명령은
    native에서도 원래 이름의 usage를 내므로 이름 일치 판정만으로는 위양성이 남는다.
+6-2-1. **미등록 flag 프로브에 `--help`를 붙이지 않는다.** `--help`가 unknown-option 검증을
+   건너뛰어 없는 flag도 usage를 출력한다(값 검증은 건너뛰지 않는다). 음성 대조군이 `--help`와 함께
+   돌면 판별력이 0이 된다.
 6-3. **프로브가 멈출 수 있는 명령은 자동 프로브에서 제외한다.** `claude remote-control --help`는
    2.1.260에서 반환하지 않는다. `--help`를 붙였으니 안전하다는 가정은 버전이 바뀌면 깨진다.
 7. Claude flag는 local help와 official docs-only 후보를 분리한다.

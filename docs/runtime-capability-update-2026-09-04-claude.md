@@ -33,8 +33,11 @@
 
 ## Wire result
 
-요청 본문을 기록하고 400을 돌려주는 로컬 sink에 `ANTHROPIC_BASE_URL`을 물려 캡처했다. 외부 provider
-요청과 과금은 없다. 짝 대조는 한 번에 변수 하나만 바꿨고, 그 밖의 조건(모델 `sonnet`, 프롬프트, host
+요청 본문을 기록하고 400을 돌려주는 로컬 sink에 `ANTHROPIC_BASE_URL`을 물려 캡처했다.
+**추론 요청은 나가지 않고 과금도 없다** — 모든 arm이 sink의 400으로 끝난다. 다만 "외부 provider
+요청이 전혀 없다"는 더 강한 진술은 **사실이 아니다**: `ANTHROPIC_BASE_URL`을 돌려도 CLI는 자기
+용무(인증·설정·telemetry)로 `api.anthropic.com`에 따로 접속한다(독립 재현이 CONNECT 로깅 프록시로
+호스트명까지 확인했다). 같은 census에 MCP 호스트들도 나오는데, 그게 아래 `tools` 잡음의 출처다. 짝 대조는 한 번에 변수 하나만 바꿨고, 그 밖의 조건(모델 `sonnet`, 프롬프트, host
 설정)은 모든 arm에서 같다. 측정 대상은 native binary `/Users/kangmin/.local/bin/claude`다 — PATH의
 shim은 인자를 주입할 수 있어 짝 대조를 오염시킨다.
 
@@ -44,9 +47,9 @@ sink는 CLI 실행 전에 `curl`로 자가 검사해 "본문 0건"이 계기 실
 
 | 항목 | 결과 | 권위 |
 | --- | --- | --- |
-| `--thinking` | `disabled`가 `thinking:{"type":"disabled"}`를 싣는다. `enabled`와 `adaptive`는 서로도 대조군과도 **바이트 동일**한 `{"type":"adaptive","display":"omitted"}` — 값 도메인은 셋이지만 wire 상태는 둘이다 | L5 양방향 |
+| `--thinking` | `disabled`가 `thinking:{"type":"disabled"}`를 싣는다(`display` 키 없음). `enabled`와 `adaptive`는 서로도 대조군과도 **잡음 필드(`metadata.session_id`, `tools`)를 뺀 모든 필드가 같다** — 값 도메인은 셋이지만 wire 상태는 둘이다 | L5 양방향 |
 | `--thinking-display` | `thinking.display`가 값대로 움직인다. 미설정 기본값은 `omitted` | L5 양방향 |
-| `--task-budget` | `output_config.task_budget`이 `{"type":"tokens","total":4096}`으로 실린다. 대조군에는 키가 없다 | L5 |
+| `--task-budget` | `output_config.task_budget`이 `{"type":"tokens","total":4096}`으로 실린다. 대조군에 없는 것은 `task_budget`뿐이고 `output_config` 자체는 `{"effort":"xhigh"}`로 실린다 | L5 |
 
 ### 뒤집힌 주장
 
@@ -69,9 +72,12 @@ sink는 살아 있음을 보여 원인이 갈렸다. 규칙 5-5의 후단("대�
 inconclusive")이 이번에 실제로 걸린 경우다.
 
 **`tools` 배열 길이는 이 환경에서 잡음이다.** 같은 arm을 3회 반복했는데 117·166·164로 흔들렸다.
-host-default에는 실행마다 변하는 필드가 있으므로 tool 수를 짝 대조의 신호로 읽으면 안 된다.
-위 판정은 3회 반복에서 값이 고정된 `thinking`과 `context_management`에만 근거한다. 반대로 이 반복이
-없었다면 `context_management` 유무도 잡음일 가능성을 배제하지 못했다.
+한 번씩만 재고 비교했다면 flag가 tool을 줄였다고 읽었을 것이다. 위 판정은 반복에서 고정된
+`thinking`과 `context_management`에만 근거한다.
+
+독립 재현이 그 원인과 억제법까지 찾았다. **MCP tool 발견이 요청과 경합하는 것**이고, 흔들리는 이름
+28개 중 27개가 `mcp__*`다. `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`를 주면 12회 실행
+내내 25개로 고정된다 — 다음 L5는 "tool 수는 무시한다" 대신 이걸로 훨씬 깨끗한 대조를 만들 수 있다.
 
 ## 남긴 부채
 
@@ -109,3 +115,36 @@ native binary로 돌려야 한다.** 수집기는 아직 그렇게 하지 않으
 `claude remote-control --help`도 이번에 걸렸다. 문서는 "조사 목적이면 반드시 `--help`만 붙인다"고
 안내하는데, 2.1.260에서는 그렇게 해도 5분 동안 반환하지 않아 프로브를 죽여야 했다. 자동 프로브
 대상에서 제외하도록 문서를 고쳤다.
+
+## 독립 재현 (2026-09-04, 별도 계기)
+
+위 Wire result를 다른 세션이 **자기 sink·자기 러너로 처음부터** 다시 쟀다. 39 arm, 39 본문,
+발사 실패 0건. 결과: 다섯 주장 중 **넷은 그대로 재현**됐고, 하나는 **결론은 맞지만 표현이 틀렸다**.
+
+- 재현: `--thinking disabled`(6/6), `--thinking-display`의 양방향과 기본값 `omitted`,
+  `--task-budget`(4096과 8192가 서로 다른 정규화 그룹), `disabled`와 `MAX_THINKING_TOKENS=0`의
+  동일 본문 + `context_management` 동반 소실(3+3).
+- `context_management`는 **잡음이 아니다**: reasoning ON 계열 9/9 존재, OFF 계열 6/6 부재,
+  arm 내 변동 0. 이게 흔들렸다면 다섯 번째 주장이 무너졌을 것이다.
+
+### 재현이 잡아낸 것
+
+1. **"바이트 동일"은 이 실험이 만들 수 없는 결과다.** `metadata.user_id.session_id`가 실행마다
+   새로 생겨, 같은 arm의 두 실행조차 바이트가 다르다. 정확한 진술은 "`metadata.session_id`와
+   `tools`를 뺀 모든 필드가 같다"이다. 결론(값 셋, wire 상태 둘)은 정규화 해시로 확인됐다 —
+   MCP를 끄고 `tools`까지 해시에 넣으면 control·enabled·adaptive 9개 본문이 **한 해시**로 묶인다.
+2. **`tools` 잡음의 원인과 억제법**(위 본문에 반영).
+3. **`output_config` 자체는 대조군에도 있다**(위 표에 반영).
+4. **격리 주장의 정정**(위 Wire result에 반영).
+
+### 재현이 추가한 대조군
+
+`MAX_THINKING_TOKENS=2048` — 환경변수를 설정하되 0이 아닌 arm. 이것이 **대조군 그룹에 들어갔고
+`context_management`도 존재**했다. 즉 `context_management` 소실의 원인은 "환경변수를 설정한 것"이
+아니라 "reasoning이 꺼진 것"이다. 이 arm이 없었다면 둘을 구분할 수 없었다. 원 측정에는 없던 대조다.
+
+### 프로브 주의 하나
+
+`--zzz-not-a-real-flag --help`는 오류가 아니라 usage를 출력한다. `--help`가 unknown-option 검증을
+건너뛰기 때문이다(값 검증은 건너뛰지 않는다). **미등록 flag 프로브는 `--help` 없이 돌려야** 판별력이
+있다. 이 문서의 프로브 예시는 원래 그렇게 돼 있어 영향은 없다.
