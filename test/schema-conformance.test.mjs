@@ -31,6 +31,13 @@ test('hasInexactNumber: decided by value — what the double holds exactly is ju
   assert.equal(hasInexactNumber(`{"y":1.${'0'.repeat(4000)}1}`), true, '4002 significant digits, exact zeros between: inexact by arithmetic');
   assert.equal(numberIsInexact(`0.${'0'.repeat(4096)}`), false);
   assert.equal(numberIsInexact(`1${'0'.repeat(4096)}e-4096`), false);
+  // The strip is linear: `/0+$/` backtracked at every zero of an interior run
+  // (r22-fable F3: 4s at 80k zeros, a hang at 1M).
+  for (const [lexeme, expected] of [[`1${'0'.repeat(1_000_000)}1`, true], [`0.${'0'.repeat(1_000_000)}`, false], [`1.${'0'.repeat(1_000_000)}1e-3`, true]]) {
+    const started = performance.now();
+    assert.equal(numberIsInexact(lexeme), expected);
+    assert.ok(performance.now() - started < 200, `${lexeme.length} chars took ${(performance.now() - started).toFixed(0)}ms`);
+  }
   assert.ok(Date.now() - started < 200, `decided in ${Date.now() - started}ms`);
   assert.equal(hasInexactNumber('{"x":2.5e3}'), false, '2500 is exact');
   assert.equal(hasInexactNumber('{"s":"9007199254740993","n":1}'), false, 'digits inside a string are text');

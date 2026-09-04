@@ -77,3 +77,23 @@ test('messages: a cut-off call\'s complete members reach the body as the runtime
     assert.equal(JSON.parse(bodyText).stop_reason, 'max_tokens');
   });
 });
+
+test('messages: a cut-off fragment that is whole JSON but not an object is a fragment of no object — `{}` in the body, the block left open', async () => {
+  // r22-fable F1: `[1, 2]` and `12` parsed, so they bypassed the members
+  // projection and went out as a non-object `input`, the block closed.
+  for (const fragment of ['[1, 2]', '12', '"str"', 'null', '{"\\q":1,"cut":"x']) {
+    await withProxy(wrapper(fragment), 'max_tokens', async (url) => {
+      const buffered = await fetch(`${url}/v1/messages`, { method: 'POST', headers: HEADERS, body: JSON.stringify(BODY) });
+      const bodyText = await buffered.text();
+      assert.equal(buffered.status, 200, bodyText);
+      assert.ok(bodyText.includes('"input":{}'), bodyText);
+      const streamed = await fetch(`${url}/v1/messages`, { method: 'POST', headers: HEADERS, body: JSON.stringify({ ...BODY, stream: true }) });
+      const events = (await streamed.text()).split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice(6)));
+      const partial = events.filter((event) => event.type === 'content_block_delta' && event.delta?.type === 'input_json_delta').map((event) => event.delta.partial_json).join('');
+      assert.equal(partial, fragment, 'the stream carries the bytes');
+      const toolBlock = events.find((event) => event.type === 'content_block_start' && event.content_block?.type === 'tool_use');
+      assert.ok(toolBlock);
+      assert.ok(!events.some((event) => event.type === 'content_block_stop' && event.index === toolBlock.index), 'the cut block stays open');
+    });
+  }
+});

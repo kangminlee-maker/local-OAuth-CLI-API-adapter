@@ -66,8 +66,12 @@ function events(text) {
 }
 
 async function withProxy(args, run) {
+  return withProxyEvents(completedCall(args), run);
+}
+
+async function withProxyEvents(vendorEvents, run) {
   const codexHome = await createCodexHome();
-  globalThis.fetch = async () => new Response(sse(completedCall(args)), { status: 200 });
+  globalThis.fetch = async () => new Response(sse(vendorEvents), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
   try {
@@ -97,7 +101,9 @@ test('chat over the native transport: a completed call that is not JSON is the s
 });
 
 test('messages over the native transport: a completed call that is not a JSON object is refused, bytes first on the stream', async () => {
-  for (const [args, sentence] of [['not json', 'arguments that are not JSON'], ['[1, 2]', 'arguments that are not a JSON object']]) {
+  // Whitespace-only arguments are bytes the vendor wrote, not "wrote none"
+  // (r22-fable F2: the body said `{}` behind a stream that carried spaces).
+  for (const [args, sentence] of [['not json', 'arguments that are not JSON'], ['[1, 2]', 'arguments that are not a JSON object'], ['   ', 'arguments that are not JSON']]) {
     await withProxy(args, async (url) => {
       const buffered = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES);
       const body = JSON.parse(buffered.text);
@@ -127,5 +133,62 @@ test('messages over the native transport: a completed call that is a JSON object
     const partial = frames.filter((frame) => frame.type === 'content_block_delta' && frame.delta?.type === 'input_json_delta').map((frame) => frame.delta.partial_json).join('');
     assert.equal(partial, ARGS);
     assert.ok(frames.some((frame) => frame.type === 'message_stop'));
+  });
+});
+
+test('chat over the native transport: whitespace-only arguments are the same three bytes on both paths; only the empty string is `{}`', async () => {
+  for (const [args, expected] of [['   ', '   '], ['', '{}']]) {
+    await withProxy(args, async (url) => {
+      const buffered = await post(`${url}/v1/chat/completions`, OPENAI, CHAT);
+      assert.equal(buffered.status, 200, buffered.text);
+      assert.equal(JSON.parse(buffered.text).choices[0].message.tool_calls[0].function.arguments, expected);
+      const streamed = await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, stream: true });
+      const streamedArguments = events(streamed.text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).map((call) => call.function?.arguments ?? '').join('');
+      assert.equal(streamedArguments, expected);
+    });
+  }
+});
+
+test('a delta after the vendor\'s own "finished" signal is folded into neither path (r22-fable F4)', async () => {
+  const late = (delta) => [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '{"a":1}' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+  for (const delta of ['  ', ',"b":2}']) {
+    await withProxyEvents(late(delta), async (url) => {
+      const buffered = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES);
+      assert.equal(buffered.status, 200, buffered.text);
+      assert.ok(buffered.text.includes('"input":{"a":1}}'), buffered.text);
+      const streamed = await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, stream: true });
+      const frames = events(streamed.text);
+      const partial = frames.filter((frame) => frame.type === 'content_block_delta' && frame.delta?.type === 'input_json_delta').map((frame) => frame.delta.partial_json).join('');
+      assert.equal(partial, '{"a":1}');
+      assert.ok(frames.some((frame) => frame.type === 'message_stop'), JSON.stringify(frames.map((frame) => frame.type)));
+      const chat = await post(`${url}/v1/chat/completions`, OPENAI, CHAT);
+      assert.equal(JSON.parse(chat.text).choices[0].message.tool_calls[0].function.arguments, '{"a":1}');
+    });
+  }
+});
+
+test('an item closed without its arguments promises nothing: a whole-JSON prefix is not latched as final (r22-codex F3)', async () => {
+  // `1` parses, so it used to be announced as the call's final arguments and
+  // the completed output's `12` was then refused; both paths reported `1`.
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '1' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '12' }] } },
+  ];
+  await withProxyEvents(vendor, async (url) => {
+    const buffered = await post(`${url}/v1/chat/completions`, OPENAI, CHAT);
+    assert.equal(buffered.status, 200, buffered.text);
+    assert.equal(JSON.parse(buffered.text).choices[0].message.tool_calls[0].function.arguments, '12');
+    const streamed = await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, stream: true });
+    const streamedArguments = events(streamed.text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).map((call) => call.function?.arguments ?? '').join('');
+    assert.equal(streamedArguments, '12');
   });
 });

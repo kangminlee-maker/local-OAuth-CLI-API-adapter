@@ -370,6 +370,12 @@ class CodexBackendStreamState {
         id: itemId,
         anonymous: itemId === undefined,
       });
+      // A call announced as finished is finished on every path: the stream
+      // could not carry this delta (`emitArgumentExtension`), and folding it
+      // into the completed result put bytes in the body that the closed block
+      // never had (r22-fable F4). The signal promised "what you have is what
+      // the body will report".
+      if (state.argumentsDone) return out;
       state.arguments += event.delta;
       this.toolStates.set(index, state);
       // Arguments that arrive before the call is named are held, because
@@ -400,8 +406,12 @@ class CodexBackendStreamState {
         // The backend closing the item is the one point where the proxy can
         // promise a client that this call is finished: the event carries the
         // call's authoritative arguments. `response.completed` is too late —
-        // the surfaces have already had to guess where the call ended.
-        out.push(...this.emitArgumentsDone(index, state));
+        // the surfaces have already had to guess where the call ended. An
+        // item closed WITHOUT its arguments promises nothing: the call stays
+        // open and the completed output supplies the value (r22-codex F3: a
+        // streamed `{}` was latched as final because it happened to parse,
+        // and the completed `{"city":"Seoul"}` was then refused).
+        if (typeof event.item.arguments === 'string') out.push(...this.emitArgumentsDone(index, state));
       }
       return out;
     }
@@ -528,13 +538,13 @@ class CodexBackendStreamState {
     const complete = argumentsOrEmptyObject(state.arguments);
     const out = this.emitArgumentExtension(index, state, complete);
     // The signal says "what you have is what the body will report", and a
-    // surface that closes on it can send nothing afterwards. When the finishing
-    // event names no arguments and what was streamed is not a whole JSON value
-    // yet (`{"city":` with the rest still to come in the final output), that
-    // promise cannot be made: stay silent and let the end of the turn
-    // reconcile, which is the path for a backend that never says where
-    // arguments end. (Until round 21 the repair function answered this
-    // question by the side effect of not returning the fragment unchanged.)
+    // surface that closes on it can send nothing afterwards. When the value
+    // the finishing event names is not a whole JSON value (`{"city":` with
+    // the rest still to come in the final output), that promise cannot be
+    // made: stay silent and let the end of the turn reconcile, which is the
+    // path for a backend that never says where arguments end. (Until round
+    // 21 the repair function answered this question by the side effect of
+    // not returning the fragment unchanged.)
     if (state.streamed !== complete || !parsesAsJson(complete)) return out;
     // Keep both baselines in one coordinate system: `emitPending` compares
     // later values against `arguments`, and leaving it unnormalized here made a
@@ -2105,15 +2115,17 @@ function isInstructionMessage(message: NormalizedMessage): boolean {
  * strict schema rejects and a loose one silently accepts.
  */
 /**
- * A call the backend finished without naming any arguments is the direct API's
- * `"{}"`. Everything else is the bytes the vendor wrote, JSON or not: the
- * direct API delivers what the model produced (its own documentation says the
- * arguments may not be valid JSON), and wrapping what did not parse as
- * `{"input": …}` published an object the model never produced while the
- * stream had already carried the bytes (round 21).
+ * A call the backend finished without writing any arguments is the direct
+ * API's `"{}"`. Everything else — whitespace included — is the bytes the
+ * vendor wrote, JSON or not: the direct API delivers what the model produced
+ * (its own documentation says the arguments may not be valid JSON), and
+ * wrapping what did not parse as `{"input": …}` published an object the model
+ * never produced while the stream had already carried the bytes (round 21).
+ * Reading `"   "` as "wrote none" put `{}` in the body behind a stream that
+ * had carried three spaces (round 22).
  */
 function argumentsOrEmptyObject(value: string): string {
-  return value.trim() === '' ? '{}' : value;
+  return value === '' ? '{}' : value;
 }
 
 function parsesAsJson(value: string): boolean {

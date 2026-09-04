@@ -188,6 +188,14 @@ export function completeTopLevelMembers(fragment: string): string {
     const key = readJsonString(fragment, cursor);
     if (!key.closed) break;
     const keyText = fragment.slice(cursor, key.end + 1);
+    // The lexer reads any `\x` escape and a raw control character as string
+    // content; the key slice goes out as written, so it is verified to parse
+    // like the value slice (r22-codex F2: `{"\q":1` reached the writer).
+    try {
+      JSON.parse(keyText);
+    } catch {
+      break;
+    }
     cursor = skipWhitespace(fragment, key.end + 1);
     if (fragment[cursor] !== ':') break;
     cursor = skipWhitespace(fragment, cursor + 1);

@@ -3969,7 +3969,9 @@ function anthropicToolUse(call: LocalToolCall, cutOff = false): unknown {
     type: 'tool_use',
     id: call.id,
     name: call.name,
-    input: new RawJson(parsesAsJson(call.arguments) ? call.arguments : completeTopLevelMembers(call.arguments)),
+    // A cut-off fragment that is whole JSON but not an object (`[1, 2]`,
+    // `12`) is a fragment of no object: the members projection, `{}` (r22).
+    input: new RawJson(parsesAsJsonObject(call.arguments) ? call.arguments : completeTopLevelMembers(call.arguments)),
   };
 }
 
@@ -3983,15 +3985,16 @@ function cutCallLeftOpen(result: LocalCompletionResult): number | null {
   if (!responseCutOff(result) || result.toolCalls.length === 0) return null;
   const last = result.toolCalls.length - 1;
   const lastCall = result.toolCalls[last];
-  if (!lastCall || parsesAsJson(lastCall.arguments)) return null;
+  if (!lastCall || parsesAsJsonObject(lastCall.arguments)) return null;
   const trailing = textRunsFor(result, result.toolCalls.length).some((run) => run.afterCalls >= result.toolCalls.length && run.text.length > 0);
   return trailing ? null : last;
 }
 
-function parsesAsJson(value: string): boolean {
+/** Whether the bytes are a whole JSON object — the only complete `input`. */
+function parsesAsJsonObject(value: string): boolean {
   try {
-    JSON.parse(value);
-    return true;
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed);
   } catch {
     return false;
   }

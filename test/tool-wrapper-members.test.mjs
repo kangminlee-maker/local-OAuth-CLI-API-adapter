@@ -24,3 +24,13 @@ test('completeTopLevelMembers: each member is the bytes the runtime wrote — no
     assert.doesNotThrow(() => JSON.parse(completeTopLevelMembers(fragment)), 'the projection is itself JSON');
   }
 });
+
+test('completeTopLevelMembers: a key that is not a JSON string ends the projection before it (r22-codex F2)', () => {
+  assert.equal(completeTopLevelMembers('{"\\q":1,"cut":"x'), '{}', 'an escape JSON does not define');
+  assert.equal(completeTopLevelMembers('{"a":1,"\\q":2,"c":3,"cut":"x'), '{"a":1}', 'the members before it survive');
+  assert.equal(completeTopLevelMembers('{"a\u0001b":1,"cut":"x'), '{}', 'a raw control character inside the key');
+  assert.equal(completeTopLevelMembers('{"a":"\\q","cut":"x'), '{}', 'the same escape inside a value was already refused');
+  for (const fragment of ['{"\\q":1,"cut":"x', '{"a":1,"\\q":2,"c":3', '{"a\u0001b":1']) {
+    assert.doesNotThrow(() => JSON.parse(completeTopLevelMembers(fragment)), 'the projection is itself JSON');
+  }
+});

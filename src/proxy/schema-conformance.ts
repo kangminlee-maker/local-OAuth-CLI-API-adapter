@@ -132,8 +132,15 @@ export function numberIsInexact(lexeme: string): boolean {
   // The SIGNIFICANT digits: leading zeros say nothing, and trailing zeros move
   // into the exponent. `0.000…0` is zero however long, and `1000…0e-4096` is
   // one; round 20 capped the raw length and so read both as inexact (r21-codex).
-  const digits = (whole + fraction).replace(/^0+/, '');
-  const significant = digits.replace(/0+$/, '');
+  // Two linear scans: `/0+$/` backtracks at every zero of an interior run and
+  // took seconds on a lexeme with 80k of them (r22-fable F3).
+  const all = whole + fraction;
+  let start = 0;
+  while (start < all.length && all[start] === '0') start += 1;
+  let end = all.length;
+  while (end > start && all[end - 1] === '0') end -= 1;
+  const digits = all.slice(start);
+  const significant = all.slice(start, end);
   if (significant === '') return value !== 0;
   // More significant digits than any double's exact decimal expansion has
   // (767): inexact without arithmetic, which the comparison below would
