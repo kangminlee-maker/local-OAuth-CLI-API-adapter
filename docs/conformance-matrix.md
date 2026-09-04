@@ -977,9 +977,10 @@ either canonical framing or one shared representation. No predicate decides them
 | # | axis | what a client sees |
 |---|---|---|
 | 1 | the root's **end** is never found, so bytes after the wrapper are read as its members | under `tool_choice:"required"` the stream delivers a complete executable call, then the frame refusing it |
-| 2 | the root may never **close** at all | the stream publishes the call **and then the entire raw wrapper as assistant prose**, terminating with an ordinary `finish_reason:"stop"` and no error; the buffered body returns the fragment as prose with no call |
+| 2 | the root may never **close** at all | the stream publishes the call and the wrapper's readable `text` member (in wrapper key order), then terminates with an ordinary `finish_reason:"stop"` and no error; the buffered body returns the **entire malformed fragment** as prose with no call. (An earlier version of this row said the stream publishes the raw wrapper — it does not; only the buffered body does.) |
 | 3 | duplicate keys: this walk is first-wins, `JSON.parse` is last-wins | not merely two block orders — with duplicate `toolCalls` the two clients **execute different functions with different arguments**, and with duplicate `text` they receive different answers |
-| 4 | argument normalization on the wrapper path: buffered wraps invalid text as `{"input":…}`, the stream forwards it raw | the two clients receive different tool input; only the buffered one can execute the call |
+| 4 | **any byte the reader steps over that `JSON.parse` would reject** — a non-JSON whitespace character after a member, inside `toolCalls`, or before the closing brace; an invalid string escape; a raw control character inside a string; a missing comma | the stream reads a wrapper and publishes a complete executable call; `JSON.parse` rejects the artefact, so under `tool_choice:"required"` the body answers 502 after the call is already on the wire. Round 15 fixed exactly one position — a BOM or NBSP *before* the root — and declared the class closed. It is not: `skipWhitespace` is consulted at three positions and every other byte is accepted unconditionally |
+| 5 | a check that can only fire **after** a release | with two calls, the first declared and the second not, the stream publishes the first — name, id, full arguments — and refuses only when the second closes; the body refuses the whole turn. The declared-name backstop is correct as a decision and cannot be a release gate for a multi-call wrapper, because calls are announced as each closes and a released byte cannot be retracted |
 
 ### 7b. Both readers agree, and both are wrong — separable, not yet fixed
 
@@ -988,8 +989,9 @@ which is false and made them look like they had to wait for the redesign. Each h
 
 | # | defect | what a client sees | why it is not 7a |
 |---|---|---|---|
-| 5 | a forced single tool bypasses the wrapper entirely, and `normalizeToolArgumentsText` passes any `{`/`[`-opening payload through unvalidated | a truncated `{"city":"Seo` is published as `function.arguments` and fails `JSON.parse` on both paths | agreement is not enforcement. The runtime was handed the tool's own input schema, so this is the backstop's job: reject, do not repair. No JSON format is involved |
-| 6 | with a JSON format present, a wrapper-shaped object with no usable `status` is exempted from refusal | `{"status":"done","text":"…","toolCalls":[]}` is published verbatim — the proxy's internal grammar as the client's JSON answer | a one-reader decision, not a two-reader one. **This is the row that genuinely needs design**: with `tools` present the runtime gets the wrapper schema and never the client's, so the object is probably a malformed wrapper — but it is also exactly what a client's own task-record schema produces, and nothing in the bytes separates them |
+| 6 | argument normalization on the wrapper path: buffered wraps invalid text as `{"input":…}`, the stream forwards it raw | the two clients receive different tool input; only the buffered one can execute the call | a predicate the repo already uses decides it — the forced-tool path's opening-character rule (`KnownToolArgumentsDeltaExtractor` / `normalizeToolArgumentsText`), which the wrapper path never received. Applying it as-is would make both readers agree on the unparseable value row 7 describes, so it is filed, not applied |
+| 7 | a forced single tool bypasses the wrapper entirely, and `normalizeToolArgumentsText` passes any `{`/`[`-opening payload through unvalidated | a truncated `{"city":"Seo` is published as `function.arguments` and fails `JSON.parse` on both paths | agreement is not enforcement. The runtime was handed the tool's own input schema, so this is the backstop's job: reject, do not repair. No JSON format is involved |
+| 8 | with a JSON format present, a wrapper-shaped object with no usable `status` is exempted from refusal | `{"status":"done","text":"…","toolCalls":[]}` is published verbatim — the proxy's internal grammar as the client's JSON answer | a one-reader decision, not a two-reader one. Split by format: under `json_object` the only predicate is "is an object", which this value satisfies, so **nothing in the bytes separates** a malformed wrapper from a client's own task-record answer — that subset genuinely needs design. Under an explicit `json_schema` the request retains the client schema (`NormalizedRequest.jsonSchema`) and a value that fails it is deterministically not the client's answer — that subset **is decidable** by validating the candidate against the retained schema, and no consumer does so today |
 
 ### What round 15 fixed, and what it corrected about round 14
 
@@ -997,14 +999,16 @@ Round 15 (2026-09-04, two independent reviewers, blind, offline) reproduced thre
 round 14's own fixes had introduced, plus the misclassifications above.
 
 Fixed here:
-- **A call naming a tool the request never declared** is now refused on both paths.
-  `declaredToolNames` is the set `toolDecisionSchema` already hands the runtime, so the response
-  path and the incremental reader cannot decide it differently. Previously filed as undesignable;
-  both reviewers independently showed a predicate decides it.
-- **The wrapper reader's whitespace class** is JSON's four characters, not JavaScript's `\s`. A BOM
-  or NBSP before the wrapper made the stream read a wrapper that `JSON.parse` rejects, so under
-  `tool_choice:"required"` the stream published an executable call the body answered 502 to. A
-  closed lexical test, no redesign needed.
+- **A call naming a tool the request never declared** is refused on both paths for a single-call
+  wrapper. `declaredToolNames` is the set `toolDecisionSchema` hands the runtime, and
+  `callNameIsDeclared` tests the raw name in both readers — round 16 found round 15's version tested
+  the raw name in one reader and the substituted `tool` in the other, so a nameless call was refused
+  by the body and published by the stream. For a multi-call wrapper the decision is right and the
+  release is not (7a row 5).
+- **The wrapper reader's whitespace class** at the positions `skipWhitespace` is consulted is JSON's
+  four characters, not JavaScript's `\s`. This closed one position — a BOM or NBSP *before* the
+  root. Round 15 called it "a closed lexical test, no redesign needed"; round 16 showed that was
+  false (7a row 4): every byte the reader steps over elsewhere is still accepted unconditionally.
 
 Reverted here, because round 14 removed them for a reason that turned out to be the wrong one:
 - **`canStreamTextDeltas`** is `outputSchemaFor(request) === null` again. Round 14 narrowed it to

@@ -52,8 +52,13 @@ export class ToolCallDeltaExtractor {
   private carriesAnUndeclaredCall(): boolean {
     const declared = this.policy.declaredNames;
     if (!declared) return false;
-    return readToolCallSnapshots(this.raw)
-      .some((snapshot) => snapshot.name !== undefined && !declared.has(snapshot.name));
+    // A closed call's identity is final. Tested with the same rule the response
+    // path applies to the raw value, so a call with no usable name is
+    // undeclared here too — not substituted into `tool` and announced.
+    return readToolCallSnapshots(this.raw).some((snapshot) =>
+      snapshot.closed
+        ? !callNameIsDeclared(declared, snapshot.name)
+        : snapshot.name !== undefined && !callNameIsDeclared(declared, snapshot.name));
   }
 
   /** Whether the wrapper has committed to at least one tool call. */
@@ -291,6 +296,21 @@ function wrapperKeyIndex(raw: string, key: string): number {
     if (entry.key === key) return entry.keyIndex;
   }
   return -1;
+}
+
+/**
+ * Whether a call's name, as the backend wrote it, is one the request declared.
+ *
+ * Tested against the RAW value, before any substitution. The buffered reader
+ * used to substitute `tool` for a missing or blank name and then find `tool`
+ * undeclared, while the streamed reader tested the pre-substitution value —
+ * `undefined`, which passed — and then substituted and published. One reader
+ * refused, the other delivered an executable call for a tool the client never
+ * declared. A call the runtime schema would not have allowed is not repaired
+ * into an identity; it is undeclared, in both readers, from this one rule.
+ */
+export function callNameIsDeclared(declared: ReadonlySet<string>, name: unknown): boolean {
+  return typeof name === 'string' && name.trim() !== '' && declared.has(name);
 }
 
 function readToolCallSnapshots(raw: string): ToolCallSnapshot[] {

@@ -234,3 +234,25 @@ test('an undeclared call is refused at the response path too, not only in the st
   const declared = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{}"}]}';
   assert.deepEqual(parseBackendOutput(request, declared).toolCalls.map((c) => c.name), ['get_weather']);
 });
+
+/**
+ * Round 16: the declared-name check tested the raw name in one reader and the
+ * substituted `tool` in the other, so a call with no usable name was refused
+ * by the body and published by the stream. One rule, `callNameIsDeclared`, on
+ * the raw value, in both.
+ */
+for (const [label, call] of [
+  ['a call with no name', { id: 'c1', arguments: '{"city":"Seoul"}' }],
+  ['a call whose name is not a string', { id: 'c1', name: 7, arguments: '{"city":"Seoul"}' }],
+  ['a call whose name is blank', { id: 'c1', name: '   ', arguments: '{"city":"Seoul"}' }],
+]) {
+  test(`${label} is refused by both readers, not repaired into \`tool\``, async () => {
+    const raw = JSON.stringify({ status: 'tool_calls', text: '', toolCalls: [call] });
+    const body = { model: 'm', messages: [{ role: 'user', content: 'x' }], tools: TOOLS, tool_choice: 'required' };
+    const buffered = await chat(streamingClaude, body, { WRAPPER_RAW: raw });
+    const streamed = await chat(streamingClaude, { ...body, stream: true }, { WRAPPER_RAW: raw });
+    assert.equal(buffered.status, 502, 'the body published a call with no usable name');
+    assert.deepEqual(streamed.calls, [], `the stream announced ${JSON.stringify(streamed.calls)}`);
+    assert.match(streamed.error ?? '', /never declared/);
+  });
+}

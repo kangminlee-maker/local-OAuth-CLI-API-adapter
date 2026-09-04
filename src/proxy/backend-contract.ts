@@ -11,7 +11,9 @@ import { estimateTokens, ProxyRequestError } from './types.js';
 // `[assistant tool_call]` itself would be a second, and a grammar with two
 // writers drifts.
 import { renderToolCall, renderToolResult } from './normalizers.js';
-import { wrapperCallsPrecedeText } from './tool-call-stream.js';
+import { wrapperCallsPrecedeText,
+  callNameIsDeclared,
+} from './tool-call-stream.js';
 
 interface BuildPromptOptions {
   readonly includeInstructionMessages?: boolean;
@@ -115,22 +117,6 @@ export function outputSchemaFor(request: NormalizedRequest): unknown {
 }
 
 /**
- * Tools are available for the whole conversation, not just its first turn.
- *
- * A turn that follows a tool result used to be given the plain-text mode, on
- * the reading that a continuation is where the model finally answers. But a
- * model that wants to call another tool there has no structured way to say so:
- * it wrote the call as prose — `{"name":"get_weather","arguments":{…}}` — and
- * the turn came back as `stop_reason: end_turn` with the call stranded in a
- * text block, so every question needing two lookups broke. The decision schema
- * already carries `status: 'message'` for the answer case, so keeping it on
- * costs the continuation nothing and gives the call somewhere to go.
- *
- * A client that wants its own JSON schema honoured on such a turn says so the
- * way the API already allows: `tool_choice: "none"` takes the tools off the
- * table for that turn.
- */
-/**
  * The names this turn's runtime schema allows a call to carry, or null when
  * the turn constrains none.
  *
@@ -150,6 +136,23 @@ export function declaredToolNames(request: NormalizedRequest): ReadonlySet<strin
   return names.length > 0 ? new Set(names) : null;
 }
 
+
+/**
+ * Tools are available for the whole conversation, not just its first turn.
+ *
+ * A turn that follows a tool result used to be given the plain-text mode, on
+ * the reading that a continuation is where the model finally answers. But a
+ * model that wants to call another tool there has no structured way to say so:
+ * it wrote the call as prose — `{"name":"get_weather","arguments":{…}}` — and
+ * the turn came back as `stop_reason: end_turn` with the call stranded in a
+ * text block, so every question needing two lookups broke. The decision schema
+ * already carries `status: 'message'` for the answer case, so keeping it on
+ * costs the continuation nothing and gives the call somewhere to go.
+ *
+ * A client that wants its own JSON schema honoured on such a turn says so the
+ * way the API already allows: `tool_choice: "none"` takes the tools off the
+ * table for that turn.
+ */
 export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
   return request.tools.length > 0 && request.toolChoice.type !== 'none';
 }
@@ -246,12 +249,15 @@ export function parseBackendOutput(
   // the model never made in front of the client, and dropping it silently
   // would leave a turn that claims to have called something.
   const declared = declaredToolNames(request);
-  if (declared && decided.toolCalls.some((call) => !declared.has(call.name))) {
+  if (declared && decided.rawNames?.some((name) => !callNameIsDeclared(declared, name))) {
     throw backendContractError(
       'The local runtime called a tool the request never declared.',
       request.shape,
     );
   }
+  // `rawNames` is this backstop's evidence, not part of the answer.
+  const { rawNames: _rawNames, ...answer } = decided;
+  void _rawNames;
   // No object rule here, deliberately. The one structured-output channel is
   // carrying the tool wrapper on this path, so the JSON format never reached
   // the runtime and the model was never asked for it — rejecting the answer
@@ -259,13 +265,19 @@ export function parseBackendOutput(
   // declared unenforced in the conformance matrix instead. Enforcement and the
   // knob travel together; where there is no knob there is no enforcement, and
   // the matrix says so rather than a check inventing one.
-  return decided;
+  return answer;
 }
 
 function parseToolDecision(
   request: NormalizedRequest,
   text: string,
-): { text: string; toolCalls: readonly LocalToolCall[]; textRuns?: readonly LocalTextRun[] } {
+): {
+  text: string;
+  toolCalls: readonly LocalToolCall[];
+  textRuns?: readonly LocalTextRun[];
+  /** Each call's `name` exactly as the backend wrote it, for the declared-name backstop. */
+  rawNames?: readonly unknown[];
+} {
   // The catch belongs to `JSON.parse` and nothing else. It used to wrap the
   // whole body, so a contract violation raised below was caught by it and
   // turned back into "the answer is the raw text" — the exact leak the throw
@@ -291,6 +303,7 @@ function parseToolDecision(
       return {
         text: narration,
         toolCalls: calls,
+        rawNames: Array.isArray(obj.toolCalls) ? obj.toolCalls.map((call) => asRecord(call)?.name) : [],
         ...(calls.length > 0 && narration ? { textRuns: wrapperTextRuns(text, narration, calls.length) } : {}),
       };
     }
