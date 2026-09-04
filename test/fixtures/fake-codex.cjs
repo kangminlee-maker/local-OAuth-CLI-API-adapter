@@ -48,10 +48,16 @@ function result(id, value = {}) {
 }
 
 function emitTurn(threadId, turnId, text = 'OK') {
-  write({
-    method: 'item/agentMessage/delta',
-    params: { threadId, turnId, delta: text },
-  });
+  // One delta carrying the whole text, or — when a test asks — one delta per
+  // character, the granularity a live turn actually arrives at and the one
+  // that decides what an incremental reader releases before the turn ends.
+  const deltas = process.env.FAKE_CODEX_RAW_TEXT_DELTAS === 'chars' ? [...text] : [text];
+  for (const delta of deltas) {
+    write({
+      method: 'item/agentMessage/delta',
+      params: { threadId, turnId, delta },
+    });
+  }
   write({
     method: 'turn/completed',
     params: {

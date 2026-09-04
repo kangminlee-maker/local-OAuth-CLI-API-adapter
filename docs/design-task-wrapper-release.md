@@ -172,7 +172,7 @@ the paths (status code vs in-band error) goes with it.
 
 | stage | content | reversibility |
 |---|---|---|
-| 0 | agreement suite against current code: Fable's 15 cases plus r17 Q1-D/Q1-E, U+000B, the `\'` escape and row 10's input; buffered vs streamed × three surfaces × both wrapper backends; the disagreeing cases pinned as strict expected-fails | no behaviour change; the instrument is proven on inputs whose answer is known to be the opposite |
+| 0 | **landed 2026-09-04** — `test/wrapper-agreement-suite.test.mjs`: 19 inputs × both wrapper backends × three surfaces, buffered vs streamed; 13 inputs pinned to the disagreement they show today (plus row 8 on `/v1/messages` only), 5 agreeing inputs assert what was delivered or that nothing was released before the refusal. Both backends read identically on every input. Discovery corrected two expectations before pinning: the BOM input is agreement on a *refusal*, and the forced-tool fragment disagrees on `/v1/messages` (`{"input":…}` vs the raw fragment) | no behaviour change; the instrument was run on inputs whose answer is known to be the opposite, and it read them so |
 | 1 | stop constructing the extractors and the prestart behind one `settings.json` key, default off = today byte-for-byte; run the suite both ways (off: the pins reappear; on: the pins pass); no per-backend switch | one config flip |
 | 2 | the measurements below, then canary on; docs describe the opt-in, not a default that has not flipped | docs-only plus a flip |
 | 3 | default on; `false` rollback kept one release; contract rows (`README.md:134`, `api-interface-contract.md:121,213,452`) and matrix §7 rewritten in the same commit | one config flip |
