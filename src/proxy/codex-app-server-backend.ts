@@ -7,7 +7,6 @@ import readline from 'node:readline';
 import {
   codexProxyFallbackReasoningEffort,
   codexProxyFallbackVerbosity,
-  holdToolTurnsUntilComplete,
   honorRequestModel,
 } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
@@ -16,13 +15,10 @@ import {
   baseInstructions,
   buildPrompt,
   developerInstructions,
-  forcedSingleToolCall,
   hasToolDecisionSchema,
-  declaredToolNames,
   textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
-  toolChoiceRequiresCall,
   requestInstructionText,
   usageFor,
 } from './backend-contract.js';
@@ -48,7 +44,6 @@ import type {
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
 import { ProxyRequestError, unsupportedModelError } from './types.js';
-import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface CodexAppServerBackendOptions {
   readonly command?: string;
@@ -61,7 +56,6 @@ interface CodexAppServerBackendOptions {
   readonly proxyMode?: CodexAppServerProxyMode;
   readonly onTiming?: (timing: CodexTurnTiming) => void;
   readonly honorRequestModel?: boolean;
-  readonly holdToolTurnsUntilComplete?: boolean;
 }
 
 interface PendingRequest {
@@ -150,8 +144,6 @@ interface CodexTurnTimingDraft {
   turnWaitMs: number;
   usageWaitMs: number;
   firstTextDeltaMs?: number;
-  firstToolCallDeltaMs?: number;
-  firstToolArgumentDeltaMs?: number;
 }
 
 interface CodexTurnTiming extends Readonly<CodexTurnTimingDraft> {
@@ -187,7 +179,6 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   private readonly cwd: string;
   private readonly configuredModel?: string;
   private readonly honorRequestModel: boolean;
-  private readonly holdToolTurnsUntilComplete: boolean;
   private readonly timeoutMs: number;
   private readonly reasoningEffort: CodexReasoningEffort;
   private readonly verbosity: CodexVerbosity;
@@ -211,7 +202,6 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     this.model = options.model ?? 'codex-app-server';
     this.configuredModel = options.model;
     this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
-    this.holdToolTurnsUntilComplete = options.holdToolTurnsUntilComplete ?? holdToolTurnsUntilComplete();
     this.timeoutMs = options.timeoutMs;
     this.reasoningEffort = options.reasoningEffort ?? codexProxyFallbackReasoningEffort();
     this.verbosity = options.verbosity ?? codexProxyFallbackVerbosity();
@@ -255,54 +245,17 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       return;
     }
     const queue = new AsyncQueue<LocalStreamEvent>();
-    // A held tool turn has no incremental reader at all: nothing is released
-    // until `completed` carries the one reading the buffered path also makes.
-    const held = this.holdToolTurnsUntilComplete && hasToolDecisionSchema(request);
-    const forcedTool = held ? null : forcedSingleToolCall(request);
-    const toolExtractor = held
-      ? null
-      : forcedTool
-      ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
-      : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor({
-          requiresCall: toolChoiceRequiresCall(request),
-          jsonMode: request.jsonMode,
-          declaredNames: declaredToolNames(request),
-        })
-      : null;
-    let firstToolCallDeltaMs: number | undefined;
-    let firstToolArgumentDeltaMs: number | undefined;
+    // A tool turn has no incremental reader: nothing is released until
+    // `completed` carries the one reading the buffered path also makes. Two
+    // readers of one wrapper disagreed on malformed output, and a released byte
+    // cannot be retracted (conformance matrix §7). A turn whose text the
+    // response path may refuse is held for the same reason: the completed
+    // result still carries the text, so nothing is lost — only held.
+    const shouldStreamText = !hasToolDecisionSchema(request) && !textMayBeRefused(request);
     const run = this.runTurn(
       request,
       signal,
-      (delta, elapsedMs) => {
-        if (held) return;
-        if (toolExtractor) {
-          for (const event of toolExtractor.push(delta)) {
-            if (firstToolCallDeltaMs === undefined) firstToolCallDeltaMs = elapsedMs;
-            if (
-              event.type === 'tool_call_delta'
-              && event.argumentsDelta
-              && firstToolArgumentDeltaMs === undefined
-            ) {
-              firstToolArgumentDeltaMs = elapsedMs;
-            }
-            queue.push(event);
-          }
-        } else if (!textMayBeRefused(request)) {
-          // A turn whose text the response path may refuse is not known to be
-          // deliverable until it is complete: this branch had no gate at all,
-          // so the refused answer went out in full and the error frame arrived
-          // after it. The completed result still carries the text, so nothing
-          // is lost — only held. Spelled `!request.jsonMode`, it also held back
-          // every explicit client schema, which `parseBackendOutput` exempts.
-          queue.push({ type: 'text_delta', delta });
-        }
-      },
-      (timing) => {
-        if (firstToolCallDeltaMs !== undefined) timing.firstToolCallDeltaMs = firstToolCallDeltaMs;
-        if (firstToolArgumentDeltaMs !== undefined) timing.firstToolArgumentDeltaMs = firstToolArgumentDeltaMs;
-      },
+      shouldStreamText ? (delta) => queue.push({ type: 'text_delta', delta }) : undefined,
     )
       .then((result) => queue.push({ type: 'completed', result }))
       .catch((err: Error) => queue.fail(err))

@@ -13,7 +13,7 @@ import { estimateTokens, ProxyRequestError } from './types.js';
 import { renderToolCall, renderToolResult } from './normalizers.js';
 import { wrapperCallsPrecedeText,
   callNameIsDeclared,
-} from './tool-call-stream.js';
+} from './tool-wrapper.js';
 
 interface BuildPromptOptions {
   readonly includeInstructionMessages?: boolean;
@@ -161,15 +161,12 @@ export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
  * Where the wrapper's narration sits among its calls.
  *
  * Both ordered surfaces report a turn's parts in production order, and they
- * read it from `textRuns` — which only `CodexBackendTransport` ever set.
- * The backends that go through `ToolCallDeltaExtractor` emit `tool_call_delta`
- * before `text_delta` whenever the model writes `toolCalls` first, so their
- * STREAM said `[call, text]` while their buffered body, with the field absent,
- * said `[text, call]`: the same turn, two orders.
+ * read it from `textRuns` — which only `CodexBackendTransport` ever set, so
+ * the wrapper backends' bodies reported `[text, call]` for a turn whose stream
+ * had said `[call, text]`: the same turn, two orders.
  *
- * The wrapper's own key order is the artifact both paths see — the streamed
- * extractor decodes it left to right, and the buffered parse has the whole
- * string — so it is what decides, rather than one path's incidental timing.
+ * The wrapper's own key order is the artifact every reading of the turn sees,
+ * so it is what decides, rather than one path's incidental timing.
  * Both readings go through `wrapperCallsPrecedeText`, the single rule: while
  * the extractor kept a rule of its own — emit whatever the incremental decoder
  * produced first — the two agreed only for some chunkings of the wrapper, and
@@ -623,10 +620,9 @@ function ensureJsonString(value: string): string {
  * that is not JSON-shaped at all (wrapped) are rewritten.
  */
 function normalizeToolArgumentsText(value: string): string {
-  // Leading whitespace only, because that is what the streaming reader drops
-  // (`KnownToolArgumentsDeltaExtractor.normalizeDelta`). Trimming the tail as
-  // well made `{"a":1}\n` stream with its newline and report without it — the
-  // same turn, two values, for no gain: both parse to the same object.
+  // Leading whitespace only. Trimming the tail as well changed `{"a":1}\n`
+  // between one reading of the turn and another for no gain: both parse to
+  // the same object, and the bytes the backend wrote are the answer.
   const trimmed = value.replace(/^\s+/, '');
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) return trimmed;
   const both = trimmed.trim();

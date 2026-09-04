@@ -24,13 +24,13 @@ import type {
   OpenAiImageProxyRoute,
   ProxyServerOptions,
 } from './types.js';
-import { holdToolTurnsUntilComplete, honorRequestModel } from '../settings.js';
+import { honorRequestModel } from '../settings.js';
 import {
   BACKEND_IDENTIFIERS, MAX_ERROR_MESSAGE_CHARS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { StopSequenceGate, truncateAtStopSequence } from './stop-sequences.js';
-import { missingToolCallArgumentDelta } from './tool-call-stream.js';
+import { missingToolCallArgumentDelta } from './tool-wrapper.js';
 import { image2QualityToGpt55ReasoningEffort } from './image2-via-gpt55.js';
 import {
   jsonTypeName,
@@ -164,7 +164,6 @@ async function handleRequest(
   options: ProxyServerOptions,
 ): Promise<void> {
   const { backend, requestTimeoutMs } = options;
-  const holdToolTurns = options.holdToolTurnsUntilComplete ?? holdToolTurnsUntilComplete();
   setCorsHeaders(res);
   let errorShape: ErrorResponseShape = 'openai';
   // 204 is for a real CORS preflight — the browser's permission question, sent
@@ -242,11 +241,10 @@ async function handleRequest(
           res,
           await startFanOutStreams(
             choiceCount,
-            () => streamEvents(backend, normalized, requestTimeoutMs, res, holdToolTurns, fanOut.signal),
+            () => streamEvents(backend, normalized, requestTimeoutMs, res, fanOut.signal),
             () => fanOut.abort(),
           ),
           await requestReportingExecutedModel(backend, normalized),
-          holdToolTurns,
           () => fanOut.abort(),
         );
       } else {
@@ -262,7 +260,7 @@ async function handleRequest(
       if (normalized.stream) {
         await writeOpenAiResponsesStream(
           res,
-          await streamEvents(backend, normalized, requestTimeoutMs, res, holdToolTurns),
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
           await requestReportingExecutedModel(backend, normalized),
         );
       } else {
@@ -278,7 +276,7 @@ async function handleRequest(
       if (normalized.stream) {
         await writeAnthropicMessagesStream(
           res,
-          await streamEvents(backend, normalized, requestTimeoutMs, res, holdToolTurns),
+          await streamEvents(backend, normalized, requestTimeoutMs, res),
           await requestReportingExecutedModel(backend, normalized),
         );
       } else {
@@ -1363,7 +1361,6 @@ function streamEvents(
   request: NormalizedRequest,
   requestTimeoutMs: number,
   res: ServerResponse,
-  holdToolTurns: boolean,
   fanOut?: AbortSignal,
 ): Promise<AsyncIterable<LocalStreamEvent>> {
   // The cancel signal is wired in BOTH modes and lives for the whole
@@ -1390,11 +1387,11 @@ function streamEvents(
     runStreamWithTimeout(backend, request, requestTimeoutMs, cancelled.signal),
     release,
   );
-  // A held tool turn's first event IS its completed reading (or the refusal
-  // that replaces it), so pulling it before the headers are written is what
-  // gives the stream the same status the buffered path returns — a real 502,
-  // not a 200 with an error frame after zero content.
-  if (!honorRequestModel() && !(holdToolTurns && hasToolDecisionSchema(request))) {
+  // A tool turn's first event IS its completed reading (or the refusal that
+  // replaces it), so pulling it before the headers are written is what gives
+  // the stream the same status the buffered path returns — a real 502, not a
+  // 200 with an error frame after zero content.
+  if (!honorRequestModel() && !hasToolDecisionSchema(request)) {
     return Promise.resolve(events);
   }
   return withFirstEventSettled(events);
@@ -2486,7 +2483,6 @@ async function writeOpenAiChatStream(
   res: ServerResponse,
   streams: readonly AsyncIterable<LocalStreamEvent>[],
   request: NormalizedRequest,
-  holdToolTurns: boolean,
   cancel?: () => void,
 ): Promise<void> {
   writeSseHeaders(res);
@@ -2500,7 +2496,7 @@ async function writeOpenAiChatStream(
     service_tier: echoedServiceTier(request),
     system_fingerprint: null,
   };
-  const choices = streams.map((_, index) => new OpenAiChatChoiceStream(res, request, index, holdToolTurns));
+  const choices = streams.map((_, index) => new OpenAiChatChoiceStream(res, request, index));
   const results: LocalCompletionResult[] = [];
   try {
     for (const choice of choices) await choice.start(base);
@@ -2580,7 +2576,6 @@ class OpenAiChatChoiceStream {
     private readonly res: ServerResponse,
     private readonly request: NormalizedRequest,
     private readonly choiceIndex: number,
-    private readonly holdToolTurns: boolean,
   ) {
     this.toolState = new OpenAiChatToolStreamState(
       res,
@@ -2594,14 +2589,10 @@ class OpenAiChatChoiceStream {
   }
 
   async start(base: Record<string, unknown>): Promise<void> {
-    if (!hasToolDecisionSchema(this.request)) {
-      await this.ensureTextStarted(base);
-      return;
-    }
-    // A held turn announces its calls from the completed result only; nothing
+    // A tool turn announces its calls from the completed result only; nothing
     // predicted from the request goes on the wire ahead of that reading.
-    if (this.holdToolTurns) return;
-    await this.toolState.prestart(base, predictableOpenAiChatToolStart(this.request));
+    if (hasToolDecisionSchema(this.request)) return;
+    await this.ensureTextStarted(base);
   }
 
   /** Returns this choice's result once its turn has finished. */
@@ -2693,11 +2684,6 @@ class OpenAiChatToolStreamState {
     private readonly hasAssistantStarted: () => boolean,
     private readonly markAssistantStarted: () => void,
   ) {}
-
-  async prestart(base: Record<string, unknown>, tool: PredictableToolStart | null): Promise<void> {
-    if (!tool) return;
-    await this.ensureStarted(base, tool.index, tool.id, tool.name);
-  }
 
   async write(
     base: Record<string, unknown>,
@@ -3205,30 +3191,6 @@ class OpenAiResponsesToolStreamState {
   }
 }
 
-interface PredictableToolStart {
-  readonly index: number;
-  readonly id: string;
-  readonly name: string;
-}
-
-function predictableOpenAiChatToolStart(request: NormalizedRequest): PredictableToolStart | null {
-  if (request.shape !== 'openai-chat') return null;
-  if (request.toolChoice.type === 'tool') {
-    return {
-      index: 0,
-      id: 'call_1',
-      name: request.toolChoice.name,
-    };
-  }
-  if (request.toolChoice.type === 'required' && request.tools.length === 1) {
-    return {
-      index: 0,
-      id: 'call_1',
-      name: request.tools[0]?.name ?? 'tool',
-    };
-  }
-  return null;
-}
 
 function openAiResponsesCompletedResponse(
   responseId: string,

@@ -958,86 +958,53 @@ Standing rules for every probe: minimal token spend (`max_tokens`/`max_completio
 
 ---
 
-## 7. Known gaps in the tool wrapper
+## 7. The tool wrapper, read once
 
-**Scope: any turn with `tools`.** One row additionally needs a JSON format; the rest do not. **With the default, none of the rows below reaches a client**: a tool turn is held until its completed reading and the stream is a projection of it. The rows describe the `holdToolTurnsUntilComplete: false` rollback path and stay declared until that path is deleted.
-An earlier version of this section scoped everything to "`tools` and a JSON format combined", which
-let a client that sends no JSON format read it and conclude it was unaffected while most of the
-rows were live for it.
+**Scope: any turn with `tools`** on the `claude` and `app-server` runtimes. Such a turn is answered
+inside a private JSON wrapper (`{status, text, toolCalls}`) the runtime is asked to produce, and the
+proxy reads that wrapper **once, whole** — `JSON.parse` in `parseBackendOutput`, with the backstops
+that refuse a wrapper the schema would not have allowed (a status outside the schema, a call naming
+a tool the request never declared, a `required` turn with no call). The stream releases nothing for
+a tool turn — not even the surface's opening frames — until that reading exists; what a streaming
+client then receives is a projection of it, and a refused turn is an HTTP 502 on the stream as on
+the buffered body. Plain text turns and the `codex-backend` transport stream live.
 
-**Instrument.** `test/wrapper-agreement-suite.test.mjs` drives every row's reproduction input, one character per delta, through both wrapper backends and all three surfaces, buffered and streamed, and pins the disagreement each pair of readings shows today (`released-before-error`, `text`, `calls`, `status`). A row is closed only when its pin flips to agreement there; the pinned rows are the redesign's stage 0 in `docs/design-task-wrapper-release.md`. The suite runs every input in both arms of `holdToolTurnsUntilComplete` (`settings.json`; **on by default since stage 3**, `false` is the rollback): held, a tool turn streams nothing until its completed reading exists, and every pinned row then reads as agreement on both backends and all three surfaces, with a refused turn an HTTP 502 on the stream as on the body. The one disagreement the key does not close is row 8 on `/v1/messages`, which is between the two writers' projections of one unparseable forced call and is row 8's own fix to make. Measured live 2026-09-04 (`review-artifacts/stage2/report.md`): on the `claude` runtime the incremental reader is never fed on a real wrapper turn — the CLI streams the wrapper as a `tool_use` block's `input_json_delta` and returns it in `structured_output`, and the backend forwards text deltas only — so the rows below reach a Claude client only when the model answers in text instead of through the schema tool (0 of 12 `auto` turns). On the `app-server` runtime the wrapper streams as `agentMessage` deltas and the rows are live; holding costs ~0.3 s per turn there.
+Until 2026-09-04 there was a second reader: an incremental walk that released bytes before the
+wrapper was complete. On malformed output it disagreed with the completed reading — a streaming
+client could execute a call the buffered body denied, receive different narration, or different
+arguments — and four review rounds of patching it one axis at a time each produced the next round's
+defects. It was deleted by design, in the stages `docs/design-task-wrapper-release.md` records;
+the twelve inputs on which it disagreed (a member after the root closed, a root that never closes,
+duplicate keys at the wrapper level and inside a call, a BOM or U+00A0 or U+000B where JSON allows
+no such byte, an undeclared name after a declared call or after narration, non-object `toolCalls`
+members, arguments that are not JSON, an invalid escape) are now agreements. Measured cost of
+waiting: none on `claude`, whose wrapper already arrived whole in `structured_output` and never fed
+the incremental reader at all; about 0.3 s later call announcement per turn on `app-server`.
 
-A turn with `tools` is answered inside a private JSON wrapper (`{status, text, toolCalls}`). The
-**buffered** reader is `JSON.parse`. The **streamed** reader is a hand-written incremental walk that
-must decide what to release before the wrapper is complete — and a released byte cannot be retracted.
+**Instrument.** `test/wrapper-agreement-suite.test.mjs` drives every one of those inputs, one
+character per delta, through both wrapper backends and all three surfaces, buffered and streamed,
+and asserts the two readings agree AND what was delivered — a call set, a text, or a refusal with
+nothing released and the same HTTP status on both paths. The one input still pinned to a
+disagreement is row 8 below; flipping that pin is the only way the file's verdicts may change.
 
-### 7a. Needs the redesign — released before the artefact is complete
+### Still open
 
-The one problem: the incremental reader must release bytes before the wrapper is complete, a
-released byte cannot be retracted, and the completed reader (`JSON.parse`) may then reach a
-different value. Every row here is a face of that. The **readers** column says whether the two
-readers disagree (D) or agree on a wrong value (A) — an earlier version titled the sections by that
-instead of by what decides them, which is why a two-reader defect sat under "both readers agree".
-
-| # | readers | axis | what a client sees |
+| # | defect | what a client sees | what decides it |
 |---|---|---|---|
-| 1 | D | the root's **end** is never found, so bytes after the wrapper are read as its members | under `tool_choice:"required"` the stream delivers a complete executable call, then the frame refusing it |
-| 2 | D | the root may never **close** at all | the stream publishes the call and the wrapper's readable `text` member (in wrapper key order); the buffered body returns the **entire malformed fragment** as prose with no call. Under `auto` the stream then terminates with an ordinary `finish_reason:"stop"` and no error; under `required` it ends with the call already on the wire and an error frame after it |
-| 3 | D | duplicate keys: this walk is first-wins, `JSON.parse` is last-wins — at the wrapper level **and inside a call** (`name`, `id`, `arguments`) | with duplicate `toolCalls` the two clients **execute different functions with different arguments**; with duplicate `text` they receive different answers; with a duplicate `name` inside a call the one declared-name rule is fed two different raw values, so the stream may publish a call the body refuses |
-| 4 | D | bytes **after the release point** that `JSON.parse` would reject — a non-JSON space between `]` and the root `}`, trailing garbage | the stream has published a complete executable call; the body answers 502. (Bytes *before* the release point — inside a call object, between members, an invalid escape, a raw control character, a missing comma — are consumed by the reader before it releases anything, so a strict lexer decides them without redesign: see 7b row 9) |
-| 5 | D | anything released **before an undeclared name closes** | the declared-name check is right as a decision and cannot be a release gate: with two calls, the first declared and the second not, the stream has published the first — name, id, full arguments — when the second refuses the turn; under `auto` with `text` before `toolCalls`, the whole narration is on the wire before the name arrives. Under `required`, or with `text` after `toolCalls`, nothing is released — which is the only shape the tests drive |
-| 6 | D | `toolCalls` members that are **not objects** — `null`, a scalar, a string, a nested array | the reader walks `{}` depth only, so it steps over the non-object and reads a nested array's inner object as a call; the body's `JSON.parse` keeps every member and refuses the turn (with the wrong message — the violation is `items:{type:"object"}`, not the name enum). A trailing non-object is row 5's axis; a **leading** one is decidable before release (7b row 9) |
-| 7 | D | argument normalization on the wrapper path: buffered wraps invalid text as `{"input":…}`, the stream forwards it raw | the two clients receive different tool input; only the buffered one can execute the call. The forced-tool path has a predicate for this (the opening-character rule); applying it here as-is makes both readers agree on the unparseable value row 8 describes, so it is a design choice, not a patch |
+| 8 | a forced single tool bypasses the wrapper entirely, and `normalizeToolArgumentsText` passes any `{`/`[`-opening payload through unvalidated | a truncated `{"city":"Seo` is published as `function.arguments` on Chat and Responses — the same unusable fragment on both paths. On `/v1/messages` the two **writers** disagree: the buffered body wraps the fragment as `{"input":…}` (interface contract, tool arguments that are not JSON) while the stream sends it verbatim as `input_json_delta` | the runtime was handed the tool's own input schema, so this is the backstop's job: refuse at completion — `JSON.parse` at minimum, the schema if a validator is taken. Safe now that nothing streams before completion; its own switch and revert |
+| 10 | with a JSON format present, a wrapper-shaped object with no usable `status` is exempted from refusal | `{"status":"done","text":"…","toolCalls":[]}` is published verbatim, on both paths — the proxy's internal grammar as the client's answer | `json_schema`: validate the candidate against the retained client schema and refuse on failure (needs a validator dependency; owner decision). `json_object`: **declared unenforced** — "is an object" is satisfied and nothing in the bytes separates wrapper from answer |
+| 13 | the model echoes the wrapper grammar inside the wrapper: `"text": "{\"status\":\"message\",\"text\":\"Red\",…}"` | the client receives the proxy's grammar as the assistant's words — 1 of 12 `auto` turns on `claude` (`review-artifacts/stage2/report.md`) | a behaviour of the model against the schema instruction, not a reader defect; measure its rate before deciding whether the wrapper needs a different shape |
 
-### 7b. A predicate decides — separable, not yet fixed
+### Request-boundary gaps found alongside — not the wrapper's problem
 
-| # | readers | defect | what a client sees | what decides it |
-|---|---|---|---|---|
-| 8 | A / D on `/v1/messages` | a forced single tool bypasses the wrapper entirely, and `normalizeToolArgumentsText` passes any `{`/`[`-opening payload through unvalidated | a truncated `{"city":"Seo` is published as `function.arguments` and fails `JSON.parse` on both paths. On `/v1/messages` the readers already disagree: the buffered body wraps the fragment as `{"input":…}` (interface contract, tool arguments that are not JSON) while the stream sends it verbatim as `input_json_delta` — row 7's normalization gap on the forced path | the runtime was handed the tool's own input schema, so this is the backstop's job: reject at completion. **Precondition, or this becomes a 7a row:** `KnownToolArgumentsDeltaExtractor` streams `{`/`[` arguments live, so rejecting at completion would put an error frame after arguments already on the wire. The forced path must also withhold those arguments until completion — giving up live argument streaming — before this fix is safe |
-| 9 | D | bytes **consumed before release** that `JSON.parse` would reject (the prefix half of 7a row 4, and a leading non-object member of row 6) | the stream reads a wrapper and publishes a call; the body answers 502 | a strict lexer at the point of consumption: between members only JSON whitespace, `,` and `}`; inside `toolCalls` only JSON whitespace, `,`, `{` and `]`; in a string an invalid escape or a raw byte below 0x20 is "not a JSON string". Round 15's whitespace change fixed one of these positions and claimed the class closed; this row is the honest scope |
-| 10 | A | with a JSON format present, a wrapper-shaped object with no usable `status` is exempted from refusal | `{"status":"done","text":"…","toolCalls":[]}` is published verbatim — the proxy's internal grammar as the client's JSON answer | split by format. Under `json_object` the only predicate is "is an object", which this satisfies — that subset needs design. Under an explicit `json_schema` the request retains the client schema (`NormalizedRequest.jsonSchema`) and a value that fails it is deterministically not the client's answer — decidable by validating against the retained schema; no consumer does so today |
-
-### 7c. Request-boundary gaps found alongside — not the wrapper's problem
-
-Both reproduce on every surface and predate every round. They are decidable at the input
-validator, but the correct envelope is a **parity** question — what the direct API answers must be
-measured live before the mirror is written, per the rule that the table is written after the
-instrument, not before.
+Both reproduce on every surface. They are decidable at the input validator, but the correct
+envelope is a **parity** question — what the direct API answers must be measured live before the
+mirror is written, per the rule that the table is written after the instrument, not before.
 
 | # | defect | what a client sees | what decides it |
 |---|---|---|---|
 | 11 | a tool definition with a blank name is accepted, and Anthropic accepts one with **no** name at all | all three surfaces publish a call literally named `tool` — `readString(…, 'tool')` in each declaration reader manufactures the identity the runtime enum and both readers then trust | require a present, non-blank name at each boundary; measure each direct API's 400 envelope for the omitted and blank cases first |
 | 12 | a forced `tool_choice` naming a tool the request never declared creates a call for it | with only `real` declared and `never_declared` forced, every surface publishes `never_declared` in both modes — `forcedSingleToolCall` falls back to a generic argument schema when the lookup finds nothing, and this path bypasses `declaredToolNames` | require the forced name to match a declared tool before dispatch; measure what each direct API answers to a forced undeclared name first |
-
-### What round 15 fixed, and what it corrected about round 14
-
-Round 15 (2026-09-04, two independent reviewers, blind, offline) reproduced three defects that
-round 14's own fixes had introduced, plus the misclassifications above.
-
-Fixed here:
-- **A call naming a tool the request never declared** is refused on both paths for a single-call
-  wrapper. `declaredToolNames` is the set `toolDecisionSchema` hands the runtime, and
-  `callNameIsDeclared` tests the raw name in both readers — round 16 found round 15's version tested
-  the raw name in one reader and the substituted `tool` in the other, so a nameless call was refused
-  by the body and published by the stream. For a multi-call wrapper the decision is right and the
-  release is not (7a row 5).
-- **The wrapper reader's whitespace class** at the positions `skipWhitespace` is consulted is JSON's
-  four characters, not JavaScript's `\s`. This closed one position — a BOM or NBSP *before* the
-  root. Round 15 called it "a closed lexical test, no redesign needed"; round 16 showed that was
-  false: every byte the reader steps over elsewhere is still accepted unconditionally (7a row 4 / 7b row 9).
-
-Reverted here, because round 14 removed them for a reason that turned out to be the wrong one:
-- **`canStreamTextDeltas`** is `outputSchemaFor(request) === null` again. Round 14 narrowed it to
-  "what the backstop can refuse", which is only one of the two reasons a schema turn's text is not
-  deliverable. The other is that the CLI answers such a turn through `structured_output` and
-  `resultFromTurn` discards `turn.text` — so a `json_schema` turn streamed `Here you go: {…}` while
-  its body published `{…}`. Every structured-output turn on `/v1/messages` was on that path.
-- **The extractor's JSON-mode text gate.** Round 14 deleted it as a leftover of the reverted `json`
-  member. It was also holding an answer turn's text until the completed reader could confirm the
-  same value — which row 3 above says it cannot promise. The latency it costs is real and accepted.
-
-`textMayBeRefused` remains where it is correct: the response-path backstop, and the app-server's
-text branch, which has no second answer channel.
 
 ## Appendix: evidence tally
 

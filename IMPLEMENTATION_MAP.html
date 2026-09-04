@@ -497,8 +497,8 @@
     <h2>Responses 도구 지연 분해</h2>
     <div class="band">
       <p>arguments-only fast path 이후 proxy의 HTTP/SSE 전달 오버헤드는 계속 작습니다. <code>firstToolArgumentMs</code> 1,566ms 중 backend 내부 <code>firstToolArgumentDeltaMs</code>가 1,563ms라서, HTTP forwarding 차이는 약 3ms입니다.</p>
-      <p>단일 required tool 경로는 더 이상 <code>status/text/toolCalls</code> wrapper를 모델이 생성할 때까지 기다리지 않습니다. <code>firstTextDeltaMs</code>, <code>firstToolCallDeltaMs</code>, <code>firstToolArgumentDeltaMs</code>가 모두 1,563ms로 맞춰졌으므로 남은 차이는 JSON wrapper 파싱보다 Codex turn의 첫 delta 지연입니다.</p>
-      <p><strong>도구 턴 보류 (2026-09-04, 기본 on).</strong> wrapper의 두 리더(증분 walk vs 완료 후 <code>JSON.parse</code>)가 갈리는 입력이 conformance matrix §7에 선언돼 있고, <code>test/wrapper-agreement-suite.test.mjs</code>가 그 입력 19개를 두 백엔드·세 표면에서 버퍼/스트림으로 양쪽 팔 모두 읽습니다. 기본값(<code>holdToolTurnsUntilComplete</code> on)에서 도구 턴은 증분 리더 없이 완료 결과까지 아무것도 내보내지 않고, 거절은 스트림에서도 진짜 502가 되며, 핀 전부가 합의로 읽힙니다(<code>/v1/messages</code>의 8행 하나만 8행 자체의 502 수정 몫). 실측 비용: claude 0(실제 래퍼 턴은 <code>structured_output</code>으로 통째로 도착해 증분 리더가 먹이를 받은 적이 없음), app-server 턴당 약 0.3초. <code>false</code>는 증분 리더로의 롤백이고 위 지연 수치는 그 경로 기준입니다 — <code>docs/design-task-wrapper-release.md</code> 3단계.</p>
+      <p>단일 required tool 경로는 wrapper 없이 arguments-only 스키마로 돌지만, 2026-09-04부터 도구 턴은 어느 경로든 완료 결과가 읽힌 뒤에야 첫 프레임을 내보냅니다. 위 표의 backend 내부 delta 시점은 그 이전 계기(<code>firstToolCallDeltaMs</code>·<code>firstToolArgumentDeltaMs</code>, 삭제됨)로 잰 값이고, 남은 지연 분해는 <code>firstTextDeltaMs</code>와 <code>totalMs</code>로 봅니다.</p>
+      <p><strong>도구 턴은 완료 결과의 투영 (2026-09-04).</strong> wrapper의 리더는 완료 후 <code>JSON.parse</code> 하나뿐입니다. 증분 리더(<code>ToolCallDeltaExtractor</code>·<code>KnownToolArgumentsDeltaExtractor</code>)와 그 롤백 키 <code>holdToolTurnsUntilComplete</code>는 설계 0–4단계(<code>docs/design-task-wrapper-release.md</code>)를 거쳐 삭제됐습니다. <code>test/wrapper-agreement-suite.test.mjs</code>가 conformance matrix §7의 입력 19개를 두 백엔드·세 표면에서 버퍼/스트림으로 읽어 전부 합의함을 단언하고(<code>/v1/messages</code> 8행 하나만 8행 자체의 502 수정 몫), 거절은 스트림에서도 진짜 502입니다. 실측 비용: claude 0(실제 래퍼 턴은 <code>structured_output</code>으로 통째로 도착), app-server 턴당 약 0.3초.</p>
     </div>
     <div class="table-wrap">
       <table class="diagnostic-table sortable-table">
@@ -512,8 +512,6 @@
         <tbody>
           <tr><td>proxy HTTP firstDataMs</td><td>1</td><td>초기 SSE 메타 이벤트는 즉시 나갑니다.</td></tr>
           <tr><td>Codex firstTextDeltaMs</td><td>1,563</td><td>arguments-only JSON object의 첫 텍스트 delta가 나온 시점입니다.</td></tr>
-          <tr><td>Codex firstToolCallDeltaMs</td><td>1,563</td><td>forced single tool이라 첫 argument delta와 동시에 tool call delta를 만들 수 있습니다.</td></tr>
-          <tr><td>Codex firstToolArgumentDeltaMs</td><td>1,563</td><td>모델이 tool argument object를 내기 시작한 즉시 내부 delta로 전환됩니다.</td></tr>
           <tr><td>proxy HTTP firstToolArgumentMs</td><td>1,566</td><td>backend delta 이후 HTTP 전달 오버헤드는 약 3ms입니다.</td></tr>
           <tr><td>direct firstToolArgumentMs</td><td>923</td><td>provider native Responses tool stream 기준입니다.</td></tr>
           <tr><td>proxy stream totalMs</td><td>2,111</td><td>direct stream totalMs 1,246ms 대비 169.4%입니다.</td></tr>

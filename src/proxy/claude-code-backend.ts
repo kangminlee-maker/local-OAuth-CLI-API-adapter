@@ -1,22 +1,19 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import type { Readable } from 'node:stream';
-import { holdToolTurnsUntilComplete, honorRequestModel } from '../settings.js';
+import { honorRequestModel } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
 import {
   buildPrompt,
   claudeSystemPrompt,
-  forcedSingleToolCall,
   hasToolDecisionSchema,
-  declaredToolNames,
   textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
-  toolChoiceRequiresCall,
   usageFor,
 } from './backend-contract.js';
 import { claudeMessageContentFor, hasImageInputs } from './multimodal.js';
-import { rawTopLevelValue } from './tool-call-stream.js';
+import { rawTopLevelValue } from './tool-wrapper.js';
 import { proxyChildProcessEnv } from './process-env.js';
 import type {
   LocalCliBackend,
@@ -26,7 +23,6 @@ import type {
   NormalizedRequest,
 } from './types.js';
 import { MAX_ERROR_MESSAGE_CHARS, unsupportedModelError } from './types.js';
-import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface ClaudeCodeBackendOptions {
   readonly command?: string;
@@ -35,7 +31,6 @@ interface ClaudeCodeBackendOptions {
   readonly timeoutMs: number;
   readonly extraArgs?: readonly string[];
   readonly honorRequestModel?: boolean;
-  readonly holdToolTurnsUntilComplete?: boolean;
   // Off by default: the CLI's `user` setting source carries the operator's
   // global CLAUDE.md bundle into every proxied session, which taxes latency
   // and lets personal instructions color provider-like API responses. Opting
@@ -83,7 +78,6 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   private readonly cwd: string;
   private readonly configuredModel?: string;
   private readonly honorRequestModel: boolean;
-  private readonly holdToolTurnsUntilComplete: boolean;
   private readonly timeoutMs: number;
   private readonly extraArgs: readonly string[];
   private readonly isolateUserSettings: boolean;
@@ -128,7 +122,6 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     this.model = options.model ?? 'claude-code-cli';
     this.configuredModel = options.model;
     this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
-    this.holdToolTurnsUntilComplete = options.holdToolTurnsUntilComplete ?? holdToolTurnsUntilComplete();
     this.timeoutMs = options.timeoutMs;
     this.extraArgs = options.extraArgs ?? [];
     // Defaults to isolated: see the note in proxy-cli.ts. A backend constructed
@@ -224,32 +217,15 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     signal?: AbortSignal,
   ): AsyncIterable<LocalStreamEvent> {
     const queue = new AsyncQueue<LocalStreamEvent>();
-    // A held tool turn has no incremental reader at all: nothing is released
-    // until `completed` carries the one reading the buffered path also makes.
-    const held = this.holdToolTurnsUntilComplete && hasToolDecisionSchema(request);
-    const forcedTool = held ? null : forcedSingleToolCall(request);
-    const toolExtractor = held
-      ? null
-      : forcedTool
-      ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
-      : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor({
-          requiresCall: toolChoiceRequiresCall(request),
-          jsonMode: request.jsonMode,
-          declaredNames: declaredToolNames(request),
-        })
-      : null;
-    const shouldStreamText = !held && !toolExtractor && this.canStreamTextDeltas(request);
+    // A tool turn has no incremental reader: nothing is released until
+    // `completed` carries the one reading the buffered path also makes. Two
+    // readers of one wrapper disagreed on malformed output, and a released byte
+    // cannot be retracted (conformance matrix §7).
+    const shouldStreamText = this.canStreamTextDeltas(request);
     const run = this.runRequest(
       request,
       signal,
-      toolExtractor
-        ? (delta) => {
-            for (const event of toolExtractor.push(delta)) queue.push(event);
-          }
-        : shouldStreamText
-        ? (delta) => queue.push({ type: 'text_delta', delta })
-        : undefined,
+      shouldStreamText ? (delta) => queue.push({ type: 'text_delta', delta }) : undefined,
     )
       .then((result) => queue.push({ type: 'completed', result }))
       .catch((err: Error) => queue.fail(err))

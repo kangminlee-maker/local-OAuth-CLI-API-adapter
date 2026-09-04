@@ -123,43 +123,6 @@ test('CodexAppServerBackend streams buffered text deltas', async () => {
   }
 });
 
-test('CodexAppServerBackend records app-server tool stream timing checkpoints', async () => {
-  process.env.CODEX_HOME = await createCodexHome();
-  const timings = [];
-  // The checkpoints are the incremental reader's — the rollback path
-  // (`holdToolTurnsUntilComplete: false`); this test goes with it when it is
-  // deleted.
-  const backend = new CodexAppServerBackend({
-    command: fakeCodex,
-    cwd: process.cwd(),
-    timeoutMs: 30_000,
-    onTiming: (timing) => timings.push(timing),
-    holdToolTurnsUntilComplete: false,
-  });
-
-  try {
-    const events = [];
-    for await (const event of backend.stream(toolStreamRequest())) {
-      events.push(event);
-    }
-
-    const toolDeltas = events.filter((event) => event.type === 'tool_call_delta');
-    assert.equal(toolDeltas.length, 3);
-    assert.equal(toolDeltas[0].name, 'get_weather');
-    assert.equal(toolDeltas[1].argumentsDelta, '{"city"');
-    assert.equal(toolDeltas[2].argumentsDelta, ':"Seoul"}');
-    assert.equal(events.at(-1).type, 'completed');
-    assert.equal(events.at(-1).result.toolCalls[0].arguments, '{"city":"Seoul"}');
-    assert.equal(timings.length, 1);
-    assert.equal(Number.isFinite(timings[0].firstTextDeltaMs), true);
-    assert.equal(Number.isFinite(timings[0].firstToolCallDeltaMs), true);
-    assert.equal(Number.isFinite(timings[0].firstToolArgumentDeltaMs), true);
-    assert.equal(timings[0].firstTextDeltaMs <= timings[0].firstToolArgumentDeltaMs, true);
-  } finally {
-    await backend.close();
-  }
-});
-
 // The app-server half of the removed `.trim()`. `test/tool-stream-surface-parity`
 // pins the codex TRANSPORT half; this backend resolves its completed turn in
 // `resolveTurnWaiter`, and re-adding the trim there is invisible to every other
@@ -699,26 +662,6 @@ function earlyDeltaRequest() {
   return {
     ...textRequest(),
     messages: [{ role: 'user', content: 'EARLY_DELTA' }],
-  };
-}
-
-function toolStreamRequest() {
-  return {
-    ...textRequest(),
-    shape: 'openai-responses',
-    messages: [{ role: 'user', content: 'TOOL_STREAM_DIAGNOSTIC' }],
-    stream: true,
-    tools: [{
-      name: 'get_weather',
-      description: 'Get weather.',
-      inputSchema: {
-        type: 'object',
-        properties: { city: { type: 'string' } },
-        required: ['city'],
-      },
-      raw: {},
-    }],
-    toolChoice: { type: 'required' },
   };
 }
 

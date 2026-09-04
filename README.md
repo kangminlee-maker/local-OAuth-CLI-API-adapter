@@ -169,23 +169,19 @@ model that actually runs image turns is `codexProxy.imageModel`.
 ## Tool Turns and Streaming
 
 A turn with `tools` on the `claude` and `app-server` runtimes is answered
-through a private JSON wrapper that the proxy reads twice — once incrementally
-for a stream, once whole for a buffered body — and the two readings can
-disagree on malformed output (conformance matrix §7). `holdToolTurnsUntilComplete`
-in `settings.json` selects which reader the stream trusts:
+through a private JSON wrapper the runtime is asked to produce, and the proxy
+reads that wrapper once, whole. The stream releases nothing for such a turn —
+not even the surface's opening frames — until the runtime has finished and the
+completed answer has been read; what the client then receives is that one
+reading, and a refused turn is an HTTP 502 on the stream as on the buffered
+body. Plain text turns and the `codex-backend` transport stream live.
 
-- absent or `true` (default): a tool turn streams nothing until the runtime has
-  finished and the completed answer has been read; the stream then carries that
-  one reading, and a refused turn is an HTTP 502 on the stream as on the
-  buffered body. Plain text turns and the `codex-backend` transport still
-  stream live. Measured cost: none on `claude` (its wrapper already arrived
-  whole), about 0.3 s per turn on `app-server`.
-- `false`: the rollback to the incremental reader, which releases narration and
-  tool-call deltas as the runtime produces them, with the disagreements the
-  matrix lists.
-
-The key is temporary — stage 3 of `docs/design-task-wrapper-release.md` — and
-goes away with the incremental reader once a release has run with the default.
+Measured cost: none on `claude`, whose wrapper already arrived whole in
+`structured_output`; about 0.3 s later call announcement per turn on
+`app-server`. Why the turn waits: an incremental reader used to release bytes
+before the wrapper was complete, and on malformed output it disagreed with the
+completed reading — a streaming client could execute a call the buffered body
+denied (conformance matrix §7).
 
 ## Important Differences From Full Provider APIs
 

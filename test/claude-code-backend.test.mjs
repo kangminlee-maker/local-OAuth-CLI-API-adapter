@@ -110,33 +110,6 @@ test('ClaudeCodeBackend sends an OpenAI json_schema through the native channel',
   }
 });
 
-test('ClaudeCodeBackend extracts live tool argument deltas from structured output', async () => {
-  // The incremental reader is the rollback path (`holdToolTurnsUntilComplete:
-  // false`); this test goes with it when it is deleted.
-  const backend = new ClaudeCodeBackend({
-    command: fakeClaude,
-    cwd: process.cwd(),
-    timeoutMs: 30_000,
-    holdToolTurnsUntilComplete: false,
-  });
-  try {
-    const events = [];
-    for await (const event of backend.stream(toolRequest())) {
-      events.push(event);
-    }
-
-    const deltas = events
-      .filter((event) => event.type === 'tool_call_delta')
-      .map((event) => event.argumentsDelta ?? '')
-      .join('');
-    assert.equal(deltas, '{"city":"Seoul"}');
-    const completed = events.find((event) => event.type === 'completed');
-    assert.equal(completed.result.toolCalls[0].arguments, '{"city":"Seoul"}');
-  } finally {
-    await backend.close();
-  }
-});
-
 test('ClaudeCodeBackend does not pass direct provider env to child CLI', async () => {
   const snapshot = snapshotProviderEnv();
   setProviderEnv();

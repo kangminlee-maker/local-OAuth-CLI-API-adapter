@@ -11,29 +11,24 @@ import { CodexAppServerBackend } from '../dist/proxy/codex-app-server-backend.js
 /**
  * One turn, read both ways, on every surface, through both wrapper backends.
  *
- * The tool wrapper has two readers — `JSON.parse` over the completed artefact
- * for a buffered response, and an incremental walk that must release bytes
- * before the artefact is complete for a streamed one. Conformance matrix §7
- * lists the inputs on which they disagree. This suite drives each of those
- * inputs, one character per delta, through the REAL `ClaudeCodeBackend` and
- * `CodexAppServerBackend` and the REAL HTTP layer, and reduces each pair of
- * readings to one verdict: the list of ways the two clients were told
- * different things.
+ * The tool wrapper has ONE reader: `JSON.parse` over the completed artefact,
+ * in `parseBackendOutput`. The stream is a projection of that reading — a tool
+ * turn releases nothing until it exists — so the two ways a client can read a
+ * turn must agree on every input, including the malformed ones on which a
+ * second, incremental reader used to disagree (conformance matrix §7; the
+ * inputs below are that section's reproductions, one character per delta).
  *
- * Every case declares what that list reads TODAY. An input the readers agree
- * on asserts the empty list AND what was delivered, so the instrument cannot
- * pass by delivering nothing. An input they disagree on asserts the exact
- * disagreement observed — a pin, not a tolerance: the day a change makes the
- * readers agree, the pin fails and is flipped to the empty list. That is the
- * only way this suite is allowed to change, and it is how the redesign in
- * `docs/design-task-wrapper-release.md` proves it closed a row rather than
- * moved it.
+ * Each input asserts the empty verdict AND what was delivered — a call set, a
+ * text, or a refusal with nothing released and the same HTTP status on both
+ * paths — so agreement on nothing proves nothing. The one input still pinned
+ * to a disagreement is row 8 on /v1/messages, which is between the two
+ * WRITERS' projections of one unparseable forced call; row 8's own fix flips
+ * that pin, and that is the only way this file's verdicts may change.
  *
  * Verdict kinds:
  *   status                  one reading is an error and the other an answer
  *   released-before-error   the stream put content or a call on the wire and
- *                           then refused the turn — bytes that cannot be
- *                           retracted, next to a refusal the client cannot act on
+ *                           then refused the turn
  *   text                    both answered; the narration differs
  *   calls                   both answered; the call set (id, name, arguments) differs
  */
@@ -67,67 +62,63 @@ const CANON_GT = { id: 'c2', name: 'get_time', arguments: '{"tz":"Asia/Seoul"}' 
 const AGREE = [];
 
 /**
- * `expect` is the verdict per surface TODAY, for both backends unless
- * `expectByBackend` narrows one. `delivered` is asserted on the buffered
- * reading when the verdict is agreement — the denominator.
+ * `delivered` is what the buffered reading must carry (or `refused: true`),
+ * the denominator of each agreement. `expect` names a surface whose verdict
+ * is still a disagreement — only row 8 has one.
  */
 const CASES = [
   {
     id: 'CONTROL valid wrapper: narration and one call',
     raw: `{"status":"tool_calls","text":"Checking.","toolCalls":[${GW}]}`,
     choice: 'auto',
-    expect: AGREE,
     delivered: { text: 'Checking.', calls: [CANON_GW] },
   },
   {
     id: 'CONTROL plain text with no tools streams live',
     raw: 'hello there',
     choice: 'none',
-    expect: AGREE,
     delivered: { text: 'hello there', calls: [] },
   },
   {
     id: '7a-1 a member after the root closed (r14-claude F3)',
     raw: `{"status":"tool_calls","text":"sorry, I will not call anything"}\ntrailing "toolCalls":[${GW}]`,
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7a-2 the root never closes (r16-codex F3, r17-codex F5)',
     raw: `{"status":"tool_calls","text":"narration","toolCalls":[${GW}]`,
     choice: 'auto',
-    expect: ['text', 'calls'],
+    delivered: { text: `{"status":"tool_calls","text":"narration","toolCalls":[${GW}]`, calls: [] },
   },
   {
     id: '7a-3a duplicate `toolCalls` members (r15-codex F1)',
     raw: `{"status":"tool_calls","text":"","toolCalls":[${GW}],"toolCalls":[${GT}]}`,
     choice: 'required',
-    expect: ['calls'],
+    delivered: { text: '', calls: [CANON_GT] },
   },
   {
     id: '7a-3b duplicate `text` members',
     raw: '{"status":"message","text":"FIRST","toolCalls":[],"text":"SECOND"}',
     choice: 'auto',
-    expect: ['text'],
+    delivered: { text: 'SECOND', calls: [] },
   },
   {
     id: '7a-3c duplicate `name` inside a call, declared first (r17-fable Q1-D)',
     raw: '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","name":"never","arguments":"{}"}]}',
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7a-3d duplicate `name` inside a call, declared last (r17-fable Q1-E)',
     raw: '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"never","name":"get_weather","arguments":"{}"}]}',
     choice: 'required',
-    expect: AGREE,
     delivered: { text: '', calls: [{ id: 'c1', name: 'get_weather', arguments: '{}' }] },
   },
   {
     id: '7a-4a a BOM before the root (r15-codex F3)',
     raw: `\uFEFF{"status":"tool_calls","text":"","toolCalls":[${GW}]}`,
     choice: 'required',
-    expect: AGREE,
     // Agreement on a REFUSAL: `JSON.parse` rejects the BOM, so the buffered
     // reading finds no call under `required`, and the stream releases nothing
     // before saying the same. The pre-round-15 stream published the call.
@@ -137,37 +128,37 @@ const CASES = [
     id: '7a-4b U+00A0 between `]` and the root `}` (r17-fable R4ii)',
     raw: `{"status":"tool_calls","text":"","toolCalls":[${GW}]\u00A0}`,
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7a-5a a declared call followed by an undeclared one (r16-codex F1)',
     raw: `{"status":"tool_calls","text":"","toolCalls":[${GW},{"id":"c2","name":"never_declared","arguments":"{}"}]}`,
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7a-5b narration before an undeclared call under auto (r17-fable Q1-K)',
     raw: '{"status":"tool_calls","text":"Checking the weather now.","toolCalls":[{"id":"c1","name":"never_declared","arguments":"{}"}]}',
     choice: 'auto',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7a-6a a nested array as a `toolCalls` member (r17-codex F1)',
     raw: `{"status":"tool_calls","text":"","toolCalls":[[${GW}]]}`,
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7a-6b `null` then a call as `toolCalls` members (r17-fable F2)',
     raw: `{"status":"tool_calls","text":"","toolCalls":[null,${GW}]}`,
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7a-7 arguments that are not JSON (r17-codex F3, r14-codex F6)',
     raw: '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"Seoul"}]}',
     choice: 'required',
-    expect: ['calls'],
+    delivered: { text: '', calls: [{ id: 'c1', name: 'get_weather', arguments: '{"input":"Seoul"}' }] },
   },
   {
     id: '7b-8 a forced tool answered with truncated arguments (r15-codex F5)',
@@ -178,33 +169,29 @@ const CASES = [
     // reading wraps text that is not JSON as `{"input":…}` (interface contract
     // line 380) while the stream sends the fragment as `input_json_delta` — the
     // row-7 normalization gap, on the forced path. Matrix §7b row 8.
-    expect: AGREE,
-    expectBySurface: { messages: ['calls'] },
-    // Held, the disagreement on /v1/messages remains: it is between the two
-    // WRITERS' projections of one completed call whose arguments do not parse,
-    // not between two readers. Row 8's own fix — refuse the forced turn at
-    // completion — is what flips this pin; the switch made that fix safe.
-    expectHeld: { messages: ['calls'] },
+    // The one remaining disagreement: between the two WRITERS' projections of
+    // one completed call whose arguments do not parse, not between two
+    // readers. Row 8's own fix — refuse the forced turn at completion — flips it.
+    expect: { messages: ['calls'] },
     delivered: { text: '', calls: [{ id: null, name: 'get_weather', arguments: '{"city":"Seo' }] },
   },
   {
     id: '7b-9a U+000B as a member separator (r16-codex F2)',
     raw: `{"status":"tool_calls",\u000B"text":"","toolCalls":[${GW}]}`,
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: "7b-9b an invalid `\\'` escape inside arguments (r17-fable R4i)",
     raw: `{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{\\'a\\':1}"}]}`,
     choice: 'required',
-    expect: ['released-before-error'],
+    delivered: { refused: true },
   },
   {
     id: '7b-10 the wrapper grammar as a JSON-format answer (r14-claude F5, r16-codex F5)',
     raw: '{"status":"done","text":"Seoul is sunny.","toolCalls":[]}',
     choice: 'auto',
     format: 'json_object',
-    expect: AGREE,
     delivered: { text: '{"status":"done","text":"Seoul is sunny.","toolCalls":[]}', calls: [] },
   },
 ];
@@ -422,13 +409,11 @@ function disagreements({ buffered, streamed }) {
 // ---------------------------------------------------------------------------
 
 const BACKENDS = {
-  claude: async (raw, hold) => {
+  claude: async (raw) => {
     process.env.WRAPPER_RAW = raw;
-    return new ClaudeCodeBackend({
-      command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000, holdToolTurnsUntilComplete: hold,
-    });
+    return new ClaudeCodeBackend({ command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
   },
-  'app-server': async (raw, hold) => {
+  'app-server': async (raw) => {
     const dir = await mkdtemp(join(tmpdir(), 'codex-agreement-home-'));
     tempDirs.push(dir);
     await writeFile(join(dir, 'auth.json'), '{"token":"local"}\n');
@@ -436,18 +421,16 @@ const BACKENDS = {
     process.env.CODEX_HOME = dir;
     process.env.FAKE_CODEX_RAW_TEXT = raw;
     process.env.FAKE_CODEX_RAW_TEXT_DELTAS = 'chars';
-    return new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, holdToolTurnsUntilComplete: hold });
+    return new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000 });
   },
 };
 
 const PRINT = process.env.WRAPPER_AGREEMENT_PRINT === '1';
 
-/** One arm: every surface read both ways through one backend, held or not. */
-async function readArm(kase, makeBackend, hold) {
-  const backend = await makeBackend(kase.raw, hold);
-  const server = await startLocalApiProxy({
-    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000, holdToolTurnsUntilComplete: hold,
-  });
+/** Every surface, read both ways, through one backend. */
+async function readAll(kase, makeBackend) {
+  const backend = await makeBackend(kase.raw);
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
   try {
     const readings = {};
     for (const surfaceName of Object.keys(SURFACES)) {
@@ -462,74 +445,42 @@ async function readArm(kase, makeBackend, hold) {
   }
 }
 
-function printArm(kase, backendName, arm, readings) {
-  for (const [surfaceName, both] of Object.entries(readings)) {
-    const { buffered, streamed } = both;
-    console.log(`${kase.id} | ${backendName} | ${arm} | ${surfaceName} | ${disagreements(both).join(',') || 'AGREE'} | b=${buffered.httpStatus}:${JSON.stringify(buffered.text).slice(0, 30)}/${buffered.calls.length} s=${streamed.httpStatus}:${JSON.stringify(streamed.text).slice(0, 30)}/${streamed.calls.length} rel=${streamed.releasedBeforeError}`);
-  }
-}
-
 for (const kase of CASES) {
   for (const [backendName, makeBackend] of Object.entries(BACKENDS)) {
     test(`${kase.id} — ${backendName}`, async () => {
-      // Arm 1 — the incremental readers (`holdToolTurnsUntilComplete: false`,
-      // the rollback path): the pins.
-      const today = await readArm(kase, makeBackend, false);
-      // Arm 2 — the turn held until its completed reading (the default).
-      const held = await readArm(kase, makeBackend, true);
+      const readings = await readAll(kase, makeBackend);
       if (PRINT) {
-        printArm(kase, backendName, 'off', today);
-        printArm(kase, backendName, 'on', held);
+        for (const [surfaceName, both] of Object.entries(readings)) {
+          const { buffered, streamed } = both;
+          console.log(`${kase.id} | ${backendName} | ${surfaceName} | ${disagreements(both).join(',') || 'AGREE'} | b=${buffered.httpStatus}:${JSON.stringify(buffered.text).slice(0, 30)}/${buffered.calls.length} s=${streamed.httpStatus}:${JSON.stringify(streamed.text).slice(0, 30)}/${streamed.calls.length} rel=${streamed.releasedBeforeError}`);
+        }
         return;
       }
-
-      const expectFor = (surfaceName) => kase.expectByBackend?.[backendName]?.[surfaceName]
-        ?? kase.expectBySurface?.[surfaceName]
-        ?? kase.expect;
-      for (const [surfaceName, both] of Object.entries(today)) {
-        const kinds = disagreements(both);
-        const expected = expectFor(surfaceName);
+      for (const [surfaceName, both] of Object.entries(readings)) {
+        const expected = kase.expect?.[surfaceName] ?? AGREE;
         assert.deepEqual(
-          kinds,
+          disagreements(both),
           expected,
-          `off/${surfaceName}: the readers ${expected.length === 0 ? 'disagree' : 'no longer disagree as pinned'} — ${JSON.stringify(both)}`,
+          `${surfaceName}: ${expected.length === 0 ? 'the two readings disagree' : 'no longer disagrees as pinned'} — ${JSON.stringify(both)}`,
         );
-        if (expected.length === 0 && kase.delivered?.refused) {
+        if (expected.length > 0) continue;
+        const { buffered, streamed } = both;
+        assert.equal(streamed.httpStatus, buffered.httpStatus, `${surfaceName}: the stream's HTTP status is not the buffered path's`);
+        if (kase.delivered?.refused) {
           // Agreement on a refusal is only agreement if the stream refused
           // BEFORE releasing anything — the verdict already checked that; the
           // denominator here is that the turn was in fact refused.
-          assert.equal(both.buffered.status, 'error', `off/${surfaceName}: expected a refusal, got ${JSON.stringify(both.buffered)}`);
-          assert.equal(both.streamed.releasedBeforeError, 0, `off/${surfaceName}: the stream released before refusing`);
-        } else if (expected.length === 0 && kase.delivered) {
+          assert.equal(buffered.status, 'error', `${surfaceName}: expected a refusal, got ${JSON.stringify(buffered)}`);
+          assert.equal(streamed.releasedBeforeError, 0, `${surfaceName}: the stream released before refusing`);
+        } else {
           // The denominator: agreement on nothing delivered proves nothing.
-          assert.equal(both.buffered.status, 'ok', `off/${surfaceName}: ${both.buffered.error}`);
-          assert.equal(both.buffered.text, kase.delivered.text, `off/${surfaceName}: buffered text`);
+          assert.equal(buffered.status, 'ok', `${surfaceName}: ${buffered.error}`);
+          assert.equal(buffered.text, kase.delivered.text, `${surfaceName}: buffered text`);
           assert.deepEqual(
-            both.buffered.calls.map((call) => ({ ...call, id: kase.delivered.calls[0]?.id === null ? null : call.id })),
+            buffered.calls.map((call) => ({ ...call, id: kase.delivered.calls[0]?.id === null ? null : call.id })),
             kase.delivered.calls,
-            `off/${surfaceName}: buffered calls`,
+            `${surfaceName}: buffered calls`,
           );
-        }
-      }
-
-      // Held, every pin flips to agreement — and the buffered reading is the
-      // SAME reading as with the key off, so the switch changed the stream
-      // only. A refusal is then a real HTTP status on both paths, not a 200
-      // carrying an error frame.
-      for (const [surfaceName, both] of Object.entries(held)) {
-        const expectedHeld = kase.expectHeld?.[surfaceName] ?? AGREE;
-        assert.deepEqual(
-          disagreements(both),
-          expectedHeld,
-          `on/${surfaceName}: ${expectedHeld.length === 0 ? 'the readers still disagree' : 'no longer disagrees as pinned'} — ${JSON.stringify(both)}`,
-        );
-        const { error: _todayError, ...todayBuffered } = today[surfaceName].buffered;
-        const { error: _heldError, ...heldBuffered } = both.buffered;
-        assert.deepEqual(heldBuffered, todayBuffered, `on/${surfaceName}: the key changed the buffered reading`);
-        assert.equal(both.streamed.httpStatus, both.buffered.httpStatus, `on/${surfaceName}: the stream's HTTP status is not the buffered path's`);
-        if (both.buffered.status === 'ok') {
-          const nonEmpty = both.buffered.text !== '' || both.buffered.calls.length > 0;
-          assert.ok(nonEmpty, `on/${surfaceName}: a held answer delivered nothing`);
         }
       }
     });

@@ -15,19 +15,6 @@ export interface AddonSettings {
   readonly modelSelection: {
     readonly honorRequestModel: boolean;
   };
-  /**
-   * On (absent, or true): a turn with `tools` streams nothing — not even the
-   * surface's opening frames — until the runtime has finished and the response
-   * path has read the completed answer; the stream is then a projection of that
-   * one reading. `false` is the rollback to the incremental wrapper reader,
-   * which releases bytes as they arrive and can disagree with the completed
-   * reading (conformance matrix §7a).
-   *
-   * Temporary. This is stage 3 of `docs/design-task-wrapper-release.md`: the
-   * key and the incremental reader are deleted once one release has run with
-   * it on and nothing has needed the old path back.
-   */
-  readonly holdToolTurnsUntilComplete: boolean;
 }
 
 const SETTINGS_URL = new URL('../settings.json', import.meta.url);
@@ -83,17 +70,8 @@ export function loadSettings(): AddonSettings {
         false,
       ),
     },
-    holdToolTurnsUntilComplete: readOptionalBooleanSetting(
-      root?.holdToolTurnsUntilComplete,
-      'holdToolTurnsUntilComplete',
-      true,
-    ),
   };
   return cachedSettings;
-}
-
-export function holdToolTurnsUntilComplete(): boolean {
-  return loadSettings().holdToolTurnsUntilComplete;
 }
 
 export function codexProxyTransport(): CodexProxyTransport {

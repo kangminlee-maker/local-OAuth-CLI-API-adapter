@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
-import { ToolCallDeltaExtractor, wrapperCallsPrecedeText } from '../dist/proxy/tool-call-stream.js';
+import { wrapperCallsPrecedeText } from '../dist/proxy/tool-wrapper.js';
 import { parseBackendOutput } from '../dist/proxy/backend-contract.js';
 
 /**
@@ -15,11 +15,12 @@ import { parseBackendOutput } from '../dist/proxy/backend-contract.js';
  * bytes.
  *
  * Giving the wrapper a `json` member let a client's own schema put a
- * `"toolCalls":[…]` or a `"text"` INSIDE it. Two of the three scanners in
- * `tool-call-stream.ts` still walked at any depth, so the streamed reader
- * announced a tool call assembled out of the client's answer — its name, its
- * id, its arguments — and read the turn's block order off the client's data.
- * The buffered reader was right throughout, because it reads a parsed object.
+ * `"toolCalls":[…]` or a `"text"` INSIDE it. The incremental reader of that
+ * time walked at any depth, so the stream announced a tool call assembled out
+ * of the client's answer — its name, its id, its arguments — and read the
+ * turn's block order off the client's data. The reader that reads a parsed
+ * object was right throughout; it is now the only reader, and the key walk in
+ * `tool-wrapper.ts` is held to the same rule here.
  *
  * Separately, the stream's release gate restated the backstop's conditions
  * instead of sharing them, so a `status:"tool_calls"` with an empty array and
@@ -127,19 +128,6 @@ for (const [label, raw, callsFirst] of [
   });
 }
 
-test('the extractor and the parse agree about a client `toolCalls` at unit level', () => {
-  const request = {
-    model: 'm', shape: 'openai-chat', messages: [], jsonMode: true,
-    jsonSchema: { type: 'object', properties: { toolCalls: { type: 'array' } } },
-    tools: [{ name: 'get_weather', inputSchema: { type: 'object' } }, { name: 'get_time', inputSchema: { type: 'object' } }],
-    toolChoice: { type: 'auto' }, raw: {},
-  };
-  const raw = '{"status":"tool_calls","json":{"toolCalls":[{"id":"CLIENT","name":"get_time","arguments":"{}"}]},"text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{}"}]}';
-  const streamed = new ToolCallDeltaExtractor({ jsonMode: true }).push(raw)
-    .filter((e) => e.type === 'tool_call_delta').map((e) => e.name);
-  assert.deepEqual([...new Set(streamed)], parseBackendOutput(request, raw).toolCalls.map((c) => c.name));
-});
-
 /**
  * The generalizing guard: no data the CLIENT controls may change how the
  * wrapper is read, whatever it is named or wherever it sits.
@@ -149,7 +137,8 @@ test('the extractor and the parse agree about a client `toolCalls` at unit level
  * keys actually reach. Sweeping the wrapper's own key names through it catches
  * the next reader that walks at any depth, without anyone having to think of
  * it again. This class of defect was fixed in one reader per round for three
- * rounds while the others kept their own walk; all four now share one.
+ * rounds while the others kept their own walk; the wrapper now has one reader
+ * and one key walk, and this sweep holds both to it.
  */
 const WRAPPER_KEYS = ['status', 'text', 'toolCalls'];
 const DECOYS = {
@@ -171,14 +160,8 @@ for (const key of WRAPPER_KEYS) {
         toolChoice: { type: 'auto' }, raw: {},
       };
       const parsed = parseBackendOutput(request, raw);
-      const events = new ToolCallDeltaExtractor({}).push(raw);
-      const streamedNames = [...new Set(events.filter((e) => e.type === 'tool_call_delta').map((e) => e.name))];
-      const streamedText = events.filter((e) => e.type === 'text_delta').map((e) => e.delta).join('');
-
-      assert.deepEqual(parsed.toolCalls.map((c) => c.name), ['get_weather'], 'the body read the decoy');
-      assert.deepEqual(streamedNames, ['get_weather'], 'the stream read the decoy');
-      assert.equal(parsed.text, 'REAL');
-      assert.equal(streamedText, 'REAL', 'the stream narrated the decoy');
+      assert.deepEqual(parsed.toolCalls.map((c) => c.name), ['get_weather'], 'the reader took the decoy for a call');
+      assert.equal(parsed.text, 'REAL', 'the reader narrated the decoy');
       assert.equal(wrapperCallsPrecedeText(raw), orderLabel.startsWith('the call'), 'the decoy moved the block order');
     });
   }

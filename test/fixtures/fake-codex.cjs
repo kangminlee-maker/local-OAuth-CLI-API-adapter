@@ -115,90 +115,6 @@ function emitEarlyTurn(threadId, turnId) {
   });
 }
 
-function emitToolTurn(threadId, turnId) {
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: '{"status":"tool_calls","text":"","toolCalls":[{"arguments":"{\\"city\\"',
-    },
-  });
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: ':\\"Seoul\\"}","id":"call_1","name":"get_weather"}]}',
-    },
-  });
-  write({
-    method: 'thread/tokenUsage/updated',
-    params: {
-      threadId,
-      turnId,
-      tokenUsage: {
-        last: {
-          totalTokens: 15,
-          inputTokens: 9,
-          cachedInputTokens: 2,
-          outputTokens: 4,
-          reasoningOutputTokens: 0,
-        },
-      },
-    },
-  });
-  write({
-    method: 'turn/completed',
-    params: {
-      threadId,
-      turn: { id: turnId, status: 'completed' },
-    },
-  });
-}
-
-function emitToolArgumentsOnlyTurn(threadId, turnId) {
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: '{"city"',
-    },
-  });
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: ':"Seoul"}',
-    },
-  });
-  write({
-    method: 'thread/tokenUsage/updated',
-    params: {
-      threadId,
-      turnId,
-      tokenUsage: {
-        last: {
-          totalTokens: 11,
-          inputTokens: 7,
-          cachedInputTokens: 2,
-          outputTokens: 4,
-          reasoningOutputTokens: 0,
-        },
-      },
-    },
-  });
-  write({
-    method: 'turn/completed',
-    params: {
-      threadId,
-      turn: { id: turnId, status: 'completed' },
-    },
-  });
-}
-
 function emitImageTurn(threadId, turnId, options = {}) {
   const revisedPrompt = options.revisedPrompt ?? 'fake revised image prompt';
   write({
@@ -297,16 +213,6 @@ rl.on('line', (line) => {
     if (input.includes('EARLY_DELTA')) {
       emitEarlyTurn(threadId, turnId);
       result(payload.id, { turn: { id: turnId } });
-      return;
-    }
-    if (input.includes('TOOL_STREAM_DIAGNOSTIC')) {
-      result(payload.id, { turn: { id: turnId } });
-      const schema = payload.params?.outputSchema;
-      const argsOnly = schema?.properties?.city;
-      setTimeout(() => {
-        if (argsOnly) emitToolArgumentsOnlyTurn(threadId, turnId);
-        else emitToolTurn(threadId, turnId);
-      }, 0);
       return;
     }
     if (input.includes('PADDED_NARRATION')) {

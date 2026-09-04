@@ -3019,8 +3019,6 @@ function summarizeBackendTimings(samples) {
     'turnWaitMs',
     'usageWaitMs',
     'firstTextDeltaMs',
-    'firstToolCallDeltaMs',
-    'firstToolArgumentDeltaMs',
     'totalMs',
   ]) {
     const values = timings.map((timing) => timing[key]).filter(Number.isFinite);

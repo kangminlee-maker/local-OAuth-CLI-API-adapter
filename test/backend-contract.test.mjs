@@ -288,7 +288,7 @@ test('narration that comes with a tool call survives the wrapper', () => {
 // Both ordered surfaces report a turn's parts in production order and read it
 // from `textRuns` — where each run of the narration sits among the calls. Only
 // `CodexBackendTransport` ever set it, so the two backends that go through
-// `ToolCallDeltaExtractor` streamed `[call, text]` while their buffered body
+// the incremental reader of the time streamed `[call, text]` while their buffered body
 // said `[text, call]`. The wrapper's own key order is the artifact BOTH paths
 // see, so it is what decides. The wrapper holds one array and one text field,
 // so the turn it describes has at most ONE run: all-before (the call count) or
@@ -348,48 +348,24 @@ test('the ordinal is the CALL COUNT, not a fixed one', () => {
   assert.equal(new Set(ordinals).size, 4, 'the ordinal moved with the call count');
 });
 
-// The flag is only worth anything if the STREAM agrees with it. This drove the
-// shipped extractor at ONE chunk size — eight characters — and passed while a
-// backend that delivered the same wrapper in a single delta streamed the turn
-// in the opposite order from the buffered body this file measures above. A
-// fixed arrangement cannot establish a property that holds for any arrangement,
-// so the comparison runs at every chunk size the wrapper admits.
-for (const [label, raw] of [
-  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`],
-  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`],
-]) {
-  test(`the extractor emits in the order the flag reports, at every chunking: ${label}`, async () => {
-    const { ToolCallDeltaExtractor } = await import('../dist/proxy/tool-call-stream.js');
-    const firstKind = (chunkSize) => {
-      const extractor = new ToolCallDeltaExtractor();
-      for (let at = 0; at < raw.length; at += chunkSize) {
-        for (const event of extractor.push(raw.slice(at, at + chunkSize))) return event.type;
-      }
-      return null;
-    };
-    // What the buffered body says came first, read off the very flag under test.
-    const buffered = (runPositions(parseBackendOutput(ORDER_REQUEST, raw))[0] ?? 0) > 0
-      ? 'tool_call_delta'
-      : 'text_delta';
-    const disagreed = [];
-    for (let size = 1; size <= raw.length; size += 1) {
-      if (firstKind(size) !== buffered) disagreed.push(size);
-    }
-    assert.deepEqual(
-      disagreed,
-      [],
-      `chunk sizes where the stream contradicted the buffered body (of ${raw.length}): ${disagreed.join(',')}`,
-    );
-    assert.equal(firstKind(raw.length), buffered, 'the whole wrapper in ONE delta');
-  });
-}
-
 test('CONTROL: the two key orders report opposite flags', () => {
-  // The sweep above compares the stream against the flag, so a flag stuck on
-  // one answer would satisfy it twice over. These are the same parts in the
-  // opposite key order, and they must not read alike.
+  // A flag stuck on one answer would satisfy every consumer twice over. These
+  // are the same parts in the opposite key order, and they must not read alike.
   const textFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`);
   const callsFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`);
   assert.deepEqual(runPositions(textFirst), [0]);
   assert.deepEqual(runPositions(callsFirst), [1]);
+});
+
+test('an object that is not wrapper-shaped, and plain prose, are the answer', () => {
+  // Only a wrapper this backend produced may be unwrapped. Reading a
+  // non-wrapper object as a wrapper found no `text` and returned an empty
+  // answer — the whole reply dropped on the floor.
+  const request = {
+    model: 'm', shape: 'openai-chat', messages: [], jsonMode: false,
+    tools: [{ name: 'get_weather', inputSchema: { type: 'object' } }], toolChoice: { type: 'auto' }, raw: {},
+  };
+  assert.equal(parseBackendOutput(request, '{"my":"object"}').text, '{"my":"object"}');
+  assert.equal(parseBackendOutput(request, 'plain prose').text, 'plain prose');
+  assert.deepEqual(parseBackendOutput(request, 'plain prose').toolCalls, []);
 });

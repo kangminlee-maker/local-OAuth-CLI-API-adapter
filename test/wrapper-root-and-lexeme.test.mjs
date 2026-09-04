@@ -4,7 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
-import { ToolCallDeltaExtractor, rawTopLevelValue } from '../dist/proxy/tool-call-stream.js';
+import { rawTopLevelValue } from '../dist/proxy/tool-wrapper.js';
 import { parseBackendOutput } from '../dist/proxy/backend-contract.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -21,22 +21,20 @@ const request = {
 /**
  * The wrapper is an OBJECT, and only its own top level is the wrapper.
  *
- * The buffered reader checks the parsed root and hands back anything else as
- * the answer. The streamed reader had no root notion at all: given
+ * The reader checks the parsed root and hands back anything else as the
+ * answer. A second, incremental reader once had no root notion at all: given
  * `[{"status":"tool_calls",…}]` it read the object INSIDE the array and
- * announced a real, executable tool call that the buffered reading of the same
- * bytes said never happened.
+ * announced a real, executable tool call that this reading of the same bytes
+ * said never happened. That reader is gone; the root rule stays pinned here.
  */
 for (const [label, raw] of [
   ['an array wrapping the wrapper', '[{"status":"tool_calls","toolCalls":[{"id":"call_1","name":"get_weather","arguments":"{}"}],"text":"answer"}]'],
   ['an array of two wrappers', '[{"status":"message","text":"a","toolCalls":[]},{"status":"tool_calls","toolCalls":[{"id":"c","name":"get_weather","arguments":"{}"}],"text":""}]'],
   ['a bare string that merely contains wrapper text', '"status tool_calls toolCalls"'],
 ]) {
-  test(`${label} is not read as a wrapper by either reader`, () => {
+  test(`${label} is not read as a wrapper`, () => {
     const parsed = parseBackendOutput(request, raw);
-    const events = new ToolCallDeltaExtractor({}).push(raw);
-    assert.deepEqual(parsed.toolCalls, [], 'the body invented a call');
-    assert.deepEqual(events, [], `the stream emitted ${JSON.stringify(events)} for a non-wrapper`);
+    assert.deepEqual(parsed.toolCalls, [], 'the reader invented a call');
     assert.equal(parsed.text, raw, 'a non-wrapper is the answer, verbatim');
   });
 }
@@ -44,9 +42,6 @@ for (const [label, raw] of [
 test('CONTROL: a real wrapper object is still read as one', () => {
   const raw = '{"status":"tool_calls","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{}"}],"text":"answer"}';
   assert.deepEqual(parseBackendOutput(request, raw).toolCalls.map((c) => c.name), ['get_weather']);
-  const names = new ToolCallDeltaExtractor({}).push(raw)
-    .filter((e) => e.type === 'tool_call_delta').map((e) => e.name);
-  assert.deepEqual([...new Set(names)], ['get_weather']);
 });
 
 // Numbers survive as written. Re-serializing a parsed value rounds every one of
