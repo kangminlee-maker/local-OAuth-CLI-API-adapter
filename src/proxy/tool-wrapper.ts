@@ -172,30 +172,39 @@ function* topLevelKeys(raw: string): Generator<{ keyIndex: number; key: string; 
  * with the `body` member dropped, `{}` when nothing had closed). A walk over a
  * COMPLETED fragment, with the lexer that survived the incremental reader; not
  * a stream reader. Anything that is not an object at all yields `{}`.
+ *
+ * Each member goes out as the bytes the runtime wrote for it — its key and
+ * value slices, verified to parse, never re-serialized (round 21: a parse and
+ * stringify here rounded `9007199254740993` and rewrote `1e999` as `null`). A
+ * repeated key keeps its first position and its last value, as `JSON.parse`
+ * reads it.
  */
 export function completeTopLevelMembers(fragment: string): string {
-  const members: Record<string, unknown> = {};
+  const members = new Map<string, string>();
   let cursor = skipWhitespace(fragment, 0);
   if (fragment[cursor] !== '{') return '{}';
   cursor = skipWhitespace(fragment, cursor + 1);
   while (cursor < fragment.length && fragment[cursor] === '"') {
     const key = readJsonString(fragment, cursor);
     if (!key.closed) break;
+    const keyText = fragment.slice(cursor, key.end + 1);
     cursor = skipWhitespace(fragment, key.end + 1);
     if (fragment[cursor] !== ':') break;
     cursor = skipWhitespace(fragment, cursor + 1);
     const valueEnd = skipJsonValue(fragment, cursor);
     if (valueEnd === -1) break;
+    const valueText = fragment.slice(cursor, valueEnd);
     try {
-      members[key.value] = JSON.parse(fragment.slice(cursor, valueEnd)) as unknown;
+      JSON.parse(valueText);
     } catch {
       break;
     }
+    members.set(key.value, `${keyText}:${valueText}`);
     cursor = skipWhitespace(fragment, valueEnd);
     if (fragment[cursor] === ',') cursor = skipWhitespace(fragment, cursor + 1);
     else break;
   }
-  return JSON.stringify(members);
+  return `{${[...members.values()].join(',')}}`;
 }
 
 export function rawTopLevelValue(raw: string, key: string): string | undefined {

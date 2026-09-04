@@ -2942,22 +2942,21 @@ function readOpenAiTools(value: unknown, shape: 'openai-chat' | 'openai-response
   if (!Array.isArray(value)) return [];
   return value.map((tool) => {
     const item = asRecord(tool);
-    const fn = asRecord(item?.function);
-    const directName = typeof item?.name === 'string' ? item.name : undefined;
-    const directDescription = typeof item?.description === 'string'
-      ? item.description
-      : undefined;
+    // Every member from the surface's own location only — Chat's `function`,
+    // Responses' top level — as the direct APIs read them (measured
+    // 2026-09-05, `review-artifacts/stage2/report.md` M9): Chat ignores a
+    // top-level `parameters` or `description` and reports a top-level `name`
+    // alone as `tools[0].function.name` missing; Responses ignores a stray
+    // `function` member and reports its name alone as `tools[0].name`
+    // missing. Round 20 scoped `strict` this way; round 21 found the name,
+    // description and schema still cross-read, so a foreign-location schema
+    // was what `strict` enforced and a nested name shadowed a declared one.
+    const source = shape === 'openai-chat' ? asRecord(item?.function) : item;
     return {
-      name: readString(fn?.name ?? directName, 'tool'),
-      description: typeof fn?.description === 'string'
-        ? fn.description
-        : directDescription,
-      inputSchema: fn?.parameters ?? item?.parameters,
-      // Each surface's own location only — Chat's `function.strict`, Responses'
-      // top-level `strict` — so a member in the other surface's place never
-      // turns enforcement on (r19-codex); what the direct API does with that
-      // extra member is unmeasured.
-      strict: (shape === 'openai-chat' ? fn?.strict : item?.strict) === true,
+      name: readString(source?.name, 'tool'),
+      description: typeof source?.description === 'string' ? source.description : undefined,
+      inputSchema: source?.parameters,
+      strict: source?.strict === true,
       raw: tool,
     };
   });

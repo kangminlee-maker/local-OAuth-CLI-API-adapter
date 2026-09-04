@@ -699,7 +699,7 @@ function normalizeToolCall(value: unknown, index: number, shape: NormalizedReque
  * APIs deliver whatever the model wrote, and refusing would be stricter than
  * the authority (r18-codex). What cannot be judged passes (`judgeJsonText`).
  */
-function assertCallArguments(
+export function assertCallArguments(
   args: string,
   tool: { readonly inputSchema?: unknown; readonly strict?: boolean } | undefined,
   shape: NormalizedRequest['shape'],

@@ -517,23 +517,25 @@ class CodexBackendStreamState {
 
   /**
    * Says the call is finished, after sending the value the completed result
-   * will report. `toolCalls()` normalizes arguments that are empty or do not
-   * parse, so a call announced as finished has to be normalized here too: a
+   * will report. `toolCalls()` reports empty arguments as `{}`, so a call
+   * announced as finished has to be normalized the same way here: a
    * no-argument call would otherwise be closed on the wire having streamed
    * nothing while the body said `{}`, and a closed call has no way left to
    * carry the difference.
    */
   private emitArgumentsDone(index: number, state: ToolState): LocalStreamEvent[] {
     if (state.argumentsDone) return [];
-    const complete = ensureJsonString(state.arguments);
+    const complete = argumentsOrEmptyObject(state.arguments);
     const out = this.emitArgumentExtension(index, state, complete);
     // The signal says "what you have is what the body will report", and a
     // surface that closes on it can send nothing afterwards. When the finishing
-    // event names no arguments and what was streamed does not normalize to the
-    // streamed value, that promise cannot be made: stay silent and let the end
-    // of the turn reconcile, which is the path for a backend that never says
-    // where arguments end.
-    if (state.streamed !== complete) return out;
+    // event names no arguments and what was streamed is not a whole JSON value
+    // yet (`{"city":` with the rest still to come in the final output), that
+    // promise cannot be made: stay silent and let the end of the turn
+    // reconcile, which is the path for a backend that never says where
+    // arguments end. (Until round 21 the repair function answered this
+    // question by the side effect of not returning the fragment unchanged.)
+    if (state.streamed !== complete || !parsesAsJson(complete)) return out;
     // Keep both baselines in one coordinate system: `emitPending` compares
     // later values against `arguments`, and leaving it unnormalized here made a
     // no-argument call's `arguments` ('') disagree with its `streamed` ('{}'),
@@ -631,9 +633,9 @@ class CodexBackendStreamState {
         name: state.name,
         // A call the backend cut off at its output limit is a fragment by the
         // backend's own account, and the direct API delivers it verbatim under
-        // `finish_reason: "length"` (measured 2026-09-04); wrapping it as
-        // `{"input": …}` published an object the model never produced.
-        arguments: this.stopReason === 'max_tokens' ? state.arguments : ensureJsonString(state.arguments),
+        // `finish_reason: "length"` (measured 2026-09-04); a completed call is
+        // the bytes the vendor wrote, or `{}` where it wrote none.
+        arguments: this.stopReason === 'max_tokens' ? state.arguments : argumentsOrEmptyObject(state.arguments),
       }));
   }
 
@@ -2102,13 +2104,24 @@ function isInstructionMessage(message: NormalizedMessage): boolean {
  * shape a no-parameter tool expects — not a phantom `input` property, which a
  * strict schema rejects and a loose one silently accepts.
  */
-function ensureJsonString(value: string): string {
-  if (value.trim() === '') return '{}';
+/**
+ * A call the backend finished without naming any arguments is the direct API's
+ * `"{}"`. Everything else is the bytes the vendor wrote, JSON or not: the
+ * direct API delivers what the model produced (its own documentation says the
+ * arguments may not be valid JSON), and wrapping what did not parse as
+ * `{"input": …}` published an object the model never produced while the
+ * stream had already carried the bytes (round 21).
+ */
+function argumentsOrEmptyObject(value: string): string {
+  return value.trim() === '' ? '{}' : value;
+}
+
+function parsesAsJson(value: string): boolean {
   try {
     JSON.parse(value);
-    return value;
+    return true;
   } catch {
-    return JSON.stringify({ input: value });
+    return false;
   }
 }
 

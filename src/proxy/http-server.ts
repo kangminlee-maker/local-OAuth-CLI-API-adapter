@@ -28,8 +28,9 @@ import { honorRequestModel } from '../settings.js';
 import {
   BACKEND_IDENTIFIERS, MAX_ERROR_MESSAGE_CHARS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
-import { hasToolDecisionSchema } from './backend-contract.js';
+import { assertCallArguments, hasToolDecisionSchema } from './backend-contract.js';
 import { StopSequenceGate, truncateAtStopSequence } from './stop-sequences.js';
+import { RawJson, stringifyJson } from './raw-json.js';
 import { completeTopLevelMembers, missingToolCallArgumentDelta } from './tool-wrapper.js';
 import { image2QualityToGpt55ReasoningEffort } from './image2-via-gpt55.js';
 import {
@@ -3553,6 +3554,7 @@ async function writeAnthropicMessagesStream(
       const gated = applyStreamStopSequence(event.result, stopGate, streamedText);
       const result = gated.result;
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
+      toolState.cutOff = responseCutOff(result);
       if (result.toolCalls.length > 0) {
         // Blocks follow production order, which is what the non-streamed body
         // reports through `orderedByEmission`: each run of the turn's text sits
@@ -3731,6 +3733,11 @@ class AnthropicToolUseStreamState {
    * block would open nested inside it (r20).
    */
   leaveOpen: number | null = null;
+  /**
+   * Whether the turn was cut off at the output limit: then no call's
+   * arguments are judged, as nowhere else on that turn (matrix §7 row 8).
+   */
+  cutOff = false;
   private readonly states = new Map<number, AnthropicToolUseState>();
 
   /**
@@ -3821,6 +3828,7 @@ class AnthropicToolUseStreamState {
       // The block `finish` left open on purpose — the turn's final call, cut
       // off at the output limit — stays open here too.
       if (index === this.leaveOpen) continue;
+      if (call) this.judge(call);
       await this.stop(state);
     }
   }
@@ -3847,12 +3855,28 @@ class AnthropicToolUseStreamState {
       // here: whatever needs a block of its own queues until the call settles
       // rather than stopping it, which leaves this line reachable only for the
       // first fact.
-      if (state.closed) continue;
-      const rest = missingToolCallArgumentDelta(state.arguments, call);
-      if (rest) await this.writeArgumentsDelta(index, state, rest);
-      if (index === this.leaveOpen) continue;
+      if (!state.closed) {
+        const rest = missingToolCallArgumentDelta(state.arguments, call);
+        if (rest) await this.writeArgumentsDelta(index, state, rest);
+      }
+      // Judged whether or not the block is already stopped — the native
+      // transport stops it on its own "arguments final" signal, before the
+      // completed result (and its stop reason) exists to judge by.
+      this.judge(call);
+      if (state.closed || index === this.leaveOpen) continue;
       await this.stop(state);
     }
+  }
+
+  /**
+   * The buffered writer's rule, applied where this stream would otherwise
+   * close a block on arguments that are not a JSON object: the bytes are
+   * already on the wire, so the refusal follows them as an in-band error —
+   * the same turn the buffered body answers 502 (r21, native transport).
+   */
+  private judge(call: LocalToolCall): void {
+    if (this.cutOff) return;
+    assertCallArguments(call.arguments, undefined, 'anthropic-messages', 'called a tool with');
   }
 
   private async stop(state: AnthropicToolUseState): Promise<void> {
@@ -3925,23 +3949,30 @@ function openAiResponseToolCall(call: LocalToolCall, status: 'completed' | 'inco
   };
 }
 
+/**
+ * A `tool_use` block whose `input` is the bytes the runtime wrote, spliced
+ * into the body by `stringifyJson` — this surface publishes the arguments as
+ * a JSON value, not a string, and a parse-and-stringify round trip rounded
+ * `9007199254740993` to `…992` and `1e999` to `null` while the stream of the
+ * same turn carried the bytes (round 21). A completed turn's arguments are a
+ * JSON object by the time they reach this writer (matrix §7 row 8). A call
+ * the runtime cut off at its output limit is published as the direct API
+ * publishes it: the complete top-level members parsed so far, the cut member
+ * dropped (measured 2026-09-04, `review-artifacts/stage2/report.md` M6).
+ */
 function anthropicToolUse(call: LocalToolCall, cutOff = false): unknown {
+  // The wrapper reading refused such a call before it got here; the native
+  // transport's arguments are the vendor's own and arrive unjudged, so this
+  // surface — whose `input` is a JSON value — applies the same rule (r21).
+  if (!cutOff) assertCallArguments(call.arguments, undefined, 'anthropic-messages', 'called a tool with');
   return {
     type: 'tool_use',
     id: call.id,
     name: call.name,
-    input: parseToolArguments(call.arguments, cutOff),
+    input: new RawJson(parsesAsJson(call.arguments) ? call.arguments : completeTopLevelMembers(call.arguments)),
   };
 }
 
-/**
- * A call the runtime cut off at its output limit is published as the direct
- * API publishes it: the complete top-level members parsed so far, the cut
- * member dropped (measured 2026-09-04, `review-artifacts/stage2/report.md`
- * M6). Arguments that are not JSON on a completed turn cannot reach this
- * writer any more (matrix §7 row 8), so the `{"input": …}` shape below is a
- * projection of a call the response path admitted, kept for that path.
- */
 /**
  * The call whose block the Messages stream leaves open: the last call of a
  * turn the runtime cut off inside that call's arguments, with no narration
@@ -3963,15 +3994,6 @@ function parsesAsJson(value: string): boolean {
     return true;
   } catch {
     return false;
-  }
-}
-
-function parseToolArguments(value: string, cutOff = false): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    if (cutOff) return JSON.parse(completeTopLevelMembers(value));
-    return { input: value };
   }
 }
 
@@ -4044,7 +4066,7 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
   });
-  res.end(`${JSON.stringify(payload)}\n`);
+  res.end(`${stringifyJson(payload)}\n`);
 }
 
 function writeSseHeaders(res: ServerResponse): void {

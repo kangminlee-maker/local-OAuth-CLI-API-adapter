@@ -129,18 +129,25 @@ export function numberIsInexact(lexeme: string): boolean {
   const value = Number(lexeme);
   if (!Number.isFinite(value)) return true;
   const [, sign, whole, fraction = '', exponent = '0'] = parts;
-  // A mantissa this long is not one a double holds, and the comparison below
-  // would scale BigInts by its length; decide without it (r20).
-  if (whole.length + fraction.length > 4096) return true;
+  // The SIGNIFICANT digits: leading zeros say nothing, and trailing zeros move
+  // into the exponent. `0.000…0` is zero however long, and `1000…0e-4096` is
+  // one; round 20 capped the raw length and so read both as inexact (r21-codex).
+  const digits = (whole + fraction).replace(/^0+/, '');
+  const significant = digits.replace(/0+$/, '');
+  if (significant === '') return value !== 0;
+  // More significant digits than any double's exact decimal expansion has
+  // (767): inexact without arithmetic, which the comparison below would
+  // otherwise scale BigInts by (r20).
+  if (significant.length > 4096) return true;
   // The lexeme as D × 10^E.
-  let decimal = BigInt(whole + fraction);
+  let decimal = BigInt(significant);
   if (sign === '-') decimal = -decimal;
   // Zero first: `1e-999999999` underflows to it, and scaling the comparison by
   // 10^999999999 would exceed BigInt's size (or burn seconds below it).
   // After this, a finite non-zero double bounds |E| by the mantissa's length
   // plus the double's own exponent range.
-  if (value === 0) return decimal !== 0n;
-  const decimalExponent = Number(exponent) - fraction.length;
+  if (value === 0) return true;
+  const decimalExponent = Number(exponent) - fraction.length + (digits.length - significant.length);
   // The double as M × 2^P, exactly.
   const { mantissa, exponent: binaryExponent } = decompose(value);
   // D × 10^E = M × 2^P, cross-multiplied into integers.

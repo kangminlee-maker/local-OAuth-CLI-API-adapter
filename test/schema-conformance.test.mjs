@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { conformsToSchema, hasInexactNumber, judgeJsonText } from '../dist/proxy/schema-conformance.js';
+import { conformsToSchema, hasInexactNumber, judgeJsonText, numberIsInexact } from '../dist/proxy/schema-conformance.js';
 
 test('hasInexactNumber: decided by value — what the double holds exactly is judged, nothing else (r19)', () => {
   assert.equal(hasInexactNumber('{"id":9007199254740993}'), true, '2^53+1 rounds');
@@ -20,7 +20,17 @@ test('hasInexactNumber: decided by value — what the double holds exactly is ju
   assert.equal(hasInexactNumber('{"y":1e-999999999}'), true);
   assert.equal(hasInexactNumber('{"y":0e-999999999}'), false, 'a zero mantissa is exactly zero');
   assert.equal(hasInexactNumber('{"y":1e-40000000}'), true);
-  assert.equal(hasInexactNumber(`{"y":1${'0'.repeat(5000)}}`), true, 'a 5001-digit mantissa is decided without arithmetic');
+  assert.equal(hasInexactNumber(`{"y":1${'0'.repeat(5000)}}`), true, 'a 5001-digit integer overflows the double: decided without arithmetic');
+  // Zero padding is not inexactness (r21-codex): the significant digits decide.
+  assert.equal(hasInexactNumber(`{"y":0.${'0'.repeat(4096)}}`), false, 'zero however long is zero');
+  assert.equal(hasInexactNumber(`{"y":-0.${'0'.repeat(5000)}e7}`), false, 'negative zero, padded, scaled');
+  assert.equal(hasInexactNumber(`{"y":1${'0'.repeat(4096)}e-4096}`), false, 'one written with 4096 trailing zeros');
+  assert.equal(hasInexactNumber(`{"y":0.${'0'.repeat(5000)}1e5001}`), false, 'one written with 5000 leading zeros');
+  assert.equal(hasInexactNumber(`{"y":${'0'.repeat(5000)}25e-1}`), false, '2.5 behind 5000 leading zeros');
+  assert.equal(hasInexactNumber(`{"y":1.${'1'.repeat(4096)}}`), true, '4097 significant digits: no double holds them, decided without arithmetic');
+  assert.equal(hasInexactNumber(`{"y":1.${'0'.repeat(4000)}1}`), true, '4002 significant digits, exact zeros between: inexact by arithmetic');
+  assert.equal(numberIsInexact(`0.${'0'.repeat(4096)}`), false);
+  assert.equal(numberIsInexact(`1${'0'.repeat(4096)}e-4096`), false);
   assert.ok(Date.now() - started < 200, `decided in ${Date.now() - started}ms`);
   assert.equal(hasInexactNumber('{"x":2.5e3}'), false, '2500 is exact');
   assert.equal(hasInexactNumber('{"s":"9007199254740993","n":1}'), false, 'digits inside a string are text');

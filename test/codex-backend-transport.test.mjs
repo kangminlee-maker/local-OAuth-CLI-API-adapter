@@ -1921,14 +1921,16 @@ test('a forced call cut off at the output limit keeps its fragment verbatim (r18
   const cut = await new CodexBackendTransport({ codexHome, timeoutMs: 30_000 }).generate({ ...toolRequest(), stream: false });
   assert.equal(cut.stopReason, 'max_tokens');
   assert.equal(cut.toolCalls[0].arguments, '{"city":"Seo');
-  // CONTROL: a turn the backend reports as completed still normalizes what
-  // is not JSON — this transport has no completion backstop (matrix §7 row 8
-  // is scoped to `claude` and `app-server`).
+  // CONTROL: a turn the backend reports as completed keeps its bytes too —
+  // this transport has no completion backstop (matrix §7 row 8 is scoped to
+  // `claude` and `app-server`); the direct API delivers what the model wrote,
+  // and wrapping it as `{"input": …}` published an object the model never
+  // produced while the stream had carried the bytes (round 21).
   globalThis.fetch = async () => new Response(sse(events({
     type: 'response.completed',
     response: { id: 'r', model: 'gpt-5.5', output: [] },
   })), { status: 200 });
   const whole = await new CodexBackendTransport({ codexHome, timeoutMs: 30_000 }).generate({ ...toolRequest(), stream: false });
   assert.equal(whole.stopReason, undefined);
-  assert.equal(whole.toolCalls[0].arguments, JSON.stringify({ input: '{"city":"Seo' }));
+  assert.equal(whole.toolCalls[0].arguments, '{"city":"Seo');
 });
