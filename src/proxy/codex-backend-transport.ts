@@ -629,7 +629,11 @@ class CodexBackendStreamState {
       .map(([, state]) => ({
         id: state.id,
         name: state.name,
-        arguments: ensureJsonString(state.arguments),
+        // A call the backend cut off at its output limit is a fragment by the
+        // backend's own account, and the direct API delivers it verbatim under
+        // `finish_reason: "length"` (measured 2026-09-04); wrapping it as
+        // `{"input": …}` published an object the model never produced.
+        arguments: this.stopReason === 'max_tokens' ? state.arguments : ensureJsonString(state.arguments),
       }));
   }
 

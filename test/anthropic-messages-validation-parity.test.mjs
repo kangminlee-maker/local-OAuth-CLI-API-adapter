@@ -92,6 +92,11 @@ const REJECTIONS = [
   ["tool with a blank name", { tools: [{ name: '', input_schema: { type: 'object', properties: {} } }] }, "tools.0.custom.name: String should have at least 1 character"],
   ["tool without a name", { tools: [{ input_schema: { type: 'object', properties: {} } }] }, "tools.0.custom.name: Field required"],
   ["tool_choice naming an undeclared tool", { tools: [{ name: 'f', input_schema: { type: 'object', properties: {} } }], tool_choice: { type: 'tool', name: 'never_declared' } }, "Tool 'never_declared' not found in provided tools"],
+  // Round 18 (measured 2026-09-04).
+  ["tool with a whitespace-only name", { tools: [{ name: '   ', input_schema: { type: 'object', properties: {} } }] }, "tools.0.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'"],
+  ["tool_choice any with tools absent", { tool_choice: { type: 'any' } }, "tool_choice.any may only be specified while providing tools"],
+  ["tool_choice tool with tools absent", { tool_choice: { type: 'tool', name: 'x' } }, "Tool 'x' not found in provided tools"],
+  ["strict tool whose object schema is not closed", { tools: [{ name: 'f', input_schema: { type: 'object', properties: {} }, strict: true }] }, "tools.0.custom: For 'object' type, 'additionalProperties' must be explicitly set to false"],
   ["system as an integer", { system: 7 }, "system: Input should be a valid array"],
   ["system null", { system: null }, "system: Input should be a valid array"],
   ["system member not an object", { system: [7] }, "system.0: Input does not match the expected shape."],

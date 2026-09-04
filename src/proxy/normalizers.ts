@@ -161,10 +161,21 @@ function validateOpenAiChatFields(
   if (present('functions')) {
     if (!Array.isArray(input.functions)) throw invalidType('functions', 'an array of function definitions', input.functions);
     input.functions.forEach((fn, index) => {
-      if (typeof asRecord(fn)?.name !== 'string') throw missingRequiredParameter(`functions[${index}].name`);
+      const name = asRecord(fn)?.name;
+      if (typeof name !== 'string') throw missingRequiredParameter(`functions[${index}].name`);
+      if (name === '') throw emptyString(`functions[${index}].name`);
     });
   }
-  if (present('function_call')) readOpenAiLegacyFunctionCall(input.function_call);
+  if (present('function_call')) {
+    const choice = readOpenAiLegacyFunctionCall(input.function_call);
+    // The deprecated pair is validated as the direct API validates it
+    // (measured 2026-09-04): a `function_call` naming a function `functions`
+    // never declared is the same envelope the modern `tool_choice` gets.
+    if (choice.type === 'tool') {
+      const declared = Array.isArray(input.functions) ? input.functions.map((fn) => asRecord(fn)?.name) : [];
+      if (!declared.includes(choice.name)) throw undeclaredFunctionCall(choice.name);
+    }
+  }
   if (present('tools')) {
     if (!Array.isArray(input.tools)) throw invalidType('tools', 'an array of objects', input.tools);
     input.tools.forEach((tool, index) => {
@@ -172,9 +183,19 @@ function validateOpenAiChatFields(
       if (!fn) throw missingRequiredParameter(`tools[${index}].function`);
       if (typeof fn.name !== 'string') throw missingRequiredParameter(`tools[${index}].function.name`);
       if (fn.name === '') throw emptyString(`tools[${index}].function.name`);
+      if (!OPENAI_TOOL_NAME.test(fn.name)) throw nameOutsidePattern(`tools[${index}].function.name`);
     });
   }
   if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice);
+  // Every well-formed `tool_choice` — a mode or a forced function — is refused
+  // when `tools` is absent (measured 2026-09-04 for `auto`, `none`, `required`
+  // and a forced function alike); a malformed one reports its type first.
+  if (present('tool_choice') && !present('tools')) {
+    throw new ProxyRequestError(
+      "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+      400, 'openai', 'invalid_request_error', 'tool_choice',
+    );
+  }
   if (present('parallel_tool_calls') && typeof input.parallel_tool_calls !== 'boolean') {
     throw invalidType('parallel_tool_calls', 'a boolean', input.parallel_tool_calls);
   }
@@ -390,7 +411,14 @@ function validateOpenAiChatResponseFormat(value: unknown): void {
   // the proxy used to accept `{type:"json_schema"}` alone and run the turn in
   // JSON mode with no schema at all — structured output the caller asked for
   // and never got.
-  if (format.type !== 'json_schema') return;
+  if (format.type !== 'json_schema') {
+    // Under `text` and `json_object` the member is unknown (measured
+    // 2026-09-04, both types). Accepting it produced a request with a schema
+    // and no JSON format — a schema the runtime was handed and the streaming
+    // gates did not know to hold.
+    if (format.json_schema !== undefined) throw unknownParameter('response_format.json_schema');
+    return;
+  }
   const jsonSchema = asRecord(format.json_schema);
   if (!jsonSchema) throw missingRequiredParameter('response_format.json_schema');
   if (typeof jsonSchema.name !== 'string') throw missingRequiredParameter('response_format.json_schema.name');
@@ -483,6 +511,27 @@ function missingRequiredParameter(field: string): ProxyRequestError {
   return new ProxyRequestError(`Missing required parameter: '${field}'.`, 400, 'openai', 'invalid_request_error', field, 'missing_required_parameter');
 }
 
+// The direct APIs constrain a tool's name to one pattern; the OpenAI surfaces
+// report it without a length, the Messages API with `{1,128}` (measured
+// 2026-09-04 with a whitespace-only name). A name outside it used to reach the
+// readers, whose `readString` treated it as absent and ran the tool as `tool`.
+const OPENAI_TOOL_NAME = /^[a-zA-Z0-9_-]+$/;
+const ANTHROPIC_TOOL_NAME = /^[a-zA-Z0-9_-]{1,128}$/;
+
+function nameOutsidePattern(field: string): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid '${field}': string does not match pattern. Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'.`,
+    400, 'openai', 'invalid_request_error', field, 'invalid_value',
+  );
+}
+
+function undeclaredFunctionCall(name: string): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid value for 'function_call': no function named '${name}' was specified in the 'functions' parameter.`,
+    400, 'openai', 'invalid_request_error', 'function_call',
+  );
+}
+
 function emptyString(field: string): ProxyRequestError {
   return new ProxyRequestError(
     `Invalid '${field}': empty string. Expected a string with minimum length 1, but got an empty string instead.`,
@@ -506,14 +555,12 @@ function assertForcedToolDeclared(
   if (toolChoice.type !== 'tool') return;
   const name = toolChoice.name;
   if (tools.some((tool) => tool.name === name)) return;
-  if (shape === 'openai-chat') {
-    throw new ProxyRequestError(
-      `Invalid value for 'function_call': no function named '${name}' was specified in the 'functions' parameter.`,
-      400, 'openai', 'invalid_request_error', 'function_call',
-    );
-  }
+  if (shape === 'openai-chat') throw undeclaredFunctionCall(name);
   if (shape === 'openai-responses') {
-    throw new ProxyRequestError(`Tool choice '${name}' not found in 'tools' parameter.`, 400, 'openai', 'invalid_request_error', 'tool_choice');
+    // With no tools at all the direct API names the choice's TYPE, not the
+    // function (measured 2026-09-04, `tools` absent and `tools: []` alike).
+    const missing = tools.length === 0 ? 'function' : name;
+    throw new ProxyRequestError(`Tool choice '${missing}' not found in 'tools' parameter.`, 400, 'openai', 'invalid_request_error', 'tool_choice');
   }
   throw anthropicFault(`Tool '${name}' not found in provided tools`);
 }
@@ -790,7 +837,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     stream: input.stream === true,
     streamOptions: readStreamOptions(input.stream_options),
     jsonMode: format?.type === 'json_object' || format?.type === 'json_schema',
-    jsonSchema: format?.schema,
+    jsonSchema: format?.type === 'json_schema' ? format.schema : undefined,
     jsonSchemaName: format?.type === 'json_schema' ? readOptionalString(format.name) : undefined,
     jsonSchemaStrict: format?.type === 'json_schema' ? readOptionalBoolean(format.strict) : undefined,
     tools: responsesTools,
@@ -883,7 +930,17 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
         throw missingRequiredParameter(`tools[${index}].name`);
       }
       if (record.type === 'function' && record.name === '') throw emptyString(`tools[${index}].name`);
+      if (record.type === 'function' && !OPENAI_TOOL_NAME.test(record.name as string)) throw nameOutsidePattern(`tools[${index}].name`);
     });
+  }
+  // `auto` without tools is served; `required` is refused (measured
+  // 2026-09-04). A forced function without tools is refused where the
+  // declared-name check runs, with the envelope measured for that case.
+  if (input.tool_choice === 'required' && !present('tools')) {
+    throw new ProxyRequestError(
+      "Tool choice 'required' must be specified with 'tools' parameter.",
+      400, 'openai', 'invalid_request_error', 'tool_choice',
+    );
   }
   if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice, 'openai-responses');
   if (present('metadata')) validateOpenAiMetadata(input.metadata);
@@ -1232,7 +1289,22 @@ function validateAnthropicMessagesFields(input: Record<string, unknown>): void {
       if (record.name === undefined) throw anthropicFault(`tools.${index}.custom.name: Field required`);
       if (typeof record.name !== 'string') throw anthropicFault(`tools.${index}.custom.name: Input should be a valid string`);
       if (record.name === '') throw anthropicFault(`tools.${index}.custom.name: String should have at least 1 character`);
+      if (!ANTHROPIC_TOOL_NAME.test(record.name)) {
+        throw anthropicFault(`tools.${index}.custom.name: String should match pattern '^[a-zA-Z0-9_-]{1,128}$'`);
+      }
+      // A strict tool's object schema must close itself (measured 2026-09-04
+      // at the root; nested objects unmeasured).
+      const schema = asRecord(record.input_schema);
+      if (record.strict === true && schema?.type === 'object' && schema.additionalProperties !== false) {
+        throw anthropicFault(`tools.${index}.custom: For 'object' type, 'additionalProperties' must be explicitly set to false`);
+      }
     });
+  }
+  // `auto` without tools is served; `any` is refused (measured 2026-09-04). A
+  // forced tool without tools answers the not-found envelope where the
+  // declared-name check runs.
+  if (asRecord(input.tool_choice)?.type === 'any' && !sent('tools')) {
+    throw anthropicFault('tool_choice.any may only be specified while providing tools');
   }
 
   if (!sent('messages')) throw anthropicFault('messages: Field required');
@@ -2041,6 +2113,9 @@ function validateOpenAiResponsesText(value: unknown): void {
     if (!OPENAI_RESPONSES_FORMATS.some((type) => type === format.type)) {
       throw invalidValue('text.format.type', typeof format.type === 'string' ? format.type : '', OPENAI_RESPONSES_FORMATS);
     }
+    // A `schema` under `text` or `json_object` is unknown (measured 2026-09-04,
+    // both types); see the Chat twin above for what accepting it did.
+    if (format.type !== 'json_schema' && format.schema !== undefined) throw unknownParameter('text.format.schema');
     // The proxy used to run a `json_schema` format with no schema and no name
     // at all — structured output the caller asked for and never got.
     if (format.type === 'json_schema' && typeof format.name !== 'string') {
@@ -2845,6 +2920,7 @@ function readOpenAiTools(value: unknown): NormalizedTool[] {
         ? fn.description
         : directDescription,
       inputSchema: fn?.parameters ?? item?.parameters,
+      strict: (fn?.strict ?? item?.strict) === true,
       raw: tool,
     };
   });
@@ -2858,6 +2934,7 @@ function readAnthropicTools(value: unknown): NormalizedTool[] {
       name: readString(item?.name, 'tool'),
       description: typeof item?.description === 'string' ? item.description : undefined,
       inputSchema: item?.input_schema,
+      strict: item?.strict === true,
       raw: tool,
     };
   });

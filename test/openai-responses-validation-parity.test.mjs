@@ -126,6 +126,13 @@ const REJECTIONS = [
   // Conformance matrix §7 rows 11–12, measured live 2026-09-04 (`e2e:text:parity`).
   ["tools function with a blank name", { ...OUT, tools: [{ type: 'function', name: '', parameters: { type: 'object', properties: {} } }] }, { param: "tools[0].name", code: "empty_string", message: "Invalid 'tools[0].name': empty string. Expected a string with minimum length 1, but got an empty string instead." }],
   ["tool_choice naming an undeclared function", { ...OUT, tools: [RTOOL], tool_choice: { type: 'function', name: 'never_declared' } }, { param: "tool_choice", code: null, message: "Tool choice 'never_declared' not found in 'tools' parameter." }],
+  // Round 18 (measured 2026-09-04).
+  ["text.format text with a stray schema", { ...OUT, text: { format: { type: 'text', schema: { type: 'object' } } } }, { param: "text.format.schema", code: "unknown_parameter", message: "Unknown parameter: 'text.format.schema'." }],
+  ["text.format json_object with a stray schema", { ...OUT, text: { format: { type: 'json_object', schema: { type: 'object' } } } }, { param: "text.format.schema", code: "unknown_parameter", message: "Unknown parameter: 'text.format.schema'." }],
+  ["tools function with a whitespace-only name", { ...OUT, tools: [{ type: 'function', name: '   ', parameters: { type: 'object', properties: {} } }] }, { param: "tools[0].name", code: "invalid_value", message: "Invalid 'tools[0].name': string does not match pattern. Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'." }],
+  ["tool_choice required with tools absent", { ...OUT, tool_choice: 'required' }, { param: "tool_choice", code: null, message: "Tool choice 'required' must be specified with 'tools' parameter." }],
+  ["tool_choice function with tools absent", { ...OUT, tool_choice: { type: 'function', name: 'x' } }, { param: "tool_choice", code: null, message: "Tool choice 'function' not found in 'tools' parameter." }],
+  ["tool_choice function with tools empty", { ...OUT, tools: [], tool_choice: { type: 'function', name: 'x' } }, { param: "tool_choice", code: null, message: "Tool choice 'function' not found in 'tools' parameter." }],
   // reasoning — its own enum, wider than Chat's.
   ["reasoning as a string", { ...OUT, reasoning: 'low' }, { param: "reasoning", code: "invalid_type", message: "Invalid type for 'reasoning': expected an object, but got a string instead." }],
   ["reasoning.effort unknown", { ...OUT, reasoning: { effort: 'bogus' } }, { param: "reasoning.effort", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'." }],

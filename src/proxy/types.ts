@@ -206,6 +206,13 @@ export interface NormalizedTool {
   readonly name: string;
   readonly description?: string;
   readonly inputSchema?: unknown;
+  /**
+   * Whether the client asked for strict schema adherence on this tool's
+   * arguments (`strict: true` on all three surfaces). Without it the schema
+   * is a request to the model, not a promise the direct APIs enforce, and the
+   * response path delivers what the runtime produced.
+   */
+  readonly strict?: boolean;
   readonly raw: unknown;
 }
 

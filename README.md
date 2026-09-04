@@ -176,13 +176,16 @@ completed answer has been read; what the client then receives is that one
 reading, and a refused turn is an HTTP 502 on the stream as on the buffered
 body. Plain text turns and the `codex-backend` transport stream live.
 
-The schema the client supplied is enforced when the turn completes. A forced
-tool's arguments that are not JSON, or that fall outside the tool's
-`parameters` / `input_schema`, and a `json_schema` answer outside its schema
-are refused with 502 rather than published as a near miss; the one exception
-is a forced call the runtime reports as cut off by its output limit, which is
-delivered as the fragment it is, the way the direct API answers
-`finish_reason: "length"` (conformance matrix §7, rows 8 and 10).
+The schema the client supplied is enforced when the turn completes, where the
+client took that promise: under `strict: true` on a tool or a `json_schema`
+format, or on any Messages structured output, arguments or an answer outside
+the schema are refused with 502 rather than published as a near miss; what is
+not JSON at all is refused regardless. Without `strict` the direct OpenAI APIs
+are best-effort themselves, and so is the proxy. The one exception is a turn
+the runtime reports as cut off by its output limit, which is delivered as the
+fragment it is with the terminal fields saying so — `finish_reason: "length"`,
+`status: "incomplete"`, `stop_reason: "max_tokens"` — the way the direct APIs
+answer (conformance matrix §7, rows 8 and 10).
 
 Measured cost: none on `claude`, whose wrapper already arrived whole in
 `structured_output`; about 0.3 s later call announcement per turn on

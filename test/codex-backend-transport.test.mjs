@@ -1903,3 +1903,32 @@ test('deltas with no call between them are ONE run, not one per delta', async ()
   ]);
   assert.deepEqual(runsOf(turn), [['AB', 0], ['CD', 1]]);
 });
+
+test('a forced call cut off at the output limit keeps its fragment verbatim (r18-fable F7)', async () => {
+  // The direct Responses API delivers the fragment under `status: incomplete`
+  // (measured 2026-09-04); wrapping it as `{"input": …}` published an object
+  // the model never produced.
+  const events = (terminal) => [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seo' },
+    terminal,
+  ];
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse(events({
+    type: 'response.incomplete',
+    response: { id: 'r', model: 'gpt-5.5', output: [], incomplete_details: { reason: 'max_output_tokens' } },
+  })), { status: 200 });
+  const cut = await new CodexBackendTransport({ codexHome, timeoutMs: 30_000 }).generate({ ...toolRequest(), stream: false });
+  assert.equal(cut.stopReason, 'max_tokens');
+  assert.equal(cut.toolCalls[0].arguments, '{"city":"Seo');
+  // CONTROL: a turn the backend reports as completed still normalizes what
+  // is not JSON — this transport has no completion backstop (matrix §7 row 8
+  // is scoped to `claude` and `app-server`).
+  globalThis.fetch = async () => new Response(sse(events({
+    type: 'response.completed',
+    response: { id: 'r', model: 'gpt-5.5', output: [] },
+  })), { status: 200 });
+  const whole = await new CodexBackendTransport({ codexHome, timeoutMs: 30_000 }).generate({ ...toolRequest(), stream: false });
+  assert.equal(whole.stopReason, undefined);
+  assert.equal(whole.toolCalls[0].arguments, JSON.stringify({ input: '{"city":"Seo' }));
+});

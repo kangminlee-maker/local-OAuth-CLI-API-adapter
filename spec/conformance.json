@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "a2936bbb3bf475b6f86ccb2426d6f471fde1163f8ea6afde0ba934b80cd3517f",
+    "matrixDigest": "b4f82c8347c7ccf077c33a530a87702f200c1b327ae9a8f4d8500ab084c43f00",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -760,7 +760,7 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported for `json_object` + `json_schema` (`normalizers.ts:35-38`); `strict` and schema `name` parsed. Both go through a **runtime schema**, not a prompt sentence: `json_schema` carries the client's schema and `json_object` carries `{\"type\":\"object\"}` — the direct API forces a top-level object here (asked for `[1,2,3]` it answered `{\"0\":1,\"1\":2,\"2\":3}`, measured 2026-09-02). Output that is not a JSON object is rejected at the response boundary rather than passed through — for `json_object` only, since a client `json_schema` declares its own root (a schema rooted at an array is handed to the runtime and its arrays are accepted back). A `json_schema` answer is instead validated against the client's schema at the response boundary (`ajv`, draft 2020-12; §7 row 10) and refused outside it — the promise is kept or refused, never published as a near miss. **Sent together with `tools` the format is NOT enforced**: the one structured-output channel is carrying the tool wrapper, so the client's schema does not reach the runtime and the turn's `text` is returned as it stands. The direct API does serve the pair and honour the schema (measured 2026-09-03), so this is a divergence, declared here rather than faked — supporting it needs a second channel or a wrapper that isolates client data, which is a design change and not a bug fix. Numbers in a runtime-enforced answer are published as the bytes the runtime wrote — an id of `9007199254740993` is not rounded to `…992`",
+      "claimedNote": "supported for `json_object` + `json_schema` (`normalizers.ts:35-38`); `strict` and schema `name` parsed. Both go through a **runtime schema**, not a prompt sentence: `json_schema` carries the client's schema and `json_object` carries `{\"type\":\"object\"}` — the direct API forces a top-level object here (asked for `[1,2,3]` it answered `{\"0\":1,\"1\":2,\"2\":3}`, measured 2026-09-02). Output that is not a JSON object is rejected at the response boundary rather than passed through — for `json_object` only, since a client `json_schema` declares its own root (a schema rooted at an array is handed to the runtime and its arrays are accepted back). A `json_schema` answer is validated against the client's schema at the response boundary (`ajv`, draft 2020-12; §7 row 10) under `strict: true` — the promise the direct API itself enforces — and refused outside it; without `strict` the direct API is best-effort too and the answer is delivered. What cannot be judged passes: an uncompilable or `$async` schema, a `$ref` outside the schema, a number a double cannot hold exactly (the direct API accepts `$async` and `$id`/`$ref` at request time, measured 2026-09-04). **Sent together with `tools` the format is NOT enforced**: the one structured-output channel is carrying the tool wrapper, so the client's schema does not reach the runtime and the turn's `text` is returned as it stands. The direct API does serve the pair and honour the schema (measured 2026-09-03), so this is a divergence, declared here rather than faked — supporting it needs a second channel or a wrapper that isolates client data, which is a design change and not a bug fix. Numbers in a runtime-enforced answer are published as the bytes the runtime wrote — an id of `9007199254740993` is not rounded to `…992`",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (`openai.chat.json_schema.schema_exact`, `option-is-a-promise`)",
       "liveParityRow": true
@@ -802,11 +802,11 @@
         "observableEffect": "strict schema adherence on arguments",
         "invalidValue": "UNKNOWN"
       },
-      "claimedLead": "unknown",
+      "claimedLead": "read",
       "claimedLeadInLegend": false,
-      "claimedNote": "**UNKNOWN — parsed for `response_format` (`normalizers.ts:38`) but not confirmed read off tool definitions**; probe P-34",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "read on all three surfaces (`NormalizedTool.strict`: Chat `function.strict`, Responses `strict`, Messages `strict`) and handed to the response path: a forced call's arguments outside the tool's schema are refused (502) only under `strict: true`; without it the direct APIs deliver whatever the model wrote and so does the proxy (§7 row 8, round 18). The runtime schema channel is used either way. The direct API's own envelope for a bad `strict` value is unmeasured",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`backend-contract.test` r18 strict)",
       "liveParityRow": true
     },
     {
@@ -1420,9 +1420,9 @@
       },
       "claimedLead": "parsed",
       "claimedLeadInLegend": false,
-      "claimedNote": "parsed but **not enforced**; echoed in the body. **`incomplete_details` is hard `null` and `status` never becomes `incomplete`** → a capped turn is reported `completed`, where the direct API reports `status:\"incomplete\"` + `incomplete_details.reason:\"max_output_tokens\"` with `usage.output_tokens` exactly at the cap (measured 2026-09-02). No runtime channel exists — see row A-2 for the two that were tried",
+      "claimedNote": "parsed but the cap itself is **not enforced**; echoed in the body. No runtime channel exists for the cap (row A-2). But when the backend reports the limit — the `codex-backend` transport on `response.incomplete`, Claude Code on `stop_reason: \"max_tokens\"` — the response is `status: \"incomplete\"`, `incomplete_details: {reason: \"max_output_tokens\"}`, `completed_at: null`, a `function_call` item with `status: \"incomplete\"`, and the stream ends in `response.incomplete`, as the direct API answers (measured 2026-09-04, `review-artifacts/stage2/report.md` M6)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (measured 2026-09-02)",
+      "evidenceNote": "VERIFIED (`output-limit-projection.test`, `codex-backend-transport.test`)",
       "liveParityRow": true
     },
     {
@@ -1596,7 +1596,7 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported (`normalizers.ts:65-68`), through the same runtime schema as chat row 28 — `json_object` carries `{\"type\":\"object\"}` and non-object output is rejected; a client `json_schema` keeps its own root, is validated against that schema at the response boundary (chat row 28, §7 row 10) and is published with its numbers verbatim. **Not enforced together with `tools`**, same as chat row 28",
+      "claimedNote": "supported (`normalizers.ts:65-68`), through the same runtime schema as chat row 28 — `json_object` carries `{\"type\":\"object\"}` and non-object output is rejected; a client `json_schema` keeps its own root, is validated against that schema at the response boundary under `strict: true` (chat row 28, §7 row 10) and is published with its numbers verbatim. **Not enforced together with `tools`**, same as chat row 28",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (`option-is-a-promise`, `wrapper-root-and-lexeme`)",
       "liveParityRow": true
@@ -2666,9 +2666,9 @@
       },
       "claimedLead": "accepted",
       "claimedLeadInLegend": false,
-      "claimedNote": "accepted and required, but **the cap is NOT enforced**: a turn longer than `max_tokens` is returned whole with `stop_reason:\"end_turn\"` and a `usage.output_tokens` above the cap, where the direct API truncates and reports `stop_reason:\"max_tokens\"`. Neither runtime has a channel for it — codex has no upstream cap, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` makes the CLI **error** and discard the partial text instead of truncating (measured 2026-09-02 at 16 and 32). Trimming in the response path would leave `usage.output_tokens` reporting tokens that were generated and billed, so the cap is declared unenforced rather than faked. **`0` accepted** on the claim that the direct API accepts it (contract `:316`) — an unverified claim about the provider",
+      "claimedNote": "accepted and required, but **the cap is NOT enforced**: a turn longer than `max_tokens` is returned whole with `stop_reason:\"end_turn\"` and a `usage.output_tokens` above the cap, where the direct API truncates and reports `stop_reason:\"max_tokens\"`. Neither runtime has a channel for it — codex has no upstream cap, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` makes the CLI **error** and discard the partial text instead of truncating (measured 2026-09-02 at 16 and 32). Trimming in the response path would leave `usage.output_tokens` reporting tokens that were generated and billed, so the cap is declared unenforced rather than faked. **`0` accepted** on the claim that the direct API accepts it (contract `:316`) — an unverified claim about the provider When the runtime does report the limit, `stop_reason: \"max_tokens\"` is reported even with a `tool_use` block present — the direct API keeps the block and its complete members (measured 2026-09-04, M6); the proxy's buffered writer still wraps an unparseable fragment as `{\"input\": …}` (§7 `7b-8b`)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (measured 2026-09-02)",
+      "evidenceNote": "VERIFIED (measured 2026-09-02, 2026-09-04)",
       "liveParityRow": true
     },
     {

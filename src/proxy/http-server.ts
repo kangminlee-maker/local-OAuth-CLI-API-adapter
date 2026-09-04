@@ -1920,12 +1920,20 @@ function openAiChatChoice(result: LocalCompletionResult, index: number): unknown
       refusal: null,
       annotations: [],
     },
-    // `length` is how the chat surface says "stopped at the cap"; the
-    // Anthropic surface already passes `max_tokens` through as a stop reason.
-    finish_reason: hasToolCalls
-      ? 'tool_calls'
-      : result.stopReason === 'max_tokens' ? 'length' : 'stop',
+    finish_reason: openAiChatFinishReason(result),
   };
+}
+
+/**
+ * `length` is how the chat surface says "stopped at the cap", and it says so
+ * even when the cut-off turn carries a tool call — the direct API answers a
+ * forced call cut off by `max_completion_tokens` with the fragment under
+ * `finish_reason: "length"`, not `"tool_calls"` (measured 2026-09-04). One
+ * rule for the body and the stream.
+ */
+function openAiChatFinishReason(result: LocalCompletionResult): 'length' | 'tool_calls' | 'stop' {
+  if (result.stopReason === 'max_tokens') return 'length';
+  return result.toolCalls.length > 0 ? 'tool_calls' : 'stop';
 }
 
 /**
@@ -1980,12 +1988,13 @@ function openAiResponsesResponse(
   const reasoning = result.reasoning
     ? [openAiResponseReasoningItem(result.reasoning.id)]
     : [];
+  const cutOff = responseCutOff(result);
   const output = result.toolCalls.length > 0
     ? [
         ...reasoning,
         ...orderedByEmission(
           mergedTextRun(textRunsFor(result, result.toolCalls.length)),
-          result.toolCalls.map(openAiResponseToolCall),
+          result.toolCalls.map((call) => openAiResponseToolCall(call, cutOff ? 'incomplete' : 'completed')),
           (run) => openAiResponseMessageItem(`msg_${randomUUID()}`, run.text),
         ),
       ]
@@ -1997,10 +2006,11 @@ function openAiResponsesResponse(
     id: `resp_${result.id}`,
     model: result.model,
     request,
-    status: 'completed',
+    status: cutOff ? 'incomplete' : 'completed',
     output,
     usage: openAiResponsesUsage(result.usage),
-    completed: true,
+    completed: !cutOff,
+    incompleteDetails: cutOff ? { reason: 'max_output_tokens' } : null,
   });
 }
 
@@ -2224,7 +2234,9 @@ const ANTHROPIC_PASSTHROUGH_STOP_REASONS = new Set([
 ]);
 
 function anthropicStopReason(result: LocalCompletionResult, hasToolCalls: boolean): string {
-  if (hasToolCalls) return 'tool_use';
+  // A call cut off by the output limit is reported as `max_tokens` with the
+  // `tool_use` block still present (measured 2026-09-04, direct API).
+  if (hasToolCalls && result.stopReason !== 'max_tokens') return 'tool_use';
   const reported = result.stopReason;
   if (reported && ANTHROPIC_PASSTHROUGH_STOP_REASONS.has(reported)) return reported;
   return 'end_turn';
@@ -2295,11 +2307,24 @@ interface OpenAiResponseObjectOptions {
   readonly id: string;
   readonly model: string;
   readonly request: NormalizedRequest;
-  readonly status: 'in_progress' | 'completed';
+  readonly status: 'in_progress' | 'completed' | 'incomplete';
   readonly output: readonly unknown[];
   readonly usage: unknown;
   readonly completed: boolean;
+  readonly incompleteDetails?: { readonly reason: string } | null;
   readonly includeBilling?: boolean;
+}
+
+/**
+ * A turn the backend reports as cut off by its output limit is an incomplete
+ * response: `status: "incomplete"`, `incomplete_details.reason:
+ * "max_output_tokens"`, `completed_at: null`, and a `function_call` item with
+ * `status: "incomplete"` (measured 2026-09-04, direct API). Only the backends
+ * that report a stop reason can say so — the codex transport on
+ * `response.incomplete`, Claude Code on `stop_reason: "max_tokens"`.
+ */
+function responseCutOff(result: LocalCompletionResult): boolean {
+  return result.stopReason === 'max_tokens';
 }
 
 function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
@@ -2315,7 +2340,7 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     completed_at: options.completed ? now : null,
     error: null,
     frequency_penalty: numberOrDefault(raw.frequency_penalty, 0),
-    incomplete_details: null,
+    incomplete_details: options.incompleteDetails ?? null,
     instructions: typeof raw.instructions === 'string' ? raw.instructions : null,
     max_output_tokens: options.request.maxTokens ?? null,
     max_tool_calls: numberOrNull(raw.max_tool_calls),
@@ -2634,13 +2659,13 @@ class OpenAiChatChoiceStream {
         }
       }
       await this.toolState.finish(finalBase, result.toolCalls);
-      await this.write(finalBase, { delta: {}, finish_reason: 'tool_calls' });
+      await this.write(finalBase, { delta: {}, finish_reason: openAiChatFinishReason(result) });
     } else {
       await this.ensureTextStarted(finalBase);
       for (const chunk of chunkText(missingTextTail(this.streamedText, result.text))) {
         await this.write(finalBase, { delta: { content: chunk }, finish_reason: null });
       }
-      await this.write(finalBase, { delta: {}, finish_reason: 'stop' });
+      await this.write(finalBase, { delta: {}, finish_reason: openAiChatFinishReason(result) });
     }
     return result;
   }
@@ -2942,6 +2967,7 @@ async function writeOpenAiResponsesStream(
         });
       };
       if (result.toolCalls.length > 0) {
+        toolState.itemStatus = responseCutOff(result) ? 'incomplete' : 'completed';
         // The turn's calls `[from, to)`, each taking the next free output
         // position as it is closed.
         const finishCalls = async (from: number, to: number): Promise<void> => {
@@ -3032,8 +3058,11 @@ async function writeOpenAiResponsesStream(
       const finalOutput = [...finalItems.entries()]
         .sort(([left], [right]) => left - right)
         .map(([, item]) => item);
-      await writeResponseEvent('response.completed', {
-        type: 'response.completed',
+      // The terminal event names the outcome: `response.incomplete` for a turn
+      // the backend cut off at its output limit (measured 2026-09-04).
+      const terminal = responseCutOff(result) ? 'response.incomplete' : 'response.completed';
+      await writeResponseEvent(terminal, {
+        type: terminal,
         response: openAiResponsesCompletedResponse(responseId, result, request, finalOutput),
       });
     }
@@ -3067,6 +3096,8 @@ interface OpenAiResponseToolItemState {
 type OpenAiResponseEventWriter = (event: string, payload: Record<string, unknown>) => Promise<void>;
 
 class OpenAiResponsesToolStreamState {
+  /** The status the completed items report — `incomplete` for a turn cut off at its output limit. */
+  itemStatus: 'completed' | 'incomplete' = 'completed';
   private readonly items = new Map<number, OpenAiResponseToolItemState>();
 
   /**
@@ -3126,7 +3157,7 @@ class OpenAiResponsesToolStreamState {
       const item = {
         id: state.itemId,
         type: 'function_call',
-        status: 'completed',
+        status: this.itemStatus,
         call_id: state.callId,
         name: state.name,
         arguments: call.arguments,
@@ -3200,14 +3231,16 @@ function openAiResponsesCompletedResponse(
   request: NormalizedRequest,
   output: unknown[],
 ): unknown {
+  const cutOff = responseCutOff(result);
   return openAiResponseObject({
     id: responseId,
     model: result.model,
     request,
-    status: 'completed',
+    status: cutOff ? 'incomplete' : 'completed',
     output,
     usage: openAiResponsesUsage(result.usage),
-    completed: true,
+    completed: !cutOff,
+    incompleteDetails: cutOff ? { reason: 'max_output_tokens' } : null,
     includeBilling: false,
   });
 }
@@ -3866,11 +3899,11 @@ function openAiToolCall(call: LocalToolCall): unknown {
   };
 }
 
-function openAiResponseToolCall(call: LocalToolCall): unknown {
+function openAiResponseToolCall(call: LocalToolCall, status: 'completed' | 'incomplete' = 'completed'): unknown {
   return {
     id: `fc_${randomUUID()}`,
     type: 'function_call',
-    status: 'completed',
+    status,
     call_id: call.id,
     name: call.name,
     arguments: call.arguments,

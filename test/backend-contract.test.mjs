@@ -10,6 +10,7 @@ import {
   outputSchemaFor,
   parseBackendOutput,
   requestInstructionText,
+  textMayBeRefused,
 } from '../dist/proxy/backend-contract.js';
 
 test('tool decision schema remains enabled before an auto tool call', () => {
@@ -377,10 +378,10 @@ test('an object that is not wrapper-shaped, and plain prose, are the answer', ()
 
 const WEATHER_SCHEMA = { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] };
 
-function forcedRequest(inputSchema = WEATHER_SCHEMA) {
+function forcedRequest(inputSchema = WEATHER_SCHEMA, strict = true) {
   return {
     model: 'm', shape: 'openai-chat', messages: [], jsonMode: false,
-    tools: [{ name: 'get_weather', inputSchema }], toolChoice: { type: 'required' }, raw: {},
+    tools: [{ name: 'get_weather', inputSchema, strict }], toolChoice: { type: 'required' }, raw: {},
   };
 }
 
@@ -398,12 +399,62 @@ test('row 8: a forced call whose arguments are not JSON is refused at completion
 });
 
 test('row 8: the fragment is kept only when the output limit cut the call off', () => {
-  // Claude Code reports the Messages API name, the Codex transport the
-  // Responses API name; both are the direct APIs' `finish_reason: "length"`.
-  for (const stopReason of ['max_tokens', 'length']) {
-    const kept = parseBackendOutput(forcedRequest(), '{"city":"Seo', stopReason);
-    assert.deepEqual(kept.toolCalls, [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seo' }], stopReason);
-  }
+  // Both readers of this function spell the limit the Messages API's way.
+  const kept = parseBackendOutput(forcedRequest(), '{"city":"Seo', 'max_tokens');
+  assert.deepEqual(kept.toolCalls, [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seo' }]);
+  // CONTROL: the Responses API's word is not one this reading ever receives
+  // (r18-fable F7 — an arm nothing fed), so it is not an excuse.
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo', 'length'), (e) => refused(e, /not JSON/));
+});
+
+// ---------------------------------------------------------------------------
+// Round 18: what the two reviewers found in the row 8/10 closure.
+// ---------------------------------------------------------------------------
+
+test('r18: a turn cut off at the output limit is delivered whatever it holds (F4, codex C4)', () => {
+  // The direct APIs deliver a limit-cut structured answer as the fragment it
+  // is under `finish_reason: "length"` (measured 2026-09-04, M7), so none of
+  // the completion rules apply to it.
+  const partial = parseBackendOutput(forcedRequest(), '{"city":"Seoul"}', 'max_tokens');
+  assert.equal(partial.toolCalls[0].arguments, '{"city":"Seoul"}', 'a parseable partial under a schema needing more');
+  const strict = forcedRequest({ ...WEATHER_SCHEMA, required: ['city', 'country'] });
+  assert.equal(parseBackendOutput(strict, '{"city":"Seoul"}', 'max_tokens').toolCalls[0].arguments, '{"city":"Seoul"}');
+  assert.equal(parseBackendOutput(forcedRequest(), '{}', 'max_tokens').toolCalls[0].arguments, '{}');
+  assert.equal(parseBackendOutput(schemaRequest(WEATHER_SCHEMA), '{"city":"Seo', 'max_tokens').text, '{"city":"Seo', 'json_schema fragment');
+  const object = { ...schemaRequest(undefined), jsonSchema: undefined };
+  assert.equal(parseBackendOutput(object, '{"a":', 'max_tokens').text, '{"a":', 'json_object fragment');
+  // CONTROL: the same inputs with no stop reason are the refusals rows 8/10 promise.
+  assert.throws(() => parseBackendOutput(strict, '{"city":"Seoul"}'), (e) => refused(e, /outside the tool's schema/));
+  assert.throws(() => parseBackendOutput(schemaRequest(WEATHER_SCHEMA), '{"city":"Seo'), (e) => refused(e, /not JSON/));
+  assert.throws(() => parseBackendOutput(object, '{"a":'), (e) => refused(e, /not a JSON object/));
+});
+
+test('r18: a schema this path cannot judge passes — $async, $id/$ref across requests, inexact numbers (F1, F3, codex C1/C3)', () => {
+  // `$async: true` compiles to a promise-returning validator: a conforming
+  // answer used to be refused (a promise is never `=== true`) and a
+  // non-conforming one ended the process on an unhandled rejection.
+  const async = forcedRequest({ $async: true, type: 'object', required: ['city'] });
+  assert.equal(parseBackendOutput(async, '{"city":"Seoul"}').toolCalls[0].arguments, '{"city":"Seoul"}');
+  assert.equal(parseBackendOutput(async, '{"town":"Seoul"}').toolCalls[0].arguments, '{"town":"Seoul"}');
+  // One request's `$id` must not decide another's verdict.
+  const a = schemaRequest({ $id: 'https://example.com/r18', type: 'object', required: ['zzz'] });
+  assert.throws(() => parseBackendOutput(a, '{"ok":1}'), (e) => refused(e, /outside the request's JSON schema/));
+  const b = schemaRequest({ $ref: 'https://example.com/r18' });
+  assert.equal(parseBackendOutput(b, '{"ok":1}').text, '{"ok":1}', 'an unresolvable $ref judges nothing, even after A registered that id');
+  const c = schemaRequest({ $id: 'https://example.com/r18', type: 'object', properties: { x: { const: 2 } }, required: ['x'] });
+  assert.throws(() => parseBackendOutput(c, '{"x":1}'), (e) => refused(e, /outside the request's JSON schema/), 'a second schema under a taken $id is still judged');
+  // The client is promised the runtime's bytes; a constraint judged on the
+  // rounded double refused `9007199254740993` against `exclusiveMinimum: 9007199254740992`.
+  const big = schemaRequest({ type: 'object', properties: { id: { type: 'integer', exclusiveMinimum: 9007199254740992 } }, required: ['id'] });
+  assert.equal(parseBackendOutput(big, '{"id":9007199254740993}').text, '{"id":9007199254740993}');
+  // CONTROL: an exact number under the same schema is still judged.
+  assert.throws(() => parseBackendOutput(big, '{"id":5}'), (e) => refused(e, /outside the request's JSON schema/));
+});
+
+test('r18: a schema without a JSON format is not enforced, and the normalizers no longer produce that pair (F2)', () => {
+  const stray = { ...schemaRequest(WEATHER_SCHEMA), jsonMode: false };
+  assert.equal(parseBackendOutput(stray, 'hello world prose').text, 'hello world prose');
+  assert.equal(textMayBeRefused(stray), false, 'and the gates agree: nothing to hold');
 });
 
 test('row 8: arguments outside the forced tool\'s schema are refused; conforming ones pass', () => {
@@ -420,9 +471,21 @@ test('row 8: arguments outside the forced tool\'s schema are refused; conforming
   assert.equal(parseBackendOutput(schemaless, '{"city":1}').toolCalls[0].arguments, '{"city":1}');
 });
 
-function schemaRequest(jsonSchema) {
-  return { model: 'm', shape: 'openai-chat', messages: [], jsonMode: true, jsonSchema, tools: [], toolChoice: { type: 'auto' }, raw: {} };
+function schemaRequest(jsonSchema, strict = true) {
+  return { model: 'm', shape: 'openai-chat', messages: [], jsonMode: true, jsonSchema, jsonSchemaStrict: strict, tools: [], toolChoice: { type: 'auto' }, raw: {} };
 }
+
+test('r18: the schema is enforced only where the client took the promise (codex, `strict`)', () => {
+  // The direct OpenAI APIs validate tool arguments and a `json_schema` answer
+  // only under `strict: true`; without it the schema is a request to the
+  // model. The Messages API's structured output is always exact.
+  assert.equal(parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '{"city":1}').toolCalls[0].arguments, '{"city":1}', 'non-strict tool: delivered');
+  assert.throws(() => parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '{"city":"Seo'), (e) => refused(e, /not JSON/), 'non-strict tool: still JSON');
+  assert.equal(parseBackendOutput(schemaRequest(WEATHER_SCHEMA, false), '{"city":1}').text, '{"city":1}', 'non-strict json_schema: delivered');
+  assert.throws(() => parseBackendOutput(schemaRequest(WEATHER_SCHEMA, false), 'prose'), (e) => refused(e, /not JSON/), 'non-strict json_schema: still JSON');
+  const anthropic = { ...schemaRequest(WEATHER_SCHEMA, undefined), jsonSchemaStrict: undefined, shape: 'anthropic-messages' };
+  assert.throws(() => parseBackendOutput(anthropic, '{"city":1}'), (e) => refused(e, /outside the request's JSON schema/), 'Messages: exact without a flag');
+});
 
 test('row 10: text outside the client\'s json_schema is refused; conforming text passes', () => {
   const request = schemaRequest(WEATHER_SCHEMA);
