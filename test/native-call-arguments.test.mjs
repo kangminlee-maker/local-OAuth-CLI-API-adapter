@@ -299,3 +299,30 @@ test('an identity the stream announced is kept by the body: the completed output
     assert.equal(block.name, 'probe');
   });
 });
+
+test('an announced identity is frozen at every door: output_item.done and a repeated output_item.added cannot rename call_1/probe either (r25-fable)', async () => {
+  const renameBy = (frame) => [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{}' },
+    frame,
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_2', name: 'other', arguments: '{}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_2', name: 'other', arguments: '{}' }] } },
+  ];
+  const TWO = { ...CHAT, tools: [...CHAT.tools, { type: 'function', function: { name: 'other', parameters: { type: 'object' } } }] };
+  const TWO_MESSAGES = { ...MESSAGES, tools: [...MESSAGES.tools, { name: 'other', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } };
+  const repeatedAdded = { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_2', name: 'other' } };
+  const doneOnly = { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{}' };
+  for (const frame of [repeatedAdded, doneOnly]) {
+    await withProxyEvents(renameBy(frame), async (url) => {
+      const chat = JSON.parse((await post(`${url}/v1/chat/completions`, OPENAI, TWO)).text).choices[0].message.tool_calls[0];
+      assert.equal(chat.id, 'call_1');
+      assert.equal(chat.function.name, 'probe');
+      const announced = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO, stream: true })).text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
+      assert.deepEqual(announced.map((call) => [call.id, call.function.name]), [['call_1', 'probe']]);
+      const messages = await post(`${url}/v1/messages`, ANTHROPIC, TWO_MESSAGES);
+      assert.equal(messages.status, 200, messages.text);
+      const blocks = JSON.parse(messages.text).content.filter((item) => item.type === 'tool_use');
+      assert.deepEqual(blocks.map((block) => [block.id, block.name]), [['call_1', 'probe']]);
+    });
+  }
+});

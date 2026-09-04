@@ -3965,14 +3965,16 @@ function anthropicToolUse(call: LocalToolCall, cutOff = false, fragment = false)
   // transport's arguments are the vendor's own and arrive unjudged, so this
   // surface — whose `input` is a JSON value — applies the same rule (r21).
   if (!cutOff) assertCallArguments(call.arguments, undefined, 'anthropic-messages', 'called a tool with');
-  // The one call the cut hit is a fragment: an object prefix keeps its
-  // complete members, and whole JSON that is no object (`[1, 2]`, `12`) is a
-  // fragment of no object, `{}` (r22). Every other call of a cut turn is
-  // complete by construction and goes out as written where its bytes are
-  // JSON — the stream closed its block on them, and projecting `[1, 2]` to
-  // `{}` here split the two paths (r23) — and as the projection where they
-  // are not, since `input` must be a JSON value and nothing on a cut turn is
-  // judged (declared, matrix §7 row 8).
+  // The one call the cut hit — the turn's last call with nothing after it,
+  // the one whose block the stream leaves open (`cutCallLeftOpen`) — is a
+  // fragment: an object prefix keeps its complete members, and whole JSON
+  // that is no object (`[1, 2]`, `12`) is a fragment of no object, `{}`
+  // (r22). Every other call of a cut turn, a last call with narration after
+  // it included, goes out as written where its bytes are JSON — the stream
+  // closed its block on them, and projecting `[1, 2]` to `{}` here split the
+  // two paths (r23) — and as the projection where they are not, since
+  // `input` must be a JSON value and nothing on a cut turn is judged
+  // (declared, matrix §7 row 8).
   const whole = fragment ? parsesAsJsonObject(call.arguments) : parsesAsJson(call.arguments);
   return {
     type: 'tool_use',

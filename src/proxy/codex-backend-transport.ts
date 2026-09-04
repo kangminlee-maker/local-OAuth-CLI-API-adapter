@@ -354,10 +354,16 @@ class CodexBackendStreamState {
       const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name, anonymous: !named });
       // Same rule the `.done` branch states: never downgrade an announced
       // `call_id` to an item id. A repeat of the item that omits it would
-      // otherwise rename a call the client has already reported under.
-      if (event.item.call_id !== undefined) state.id = event.item.call_id;
-      else if (!state.identified) state.id = id;
-      state.name = event.item.name ?? state.name;
+      // otherwise rename a call the client has already reported under — and
+      // once the client has been told an identity (`started`), no later
+      // frame changes it at all (r25-fable: a repeat carrying `call_2`/`other`
+      // renamed the body's call behind a stream that had announced
+      // `call_1`/`probe`).
+      if (!state.started) {
+        if (event.item.call_id !== undefined) state.id = event.item.call_id;
+        else if (!state.identified) state.id = id;
+        state.name = event.item.name ?? state.name;
+      }
       if (named) state.anonymous = false;
       // `call_id` is the identity the client echoes back with the tool result;
       // an item id is not interchangeable with it, so a call is only worth
@@ -420,8 +426,12 @@ class CodexBackendStreamState {
       });
       // Never downgrade an announced call_id to an item id: the client echoes
       // this value back, and the two surfaces would disagree about the call.
-      state.id = event.item.call_id ?? state.id;
-      state.name = event.item.name ?? state.name;
+      // An identity the client has been told is frozen (`started`), as in
+      // `captureFinalOutput` (r25-fable).
+      if (!state.started) {
+        state.id = event.item.call_id ?? state.id;
+        state.name = event.item.name ?? state.name;
+      }
       if (named) state.anonymous = false;
       if (event.item.call_id !== undefined) state.identified = true;
       // A call already announced as finished keeps the value it was finished
