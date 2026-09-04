@@ -90,9 +90,6 @@ export function collectMethodEnums(schema) {
     if (Array.isArray(methodEnum)) {
       for (const value of methodEnum) values.add(value);
     }
-    if (Array.isArray(node?.enum) && node.enum.every((value) => typeof value === 'string' && value.includes('/'))) {
-      for (const value of node.enum) values.add(value);
-    }
   });
   return [...values].sort();
 }

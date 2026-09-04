@@ -10,6 +10,7 @@ import test from 'node:test';
 
 import { classifyFlagProbe } from '../scripts/runtime-capability/probes.mjs';
 import { parseHelpText } from '../scripts/runtime-capability/help-parser.mjs';
+import { collectMethodEnums } from '../scripts/runtime-capability/schema.mjs';
 
 test('help with no usage line parses to an empty string, not null', () => {
   // The premise the guards rest on. If this ever returns null, the truthiness
@@ -71,4 +72,23 @@ test('the negative controls are flags no CLI can have', async () => {
     assert.match(control, /^--zzz-/, 'controls must be obviously synthetic');
   }
   assert.ok(FLAG_PROBE_CONTROLS.length >= 2, 'one control cannot distinguish a reworded rejection from a real one');
+});
+
+test('schema method collection reads method discriminators, not slash-bearing nested enums', () => {
+  const schema = {
+    oneOf: [
+      {
+        properties: {
+          method: { enum: ['mcpServer/elicitation/request'] },
+          params: { properties: { mode: { enum: ['form', 'openai/form', 'openaiForm', 'url'] } } },
+        },
+      },
+      { properties: { method: { enum: ['turn/start'] } } },
+    ],
+    definitions: {
+      unrelated: { enum: ['also/not-a-method'] },
+    },
+  };
+
+  assert.deepEqual(collectMethodEnums(schema), ['mcpServer/elicitation/request', 'turn/start']);
 });

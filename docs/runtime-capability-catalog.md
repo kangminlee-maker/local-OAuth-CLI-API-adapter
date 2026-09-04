@@ -10,8 +10,8 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 
 | Runtime | Local version | Command on PATH | Scan target | Primary hot path |
 | --- | --- | --- | --- | --- |
-| Codex CLI | `codex-cli 0.149.1` | `/opt/homebrew/bin/codex` | 동일 | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.251` | `/Users/kangmin/.superset/bin/claude` (wrapper) | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Codex CLI | `codex-cli 0.153.0` | `/opt/homebrew/bin/codex` | 동일 | `codex app-server --listen stdio://` |
+| Claude Code | `2.1.260` | `/Users/kangmin/.superset/bin/claude` (wrapper) | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
 PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper가 실제로 실행되는 명령이므로 version·help·schema·parse probe 같은 동작 권위는 wrapper 기준으로 수집한다. 다만 wrapper script에는 바이너리 문자열이 없으므로 string scan만 native 바이너리를 대상으로 하며, 그 후보는 wrapper와 `--version`이 일치할 때만 채택한다. 일치하는 후보가 없으면 scan은 대상 없음으로 보고한다. report의 `Command on PATH`와 `Scan target` 열이 이 둘을 구분한다.
 
@@ -30,13 +30,13 @@ PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있�
 
 L0과 L4의 관계에 주의한다. binary에 문자열이 남아 있다는 사실은 그 token이 compile되어 있다는 뜻일 뿐, parser가 그 flag를 받는다는 뜻이 아니다. 실제로 현재 Claude Code binary에는 CLI가 `unknown option`으로 거부하는 flag의 문자열도 남아 있다. flag 수용 여부의 권위는 항상 parse probe(L4)다.
 
-**L4와 L5의 관계에는 더 주의한다.** 항목의 서술이 효과를 주장하면 — 제어, 격리, 비활성화, 대체, 억제 — L4는 근거가 되지 못한다. 이 버전에서 확인된 반례가 셋이다. `--ignore-user-config`는 help에 있고 parse probe가 받아들이지만 사용자 `AGENTS.md`가 그대로 wire에 도달했고, `-c default_tools_enabled=false`는 받아들여지지만 내장 tool 9개가 바이트 동일하게 남았으며, `model_verbosity`를 `turn/start` 파라미터로 보내면 오류 없이 접수되지만 wire에는 나타나지 않는다. 세 경우 모두 수용 단계의 모든 권위가 "통과"라고 답한다.
+**L4와 L5의 관계에는 더 주의한다.** 항목의 서술이 효과를 주장하면 — 제어, 격리, 비활성화, 대체, 억제 — L4는 근거가 되지 못한다. 이 버전에서 확인된 반례가 둘이다. `-c default_tools_enabled=false`는 받아들여지지만 내장 tool 9개가 바이트 동일하게 남았으며, `model_verbosity`를 `turn/start` 파라미터로 보내면 오류 없이 접수되지만 wire에는 나타나지 않는다. 두 경우 모두 수용 단계의 모든 권위가 "통과"라고 답한다.
 
 절대 없음을 주장할 때는 도구가 있는 것을 실제로 찾아낸다는 것을 먼저 보인다(negative control). 검증하지 않은 도구가 찾지 못했다는 사실은 발견이 아니다.
 
 예외 하나. Codex app-server 요청 파라미터는 L2로 충분하다. 생성 schema와 문서화된 파라미터 표를 수집기가 직접 대조하므로 미선언 파라미터가 stale로 드러난다. CLI flag와 환경변수에는 이 대조가 없다.
 
-이 문서에서 L5로 표시된 관찰의 출처는 모두 동일하다. **2026-08-28, `codex-cli 0.149.1` / Claude Code `2.1.251`**, 요청 본문을 기록하고 400을 반환하는 로컬 HTTP sink로 수집했다. sink는 CLI 실행 전에 `curl`로 자가 검사해 "본문 0건"이 계측 실패와 구분되도록 했다.
+Codex L5 관찰은 **2026-09-04, `codex-cli 0.153.0`**, Claude L5 관찰은 **2026-08-28, Claude Code `2.1.251`** 기준이다. Claude는 그 사이 `2.1.260`으로 올라갔으므로, 갱신 방식 5-5에 따라 **이 문서의 Claude L5 효과 주장은 설치된 런타임의 권위가 아니다** — 재측정 전까지 미결로 읽는다. 둘 다 요청 본문을 기록하고 400을 반환하는 로컬 HTTP sink로 수집했으며, CLI 실행 전에 sink를 자가 검사해 "본문 0건"이 계측 실패와 구분되도록 했다.
 
 ## 갱신 방식
 
@@ -145,7 +145,8 @@ Useful official references:
 
 - Claude Code CLI reference: https://code.claude.com/docs/en/cli-usage
 - Claude Code MCP/Agent SDK docs: https://code.claude.com/docs/en/agent-sdk/mcp
-- OpenAI Codex model capability reference: https://developers.openai.com/api/docs/models/gpt-5.2-codex
+- OpenAI Codex app-server reference: https://learn.chatgpt.com/docs/app-server
+- OpenAI GPT-5.6 Sol model reference: https://developers.openai.com/api/docs/models/gpt-5.6-sol
 
 ## Codex capability list
 
@@ -183,7 +184,7 @@ hot path에서 쓰는 항목:
 | `codex exec --json` | L1 | one-shot fallback, smoke |
 | `codex exec --output-schema <file>` | L1/L5 | strict final output fallback. `text.format`이 `strict: true`로 wire에 실리는 것을 확인했다 |
 | `codex exec --ephemeral` / `codex exec --ignore-rules` | L1/L4 수용 | 등록되어 있고 parser가 받는다. 세션 파일과 execpolicy에 대한 **효과는 wire로 확인하지 않았다** — 미결 항목 참조 |
-| `codex exec --ignore-user-config` | L1/L4 수용 + L5 반증 | 등록되어 있고 받아들여지지만 instruction을 격리하지 **않는다**. 이 flag를 켠 채 캡처한 본문에도 사용자 `AGENTS.md`가 user 메시지로 도달했고, `CODEX_HOME`을 빈 디렉터리로 돌렸을 때만 사라졌다. 억제 대상은 `config.toml`뿐이다 |
+| `codex exec --ignore-user-config` | L1/L4 수용 + L5 config 효과 | 등록되어 있고 받아들인다. 0.153.0 대조에서 `config.toml`의 `model_verbosity="high"`는 flag를 켜면 기본 `low`로 돌아가 config 억제는 확인했다. 그러나 통제한 두 exec arm 모두 `CODEX_HOME/AGENTS.md` marker를 싣지 않아 instruction 효과는 미결이며, 이 flag를 instruction 격리 수단으로 쓰지 않는다 |
 | `codex debug prompt-input` / `debug models` / `features list` | L1 | 진단·발견 |
 
 CLI option 값 도메인:
@@ -238,34 +239,34 @@ Risk: hidden 항목은 `--help` diff 없이 rename/삭제될 수 있다. Codex �
 
 ### App-server protocol surface
 
-생성 schema 기준 현재 method 수는 238개이며, `--experimental` 생성물은 401개 파일이다.
+생성 schema 기준 현재 method 수는 248개이며, `--experimental` 생성물은 416개 파일이다.
 
 | Category | Count | 비고 |
 | --- | ---: | --- |
-| ClientRequest | 150 | client → server 요청 |
+| ClientRequest | 155 | client → server 요청 |
 | ClientNotification | 1 | `initialized` |
-| ServerRequest | 12 | server → client 요청 (승인, tool call, form 등) |
-| ServerNotification | 75 | server → client 알림 |
+| ServerRequest | 11 | server → client 요청 (승인, tool call, form 등) |
+| ServerNotification | 81 | server → client 알림 |
 
-전체 목록은 `artifacts/runtime-capability-catalog/latest.json`의 `codex.schema.methodEnums`에 있다. 주요 그룹:
+전체 목록은 `pnpm catalog:runtime`이 로컬 gitignored 경로 `artifacts/runtime-capability-catalog/latest.json`의 `codex.schema.methodEnums`에 생성한다. 이 report artifact는 package에 포함되지 않는다. 주요 그룹:
 
 | Group | Methods |
 | --- | --- |
 | Handshake/diagnostics | `initialize`, `server/diagnostics` |
-| Session/thread | `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unarchive`, `thread/delete`, `thread/unsubscribe`, `thread/read`, `thread/list`, `thread/search`, `thread/searchOccurrences`, `thread/loaded/list` |
+| Session/thread | `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unarchive`, `thread/delete`, `thread/unsubscribe`, `thread/read`, `thread/list`, `thread/search`, `thread/searchOccurrences`, `thread/loaded/list`, `thread/shellCommand`, `thread/timeline/list` |
 | Thread section | `threadSection/create`, `threadSection/list`, `threadSection/update`, `threadSection/delete`, `thread/section/move` |
 | Turn control | `turn/start`, `turn/interrupt`, `turn/steer`, `thread/turns/list`, `thread/items/list`, `thread/rollback`, `thread/revert` |
 | Turn queue | `thread/queue/add`, `thread/queue/start`, `thread/queue/list`, `thread/queue/update`, `thread/queue/reorder`, `thread/queue/delete` |
 | Context and settings | `thread/settings/update`, `thread/metadata/update`, `thread/name/set`, `thread/memoryMode/set`, `thread/compact/start`, `thread/inject_items`, `thread/goal/set`, `thread/goal/get`, `thread/goal/clear` |
 | Filesystem | `fs/readFile`, `fs/writeFile`, `fs/readDirectory`, `fs/createDirectory`, `fs/copy`, `fs/remove`, `fs/getMetadata`, `fs/watch`, `fs/unwatch` |
 | Process/terminal | `process/spawn`, `process/writeStdin`, `process/resizePty`, `process/kill`, `command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`, `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, `thread/backgroundTerminals/clean` |
-| Tools/MCP | `mcpServer/tool/call`, `mcpServer/resource/read`, `mcpServer/oauth/login`, `mcpServerStatus/list`, `skills/list`, `skills/config/write`, `skills/extraRoots/set`, `config/mcpServer/reload`, `hooks/list` |
-| Plugin/app/marketplace | `plugin/list`, `plugin/read`, `plugin/search`, `plugin/install`, `plugin/uninstall`, `app/list`, `app/read`, `app/installed`, `marketplace/add`, `marketplace/remove`, `marketplace/upgrade` |
+| Tools/MCP | `mcpServer/tool/call`, `mcpServer/resource/read`, `mcpServer/oauth/login`, `mcpServer/elicitation/request` ("openai/form"은 이 요청의 mode 값), `mcpServer/event/stream/start`, `mcpServer/event/stream/stop`, `mcpServerStatus/list`, `skills/list`, `skills/config/write`, `skills/extraRoots/set`, `config/mcpServer/reload`, `hooks/list` |
+| Plugin/app/marketplace | `plugin/list`, `plugin/read`, `plugin/search`, `plugin/install`, `plugin/uninstall`, `plugin/installed`, `plugin/reconcile`, `plugin/skill/read`, `plugin/share/list`, `app/list`, `app/read`, `app/installed`, `marketplace/add`, `marketplace/remove`, `marketplace/upgrade` |
 | Project | `project/create`, `project/list`, `project/read`, `project/update`, `project/delete`, `project/import`, `project/move` |
 | Memory/review/search | `memory/reset`, `review/start`, `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, `fuzzyFileSearch/sessionStop` |
-| Server requests | `item/tool/call`, `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `applyPatchApproval`, `execCommandApproval`, `mcpServer/elicitation/request`, `attestation/generate`, `account/chatgptAuthTokens/refresh`, `currentTime/read`, `openai/form` |
+| Server requests | `item/tool/call`, `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `applyPatchApproval`, `execCommandApproval`, `mcpServer/elicitation/request`, `attestation/generate`, `account/chatgptAuthTokens/refresh`, `currentTime/read` |
 | Models/features | `model/list`, `modelProvider/capabilities/read`, `experimentalFeature/list`, `experimentalFeature/enablement/set`, `collaborationMode/list`, `permissionProfile/list` |
-| Account/config | `account/read`, `account/usage/read`, `account/rateLimits/read`, `account/login/start`, `account/login/cancel`, `account/logout`, `config/read`, `config/value/write`, `config/batchWrite`, `configRequirements/read` |
+| Account/config | `account/read`, `account/usage/read`, `account/rateLimits/read`, `account/rateLimitResetCredit/consume`, `account/workspaceMessages/read`, `account/bedrock/discover`, `account/bedrock/setup`, `account/login/start`, `account/login/cancel`, `account/logout`, `config/read`, `config/value/write`, `config/batchWrite`, `configRequirements/read` |
 | Environments | `environment/add`, `environment/info`, `environment/status` |
 | Realtime | `thread/realtime/start`, `thread/realtime/appendText`, `thread/realtime/appendAudio`, `thread/realtime/appendSpeech`, `thread/realtime/stop`, `thread/realtime/listVoices` |
 
@@ -291,7 +292,7 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 | Request | Required | Optional |
 | --- | --- | --- |
 | `thread/start` | 없음 | `allowProviderModelFallback`, `approvalPolicy`, `approvalsReviewer`, `baseInstructions`, `config`, `cwd`, `developerInstructions`, `dynamicTools`, `environments`, `ephemeral`, `experimentalRawEvents`, `historyMode`, `mockExperimentalField`, `model`, `modelProvider`, `multiAgentMode`, `permissions`, `personality`, `projectId`, `runtimeWorkspaceRoots`, `sandbox`, `selectedCapabilityRoots`, `serviceName`, `serviceTier`, `sessionStartSource`, `threadSource` |
-| `turn/start` | `input`, `threadId` | `additionalContext`, `approvalPolicy`, `approvalsReviewer`, `clientUserMessageId`, `collaborationMode`, `cwd`, `effort`, `environments`, `model`, `multiAgentMode`, `outputSchema`, `permissions`, `personality`, `responsesapiClientMetadata`, `runtimeWorkspaceRoots`, `sandboxPolicy`, `serviceTier`, `summary` |
+| `turn/start` | `input`, `threadId` | `additionalContext`, `approvalPolicy`, `approvalsReviewer`, `clientUserMessageId`, `collaborationMode`, `cwd`, `cyberAccessProgram`, `effort`, `environments`, `model`, `multiAgentMode`, `outputSchema`, `permissions`, `personality`, `responsesapiClientMetadata`, `runtimeWorkspaceRoots`, `sandboxPolicy`, `serviceTier`, `serviceTierForTurn`, `summary`, `toolOutput`, `turnTrigger` |
 
 값 도메인:
 
@@ -308,18 +309,18 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 
 ### 환경 격리와 wire 기본값
 
-adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 표의 "미설정 기본값"은 캡처한 요청 본문에서 읽은 값이며, help나 schema는 필드의 존재만 말해 주므로 이 표의 권위가 될 수 없다. 관찰 조건은 위 신뢰 레벨 절에 적은 것과 같다(2026-08-28, `codex-cli 0.149.1`, 로컬 sink).
+adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 표의 "미설정 기본값"은 캡처한 요청 본문에서 읽은 값이며, help나 schema는 필드의 존재만 말해 주므로 이 표의 권위가 될 수 없다. 관찰 조건은 위 신뢰 레벨 절에 적은 것과 같다(2026-09-04, `codex-cli 0.153.0`, 로컬 sink).
 
 권위 열의 표기: **L5**는 설정을 켠 본문과 끈 본문이 실제로 달랐다는 뜻이고, **L5 양방향**은 반대 값을 주었을 때 관찰값이 따라 움직이는 것까지 확인했다는 뜻이다.
 
 | Knob | 미설정 기본값 | 효과 | 권위 |
 | --- | --- | --- | --- |
-| `CODEX_HOME` 리디렉션 | `~/.codex` 로드: `AGENTS.md`, 사용자 MCP 서버, `dangerFullAccess` sandbox | 빈 디렉터리를 가리키면 `instructionSources`가 비고, 내장 `codex_apps` 외 MCP 서버가 사라지며, sandbox가 `readOnly` + network 차단으로 내려간다. **instruction 격리의 실제 수단** | L5 |
+| `CODEX_HOME` 리디렉션 | 선택된 home의 `AGENTS.md`를 로드 | 통제 marker가 있는 home과 빈 home을 대조했을 때 marker가 전자에만 실렸다. **app-server instruction 격리의 실제 수단** | L5 양방향 |
 | `baseInstructions` (`thread/start`) | Codex persona developer 블록 + skills 블록 | persona와 skills 블록을 함께 대체한다. 대조 실행에서는 두 블록이 모두 본문에 있었다. config 등가물 `-c instructions`는 persona만 대체하고 skills 블록은 남기므로, app-server 파라미터 쪽이 더 강하다 | L5 |
 | `developerInstructions` (`thread/start`) | 없음 | base 뒤에 developer 메시지를 하나 더 추가한다 | L5 |
 | `-c model_verbosity` | `text.verbosity: "low"` — 지정하지 않아도 전송된다 | CLI가 요청하지 않은 축약을 상류에 요구한다. `high`를 주면 캡처값도 `high`로 움직인다 | L5 양방향 |
 | `-c model_reasoning_effort` | `reasoning.effort: "low"` — reasoning ON | `=none`이 reasoning off 스위치다 | L5 |
-| 내장 tool | 항상 9개: `functions`(`exec`, `wait`, `request_user_input`) + `collaboration` 6개 | **끄는 수단이 없다.** 아래 네 가지 시도가 모두 tool 목록을 바이트 단위로 동일하게 남겼다 | L5 negative |
+| 내장 tool | `input[0].tools`의 두 namespace 아래 항상 9개: `functions`(`exec`, `wait`, `request_user_input`) + `collaboration` 6개 | **끄는 수단이 없다.** 아래 네 가지 시도가 모두 이 namespace/tool 목록을 바이트 단위로 동일하게 남겼다 | L5 negative |
 | output token cap | 없음 | 상류에서 강제할 방법이 없으므로 proxy가 하류에서 처리해야 한다 | L2 + L5 negative |
 | `tool_choice` / `parallel_tool_calls` / `store` | `"auto"` / `false` / `false` | 호출자가 지정하지 않아도 무조건 실린다 | L5 |
 
@@ -327,7 +328,7 @@ adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전�
 
 내장 tool 제거 시도 네 가지는 `-c default_tools_enabled=false`, `codex --disable multi_agent`, `codex --disable code_mode_host`, 그리고 두 flag의 조합이었다. 네 경우 모두 9개가 그대로 남았다. 이 잔여는 artifact가 아니라 응답 성향의 변화이므로 출력에서 탐지하거나 상쇄할 수 없다. 받아들이고 문서화한다.
 
-`--ignore-user-config`는 이 격리를 대신하지 못한다. 이 flag를 켠 `codex exec` capture에서도 사용자 `AGENTS.md`가 user 메시지로 wire에 도달했다. 억제되는 것은 `config.toml`뿐이다. help에도 있고 parse probe도 통과하므로 수용 단계의 권위만 보면 통과로 읽힌다는 점이 이 항목의 요점이다.
+`--ignore-user-config`는 이 격리를 대신하지 못한다. 0.153.0에서 `config.toml` 억제는 L5로 확인했지만, 통제한 exec 대조군과 flag arm 모두 `CODEX_HOME/AGENTS.md` marker를 싣지 않아 instruction 효과는 관찰하지 못했다. instruction 격리는 app-server hot path에서 양방향 대조가 성립한 `CODEX_HOME` 리디렉션을 사용한다.
 
 ### Codex design implications
 
@@ -518,6 +519,7 @@ Rule: projections are convenience views. The raw event is always retained for au
 | 항목 | 지금까지 확인된 것 | 남은 질문 |
 | --- | --- | --- |
 | Codex `exec --ephemeral`, `exec --ignore-rules` | 등록·수용 | 세션 파일과 execpolicy가 실제로 달라지는지 |
+| Codex `exec --ignore-user-config`의 instruction 효과 | 등록·수용, `config.toml` 억제는 L5 | 같은 exec 대조군이 `CODEX_HOME/AGENTS.md` marker를 싣는 조건을 먼저 확립한 뒤 flag arm과 비교해야 한다 |
 | Claude `--thinking`, `--thinking-display`, `--task-budget` | 등록·수용 + 값 도메인 | 값이 요청 본문을 바꾸는지. 특히 `--thinking disabled`가 `MAX_THINKING_TOKENS=0`과 같은 일을 하는지 |
 | Claude `--safe-mode`, `--restricted`, `--disable-slash-commands`, `--exclude-dynamic-system-prompt-sections` | 등록·수용 + help 서술 | 서술대로 context와 tool이 줄어드는지 |
 | Claude `context_management` 억제 | 매 요청 전송되는 것은 관찰 | 끄는 수단이 있는지. 찾지 못했을 뿐 없다고 확인한 것이 아니다 |

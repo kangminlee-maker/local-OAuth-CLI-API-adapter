@@ -95,9 +95,9 @@ live smoke 비용을 미리 제한하는 장치는 없다. report는 실제로 �
 5. L1 help, L2 generated schema, L3 official docs는 discovery authority다. 기본 runtime path로 승격하려면 L4 runtime probe가 필요하다.
 5-1. **L4는 "파서가 받았다"까지만 증명한다. "무언가를 바꿨다"는 증명하지 않는다.** 항목의 서술이
    *효과*를 주장하면 — 제어, 격리, 비활성화, 대체, 억제 — L4로는 부족하고 **L5(와이어 캡처 + 짝 대조)**가
-   필요하다. 실측 반례가 있다: `--ignore-user-config`는 help에 있고 parse probe가 받아들이지만
-   AGENTS.md 22,262자가 그대로 와이어에 도달했고, `-c default_tools_enabled=false`는 받아들여지지만
-   내장 도구 9개가 바이트 동일하게 남았다. 두 경우 모두 이 문서의 모든 권위가 "통과"라고 말한다.
+   필요하다. 실측 반례가 있다: `-c default_tools_enabled=false`는 받아들여지지만 내장 도구 9개가
+   바이트 동일하게 남고, `model_verbosity`를 `turn/start` 파라미터로 보내면 오류 없이 접수되지만
+   wire에는 나타나지 않는다. 두 경우 모두 수용 단계의 권위는 "통과"라고 말한다.
 5-2. **예외: Codex app-server 파라미터는 L2로 충분하다.** `validateDocumentedRequestContracts`가 문서화된
    파라미터 표를 생성 스키마와 대조하므로, `TurnStartParams`에 없는 파라미터는 `documentedButAbsent`로
    stale이 된다. 실제로 그 경로가 `model_verbosity`를 잡았다. CLI 플래그와 환경변수에는 이 대조가 없다.
@@ -108,7 +108,12 @@ live smoke 비용을 미리 제한하는 장치는 없다. report는 실제로 �
    ⑤ 두 본문을 diff하고 **관찰된 본문 건수를 아티팩트에 함께 기록한다**. 매 턴이 400으로 죽으므로 비용은 없다.
 5-4. **설정이 무엇을 한다는 주장은 켠 실행과 끈 실행이 실제로 달랐을 때만 관찰된 것이다.** 둘이 같으면
    그 항목은 효과 없음으로 기록하거나 미상으로 남긴다. 받아들여졌다는 사실을 효과로 승격하지 않는다.
+5-5. **runtime 버전이 바뀌면 이전 버전의 L5는 새 버전의 권위가 아니다.** 같은 sink 자가 검사와 짝 대조를
+   새 버전에서 다시 실행하거나, 해당 효과를 「미결 효과 주장」으로 내린다. 대조군에서 기대 신호 자체가
+   나타나지 않으면 양쪽이 같아도 "효과 없음"이 아니라 **inconclusive**다.
 6. Codex app-server method는 generated schema 기준으로 삭제/rename 여부를 먼저 확인한다.
+6-1. method는 각 request/notification union arm의 `properties.method.enum` discriminator에서만 수집한다.
+   `openai/form`처럼 slash를 포함한 nested mode/값 enum은 method가 아니며, 이 반례를 negative control로 유지한다.
 7. Claude flag는 local help와 official docs-only 후보를 분리한다.
 8. service-neutral runtime 설계를 유지한다. 특정 서비스 도메인 용어를 기본 catalog 용어로 넣지 않는다.
 9. 위험한 실행은 원본 catalog에 성공한 기능처럼 기록하지 않는다. schema/help smoke와 live execution을 분리한다.
@@ -157,6 +162,8 @@ LLM에게 catalog 갱신을 맡길 때는 아래 입력을 함께 제공한다.
 - **[운영자]** 원본 catalog가 현재 runtime/version/source-level 사실만 담고 있다. 버전을 본문 산문에도
   적었다면 표와 함께 고친다 — 게이트는 `| Codex CLI |` / `| Claude Code |` 행만 읽으므로 산문에 남은
   옛 버전은 보이지 않는다.
+- **[운영자]** L5 관찰의 runtime 버전이 현재 표의 버전과 일치한다. 재측정하지 않은 효과는 L5로 유지하지
+  않고 「미결 효과 주장」에 있으며, 대조군의 기대 신호가 실제로 나타났는지도 함께 확인했다.
 - **[운영자]** 삭제/변경 이력은 artifact report에만 남아 있다.
 - **[기계, 단 범위 주의]** `pnpm pack:adapter`가 통과한다. 이것은 카탈로그가 tarball에 **존재하는지**만
   확인하며 내용은 검사하지 않는다. 내용이 틀린 카탈로그도 통과한다.
