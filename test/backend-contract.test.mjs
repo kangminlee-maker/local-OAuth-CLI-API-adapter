@@ -405,6 +405,18 @@ test('row 8: a forced call whose arguments are not JSON is refused at completion
   assert.equal(parseBackendOutput(forcedRequest(), '"Seo', 'max_tokens').toolCalls[0].arguments, '"Seo');
 });
 
+test('r20: both call paths see the same bytes — only JSON whitespace is stripped before the arguments are judged', () => {
+  // A BOM, U+00A0, U+2028 or U+000B before the object is not JSON on the
+  // wrapper path and must not be silently stripped on the forced one.
+  for (const prefix of ['\uFEFF', '\u00A0', '\u2028', '\u000B']) {
+    assert.throws(() => parseBackendOutput(forcedRequest(), `${prefix}{"city":"Seoul"}`), (e) => refused(e, /not JSON/), JSON.stringify(prefix));
+  }
+  // CONTROL: JSON whitespace around the value is accepted and PUBLISHED —
+  // the bytes the runtime wrote, head and tail alike (r20-codex F2).
+  assert.equal(parseBackendOutput(forcedRequest(), ' \t\n\r{"city":"Seoul"}').toolCalls[0].arguments, ' \t\n\r{"city":"Seoul"}');
+  assert.equal(parseBackendOutput(forcedRequest(), '{"city":"Seoul"}\n').toolCalls[0].arguments, '{"city":"Seoul"}\n');
+});
+
 test('r19: the cut-off rule on the wrapper path — a missing call is the cap\'s, a cut wrapper is refused, never leaked', () => {
   const two = { model: 'm', shape: 'openai-chat', messages: [], jsonMode: false, tools: [{ name: 'a', inputSchema: {} }, { name: 'b', inputSchema: {} }], toolChoice: { type: 'required' }, raw: {} };
   // `required` answered with no call under the cap: delivered (the direct
@@ -429,9 +441,14 @@ test('r18: a wrapper call\'s arguments are judged by the same rule, never repair
   assert.equal(parseBackendOutput(request(false), wrapper('{"city":1}')).toolCalls[0].arguments, '{"city":1}', 'non-strict: delivered');
   assert.throws(() => parseBackendOutput(request(true), wrapper('{"city":1}')), (e) => refused(e, /outside the tool's schema/), 'strict: refused');
   assert.equal(parseBackendOutput(request(true), wrapper('{"city":"Seoul"}')).toolCalls[0].arguments, '{"city":"Seoul"}');
-  // A wrapper `arguments` given as an object is the same call, stringified.
-  const objectArgs = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":{"city":"Seoul"}}]}';
-  assert.equal(parseBackendOutput(request(true), objectArgs).toolCalls[0].arguments, '{"city":"Seoul"}');
+  // A wrapper `arguments` member that is not a string is a schema violation,
+  // and re-serializing it rounded its numbers (r20-codex): refused.
+  const objectArgs = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":{"id":9007199254740993}}]}';
+  assert.throws(() => parseBackendOutput(request(false), objectArgs), (e) => refused(e, /`arguments` member that is not a string/));
+  assert.throws(() => parseBackendOutput(request(false), objectArgs, 'max_tokens'), (e) => refused(e, /not a string/), 'the cap is no excuse for a member of the wrong type');
+  // CONTROL: the same bytes as a string member are published exactly.
+  const stringArgs = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{\\"id\\":9007199254740993}"}]}';
+  assert.equal(parseBackendOutput(request(false), stringArgs).toolCalls[0].arguments, '{"id":9007199254740993}');
 });
 
 test('row 8: the fragment is kept only when the output limit cut the call off', () => {
@@ -544,4 +561,18 @@ test('CONTROL: json_object keeps the object rule and nothing more', () => {
   const request = { ...schemaRequest(undefined), jsonSchema: undefined };
   assert.throws(() => parseBackendOutput(request, '[1,2,3]'), (e) => refused(e, /not a JSON object/));
   assert.equal(parseBackendOutput(request, '{"anything":true}').text, '{"anything":true}');
+});
+
+test('r19: `strict` is read from each surface\'s own location only (codex)', async () => {
+  const { normalizeOpenAiChatRequest, normalizeOpenAiResponsesRequest } = await import('../dist/proxy/normalizers.js');
+  const chat = normalizeOpenAiChatRequest({ model: 'm', messages: [{ role: 'user', content: 'x' }], tools: [
+    { type: 'function', function: { name: 'a', parameters: {}, strict: true } },
+    { type: 'function', function: { name: 'b', parameters: {} }, strict: true },
+  ] });
+  assert.deepEqual(chat.tools.map((t) => t.strict), [true, false], "Chat: function.strict counts, a top-level strict does not");
+  const responses = normalizeOpenAiResponsesRequest({ model: 'm', input: 'x', tools: [
+    { type: 'function', name: 'a', parameters: {}, strict: true },
+    { type: 'function', name: 'b', parameters: {} },
+  ] });
+  assert.deepEqual(responses.tools.map((t) => t.strict), [true, false], 'Responses: the top-level strict counts');
 });

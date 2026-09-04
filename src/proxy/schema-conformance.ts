@@ -129,9 +129,17 @@ export function numberIsInexact(lexeme: string): boolean {
   const value = Number(lexeme);
   if (!Number.isFinite(value)) return true;
   const [, sign, whole, fraction = '', exponent = '0'] = parts;
+  // A mantissa this long is not one a double holds, and the comparison below
+  // would scale BigInts by its length; decide without it (r20).
+  if (whole.length + fraction.length > 4096) return true;
   // The lexeme as D × 10^E.
   let decimal = BigInt(whole + fraction);
   if (sign === '-') decimal = -decimal;
+  // Zero first: `1e-999999999` underflows to it, and scaling the comparison by
+  // 10^999999999 would exceed BigInt's size (or burn seconds below it).
+  // After this, a finite non-zero double bounds |E| by the mantissa's length
+  // plus the double's own exponent range.
+  if (value === 0) return decimal !== 0n;
   const decimalExponent = Number(exponent) - fraction.length;
   // The double as M × 2^P, exactly.
   const { mantissa, exponent: binaryExponent } = decompose(value);

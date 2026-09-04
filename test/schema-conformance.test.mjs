@@ -13,6 +13,15 @@ test('hasInexactNumber: decided by value — what the double holds exactly is ju
   assert.equal(hasInexactNumber('{"x":1e-999}'), true, 'underflows to zero');
   assert.equal(hasInexactNumber('{"x":1e999}'), true, 'overflows');
   assert.equal(hasInexactNumber('{"x":-0}'), false);
+  // r20 F1: an exponent that underflows must be decided without scaling a
+  // BigInt by it — `1e-999999999` used to throw "Maximum BigInt size
+  // exceeded" (a 500) and sub-cap exponents burned seconds of CPU.
+  const started = Date.now();
+  assert.equal(hasInexactNumber('{"y":1e-999999999}'), true);
+  assert.equal(hasInexactNumber('{"y":0e-999999999}'), false, 'a zero mantissa is exactly zero');
+  assert.equal(hasInexactNumber('{"y":1e-40000000}'), true);
+  assert.equal(hasInexactNumber(`{"y":1${'0'.repeat(5000)}}`), true, 'a 5001-digit mantissa is decided without arithmetic');
+  assert.ok(Date.now() - started < 200, `decided in ${Date.now() - started}ms`);
   assert.equal(hasInexactNumber('{"x":2.5e3}'), false, '2500 is exact');
   assert.equal(hasInexactNumber('{"s":"9007199254740993","n":1}'), false, 'digits inside a string are text');
   assert.equal(hasInexactNumber('{"s":"a\\"0.3","n":1}'), false, 'an escaped quote does not end the string');

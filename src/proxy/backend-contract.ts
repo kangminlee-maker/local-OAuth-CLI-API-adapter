@@ -243,10 +243,12 @@ export function parseBackendOutput(
   }
   const forcedTool = forcedSingleToolCall(request);
   if (forcedTool) {
-    // The whole answer IS the arguments, as the runtime wrote them. Leading
-    // whitespace only: trimming the tail changed `{"a":1}\n` between one
-    // reading and another for no gain.
-    const args = text.replace(/^\s+/, '');
+    // The whole answer IS the arguments, as the runtime wrote them — every
+    // byte, whitespace included. `JSON.parse` accepts JSON whitespace around a
+    // value, so nothing needs normalizing, and a BOM or U+00A0 is not JSON on
+    // this path as on the wrapper path. The head used to be trimmed for the
+    // incremental reader's first-character test; that reader is gone (r20).
+    const args = text;
     const call = { id: forcedTool.id, name: forcedTool.name, arguments: args };
     if (!cutOff) assertCallArguments(args, forcedTool, request.shape, 'answered a forced tool call with');
     return { text: '', toolCalls: [call] };
@@ -333,7 +335,7 @@ function parseToolDecision(
     if (!obj) return { text, toolCalls: [] };
     if (obj.status === 'tool_calls') {
       const calls = Array.isArray(obj.toolCalls)
-        ? obj.toolCalls.map((call, index) => normalizeToolCall(call, index))
+        ? obj.toolCalls.map((call, index) => normalizeToolCall(call, index, request.shape))
         : [];
       // The narration that came with the call is part of the turn — every
       // surface reports text alongside tool calls, and dropping it here made
@@ -662,15 +664,23 @@ function toolArgumentsSchema(tool: ForcedSingleToolCall): unknown {
   };
 }
 
-function normalizeToolCall(value: unknown, index: number): LocalToolCall {
+function normalizeToolCall(value: unknown, index: number, shape: NormalizedRequest['shape']): LocalToolCall {
   const obj = asRecord(value);
   const name = typeof obj?.name === 'string' && obj.name.trim()
     ? obj.name
     : 'tool';
   const rawArguments = obj?.arguments;
-  const args = typeof rawArguments === 'string'
-    ? rawArguments
-    : JSON.stringify(rawArguments ?? {});
+  // The wrapper schema types `arguments` as a JSON STRING. A member of any
+  // other type is a runtime that ignored its schema, and re-serializing it
+  // was a repair that also rounded its numbers (`9007199254740993` → `…992`,
+  // r20-codex) — refused, never rebuilt.
+  if (typeof rawArguments !== 'string') {
+    throw backendContractError(
+      "The local runtime called a tool with an `arguments` member that is not a string.",
+      shape,
+    );
+  }
+  const args = rawArguments;
   return {
     id: typeof obj?.id === 'string' && obj.id.trim()
       ? obj.id

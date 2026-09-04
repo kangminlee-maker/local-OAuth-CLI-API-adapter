@@ -132,13 +132,15 @@ for (const [label, raw, callsFirst] of [
  * The generalizing guard: no data the CLIENT controls may change how the
  * wrapper is read, whatever it is named or wherever it sits.
  *
- * A tool call's `arguments` is client-shaped — the buffered parse accepts an
- * object there and serializes it — so it is the nested place a client's own
- * keys actually reach. Sweeping the wrapper's own key names through it catches
- * the next reader that walks at any depth, without anyone having to think of
- * it again. This class of defect was fixed in one reader per round for three
- * rounds while the others kept their own walk; the wrapper now has one reader
- * and one key walk, and this sweep holds both to it.
+ * A tool call's `arguments` is client-shaped — a JSON STRING whose content is
+ * the client's own object — so it is the nested place a client's own keys
+ * actually reach, escaped inside that string. Sweeping the wrapper's own key
+ * names through it catches the next reader that walks at any depth, without
+ * anyone having to think of it again. This class of defect was fixed in one
+ * reader per round for three rounds while the others kept their own walk; the
+ * wrapper now has one reader and one key walk, and this sweep holds both to it.
+ * An `arguments` member that is an OBJECT is not the schema's shape and is
+ * refused (round 20), so a client's keys can no longer sit there unescaped.
  */
 const WRAPPER_KEYS = ['status', 'text', 'toolCalls'];
 const DECOYS = {
@@ -149,11 +151,12 @@ const DECOYS = {
 
 for (const key of WRAPPER_KEYS) {
   for (const [orderLabel, build] of [
-    ['the call before the narration', (decoy) => `{"status":"tool_calls","toolCalls":[{"id":"c1","name":"get_weather","arguments":{${decoy}}}],"text":"REAL"}`],
-    ['the narration before the call', (decoy) => `{"status":"tool_calls","text":"REAL","toolCalls":[{"id":"c1","name":"get_weather","arguments":{${decoy}}}]}`],
+    ['the call before the narration', (decoyArgs) => `{"status":"tool_calls","toolCalls":[{"id":"c1","name":"get_weather","arguments":${decoyArgs}}],"text":"REAL"}`],
+    ['the narration before the call', (decoyArgs) => `{"status":"tool_calls","text":"REAL","toolCalls":[{"id":"c1","name":"get_weather","arguments":${decoyArgs}}]}`],
   ]) {
     test(`a client \`arguments\` key named \`${key}\` (${orderLabel}) cannot change how the wrapper reads`, () => {
-      const raw = build(`"${key}":${DECOYS[key]}`);
+      const clientObject = `{"${key}":${DECOYS[key]}}`;
+      const raw = build(JSON.stringify(clientObject));
       const request = {
         model: 'm', shape: 'openai-chat', messages: [], jsonMode: false,
         tools: [{ name: 'get_weather', inputSchema: { type: 'object' } }, { name: 'get_time', inputSchema: { type: 'object' } }],
@@ -161,8 +164,12 @@ for (const key of WRAPPER_KEYS) {
       };
       const parsed = parseBackendOutput(request, raw);
       assert.deepEqual(parsed.toolCalls.map((c) => c.name), ['get_weather'], 'the reader took the decoy for a call');
+      assert.equal(parsed.toolCalls[0].arguments, clientObject, 'the client object reaches the call byte for byte');
       assert.equal(parsed.text, 'REAL', 'the reader narrated the decoy');
       assert.equal(wrapperCallsPrecedeText(raw), orderLabel.startsWith('the call'), 'the decoy moved the block order');
+      // The same client object as an unescaped OBJECT member is the wrong
+      // shape for the wrapper, and is refused rather than re-serialized.
+      assert.throws(() => parseBackendOutput(request, build(clientObject)), (e) => e.statusCode === 502 && /not a string/.test(e.message));
     });
   }
 }

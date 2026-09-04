@@ -152,3 +152,42 @@ test('CONTROL: a whole call under end_turn reports a completed call', async () =
     await backend.close();
   }
 });
+
+test('messages stream: only the turn\'s FINAL block stays open — a cut call followed by narration closes (r20 F4)', async () => {
+  // A wrapper turn (two tools, `required`) whose second call's arguments are
+  // the cut fragment and whose narration comes AFTER the calls: the cut block
+  // must close before the text block opens, or the wire nests two blocks and
+  // the narration the body delivers is dropped from the stream.
+  const raw = '{"status":"tool_calls","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{}"},{"id":"c2","name":"get_time","arguments":"{\\"tz\\":\\"As"}],"text":"after the calls"}';
+  process.env.WRAPPER_RAW = raw;
+  process.env.WRAPPER_STOP_REASON = 'max_tokens';
+  const backend = new ClaudeCodeBackend({ command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    const body = {
+      model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }],
+      tools: [{ name: 'get_weather', input_schema: WEATHER }, { name: 'get_time', input_schema: { type: 'object', properties: { tz: { type: 'string' } } } }],
+      tool_choice: { type: 'any' },
+    };
+    const res = await fetch(`${server.url}/v1/messages`, { method: 'POST', headers: SURFACES.messages.headers, body: JSON.stringify({ ...body, stream: true }) });
+    assert.equal(res.status, 200);
+    const events = (await res.text()).split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice(6)));
+    // No block opens while another is open, and every opened block closes.
+    let open = null;
+    for (const e of events) {
+      if (e.type === 'content_block_start') { assert.equal(open, null, `block ${e.index} opened inside block ${open}`); open = e.index; }
+      if (e.type === 'content_block_stop') { assert.equal(open, e.index); open = null; }
+    }
+    assert.equal(open, null, 'the final block (narration) is closed');
+    const text = events.filter((e) => e.type === 'content_block_delta' && e.delta.type === 'text_delta').map((e) => e.delta.text).join('');
+    assert.equal(text, 'after the calls', 'the narration after the cut call reaches the stream');
+    assert.equal(events.find((e) => e.type === 'message_delta').delta.stop_reason, 'max_tokens');
+    // And the buffered body agrees on the content.
+    const buffered = await (await fetch(`${server.url}/v1/messages`, { method: 'POST', headers: SURFACES.messages.headers, body: JSON.stringify(body) })).json();
+    assert.deepEqual(buffered.content.map((b) => b.type), ['tool_use', 'tool_use', 'text']);
+    assert.deepEqual(buffered.content[1].input, {}, 'the cut call\'s complete members');
+  } finally {
+    await server.close();
+    await backend.close();
+  }
+});

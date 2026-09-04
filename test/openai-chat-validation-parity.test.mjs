@@ -173,6 +173,9 @@ const REJECTIONS = [
   ['a legacy function_call with tools but no functions', { tools: [{ type: 'function', function: { name: 'f', parameters: {} } }], function_call: { name: 'f' } }, { param: 'function_call', code: null, message: "Invalid value for 'function_call': 'function_call' is only allowed when 'functions' are specified." }],
   ['a legacy function_call alone', { function_call: { name: 'f' } }, { param: 'function_call', code: null, message: "Invalid value for 'function_call': 'function_call' is only allowed when 'functions' are specified." }],
   ['a legacy function_call auto alone', { function_call: 'auto' }, { param: 'function_call', code: null, message: "Invalid value for 'function_call': 'function_call' is only allowed when 'functions' are specified." }],
+  // r20 F3: the mirrored 500 for `required` + `tools: []` is a generation-time answer, reached only
+  // after the direct API's whole validation walk — a request fault answers first.
+  ['required with an empty tool list AND a bad parallel_tool_calls', { tools: [], tool_choice: 'required', parallel_tool_calls: 'yes' }, { param: 'parallel_tool_calls', code: 'invalid_type', message: "Invalid type for 'parallel_tool_calls': expected a boolean, but got a string instead." }],
   ['a function_call object with no name', { functions: [{ name: 'f', parameters: {} }], function_call: { __probe__: 'wrong type' } }, { param: 'function_call.name', code: 'missing_required_parameter', message: "Missing required parameter: 'function_call.name'." }],
   ['no messages at all', { messages: '__delete__' }, { param: 'messages', code: 'missing_required_parameter', message: "Missing required parameter: 'messages'." }],
   ['an empty messages array', { messages: [] }, { param: 'messages', code: 'empty_array', message: "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead." }],

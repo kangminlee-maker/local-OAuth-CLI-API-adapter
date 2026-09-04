@@ -97,7 +97,7 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   requireOpenAiChatMessages(input.messages);
   rejectUnknownOpenAiKeys(input, OPENAI_CHAT_KEYS);
   const { messages, reasoningEffort } = validateOpenAiChatFields(input);
-  const chatTools = readOpenAiTools(input.tools);
+  const chatTools = readOpenAiTools(input.tools, 'openai-chat');
   const chatToolChoice = readOpenAiToolChoice(input.tool_choice);
   assertForcedToolDeclared('openai-chat', chatTools, chatToolChoice);
   return {
@@ -202,16 +202,6 @@ function validateOpenAiChatFields(
     throw new ProxyRequestError(
       "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
       400, 'openai', 'invalid_request_error', 'tool_choice',
-    );
-  }
-  // `required` with `tools: []` passes the direct API's validation and fails
-  // at generation, deterministically, with this 500 (measured 2026-09-04,
-  // twice, with and without a cap). The proxy used to serve it as a plain
-  // text turn — an option that promised a call, silently undelivered.
-  if (input.tool_choice === 'required' && Array.isArray(input.tools) && input.tools.length === 0) {
-    throw new ProxyRequestError(
-      'The model produced invalid content. Consider modifying your prompt if you are seeing this error persistently.',
-      500, 'openai', 'model_error',
     );
   }
   if (present('parallel_tool_calls') && typeof input.parallel_tool_calls !== 'boolean') {
@@ -325,6 +315,17 @@ function validateOpenAiChatFields(
     if (input.logprobs === true) throw unsupportedParameter('logprobs');
   }
   refuseOpenAiChatMissingContent(input.messages);
+  // `required` with `tools: []` passes the direct API's validation and fails
+  // at generation, deterministically, with this 500 (measured 2026-09-04,
+  // twice, with and without a cap). The proxy used to serve it as a plain
+  // text turn — an option that promised a call, silently undelivered. Last,
+  // after the whole walk: any request fault answers first there (r20).
+  if (input.tool_choice === 'required' && Array.isArray(input.tools) && input.tools.length === 0) {
+    throw new ProxyRequestError(
+      'The model produced invalid content. Consider modifying your prompt if you are seeing this error persistently.',
+      500, 'openai', 'model_error',
+    );
+  }
   return { messages, reasoningEffort };
 }
 
@@ -842,7 +843,7 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const text = asRecord(input.text);
   const format = asRecord(text?.format);
   const reasoning = asRecord(input.reasoning);
-  const responsesTools = readOpenAiTools(input.tools);
+  const responsesTools = readOpenAiTools(input.tools, 'openai-responses');
   const responsesToolChoice = readOpenAiToolChoice(input.tool_choice, 'openai-responses');
   assertForcedToolDeclared('openai-responses', responsesTools, responsesToolChoice);
   return {
@@ -2934,7 +2935,7 @@ function readImageDetail(value: unknown): NormalizedImageDetail | undefined {
   return undefined;
 }
 
-function readOpenAiTools(value: unknown): NormalizedTool[] {
+function readOpenAiTools(value: unknown, shape: 'openai-chat' | 'openai-responses'): NormalizedTool[] {
   if (!Array.isArray(value)) return [];
   return value.map((tool) => {
     const item = asRecord(tool);
@@ -2949,7 +2950,11 @@ function readOpenAiTools(value: unknown): NormalizedTool[] {
         ? fn.description
         : directDescription,
       inputSchema: fn?.parameters ?? item?.parameters,
-      strict: (fn?.strict ?? item?.strict) === true,
+      // Each surface's own location only — Chat's `function.strict`, Responses'
+      // top-level `strict` — so a member in the other surface's place never
+      // turns enforcement on (r19-codex); what the direct API does with that
+      // extra member is unmeasured.
+      strict: (shape === 'openai-chat' ? fn?.strict : item?.strict) === true,
       raw: tool,
     };
   });

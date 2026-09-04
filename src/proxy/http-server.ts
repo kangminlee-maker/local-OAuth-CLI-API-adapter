@@ -3601,7 +3601,7 @@ async function writeAnthropicMessagesStream(
               // has none. `finish` reconciles that one and stops it first, and
               // skips every call it already closed.
               await closeOpenTextBlock();
-              toolState.cutOff = responseCutOff(result);
+              toolState.leaveOpen = cutCallLeftOpen(result);
               await toolState.finish(result.toolCalls.slice(0, at));
             }
             // At the head: everything still queued was produced after this run.
@@ -3612,7 +3612,7 @@ async function writeAnthropicMessagesStream(
         }
         await settlePending(result.toolCalls);
         await closeOpenTextBlock();
-        toolState.cutOff = responseCutOff(result);
+        toolState.leaveOpen = cutCallLeftOpen(result);
         await toolState.finish(result.toolCalls);
       } else {
         // Flush any final text not already streamed (covers schema/refusal results
@@ -3723,12 +3723,14 @@ interface AnthropicToolUseState {
 
 class AnthropicToolUseStreamState {
   /**
-   * The turn was cut off at the output limit: a block whose arguments are the
-   * cut fragment is left open — the direct API sends no `content_block_stop`
-   * for it (measured 2026-09-04, M6), only `message_delta` with
-   * `stop_reason: "max_tokens"`.
+   * The index of the one call whose block stays open: the turn's FINAL block,
+   * when the turn was cut off at the output limit inside that call's
+   * arguments — the direct API sends no `content_block_stop` for it (measured
+   * 2026-09-04, M6), only `message_delta` with `stop_reason: "max_tokens"`. A
+   * cut call with anything after it is closed like any other, or the next
+   * block would open nested inside it (r20).
    */
-  cutOff = false;
+  leaveOpen: number | null = null;
   private readonly states = new Map<number, AnthropicToolUseState>();
 
   /**
@@ -3816,9 +3818,9 @@ class AnthropicToolUseStreamState {
       const call = toolCalls[index];
       const rest = call ? missingToolCallArgumentDelta(state.arguments, call) : '';
       if (rest) await this.writeArgumentsDelta(index, state, rest);
-      // The block `finish` left open on purpose — a reported call cut off at
-      // the output limit — stays open here too.
-      if (call && this.cutOff && !parsesAsJson(call.arguments)) continue;
+      // The block `finish` left open on purpose — the turn's final call, cut
+      // off at the output limit — stays open here too.
+      if (index === this.leaveOpen) continue;
       await this.stop(state);
     }
   }
@@ -3848,7 +3850,7 @@ class AnthropicToolUseStreamState {
       if (state.closed) continue;
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);
-      if (this.cutOff && !parsesAsJson(call.arguments)) continue;
+      if (index === this.leaveOpen) continue;
       await this.stop(state);
     }
   }
@@ -3940,6 +3942,21 @@ function anthropicToolUse(call: LocalToolCall, cutOff = false): unknown {
  * writer any more (matrix §7 row 8), so the `{"input": …}` shape below is a
  * projection of a call the response path admitted, kept for that path.
  */
+/**
+ * The call whose block the Messages stream leaves open: the last call of a
+ * turn the runtime cut off inside that call's arguments, with no narration
+ * after it — the turn's final block, as in the direct API's own stream (M6).
+ * Otherwise null, and every block closes.
+ */
+function cutCallLeftOpen(result: LocalCompletionResult): number | null {
+  if (!responseCutOff(result) || result.toolCalls.length === 0) return null;
+  const last = result.toolCalls.length - 1;
+  const lastCall = result.toolCalls[last];
+  if (!lastCall || parsesAsJson(lastCall.arguments)) return null;
+  const trailing = textRunsFor(result, result.toolCalls.length).some((run) => run.afterCalls >= result.toolCalls.length && run.text.length > 0);
+  return trailing ? null : last;
+}
+
 function parsesAsJson(value: string): boolean {
   try {
     JSON.parse(value);
