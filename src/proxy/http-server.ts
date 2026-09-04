@@ -2199,7 +2199,7 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
     // STOPS is a separate question, and this changes nothing about it.
     ? orderedByEmission(
         textRunsFor(result, result.toolCalls.length),
-        result.toolCalls.map((call) => anthropicToolUse(call, responseCutOff(result))),
+        result.toolCalls.map((call, index) => anthropicToolUse(call, responseCutOff(result), index === cutCallLeftOpen(result))),
         (run) => ({ type: 'text', text: run.text }),
       )
     // Empty text is NO block, the same rule the two branches above already
@@ -3960,18 +3960,25 @@ function openAiResponseToolCall(call: LocalToolCall, status: 'completed' | 'inco
  * publishes it: the complete top-level members parsed so far, the cut member
  * dropped (measured 2026-09-04, `review-artifacts/stage2/report.md` M6).
  */
-function anthropicToolUse(call: LocalToolCall, cutOff = false): unknown {
+function anthropicToolUse(call: LocalToolCall, cutOff = false, fragment = false): unknown {
   // The wrapper reading refused such a call before it got here; the native
   // transport's arguments are the vendor's own and arrive unjudged, so this
   // surface — whose `input` is a JSON value — applies the same rule (r21).
   if (!cutOff) assertCallArguments(call.arguments, undefined, 'anthropic-messages', 'called a tool with');
+  // The one call the cut hit is a fragment: an object prefix keeps its
+  // complete members, and whole JSON that is no object (`[1, 2]`, `12`) is a
+  // fragment of no object, `{}` (r22). Every other call of a cut turn is
+  // complete by construction and goes out as written where its bytes are
+  // JSON — the stream closed its block on them, and projecting `[1, 2]` to
+  // `{}` here split the two paths (r23) — and as the projection where they
+  // are not, since `input` must be a JSON value and nothing on a cut turn is
+  // judged (declared, matrix §7 row 8).
+  const whole = fragment ? parsesAsJsonObject(call.arguments) : parsesAsJson(call.arguments);
   return {
     type: 'tool_use',
     id: call.id,
     name: call.name,
-    // A cut-off fragment that is whole JSON but not an object (`[1, 2]`,
-    // `12`) is a fragment of no object: the members projection, `{}` (r22).
-    input: new RawJson(parsesAsJsonObject(call.arguments) ? call.arguments : completeTopLevelMembers(call.arguments)),
+    input: new RawJson(whole ? call.arguments : completeTopLevelMembers(call.arguments)),
   };
 }
 
@@ -3988,6 +3995,15 @@ function cutCallLeftOpen(result: LocalCompletionResult): number | null {
   if (!lastCall || parsesAsJsonObject(lastCall.arguments)) return null;
   const trailing = textRunsFor(result, result.toolCalls.length).some((run) => run.afterCalls >= result.toolCalls.length && run.text.length > 0);
   return trailing ? null : last;
+}
+
+function parsesAsJson(value: string): boolean {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Whether the bytes are a whole JSON object — the only complete `input`. */

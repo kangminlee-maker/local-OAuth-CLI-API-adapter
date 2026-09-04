@@ -134,6 +134,8 @@ interface CodexBackendEvent {
   readonly delta?: string;
   readonly output_index?: number;
   readonly item_id?: string;
+  /** `function_call_arguments.done` carries the call's whole arguments here. */
+  readonly arguments?: string;
   readonly item?: {
     readonly id?: string;
     readonly type?: string;
@@ -363,6 +365,24 @@ class CodexBackendStreamState {
       if (state.identified) out.push(...this.emitPending(index, state));
       return out;
     }
+    if (event.type === 'response.function_call_arguments.done' && typeof event.arguments === 'string') {
+      // The vendor's own finish event for a call's arguments, carrying the
+      // whole value; it precedes `output_item.done`, which may then arrive
+      // without an `arguments` member. Left unread (r23-codex), a delta after
+      // it was folded into every stream while the bodies kept the done value.
+      const itemId = typeof event.item_id === 'string' ? event.item_id : undefined;
+      const index = this.toolOrdinal(readOutputIndex(event), itemId);
+      const state = this.toolStates.get(index) ?? this.newToolState(index, {
+        id: itemId,
+        anonymous: itemId === undefined,
+      });
+      if (!state.argumentsDone) state.arguments = event.arguments;
+      this.toolStates.set(index, state);
+      if (!state.identified) return out;
+      out.push(...this.emitPending(index, state));
+      out.push(...this.emitArgumentsDone(index, state));
+      return out;
+    }
     if (event.type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
       const itemId = typeof event.item_id === 'string' ? event.item_id : undefined;
       const index = this.toolOrdinal(readOutputIndex(event), itemId);
@@ -399,7 +419,10 @@ class CodexBackendStreamState {
       state.name = event.item.name ?? state.name;
       if (named) state.anonymous = false;
       if (event.item.call_id !== undefined) state.identified = true;
-      if (typeof event.item.arguments === 'string') state.arguments = event.item.arguments;
+      // A call already announced as finished keeps the value it was finished
+      // on; an item that names a different one afterwards is the vendor
+      // contradicting itself, and the stream closed on the first value.
+      if (typeof event.item.arguments === 'string' && !state.argumentsDone) state.arguments = event.item.arguments;
       this.toolStates.set(index, state);
       if (state.identified) {
         out.push(...this.emitPending(index, state));

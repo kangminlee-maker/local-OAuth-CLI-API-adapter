@@ -192,3 +192,60 @@ test('an item closed without its arguments promises nothing: a whole-JSON prefix
     assert.equal(streamedArguments, '12');
   });
 });
+
+test('a completed non-object call inside a cut-off turn goes out as written on both paths; only the call the cut hit is projected (r23-fable F1)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '[1, 2]' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '[1, 2]' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '[1, 2]' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_2', delta: '{"x":' },
+    { type: 'response.incomplete', response: { id: 'r', model: 'gpt-5.5', output: [], incomplete_details: { reason: 'max_output_tokens' } } },
+  ];
+  const TWO = { ...MESSAGES, tool_choice: { type: 'any' } };
+  await withProxyEvents(vendor, async (url) => {
+    const buffered = await post(`${url}/v1/messages`, ANTHROPIC, TWO);
+    assert.equal(buffered.status, 200, buffered.text);
+    assert.ok(buffered.text.includes('"input":[1, 2]'), buffered.text);
+    assert.ok(buffered.text.includes('"input":{}'), buffered.text);
+    assert.equal(JSON.parse(buffered.text).stop_reason, 'max_tokens');
+    const streamed = await post(`${url}/v1/messages`, ANTHROPIC, { ...TWO, stream: true });
+    const frames = events(streamed.text);
+    const blocks = frames.filter((frame) => frame.type === 'content_block_start' && frame.content_block?.type === 'tool_use').map((frame) => frame.index);
+    assert.equal(blocks.length, 2);
+    const partialOf = (index) => frames.filter((frame) => frame.type === 'content_block_delta' && frame.index === index && frame.delta?.type === 'input_json_delta').map((frame) => frame.delta.partial_json).join('');
+    assert.equal(partialOf(blocks[0]), '[1, 2]');
+    assert.equal(partialOf(blocks[1]), '{"x":');
+    assert.ok(frames.some((frame) => frame.type === 'content_block_stop' && frame.index === blocks[0]), 'the completed call closes');
+    assert.ok(!frames.some((frame) => frame.type === 'content_block_stop' && frame.index === blocks[1]), 'the cut call stays open');
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, tool_choice: 'auto' });
+    const calls = JSON.parse(chat.text).choices[0].message.tool_calls.map((call) => call.function.arguments);
+    assert.deepEqual(calls, ['[1, 2]', '{"x":']);
+    assert.equal(JSON.parse(chat.text).choices[0].finish_reason, 'length');
+  });
+});
+
+test('function_call_arguments.done is the finish signal: a delta after it is folded into neither path, whatever output_item.done carries (r23-codex)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: ',"b":2}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '{"a":1}' }] } },
+  ];
+  await withProxyEvents(vendor, async (url) => {
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, CHAT);
+    assert.equal(JSON.parse(chat.text).choices[0].message.tool_calls[0].function.arguments, '{"a":1}');
+    const chatStream = await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, stream: true });
+    assert.equal(events(chatStream.text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).map((call) => call.function?.arguments ?? '').join(''), '{"a":1}');
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES);
+    assert.equal(messages.status, 200, messages.text);
+    assert.ok(messages.text.includes('"input":{"a":1}}'), messages.text);
+    const messagesStream = await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, stream: true });
+    const frames = events(messagesStream.text);
+    assert.equal(frames.filter((frame) => frame.type === 'content_block_delta' && frame.delta?.type === 'input_json_delta').map((frame) => frame.delta.partial_json).join(''), '{"a":1}');
+    assert.ok(frames.some((frame) => frame.type === 'message_stop'));
+  });
+});
