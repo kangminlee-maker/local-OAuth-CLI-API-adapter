@@ -256,3 +256,19 @@ for (const [label, call] of [
     assert.match(streamed.error ?? '', /never declared/);
   });
 }
+
+/**
+ * The raw-name rule is only distinguishable from "substitute `tool`, then
+ * check" when the request does NOT declare a tool literally named `tool`. A
+ * client that does declare one is the case that separates the two: a call
+ * with no name must still be refused, not repaired into that client's tool.
+ */
+test('a nameless call is refused even when the client declared a tool named `tool`', async () => {
+  const tools = [...TOOLS, { type: 'function', function: { name: 'tool', parameters: { type: 'object' } } }];
+  const raw = JSON.stringify({ status: 'tool_calls', text: '', toolCalls: [{ id: 'c1', arguments: '{}' }] });
+  const body = { model: 'm', messages: [{ role: 'user', content: 'x' }], tools, tool_choice: 'required' };
+  const buffered = await chat(streamingClaude, body, { WRAPPER_RAW: raw });
+  const streamed = await chat(streamingClaude, { ...body, stream: true }, { WRAPPER_RAW: raw });
+  assert.equal(buffered.status, 502, 'the body repaired a nameless call into the client\'s `tool`');
+  assert.deepEqual(streamed.calls, [], `the stream announced ${JSON.stringify(streamed.calls)}`);
+});
