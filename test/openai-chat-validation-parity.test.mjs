@@ -523,9 +523,11 @@ test('responses resolves fast to priority, as the direct API does', async () => 
 });
 
 test('chat: `required` with an empty tool list is the direct API\'s own 500, not a silent text turn (r19-fable F6)', async () => {
-  // The direct API accepts the request and fails at generation with this
-  // envelope, deterministically (measured 2026-09-04, twice). The proxy used to
-  // run it as a plain text turn — an option that promised a call, undelivered.
+  // The direct API accepts the request at validation and decides at generation:
+  // 6 samples on 2026-09-04 gave this 500 `model_error` x3, a 500 `server_error`
+  // x2 and one 200 (an earlier pair of samples had read it as deterministic).
+  // The proxy answers the modal envelope at the boundary. It used to run the
+  // request as a plain text turn — an option that promised a call, undelivered.
   const { status, payload } = await chat({ tools: [], tool_choice: 'required' });
   assert.equal(status, 500, JSON.stringify(payload));
   assert.equal(payload.error.type, 'model_error');

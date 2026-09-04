@@ -315,11 +315,14 @@ function validateOpenAiChatFields(
     if (input.logprobs === true) throw unsupportedParameter('logprobs');
   }
   refuseOpenAiChatMissingContent(input.messages);
-  // `required` with `tools: []` passes the direct API's validation and fails
-  // at generation, deterministically, with this 500 (measured 2026-09-04,
-  // twice, with and without a cap). The proxy used to serve it as a plain
-  // text turn — an option that promised a call, silently undelivered. Last,
-  // after the whole walk: any request fault answers first there (r20).
+  // `required` with `tools: []` passes the direct API's validation and is
+  // decided at generation: of 6 samples on 2026-09-04, 500 `model_error` x3,
+  // 500 `server_error` x2, 200 x1 (two earlier samples had read it as a
+  // deterministic `model_error`). The proxy answers the modal envelope here —
+  // declared in docs/conformance-matrix.md §7. It used to serve the request
+  // as a plain text turn: an option that promised a call, silently
+  // undelivered. Last, after the whole walk: any request fault answers first
+  // there (r20).
   if (input.tool_choice === 'required' && Array.isArray(input.tools) && input.tools.length === 0) {
     throw new ProxyRequestError(
       'The model produced invalid content. Consider modifying your prompt if you are seeing this error persistently.',

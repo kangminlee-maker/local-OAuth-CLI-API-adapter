@@ -284,7 +284,13 @@ const chatCases = [
   ['legacy function_call with tools but no functions', { messages: M, reasoning_effort: 'none', tools: [TOOL], function_call: { name: 'get_weather' } }],
   ['legacy function_call alone', { messages: M, reasoning_effort: 'none', function_call: { name: 'f' } }],
   ['legacy function_call auto alone', { messages: M, reasoning_effort: 'none', function_call: 'auto' }],
-  ['tool_choice required with tools empty', { messages: M, reasoning_effort: 'none', tools: [], tool_choice: 'required' }],
+  // `tool_choice: required` with `tools: []` is NOT a rejection probe: the direct
+  // API accepts the body at validation and the outcome is decided at generation —
+  // 6 samples on 2026-09-04 gave 500 `model_error` x3, 500 `server_error` x2 and
+  // one 200 (r19 had read two `model_error` answers as deterministic). The proxy
+  // answers the modal envelope at the boundary; that answer is pinned offline in
+  // test/openai-chat-validation-parity.test.mjs, and the distribution is recorded
+  // in review-artifacts/stage2/report.md M8.
   ['response_format as a string', { messages: M, response_format: 'json' }],
   ['response_format without type', { messages: M, response_format: {} }],
   ['response_format unknown type', { messages: M, response_format: { type: 'bogus' } }],
