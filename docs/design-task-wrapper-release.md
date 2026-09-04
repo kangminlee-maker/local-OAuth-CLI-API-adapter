@@ -122,3 +122,86 @@ Round 17's zero is the reason this document exists instead of a round 18.
 §7c rows 11–12 (a blank/missing tool-definition name manufactures `tool`; a forced undeclared
 `tool_choice` creates a call) are input-validation gaps, decidable at the boundary, and need the
 direct APIs' 400 envelopes measured first. They can proceed independently of A–D.
+
+---
+
+## Working draft — synthesized 2026-09-04 from two independent frontier drafts
+
+Sources, produced blind from the same packet (`review-artifacts/design-packet/PACKET.md`):
+`review-artifacts/design-fable-draft.md` (Claude Fable 5.1 max) and
+`review-artifacts/design-codex-draft.md` (codex gpt-5.6-sol ultra). Neither saw the other.
+
+**Both chose A independently, in the same strong form:** delete both incremental readers
+(`ToolCallDeltaExtractor`, `KnownToolArgumentsDeltaExtractor`) and Chat's forced-call prestart
+(`PredictableToolStart`); the stream becomes a projection of the `LocalCompletionResult` that
+`parseBackendOutput` returned, produced by the completion reconcilers the HTTP layer already has.
+Rows 1–7 and 9 close by construction (no second reader exists), row 8's fix becomes safe (its
+precondition now holds globally), row 10's `json_object` half stays declared. B, C and D were
+rejected by both for the same consequences the brief anticipated: a prefix validator cannot retract
+a released byte; neither runtime's schema channel enforces framing (Claude's `--json-schema` is an
+un-forced `StructuredOutput` tool); a per-call contract change has no measured direct-API basis.
+
+Evidence weight differs. Fable **emulated A in its copy** (both extractors' `push` muted in `dist/`,
+`src/` untouched): 15 reproduction inputs from rounds 14–17 read **10 disagreements today, 0 muted**,
+with two controls agreeing on both builds. Codex derived the same closure from reading the writers,
+`withFirstEventSettled` and the fan-out prefetch. Stage 0 below turns Fable's probe into the suite.
+
+### Release rule (adopted)
+
+No response-body byte of a wrapper-path or forced-tool turn reaches a streaming client until the
+runtime has ended the artefact and `parseBackendOutput` has returned; a call is published only as a
+member of that result's call set. A failure before commit is an HTTP 502 on both paths. This is
+codex's stronger form (Fable left prologue timing as an open cosmetic point); it is adopted because
+`withFirstEventSettled` already defers commit to the first backend event, and under A the first
+event *is* the completed result — so the true 502 falls out, and the last shape difference between
+the paths (status code vs in-band error) goes with it.
+
+### Where the drafts differed
+
+| point | Fable | codex | adopted | why |
+|---|---|---|---|---|
+| prologue frames (`response.created`, `message_start`) | immediate, then idle gap | withheld until the validated result | codex | constraint 3 read literally; an early prologue forces a 200 commit and an in-band error |
+| row 2, root never closes | agree-on-deliver (today's buffered reading: the fragment as prose) | 502, the runtime ignored its schema | Fable now; codex's 502 only after measurement | `backend-contract.ts` delivers non-JSON as the answer on purpose — Claude's schema channel is not provider-forced, so a bare-prose `auto` answer may be a real answer. Count them live before refusing them |
+| schema validation (row 8 in full, row 10 `json_schema` half) | owner decision, needs a validator dependency | mandatory standards validator over wrapper, forced `inputSchema`, client schema | **out of this design.** Row 8's minimum is `JSON.parse` at completion; a validator is a separate decision | keeps the gate concept-reducing; the direct APIs do not validate non-strict tool arguments, so schema-rejecting them is stricter than the authority and is a parity question first |
+| switch shape | config key, default = new behaviour, escape hatch back | new env var, default off, flip, delete | a `settings.json` key (the repo's config surface: `transport`, `honorRequestModel`…), **default off first**, flip after canary, delete after one release | `src/` reads one env var today (`LOCAL_OAUTH_PROXY_KEY`); the corpus rule is default-off preserving today's bytes, proven by diff |
+| Claude retry | — | a streamed turn regains the buffered path's retry, since nothing is committed | adopted; a convergence benefit, measured in stage 2 | |
+| Chat `n>1` | — | waits for the slowest choice (fan-out prefetch) | noted as cost | |
+| silent socket on Chat (no pre-content frame) | measure idle tolerance; SSE keepalive if needed | — | measure. A keepalive forces early commit and conflicts with the true 502 — if it is needed, the prologue decision reverts to Fable's form | |
+
+### Stages
+
+| stage | content | reversibility |
+|---|---|---|
+| 0 | agreement suite against current code: Fable's 15 cases plus r17 Q1-D/Q1-E, U+000B, the `\'` escape and row 10's input; buffered vs streamed × three surfaces × both wrapper backends; the disagreeing cases pinned as strict expected-fails | no behaviour change; the instrument is proven on inputs whose answer is known to be the opposite |
+| 1 | stop constructing the extractors and the prestart behind one `settings.json` key, default off = today byte-for-byte; run the suite both ways (off: the pins reappear; on: the pins pass); no per-backend switch | one config flip |
+| 2 | the measurements below, then canary on; docs describe the opt-in, not a default that has not flipped | docs-only plus a flip |
+| 3 | default on; `false` rollback kept one release; contract rows (`README.md:134`, `api-interface-contract.md:121,213,452`) and matrix §7 rewritten in the same commit | one config flip |
+| 4 | delete the key, both extractor classes, `PredictableToolStart`, the retired extractor tests; rename `tool-call-stream.ts` to what remains. Removal condition attached at stage 1: one release with no revert criterion firing | git revert of one deletion commit |
+| separate | row 8's 502 at completion (`JSON.parse` minimum); the validator dependency for rows 8-full and 10; row 2's 502 | each its own flip and revert |
+
+**Revert criterion** (both drafts): a body byte before a 502 on a required-invalid turn; any final
+text or call-set difference between the paths; parity not 431/431; a supported client broken by
+held frames; the p95 first-frame or peak-buffer ceiling exceeded.
+
+### Needs measurement before stage 2
+
+| question | probe | outcome → response |
+|---|---|---|
+| does a real client depend on live argument deltas (the pre-fixed change condition) | inventory consumers; run each unmodified against the off and on builds with a delayed double | dependence found → A stops here and C's frame probe runs |
+| idle-gap tolerance on Chat | delayed double, longest gap per surface | intolerant → keepalive, which flips the prologue decision |
+| real latency cost | live: `firstToolCallDeltaMs` vs `totalMs` per backend (the app-server backend already records both) | seconds → accept; tens of seconds → C as a follow-up on measured enforcement only |
+| bare-prose `auto` answers on Claude (row 2 upgrade) | live capture, count non-wrapper artefacts under `auto` | near zero → 502 adoptable; otherwise keep deliver |
+
+Parity cannot move on its own: every default row runs against a backend that throws if reached,
+and `--generate` rows carry no tools (both drafts, verified against the script).
+
+### Owner decisions, with the default each draft's evidence supports
+
+1. Prologue timing — default **withhold** (true 502 on both paths).
+2. Row 2 — default **deliver** now; 502 after the live count.
+3. Validator dependency — default **not in this design**; separate task.
+4. Ceilings for p95 first frame and peak buffer — numbers the owner supplies; the packet had none.
+5. The settings key's name.
+
+Concept delta: net reducing on both drafts (Fable −9/+2, codex −13/+2 final), with one transient
+key until stage 4.
