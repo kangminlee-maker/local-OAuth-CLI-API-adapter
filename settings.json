@@ -8,5 +8,6 @@
   },
   "modelSelection": {
     "honorRequestModel": false
-  }
+  },
+  "holdToolTurnsUntilComplete": true
 }

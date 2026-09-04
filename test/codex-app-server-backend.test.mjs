@@ -126,11 +126,15 @@ test('CodexAppServerBackend streams buffered text deltas', async () => {
 test('CodexAppServerBackend records app-server tool stream timing checkpoints', async () => {
   process.env.CODEX_HOME = await createCodexHome();
   const timings = [];
+  // The checkpoints are the incremental reader's — the rollback path
+  // (`holdToolTurnsUntilComplete: false`); this test goes with it when it is
+  // deleted.
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
     timeoutMs: 30_000,
     onTiming: (timing) => timings.push(timing),
+    holdToolTurnsUntilComplete: false,
   });
 
   try {

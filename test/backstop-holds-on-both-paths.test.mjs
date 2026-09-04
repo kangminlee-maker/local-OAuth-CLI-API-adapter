@@ -43,7 +43,14 @@ async function streamed(raw, body) {
       headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
       body: JSON.stringify({ ...body, stream: true }),
     });
-    const frames = (await res.text()).split('\n')
+    const wire = await res.text();
+    if (res.status !== 200) {
+      // A held tool turn is refused before the response commits, so the
+      // refusal is the response's own status and body — nothing was delivered.
+      let json; try { json = JSON.parse(wire); } catch { json = {}; }
+      return { delivered: '', error: json.error?.message ?? wire };
+    }
+    const frames = wire.split('\n')
       .filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim())
       .filter((c) => c && c !== '[DONE]')
       .flatMap((c) => { try { return [JSON.parse(c)]; } catch { return []; } });

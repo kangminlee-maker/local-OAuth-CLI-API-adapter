@@ -472,9 +472,10 @@ function printArm(kase, backendName, arm, readings) {
 for (const kase of CASES) {
   for (const [backendName, makeBackend] of Object.entries(BACKENDS)) {
     test(`${kase.id} — ${backendName}`, async () => {
-      // Arm 1 — today's readers (`holdToolTurnsUntilComplete` off): the pins.
+      // Arm 1 — the incremental readers (`holdToolTurnsUntilComplete: false`,
+      // the rollback path): the pins.
       const today = await readArm(kase, makeBackend, false);
-      // Arm 2 — the turn held until its completed reading (the key on).
+      // Arm 2 — the turn held until its completed reading (the default).
       const held = await readArm(kase, makeBackend, true);
       if (PRINT) {
         printArm(kase, backendName, 'off', today);

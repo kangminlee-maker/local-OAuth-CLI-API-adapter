@@ -151,11 +151,12 @@ async function readings(backend, stopSequences) {
 async function streamOnly(backend) {
   const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
   try {
-    const wire = await (await fetch(`${server.url}/v1/messages`, {
+    const res = await fetch(`${server.url}/v1/messages`, {
       method: 'POST', headers: HEADERS,
       body: JSON.stringify({ model: 'm', max_tokens: 64, stream: true, tools: TOOLS, messages: [{ role: 'user', content: 'ping' }] }),
-    })).text();
-    return { ...blockReading(sseEvents(wire)), frames: sseFrames(wire) };
+    });
+    const wire = await res.text();
+    return { status: res.status, ...blockReading(sseEvents(wire)), frames: sseFrames(wire) };
   } finally { await server.close(); }
 }
 
@@ -396,9 +397,14 @@ test('a turn that fails mid-stream writes the queue before the error frame', asy
   assert.equal(r.frames.filter((f) => f === 'error').length, 1, 'written exactly once');
 });
 
-test('CONTROL: a failure with nothing queued writes the error frame alone', async () => {
+test('CONTROL: a failure with nothing queued is the response status, and no frame', async () => {
+  // A tool turn is held until its first event, so a backend that fails before
+  // producing anything is refused before the stream commits: the client gets
+  // the buffered path's status, not a 200 carrying an error frame.
   const r = await streamOnly(backendFor({ steps: [], ends: 'throw' }));
-  assert.deepEqual(r.frames, ['message_start', 'error'], 'nothing was produced, so nothing is released');
+  // 500: a generic backend error, the status the buffered path gives the same throw.
+  assert.equal(r.status, 500, 'the refusal is the response itself');
+  assert.deepEqual(r.frames, [], 'nothing was produced, so nothing is released');
   assert.deepEqual(r.types, [], 'and no content block is opened');
 });
 

@@ -54,7 +54,13 @@ async function bothReadings(raw, body) {
     });
     const bufferedRes = await post({});
     const buffered = await bufferedRes.json();
-    const frames = (await (await post({ stream: true })).text()).split('\n')
+    const streamedRes = await post({ stream: true });
+    const wire = await streamedRes.text();
+    // A held tool turn is refused before the response commits: the refusal is
+    // then the stream response's own status and body, not a frame.
+    let refusal;
+    if (streamedRes.status !== 200) { try { refusal = JSON.parse(wire).error?.message; } catch { refusal = wire; } }
+    const frames = wire.split('\n')
       .filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim())
       .filter((c) => c && c !== '[DONE]')
       .flatMap((c) => { try { return [JSON.parse(c)]; } catch { return []; } });
@@ -67,7 +73,7 @@ async function bothReadings(raw, body) {
       streamedCalls: [...new Map(frames
         .flatMap((f) => (f.choices ?? []).flatMap((c) => c.delta?.tool_calls ?? []))
         .filter((t) => t.id || t.function?.name).map((t) => [t.index, call(t)])).values()],
-      error: frames.find((f) => f.error)?.error?.message,
+      error: refusal ?? frames.find((f) => f.error)?.error?.message,
     };
   } finally {
     await server.close();

@@ -69,7 +69,14 @@ async function chat(command, body, env = {}) {
         error: json.error?.message,
       };
     }
-    const frames = (await res.text()).split('\n')
+    const wire = await res.text();
+    if (res.status !== 200) {
+      // A held tool turn is refused before the response commits, so the
+      // refusal is the response's own status and body — no frame carries it.
+      let json; try { json = JSON.parse(wire); } catch { json = {}; }
+      return { status: res.status, content: '', frames: 0, calls: [], error: json.error?.message ?? wire };
+    }
+    const frames = wire.split('\n')
       .filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim())
       .filter((c) => c && c !== '[DONE]')
       .flatMap((c) => { try { return [JSON.parse(c)]; } catch { return []; } });

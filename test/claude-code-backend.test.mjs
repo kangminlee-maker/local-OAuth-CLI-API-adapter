@@ -111,10 +111,13 @@ test('ClaudeCodeBackend sends an OpenAI json_schema through the native channel',
 });
 
 test('ClaudeCodeBackend extracts live tool argument deltas from structured output', async () => {
+  // The incremental reader is the rollback path (`holdToolTurnsUntilComplete:
+  // false`); this test goes with it when it is deleted.
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
     timeoutMs: 30_000,
+    holdToolTurnsUntilComplete: false,
   });
   try {
     const events = [];

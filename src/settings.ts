@@ -16,16 +16,16 @@ export interface AddonSettings {
     readonly honorRequestModel: boolean;
   };
   /**
-   * When true, a turn with `tools` streams nothing — not even the surface's
-   * opening frames — until the runtime has finished and the response path has
-   * read the completed answer; the stream is then a projection of that one
-   * reading. Off, the incremental wrapper reader releases bytes as they arrive
-   * and can disagree with the completed reading (conformance matrix §7a).
+   * On (absent, or true): a turn with `tools` streams nothing — not even the
+   * surface's opening frames — until the runtime has finished and the response
+   * path has read the completed answer; the stream is then a projection of that
+   * one reading. `false` is the rollback to the incremental wrapper reader,
+   * which releases bytes as they arrive and can disagree with the completed
+   * reading (conformance matrix §7a).
    *
-   * Temporary. This is stage 1 of `docs/design-task-wrapper-release.md`: off
-   * preserves today's bytes, on is the redesign. The key is deleted with the
-   * incremental reader once one release has run with it on and nothing has
-   * needed the old path back.
+   * Temporary. This is stage 3 of `docs/design-task-wrapper-release.md`: the
+   * key and the incremental reader are deleted once one release has run with
+   * it on and nothing has needed the old path back.
    */
   readonly holdToolTurnsUntilComplete: boolean;
 }
@@ -86,7 +86,7 @@ export function loadSettings(): AddonSettings {
     holdToolTurnsUntilComplete: readOptionalBooleanSetting(
       root?.holdToolTurnsUntilComplete,
       'holdToolTurnsUntilComplete',
-      false,
+      true,
     ),
   };
   return cachedSettings;

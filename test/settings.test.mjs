@@ -6,6 +6,7 @@ import {
   codexProxyImageModel,
   codexProxyFallbackReasoningEffort,
   codexProxyFallbackVerbosity,
+  holdToolTurnsUntilComplete,
   isCodexProxyTransport,
   isCodexProxyImageTransport,
   isReasoningEffort,
@@ -24,6 +25,14 @@ test('settings.json provides the Codex proxy fallback reasoning effort', () => {
   assert.equal(codexProxyFallbackVerbosity(), 'medium');
   assert.equal(loadSettings().codexProxy.imageModel, 'gpt-5.5');
   assert.equal(codexProxyImageModel(), 'gpt-5.5');
+});
+
+test('settings.json holds tool turns until their completed reading by default', () => {
+  // The packaged file says so explicitly, and the loader's own fallback for an
+  // absent key is the same answer — an install that predates the key is on too;
+  // `false` is the rollback.
+  assert.equal(loadSettings().holdToolTurnsUntilComplete, true);
+  assert.equal(holdToolTurnsUntilComplete(), true);
 });
 
 test('settings reasoning effort validator shares the provider effort enum', () => {
