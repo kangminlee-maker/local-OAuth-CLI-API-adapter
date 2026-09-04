@@ -130,6 +130,26 @@ export function outputSchemaFor(request: NormalizedRequest): unknown {
  * way the API already allows: `tool_choice: "none"` takes the tools off the
  * table for that turn.
  */
+/**
+ * The names this turn's runtime schema allows a call to carry, or null when
+ * the turn constrains none.
+ *
+ * `toolDecisionSchema` already builds this enum and hands it to the runtime.
+ * The response path did not check it, and neither did the incremental reader,
+ * so a wrapper naming `never_declared` was published as an executable call on
+ * both — "a call the client never declared is not a call it can answer", and
+ * the client has no way to answer it. Both readers take the set from here so
+ * they cannot decide it differently.
+ *
+ * A forced single tool is not included: that path names the call itself and
+ * never reads a name off the wrapper.
+ */
+export function declaredToolNames(request: NormalizedRequest): ReadonlySet<string> | null {
+  if (!hasToolDecisionSchema(request)) return null;
+  const names = request.tools.map((tool) => tool.name).filter((name) => name.trim() !== '');
+  return names.length > 0 ? new Set(names) : null;
+}
+
 export function hasToolDecisionSchema(request: NormalizedRequest): boolean {
   return request.tools.length > 0 && request.toolChoice.type !== 'none';
 }
@@ -217,6 +237,18 @@ export function parseBackendOutput(
   if (toolChoiceRequiresCall(request) && decided.toolCalls.length === 0) {
     throw backendContractError(
       'The local runtime answered without calling a tool for a request that required one.',
+      request.shape,
+    );
+  }
+  // The runtime was handed the declared names as an enum; a call outside it is
+  // a backend that ignored its schema, which is what this backstop is for. It
+  // rejects rather than repairs: renaming the call would put a tool invocation
+  // the model never made in front of the client, and dropping it silently
+  // would leave a turn that claims to have called something.
+  const declared = declaredToolNames(request);
+  if (declared && decided.toolCalls.some((call) => !declared.has(call.name))) {
+    throw backendContractError(
+      'The local runtime called a tool the request never declared.',
       request.shape,
     );
   }

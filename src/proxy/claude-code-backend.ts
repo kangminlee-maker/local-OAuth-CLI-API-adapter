@@ -8,6 +8,7 @@ import {
   claudeSystemPrompt,
   forcedSingleToolCall,
   hasToolDecisionSchema,
+  declaredToolNames,
   textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
@@ -224,7 +225,11 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     const toolExtractor = forcedTool
       ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
       : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor({ requiresCall: toolChoiceRequiresCall(request) })
+      ? new ToolCallDeltaExtractor({
+          requiresCall: toolChoiceRequiresCall(request),
+          jsonMode: request.jsonMode,
+          declaredNames: declaredToolNames(request),
+        })
       : null;
     const shouldStreamText = !toolExtractor && this.canStreamTextDeltas(request);
     const run = this.runRequest(
@@ -316,15 +321,26 @@ export class ClaudeCodeBackend implements LocalCliBackend {
   /**
    * Whether this turn's text may be streamed as it is produced.
    *
-   * A turn whose output the response path may reject is a turn whose output
-   * is not known to be deliverable until it is complete: a `json_object` turn
-   * used to stream its answer live and then have `parseBackendOutput` refuse
-   * it for not being an object — the whole non-JSON sentence delivered,
-   * followed by an error frame. Only what CAN be refused is withheld, so an
-   * explicit client schema still streams.
+   * Only a turn with NO output schema at all. Two separate reasons converge
+   * on that one condition, and spelling it as "what the backstop can refuse"
+   * covered only the first:
+   *
+   * ① A `json_object` turn used to stream its answer live and then have
+   *    `parseBackendOutput` refuse it for not being an object — the whole
+   *    non-JSON sentence delivered, followed by an error frame.
+   * ② When the CLI is given a schema it answers through `structured_output`,
+   *    and `resultFromTurn` publishes those bytes and discards `turn.text`.
+   *    The streamed text is then not the answer at all: a `json_schema` turn
+   *    streamed `Here you go:\n{"ok": 1}` while its body said `{"ok":1}`, and
+   *    `missingTextTail` cannot repair it because the answer does not start
+   *    with what was streamed. An explicit client schema is exempt from ① but
+   *    not from ②.
+   *
+   * `outputSchemaFor` is the value that decides both, and it is the same value
+   * the backend hands the CLI, so the gate cannot drift from the channel.
    */
   private canStreamTextDeltas(request: NormalizedRequest): boolean {
-    return !hasToolDecisionSchema(request) && !textMayBeRefused(request);
+    return outputSchemaFor(request) === null;
   }
 
   private canUsePersistentTurn(request: NormalizedRequest): boolean {

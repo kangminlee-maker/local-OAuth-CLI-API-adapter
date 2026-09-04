@@ -958,47 +958,66 @@ Standing rules for every probe: minimal token spend (`max_tokens`/`max_completio
 
 ---
 
-## 7. Known design gap — the tool wrapper has two readers that disagree
+## 7. Known gaps in the tool wrapper
 
-**Status: declared, not fixed.** Round 14 (2026-09-04, two independent reviewers on private copies,
-neither calling a live API) reproduced ten defects. Two were separable and are fixed; the other
-eight are one design problem wearing eight faces, and patching them one at a time is what produced
-the last four rounds.
+**Scope: any turn with `tools`.** One row additionally needs a JSON format; the rest do not.
+An earlier version of this section scoped everything to "`tools` and a JSON format combined", which
+let a client that sends no JSON format read it and conclude it was unaffected while most of the
+rows were live for it.
 
-The problem: a turn with `tools` is answered inside a private JSON wrapper
-(`{status, text, toolCalls}`). The **buffered** reader is `JSON.parse`. The **streamed** reader is a
-hand-written incremental walk that must decide what to release before the wrapper is complete —
-and a released byte cannot be retracted. Two implementations of one grammar disagree on every axis
-nobody has enumerated yet, and each round enumerates a few more.
+A turn with `tools` is answered inside a private JSON wrapper (`{status, text, toolCalls}`). The
+**buffered** reader is `JSON.parse`. The **streamed** reader is a hand-written incremental walk that
+must decide what to release before the wrapper is complete — and a released byte cannot be retracted.
 
-| # | axis they disagree on | what a client sees | introduced by round 13's fixes? |
+### 7a. The two readers disagree — the undesigned part
+
+These need the incremental reader to reach the same value the completed parse reaches, which means
+either canonical framing or one shared representation. No predicate decides them.
+
+| # | axis | what a client sees |
+|---|---|---|
+| 1 | the root's **end** is never found, so bytes after the wrapper are read as its members | under `tool_choice:"required"` the stream delivers a complete executable call, then the frame refusing it |
+| 2 | the root may never **close** at all | the stream publishes the call **and then the entire raw wrapper as assistant prose**, terminating with an ordinary `finish_reason:"stop"` and no error; the buffered body returns the fragment as prose with no call |
+| 3 | duplicate keys: this walk is first-wins, `JSON.parse` is last-wins | not merely two block orders — with duplicate `toolCalls` the two clients **execute different functions with different arguments**, and with duplicate `text` they receive different answers |
+| 4 | argument normalization on the wrapper path: buffered wraps invalid text as `{"input":…}`, the stream forwards it raw | the two clients receive different tool input; only the buffered one can execute the call |
+
+### 7b. Both readers agree, and both are wrong — separable, not yet fixed
+
+Filed apart because the earlier version of this section put them under "axes they disagree on",
+which is false and made them look like they had to wait for the redesign. Each has its own cause.
+
+| # | defect | what a client sees | why it is not 7a |
 |---|---|---|---|
-| 1 | root **end** is never found, so bytes after the wrapper are read as its members | under `tool_choice:"required"`, the stream delivers a complete executable call, then the frame refusing it | no |
-| 2 | the root may never **close** at all | stream announces a call; the buffered body returns the fragment as prose with no call | no |
-| 3 | duplicate keys: the walk is first-wins, `JSON.parse` is last-wins | one artefact, two block orders; raw `structured_output` picks a different value than the parsed one | **yes** |
-| 4 | whitespace class is JavaScript's `\s`, not JSON's four characters | a leading BOM or NBSP makes the stream read a wrapper the body rejects — an executed call the body denies | no |
-| 5 | argument normalization: buffered wraps invalid text as `{"input":…}`, the stream forwards it raw | the two clients receive different tool input; only the buffered one can execute the call | no |
-| 6 | the forced-tool path now passes `{`/`[`-opening payloads through unnormalized | truncated `{"city":"Seo` is published as `function.arguments` and fails `JSON.parse` | **yes** |
-| 7 | a call's **name** is constrained in the runtime schema but validated in neither reader | a required turn can publish a tool name the client never declared | no |
-| 8 | in JSON mode the wrapper shares a namespace with client-controlled keys | `{"status":"done","text":"…","toolCalls":[]}` is published verbatim — the proxy's internal grammar as the answer | no |
+| 5 | a forced single tool bypasses the wrapper entirely, and `normalizeToolArgumentsText` passes any `{`/`[`-opening payload through unvalidated | a truncated `{"city":"Seo` is published as `function.arguments` and fails `JSON.parse` on both paths | agreement is not enforcement. The runtime was handed the tool's own input schema, so this is the backstop's job: reject, do not repair. No JSON format is involved |
+| 6 | with a JSON format present, a wrapper-shaped object with no usable `status` is exempted from refusal | `{"status":"done","text":"…","toolCalls":[]}` is published verbatim — the proxy's internal grammar as the client's JSON answer | a one-reader decision, not a two-reader one. **This is the row that genuinely needs design**: with `tools` present the runtime gets the wrapper schema and never the client's, so the object is probably a malformed wrapper — but it is also exactly what a client's own task-record schema produces, and nothing in the bytes separates them |
 
-Row 8 is the one that shows why this is design and not repair: with `tools` present the runtime is
-handed the wrapper schema and never the client's, so that object is *probably* a malformed wrapper —
-but it is also exactly what a client's own task-record schema would produce, and nothing in the
-bytes distinguishes them. Deciding it needs the client's data separated from the wrapper's own,
-which is the same separation rows 3, 5 and 6 need. A predicate cannot be written here.
+### What round 15 fixed, and what it corrected about round 14
 
-**What was fixed instead**, because it was separable rather than structural:
-- The `jsonMode` gates left behind when the wrapper's `json` member was reverted. They held back the
-  only answer there was, so a turn with `tools` and a JSON format streamed nothing and arrived in
-  one frame; spelled `!request.jsonMode`, they also withheld every explicit client schema against a
-  refusal that cannot happen. One predicate, `textMayBeRefused`, now serves the backstop and all
-  three gates.
-- A present `structured_output: null` was coalesced away by `??` and published as `""`, so a client
-  whose schema was `{"type":"null"}` never received the answer its runtime had produced.
+Round 15 (2026-09-04, two independent reviewers, blind, offline) reproduced three defects that
+round 14's own fixes had introduced, plus the misclassifications above.
 
-Until the separation is designed, rows 1–8 above are the honest statement of what this adapter does
-not guarantee when `tools` and a JSON format are combined.
+Fixed here:
+- **A call naming a tool the request never declared** is now refused on both paths.
+  `declaredToolNames` is the set `toolDecisionSchema` already hands the runtime, so the response
+  path and the incremental reader cannot decide it differently. Previously filed as undesignable;
+  both reviewers independently showed a predicate decides it.
+- **The wrapper reader's whitespace class** is JSON's four characters, not JavaScript's `\s`. A BOM
+  or NBSP before the wrapper made the stream read a wrapper that `JSON.parse` rejects, so under
+  `tool_choice:"required"` the stream published an executable call the body answered 502 to. A
+  closed lexical test, no redesign needed.
+
+Reverted here, because round 14 removed them for a reason that turned out to be the wrong one:
+- **`canStreamTextDeltas`** is `outputSchemaFor(request) === null` again. Round 14 narrowed it to
+  "what the backstop can refuse", which is only one of the two reasons a schema turn's text is not
+  deliverable. The other is that the CLI answers such a turn through `structured_output` and
+  `resultFromTurn` discards `turn.text` — so a `json_schema` turn streamed `Here you go: {…}` while
+  its body published `{…}`. Every structured-output turn on `/v1/messages` was on that path.
+- **The extractor's JSON-mode text gate.** Round 14 deleted it as a leftover of the reverted `json`
+  member. It was also holding an answer turn's text until the completed reader could confirm the
+  same value — which row 3 above says it cannot promise. The latency it costs is real and accepted.
+
+`textMayBeRefused` remains where it is correct: the response-path backstop, and the app-server's
+text branch, which has no second answer channel.
 
 ## Appendix: evidence tally
 

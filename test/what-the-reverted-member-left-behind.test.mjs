@@ -5,36 +5,39 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
-import { textMayBeRefused } from '../dist/proxy/backend-contract.js';
+import { textMayBeRefused, declaredToolNames, parseBackendOutput } from '../dist/proxy/backend-contract.js';
 
 /**
- * A member was removed from the tool wrapper; the gates written to protect it
- * were not.
+ * What a turn's answer channel is, and what may be released before it arrives.
  *
- * While the wrapper carried a `json` member, an answer turn's `text` was not
- * the answer and holding it back was right. With that member gone the wrapper's
- * only fields are `status`, `text` and `toolCalls`, and `parseToolDecision`
- * returns `text` as the answer — so the gate held back the only answer there
- * was. A client asking for JSON alongside tools received nothing for the whole
- * generation and then the entire answer in one frame.
+ * Round 14 removed a gate on the ground that it protected a wrapper member the
+ * revert before it had deleted. The gate was doing a second job nobody had
+ * written down: when the CLI is handed an output schema it answers through
+ * `structured_output`, and the streamed prose is then not the answer at all.
+ * Removing the gate made a `json_schema` turn stream `Here you go: {...}` while
+ * its own body published `{...}` — the two readings of one turn disagreeing,
+ * which is the defect this repo produces most.
  *
- * The gate was also spelled too widely. `!request.jsonMode` covers a client's
- * own `json_schema`, which the response path never refuses: those turns were
- * withheld against a rejection that cannot happen. `textMayBeRefused` is the
- * one predicate the backstop actually uses, so a gate cannot drift from it.
+ * The tests that shipped with that change could not fail: they drove
+ * `streaming-claude.cjs`, whose result carries the text and no
+ * `structured_output` — the one artefact shape where the bug cannot appear.
+ * `schema-stream-claude.cjs` exists so the shape under test is the shape a
+ * schema turn actually produces.
  */
 
 const here = dirname(fileURLToPath(import.meta.url));
 const streamingClaude = resolve(here, 'fixtures/streaming-claude.cjs');
 const structuredClaude = resolve(here, 'fixtures/structured-claude.cjs');
+const schemaStreamClaude = resolve(here, 'fixtures/schema-stream-claude.cjs');
 
 before(async () => {
-  await chmod(streamingClaude, 0o755);
-  await chmod(structuredClaude, 0o755);
+  for (const f of [streamingClaude, structuredClaude, schemaStreamClaude]) await chmod(f, 0o755);
 });
 afterEach(() => {
   delete process.env.WRAPPER_RAW;
   delete process.env.STRUCTURED_RAW;
+  delete process.env.SCHEMA_PROSE;
+  delete process.env.SCHEMA_STRUCTURED;
 });
 
 const TOOLS = [
@@ -47,76 +50,142 @@ const JSON_SCHEMA = {
   json_schema: { name: 'answer', strict: true, schema: { type: 'object', properties: { ok: { type: 'number' } } } },
 };
 
-async function streamed(raw, body) {
-  process.env.WRAPPER_RAW = raw;
-  const backend = new ClaudeCodeBackend({ command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
+async function chat(command, body, env = {}) {
+  Object.assign(process.env, env);
+  const backend = new ClaudeCodeBackend({ command, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
   const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
   try {
     const res = await fetch(`${server.url}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
-      body: JSON.stringify({ ...body, stream: true }),
+      body: JSON.stringify(body),
     });
-    const chunks = (await res.text()).split('\n')
+    if (!body.stream) {
+      const json = await res.json();
+      return {
+        status: res.status,
+        content: json.choices?.[0]?.message?.content ?? '',
+        calls: (json.choices?.[0]?.message?.tool_calls ?? []).map((c) => c.function.name),
+        error: json.error?.message,
+      };
+    }
+    const frames = (await res.text()).split('\n')
       .filter((l) => l.startsWith('data:')).map((l) => l.slice(5).trim())
       .filter((c) => c && c !== '[DONE]')
-      .flatMap((c) => { try { return [JSON.parse(c)]; } catch { return []; } })
-      .flatMap((f) => (f.choices ?? []).map((c) => c.delta?.content).filter(Boolean));
-    return { delivered: chunks.join(''), frames: chunks.length };
+      .flatMap((c) => { try { return [JSON.parse(c)]; } catch { return []; } });
+    const chunks = frames.flatMap((f) => (f.choices ?? []).map((c) => c.delta?.content).filter(Boolean));
+    return {
+      status: res.status,
+      content: chunks.join(''),
+      frames: chunks.length,
+      calls: frames.flatMap((f) => (f.choices ?? []).flatMap((c) => (c.delta?.tool_calls ?? []).map((t) => t.function?.name).filter(Boolean))),
+      error: frames.find((f) => f.error)?.error?.message,
+    };
   } finally {
     await server.close();
     await backend.close();
   }
 }
 
-// The wrapper's `text` IS the answer, so it streams as it is produced. The
-// answer is 24 characters and the fixture writes one per delta: a single frame
-// means the whole generation was silent and the answer arrived at the end.
-const ANSWER = 'Here is the verdict: Yes.';
-
-for (const [label, format] of [
-  ['json_object', { type: 'json_object' }],
-  ['json_schema', JSON_SCHEMA],
+/**
+ * The regression this file exists for: with an output schema the CLI answers
+ * through `structured_output`, so its prose must not be published as the answer.
+ */
+for (const [label, prose, structured] of [
+  ['prose wrapping the object', 'Here you go:\n{"ok": 1}', '{"ok":1}'],
+  ['a fenced block', '```json\n{"ok":1}\n```', '{"ok":1}'],
+  ['CONTROL prose that is already the answer', '{"ok":1}', '{"ok":1}'],
 ]) {
-  test(`an answer turn with tools and ${label} streams as it is produced`, async () => {
-    const { delivered, frames } = await streamed(
-      JSON.stringify({ status: 'message', text: ANSWER, toolCalls: [] }),
-      { model: 'm', messages: [{ role: 'user', content: 'verdict?' }], tools: TOOLS, response_format: format },
-    );
-    assert.equal(delivered, ANSWER, 'the answer did not arrive');
-    assert.ok(frames > 1, `the turn arrived in one piece (${frames} frame)`);
+  test(`a json_schema turn answers from structured_output on both paths: ${label}`, async () => {
+    const body = { model: 'm', messages: [{ role: 'user', content: 'x' }], response_format: JSON_SCHEMA };
+    const env = { SCHEMA_PROSE: prose, SCHEMA_STRUCTURED: structured };
+    const buffered = await chat(schemaStreamClaude, body, env);
+    const streamed = await chat(schemaStreamClaude, { ...body, stream: true }, env);
+    assert.equal(buffered.content, structured, 'the body did not publish the structured answer');
+    assert.equal(streamed.content, buffered.content, 'the stream published the prose, not the answer');
   });
 }
 
-test('CONTROL a required turn that answered instead of calling still delivers nothing', async () => {
-  const { delivered, frames } = await streamed(
-    JSON.stringify({ status: 'message', text: ANSWER, toolCalls: [] }),
-    {
-      model: 'm', messages: [{ role: 'user', content: 'weather?' }],
-      tools: TOOLS, tool_choice: 'required', response_format: { type: 'json_object' },
-    },
-  );
-  assert.equal(delivered, '', 'the refused answer reached the wire');
-  assert.equal(frames, 0);
+test('a schema turn does not stream its prose as it is produced', async () => {
+  // Held, not lost: the answer still arrives, in one frame at the end.
+  const streamed = await chat(schemaStreamClaude,
+    { model: 'm', messages: [{ role: 'user', content: 'x' }], response_format: JSON_SCHEMA, stream: true },
+    { SCHEMA_PROSE: 'Here you go:\n{"ok": 1}', SCHEMA_STRUCTURED: '{"ok":1}' });
+  assert.equal(streamed.content, '{"ok":1}');
+  assert.equal(streamed.frames, 1, 'the prose reached the client as it was produced');
+});
+
+test('CONTROL a turn with no output schema still streams as it is produced', async () => {
+  const streamed = await chat(streamingClaude,
+    { model: 'm', messages: [{ role: 'user', content: 'x' }], stream: true },
+    { WRAPPER_RAW: 'Here is a sentence in many pieces.' });
+  assert.equal(streamed.content, 'Here is a sentence in many pieces.');
+  assert.ok(streamed.frames > 1, `a plain turn was withheld (${streamed.frames} frame)`);
 });
 
 /**
- * Without tools the two JSON formats must behave DIFFERENTLY, which is the
- * whole point of the predicate: `json_object` can be refused for not being an
- * object, so its text is held until it is complete; a client's own schema is
- * exempt from that check, so holding it back bought nothing.
+ * A tools turn's answer is held for a different reason: this reader stops at a
+ * wrapper's FIRST member while `JSON.parse` keeps the LAST, so a released
+ * prefix can be contradicted by the completed body — and a released byte
+ * cannot be retracted.
  */
-test('without tools a client schema streams while a schemaless json_object is held', async () => {
-  const body = { model: 'm', messages: [{ role: 'user', content: 'x' }] };
-  const withSchema = await streamed('{"ok":1}', { ...body, response_format: JSON_SCHEMA });
-  const schemaless = await streamed('{"ok":1}', { ...body, response_format: { type: 'json_object' } });
-
-  assert.equal(withSchema.delivered, '{"ok":1}');
-  assert.ok(withSchema.frames > 1, `a client schema was withheld (${withSchema.frames} frame)`);
-
-  assert.equal(schemaless.delivered, '{"ok":1}', 'the held answer was lost rather than held');
-  assert.equal(schemaless.frames, 1, 'a refusable answer was released before it was complete');
+test('duplicate wrapper keys cannot make the two readings disagree in JSON mode', async () => {
+  const raw = '{"status":"message","text":"FIRST","toolCalls":[],"text":"SECOND"}';
+  const body = { model: 'm', messages: [{ role: 'user', content: 'x' }], tools: TOOLS, response_format: { type: 'json_object' } };
+  const buffered = await chat(streamingClaude, body, { WRAPPER_RAW: raw });
+  const streamed = await chat(streamingClaude, { ...body, stream: true }, { WRAPPER_RAW: raw });
+  assert.equal(streamed.content, buffered.content, 'the stream committed a value the body then contradicted');
 });
+
+/** A call naming a tool the request never declared is refused on both paths. */
+for (const [label, name, expectRefusal] of [
+  ['an undeclared name', 'never_declared', true],
+  ['CONTROL a declared name', 'get_weather', false],
+]) {
+  test(`${label} is treated the same by both readers`, async () => {
+    const raw = JSON.stringify({ status: 'tool_calls', text: '', toolCalls: [{ id: 'c1', name, arguments: '{}' }] });
+    const body = { model: 'm', messages: [{ role: 'user', content: 'x' }], tools: TOOLS, tool_choice: 'required' };
+    const buffered = await chat(streamingClaude, body, { WRAPPER_RAW: raw });
+    const streamed = await chat(streamingClaude, { ...body, stream: true }, { WRAPPER_RAW: raw });
+    if (expectRefusal) {
+      assert.equal(buffered.status, 502, 'the body published an undeclared call');
+      assert.deepEqual(streamed.calls, [], 'the stream published an undeclared call');
+      assert.match(streamed.error ?? '', /never declared/);
+    } else {
+      assert.deepEqual(buffered.calls, ['get_weather']);
+      assert.deepEqual([...new Set(streamed.calls)], ['get_weather']);
+    }
+  });
+}
+
+test('declaredToolNames is the set the runtime schema was given', () => {
+  const base = { model: 'm', shape: 'openai-chat', messages: [], jsonMode: false, raw: {} };
+  const tools = [{ name: 'a', inputSchema: {} }, { name: 'b', inputSchema: {} }];
+  assert.deepEqual([...declaredToolNames({ ...base, tools, toolChoice: { type: 'auto' } })], ['a', 'b']);
+  assert.equal(declaredToolNames({ ...base, tools: [], toolChoice: { type: 'auto' } }), null, 'no tools constrains nothing');
+  assert.equal(declaredToolNames({ ...base, tools, toolChoice: { type: 'none' } }), null, 'a `none` turn has no wrapper');
+});
+
+/**
+ * `skipWhitespace` decides whether an artefact is a wrapper at all, so it has
+ * to answer the same question `JSON.parse` answers. JavaScript's `\s` also
+ * matches BOM and NBSP, which `JSON.parse` rejects.
+ */
+for (const [label, prefix] of [
+  ['a BOM', '﻿'],
+  ['a non-breaking space', ' '],
+  ['CONTROL an ordinary newline', '\n'],
+]) {
+  test(`${label} before the wrapper reads the same to both readers`, async () => {
+    const raw = prefix + JSON.stringify({ status: 'tool_calls', text: '', toolCalls: [{ id: 'c1', name: 'get_weather', arguments: '{"city":"Seoul"}' }] });
+    const body = { model: 'm', messages: [{ role: 'user', content: 'x' }], tools: TOOLS, tool_choice: 'required' };
+    const buffered = await chat(streamingClaude, body, { WRAPPER_RAW: raw });
+    const streamed = await chat(streamingClaude, { ...body, stream: true }, { WRAPPER_RAW: raw });
+    const bufferedCalls = buffered.status === 502 ? [] : buffered.calls;
+    assert.deepEqual([...new Set(streamed.calls)], bufferedCalls,
+      'the stream published a call the body denied');
+  });
+}
 
 test('textMayBeRefused is true only for the format the backstop can refuse', () => {
   const base = { model: 'm', shape: 'openai-chat', messages: [], tools: [], toolChoice: { type: 'auto' }, raw: {} };
@@ -126,12 +195,9 @@ test('textMayBeRefused is true only for the format the backstop can refuse', () 
 });
 
 /**
- * A present `null` is an answer, not an absent member.
- *
- * `message.structured_output ?? waiter.structuredOutput` cannot tell them
- * apart, so a client whose schema is `{"type":"null"}` — satisfied by the
- * runtime, which returned exactly `null` — was handed the empty fallback text
- * instead of the bytes it asked for.
+ * A present `null` is an answer, not an absent member. `??` cannot tell them
+ * apart, so a client whose schema is `{"type":"null"}` was handed the empty
+ * fallback text instead of the `null` its runtime returned.
  */
 for (const [label, raw, expected] of [
   ['a present null', 'null', 'null'],
@@ -156,3 +222,15 @@ for (const [label, raw, expected] of [
     }
   });
 }
+
+test('an undeclared call is refused at the response path too, not only in the stream', () => {
+  const request = {
+    model: 'm', shape: 'openai-chat', messages: [], jsonMode: false,
+    tools: [{ name: 'get_weather', inputSchema: {} }],
+    toolChoice: { type: 'auto' }, raw: {},
+  };
+  const undeclared = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"nope","arguments":"{}"}]}';
+  assert.throws(() => parseBackendOutput(request, undeclared), (err) => err.statusCode === 502);
+  const declared = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{}"}]}';
+  assert.deepEqual(parseBackendOutput(request, declared).toolCalls.map((c) => c.name), ['get_weather']);
+});

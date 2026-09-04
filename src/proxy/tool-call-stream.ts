@@ -26,8 +26,35 @@ export class ToolCallDeltaExtractor {
    * same condition the backstop tests: `{"status":"tool_calls","toolCalls":[]}`
    * passed this gate and was refused anyway, delivering the whole answer first.
    *
+   * `jsonMode`: the client asked for JSON, so the turn's answer is ONE value
+   * and the client will parse it. A streamed prefix cannot be retracted, and
+   * the completed reader does not always choose the value this incremental one
+   * would: on a wrapper carrying `{"text":"FIRST",…,"text":"SECOND"}` this
+   * walk stops at the first member while `JSON.parse` keeps the last, so the
+   * stream delivered `FIRST` and the body said `SECOND`. Holding an answer
+   * turn's text until the result arrives costs latency and buys agreement.
+   * A `tool_calls` turn's `text` is narration, not the answer, and still
+   * streams.
    */
-  constructor(private readonly policy: { requiresCall?: boolean } = {}) {}
+  constructor(private readonly policy: {
+    requiresCall?: boolean;
+    jsonMode?: boolean;
+    declaredNames?: ReadonlySet<string> | null;
+  } = {}) {}
+
+  /**
+   * Whether a call has already committed to a name the request never declared.
+   *
+   * `snapshot.name` is only set once its closing quote has arrived, so this
+   * reads a final identity and never a prefix. The response path refuses the
+   * whole turn for such a call, so nothing about the turn may be released.
+   */
+  private carriesAnUndeclaredCall(): boolean {
+    const declared = this.policy.declaredNames;
+    if (!declared) return false;
+    return readToolCallSnapshots(this.raw)
+      .some((snapshot) => snapshot.name !== undefined && !declared.has(snapshot.name));
+  }
 
   /** Whether the wrapper has committed to at least one tool call. */
   private carriesAClosedCall(): boolean {
@@ -69,11 +96,12 @@ export class ToolCallDeltaExtractor {
     // A required turn is refused unless it actually carries a call, which is
     // the condition the backstop tests — not merely what `status` claims.
     if (this.policy.requiresCall && (status !== 'tool_calls' || !this.carriesAClosedCall())) return [];
-    // The wrapper's `text` IS the answer on an answer turn — `parseToolDecision`
-    // returns exactly it. A gate here held it back for the wrapper's `json`
-    // member, which no longer exists, so a turn with `tools` and a JSON format
-    // streamed nothing and arrived in one frame at the end.
-    const textEvents = this.textDeltas();
+    // A call naming a tool the request never declared is refused downstream.
+    if (this.carriesAnUndeclaredCall()) return [];
+    // In JSON mode an answer turn's text is the whole answer, and this reader
+    // cannot promise the completed reader will pick the same bytes. Held until
+    // the result, which is where the two are reconciled.
+    const textEvents = this.policy.jsonMode && status !== 'tool_calls' ? [] : this.textDeltas();
     const callEvents = status === 'tool_calls' ? this.toolCallDeltas() : [];
     // Which of the two came first is the wrapper's to say, not this decoder's.
     // Emitting text first unconditionally made the answer depend on where the
@@ -529,8 +557,19 @@ function unescapeJsonChar(char: string): string {
   return char;
 }
 
+/**
+ * JSON's whitespace, which is four characters and not JavaScript's `\s`.
+ *
+ * `\s` also matches U+FEFF, U+00A0, U+000B and U+2028. A wrapper with a BOM
+ * in front of it was therefore read as a wrapper here while `JSON.parse`
+ * rejected it outright, so under `tool_choice:"required"` the stream published
+ * a complete executable call and the buffered reading answered 502. Deciding
+ * "is this a wrapper" has to answer the same question `JSON.parse` answers.
+ */
 function skipWhitespace(raw: string, index: number): number {
   let cursor = index;
-  while (/\s/.test(raw[cursor] ?? '')) cursor += 1;
+  while (JSON_WHITESPACE.has(raw[cursor] ?? '')) cursor += 1;
   return cursor;
 }
+
+const JSON_WHITESPACE = new Set([' ', '\t', '\n', '\r']);

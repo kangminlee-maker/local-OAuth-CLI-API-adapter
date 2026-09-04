@@ -17,6 +17,7 @@ import {
   developerInstructions,
   forcedSingleToolCall,
   hasToolDecisionSchema,
+  declaredToolNames,
   textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
@@ -254,7 +255,11 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     const toolExtractor = forcedTool
       ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
       : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor({ requiresCall: toolChoiceRequiresCall(request) })
+      ? new ToolCallDeltaExtractor({
+          requiresCall: toolChoiceRequiresCall(request),
+          jsonMode: request.jsonMode,
+          declaredNames: declaredToolNames(request),
+        })
       : null;
     let firstToolCallDeltaMs: number | undefined;
     let firstToolArgumentDeltaMs: number | undefined;
