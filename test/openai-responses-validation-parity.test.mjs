@@ -123,6 +123,9 @@ const REJECTIONS = [
   ["tools member without a type", { ...OUT, tools: [{}] }, { param: "tools[0].type", code: "missing_required_parameter", message: "Missing required parameter: 'tools[0].type'." }],
   ["tools function without a name", { ...OUT, tools: [{ type: 'function' }] }, { param: "tools[0].name", code: "missing_required_parameter", message: "Missing required parameter: 'tools[0].name'." }],
   ["chat-shaped tool", { ...OUT, tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }] }, { param: "tools[0].name", code: "missing_required_parameter", message: "Missing required parameter: 'tools[0].name'." }],
+  // Conformance matrix §7 rows 11–12, measured live 2026-09-04 (`e2e:text:parity`).
+  ["tools function with a blank name", { ...OUT, tools: [{ type: 'function', name: '', parameters: { type: 'object', properties: {} } }] }, { param: "tools[0].name", code: "empty_string", message: "Invalid 'tools[0].name': empty string. Expected a string with minimum length 1, but got an empty string instead." }],
+  ["tool_choice naming an undeclared function", { ...OUT, tools: [RTOOL], tool_choice: { type: 'function', name: 'never_declared' } }, { param: "tool_choice", code: null, message: "Tool choice 'never_declared' not found in 'tools' parameter." }],
   // reasoning — its own enum, wider than Chat's.
   ["reasoning as a string", { ...OUT, reasoning: 'low' }, { param: "reasoning", code: "invalid_type", message: "Invalid type for 'reasoning': expected an object, but got a string instead." }],
   ["reasoning.effort unknown", { ...OUT, reasoning: { effort: 'bogus' } }, { param: "reasoning.effort", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'." }],

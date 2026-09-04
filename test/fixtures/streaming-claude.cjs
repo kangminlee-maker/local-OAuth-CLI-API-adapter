@@ -29,7 +29,10 @@ function emit() {
     type: 'result',
     subtype: 'success',
     result: raw,
-    stop_reason: 'end_turn',
+    // A test may say the turn was cut off: the response path then keeps a
+    // truncated forced-tool payload as the direct API does (finish_reason
+    // length) instead of refusing it as a runtime that ignored its schema.
+    stop_reason: process.env.WRAPPER_STOP_REASON ?? 'end_turn',
     session_id: 'fake_session',
     usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 },
   });

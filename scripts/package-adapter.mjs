@@ -142,7 +142,11 @@ async function validateExtractedPackage(packageDir) {
   // dependency has to earn its place by name. `sharp` (prebuilt libvips
   // binaries, no network, no build step) realizes Images API options on the
   // bytes for the transport that has no tool declaration to send them on.
-  const allowedRuntimeDependencies = new Set(['sharp']);
+  // `ajv` (pure JS, no network) is the JSON Schema validator behind the
+  // response path's refusal of an answer that breaks the schema the client
+  // supplied — a forced tool's input schema, or a `json_schema` format — so the
+  // proxy delivers that option or refuses, never publishes a near miss.
+  const allowedRuntimeDependencies = new Set(['sharp', 'ajv']);
   const unexpected = Object.keys(packageJson.dependencies ?? {}).filter((name) => !allowedRuntimeDependencies.has(name));
   if (unexpected.length > 0) {
     throw new Error(`Installable adapter package must not declare runtime dependencies beyond ${[...allowedRuntimeDependencies].join(', ')}: ${unexpected.join(', ')}`);

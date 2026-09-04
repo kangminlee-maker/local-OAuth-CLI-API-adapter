@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { chmod, cp, mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,6 +40,9 @@ async function treeWithSetting(honorRequestModel) {
   // The loader resolves `../settings.json` from dist/, so the copied tree needs
   // both, and only the copy is ever modified.
   await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  // `dist` resolves its runtime dependencies (`ajv`) from a `node_modules`
+  // beside it, the way an installed package does.
+  await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'));
   const settings = JSON.parse(await readFile(join(repoRoot, 'settings.json'), 'utf8'));
   // `undefined` writes a settings file with no modelSelection block at all, which
   // is what an install predating this setting looks like.

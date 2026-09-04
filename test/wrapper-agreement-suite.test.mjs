@@ -45,6 +45,7 @@ before(async () => {
 
 afterEach(async () => {
   delete process.env.WRAPPER_RAW;
+  delete process.env.WRAPPER_STOP_REASON;
   delete process.env.FAKE_CODEX_RAW_TEXT;
   delete process.env.FAKE_CODEX_RAW_TEXT_DELTAS;
   delete process.env.CODEX_HOME;
@@ -164,14 +165,27 @@ const CASES = [
     id: '7b-8 a forced tool answered with truncated arguments (r15-codex F5)',
     raw: '{"city":"Seo',
     choice: 'forced',
-    // Chat and Responses carry `arguments` as a string, so both readings hand
-    // the client the same unusable fragment. On /v1/messages the buffered
-    // reading wraps text that is not JSON as `{"input":…}` (interface contract
-    // line 380) while the stream sends the fragment as `input_json_delta` — the
-    // row-7 normalization gap, on the forced path. Matrix §7b row 8.
-    // The one remaining disagreement: between the two WRITERS' projections of
-    // one completed call whose arguments do not parse, not between two
-    // readers. Row 8's own fix — refuse the forced turn at completion — flips it.
+    // The runtime was handed the tool's own input schema and answered with
+    // bytes that are not JSON, for no reason it reported. Publishing the
+    // fragment put the same unusable `arguments` on Chat and Responses and
+    // split the two /v1/messages WRITERS (buffered `{"input":…}` against a
+    // verbatim `input_json_delta`); the refusal at completion is one answer on
+    // every surface. Matrix §7 row 8.
+    delivered: { refused: true },
+  },
+  {
+    id: '7b-8b the same fragment when the output limit cut the call off',
+    raw: '{"city":"Seo',
+    choice: 'forced',
+    // Only the Claude double can say why it stopped; the app-server path has
+    // no stop reason and refuses (declared at matrix §7 row 8).
+    backends: ['claude'],
+    env: { WRAPPER_STOP_REASON: 'max_tokens' },
+    // The direct API hands the client the fragment with `finish_reason:
+    // "length"`, so the proxy keeps it. The two /v1/messages writers still
+    // project one unparseable call differently — the direct envelope for a
+    // tool call cut off by `max_tokens` is unmeasured, so the disagreement is
+    // pinned, not resolved.
     expect: { messages: ['calls'] },
     delivered: { text: '', calls: [{ id: null, name: 'get_weather', arguments: '{"city":"Seo' }] },
   },
@@ -429,6 +443,7 @@ const PRINT = process.env.WRAPPER_AGREEMENT_PRINT === '1';
 
 /** Every surface, read both ways, through one backend. */
 async function readAll(kase, makeBackend) {
+  Object.assign(process.env, kase.env ?? {});
   const backend = await makeBackend(kase.raw);
   const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
   try {
@@ -447,6 +462,7 @@ async function readAll(kase, makeBackend) {
 
 for (const kase of CASES) {
   for (const [backendName, makeBackend] of Object.entries(BACKENDS)) {
+    if (kase.backends && !kase.backends.includes(backendName)) continue;
     test(`${kase.id} — ${backendName}`, async () => {
       const readings = await readAll(kase, makeBackend);
       if (PRINT) {

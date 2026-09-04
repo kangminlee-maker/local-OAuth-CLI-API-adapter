@@ -176,6 +176,14 @@ completed answer has been read; what the client then receives is that one
 reading, and a refused turn is an HTTP 502 on the stream as on the buffered
 body. Plain text turns and the `codex-backend` transport stream live.
 
+The schema the client supplied is enforced when the turn completes. A forced
+tool's arguments that are not JSON, or that fall outside the tool's
+`parameters` / `input_schema`, and a `json_schema` answer outside its schema
+are refused with 502 rather than published as a near miss; the one exception
+is a forced call the runtime reports as cut off by its output limit, which is
+delivered as the fragment it is, the way the direct API answers
+`finish_reason: "length"` (conformance matrix §7, rows 8 and 10).
+
 Measured cost: none on `claude`, whose wrapper already arrived whole in
 `structured_output`; about 0.3 s later call announcement per turn on
 `app-server`. Why the turn waits: an incremental reader used to release bytes
@@ -368,6 +376,12 @@ prints the guide before exiting.
 For independence, avoid `file:../path-to-adapter-source` installs. Use the
 verified tarball, a release asset containing that tarball, or a registry package
 built from the same artifact flow.
+
+The package declares two runtime dependencies, allowlisted by name in the
+packaging script: `sharp` (prebuilt libvips, no network) realizes Images API
+options on the bytes, and `ajv` (pure JavaScript, no network) validates a
+forced tool's arguments and a `json_schema` answer against the schema the
+client supplied. Neither reaches a provider.
 
 The proxy also strips direct provider credential/routing environment variables
 from spawned local CLI backends, including OpenAI/Anthropic API keys and base

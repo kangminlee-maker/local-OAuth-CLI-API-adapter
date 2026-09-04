@@ -14,6 +14,7 @@ import { renderToolCall, renderToolResult } from './normalizers.js';
 import { wrapperCallsPrecedeText,
   callNameIsDeclared,
 } from './tool-wrapper.js';
+import { conformsToSchema } from './schema-conformance.js';
 
 interface BuildPromptOptions {
   readonly includeInstructionMessages?: boolean;
@@ -202,6 +203,14 @@ function backendContractError(message: string, shape: NormalizedRequest['shape']
 export function parseBackendOutput(
   request: NormalizedRequest,
   text: string,
+  /**
+   * Why the runtime stopped, when the backend can say (`LocalCompletionResult`
+   * `stopReason`). A forced tool call cut off by the output limit is kept as
+   * the fragment it is, the way the direct API answers `finish_reason:
+   * "length"`; without this the same fragment is a runtime that ignored its
+   * schema, and is refused.
+   */
+  stopReason?: string,
 ): { text: string; toolCalls: readonly LocalToolCall[]; textRuns?: readonly LocalTextRun[] } {
   if (!hasToolDecisionSchema(request)) {
     // Only `json_object` means "any JSON OBJECT". A client that supplied its
@@ -218,18 +227,35 @@ export function parseBackendOutput(
         request.shape,
       );
     }
+    assertAnswersClientSchema(request, text);
     return { text, toolCalls: [] };
   }
   const forcedTool = forcedSingleToolCall(request);
   if (forcedTool) {
-    return {
-      text: '',
-      toolCalls: [{
-        id: forcedTool.id,
-        name: forcedTool.name,
-        arguments: normalizeToolArgumentsText(text),
-      }],
-    };
+    const args = normalizeToolArgumentsText(text);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(args) as unknown;
+    } catch {
+      // The direct API hands a client a fragment only when the output limit
+      // cut the call off (`finish_reason: "length"`); a fragment for any other
+      // reason is a runtime that ignored the schema it was handed, and the
+      // three writers would each project it differently (matrix §7 row 8).
+      if (stoppedAtOutputLimit(stopReason)) {
+        return { text: '', toolCalls: [{ id: forcedTool.id, name: forcedTool.name, arguments: args }] };
+      }
+      throw backendContractError(
+        'The local runtime answered a forced tool call with arguments that are not JSON.',
+        request.shape,
+      );
+    }
+    if (conformsToSchema(parsed, forcedTool.inputSchema) === false) {
+      throw backendContractError(
+        "The local runtime answered a forced tool call with arguments outside the tool's schema.",
+        request.shape,
+      );
+    }
+    return { text: '', toolCalls: [{ id: forcedTool.id, name: forcedTool.name, arguments: args }] };
   }
   // Every path below that yields no call breaks `required`, so the check sits
   // once at the end rather than at each `return`.
@@ -255,13 +281,14 @@ export function parseBackendOutput(
   // `rawNames` is this backstop's evidence, not part of the answer.
   const { rawNames: _rawNames, ...answer } = decided;
   void _rawNames;
-  // No object rule here, deliberately. The one structured-output channel is
-  // carrying the tool wrapper on this path, so the JSON format never reached
-  // the runtime and the model was never asked for it — rejecting the answer
-  // would refuse a turn nothing had required anything of. The combination is
-  // declared unenforced in the conformance matrix instead. Enforcement and the
-  // knob travel together; where there is no knob there is no enforcement, and
-  // the matrix says so rather than a check inventing one.
+  // No JSON-format rule here — neither the object rule nor the client's
+  // schema — deliberately. The one structured-output channel is carrying the
+  // tool wrapper on this path, so the format never reached the runtime and the
+  // model was never asked for it; refusing its text would refuse a turn
+  // nothing had required anything of, on every turn. The combination is
+  // declared unenforced in the conformance matrix instead (chat row 28).
+  // Enforcement and the knob travel together; where there is no knob there is
+  // no enforcement, and the matrix says so rather than a check inventing one.
   return answer;
 }
 
@@ -339,30 +366,66 @@ function parseToolDecision(
 }
 
 /**
- * Whether this answer satisfies the turn's JSON format.
+ * Whether this answer satisfies the object rule.
  *
  * Only `json_object` means "any JSON OBJECT"; a client that supplied its own
- * `json_schema` gets whatever root that schema declares, and a turn with no
- * JSON format has nothing to satisfy. One predicate, so the two places that
- * enforce it cannot drift — the tool-decision path had no check at all.
+ * `json_schema` gets whatever root that schema declares and is judged by
+ * `assertAnswersClientSchema` instead, and a turn with no JSON format has
+ * nothing to satisfy.
  */
 function answersAsJsonObject(request: NormalizedRequest, text: string): boolean {
-  if (!textMayBeRefused(request)) return true;
+  if (!request.jsonMode || request.jsonSchema !== undefined) return true;
   return parsesAsJsonObject(text);
 }
 
 /**
  * Whether the response path may refuse this turn's text once it is complete.
  *
- * Only the schemaless `json_object` format can be: a client that supplied its
- * own `json_schema` gets whatever root that schema declares, and the check
- * above exempts it. Three streaming gates had spelled this `!request.jsonMode`,
- * which also held back every explicit client schema — those turns streamed
- * nothing and arrived in one piece, withheld against a refusal that could not
- * happen. One predicate, so a gate cannot drift from what actually refuses.
+ * Every JSON format can be: `json_object` by the object rule above, and a
+ * client's own `json_schema` by `assertAnswersClientSchema`. A streaming gate
+ * that released text on a turn this predicate says may be refused would put
+ * the refusal after the bytes it refuses, so the gates ask this one predicate
+ * rather than spelling their own (each did, once, and drifted).
  */
 export function textMayBeRefused(request: NormalizedRequest): boolean {
-  return request.jsonMode && request.jsonSchema === undefined;
+  return request.jsonMode;
+}
+
+/**
+ * A `json_schema` format is the client's promise, not the proxy's: the runtime
+ * was handed that schema as its output contract, so text outside it is a
+ * runtime that ignored its schema (matrix §7 row 10). `json_object` carries no
+ * schema and gets only the object rule. A schema Ajv cannot compile judges
+ * nothing and the answer passes — the direct APIs reject such a schema at
+ * request time, and the request boundary is where that belongs.
+ */
+function assertAnswersClientSchema(request: NormalizedRequest, text: string): void {
+  if (request.jsonSchema === undefined) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    throw backendContractError(
+      'The local runtime returned output that is not JSON for a request that supplied a JSON schema.',
+      request.shape,
+    );
+  }
+  if (conformsToSchema(parsed, request.jsonSchema) === false) {
+    throw backendContractError(
+      "The local runtime returned output outside the request's JSON schema.",
+      request.shape,
+    );
+  }
+}
+
+/**
+ * The runtimes name the output limit differently: Claude Code reports the
+ * Messages API's `max_tokens`, the Codex transport the Responses API's
+ * `length`. Neither app-server path reports one, so a fragment from there is
+ * always a refusal — declared in the matrix at §7 row 8.
+ */
+function stoppedAtOutputLimit(stopReason: string | undefined): boolean {
+  return stopReason === 'max_tokens' || stopReason === 'length';
 }
 
 function parsesAsJsonObject(text: string): boolean {

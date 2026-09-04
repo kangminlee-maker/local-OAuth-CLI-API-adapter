@@ -88,6 +88,10 @@ const REJECTIONS = [
   ["tools as a string", { tools: 'x' }, "tools: Input should be a valid array"],
   ["tools null", { tools: null }, "tools: Input should be a valid array"],
   ["tools member not an object", { tools: [7] }, "tools.0: Input should be an object"],
+  // Conformance matrix §7 rows 11–12, measured live 2026-09-04 (`e2e:text:parity`).
+  ["tool with a blank name", { tools: [{ name: '', input_schema: { type: 'object', properties: {} } }] }, "tools.0.custom.name: String should have at least 1 character"],
+  ["tool without a name", { tools: [{ input_schema: { type: 'object', properties: {} } }] }, "tools.0.custom.name: Field required"],
+  ["tool_choice naming an undeclared tool", { tools: [{ name: 'f', input_schema: { type: 'object', properties: {} } }], tool_choice: { type: 'tool', name: 'never_declared' } }, "Tool 'never_declared' not found in provided tools"],
   ["system as an integer", { system: 7 }, "system: Input should be a valid array"],
   ["system null", { system: null }, "system: Input should be a valid array"],
   ["system member not an object", { system: [7] }, "system.0: Input does not match the expected shape."],

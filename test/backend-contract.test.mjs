@@ -369,3 +369,80 @@ test('an object that is not wrapper-shaped, and plain prose, are the answer', ()
   assert.equal(parseBackendOutput(request, 'plain prose').text, 'plain prose');
   assert.deepEqual(parseBackendOutput(request, 'plain prose').toolCalls, []);
 });
+
+// ---------------------------------------------------------------------------
+// Conformance matrix §7 rows 8 and 10: the schema the client supplied is the
+// runtime's output contract, and the response path refuses what breaks it.
+// ---------------------------------------------------------------------------
+
+const WEATHER_SCHEMA = { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] };
+
+function forcedRequest(inputSchema = WEATHER_SCHEMA) {
+  return {
+    model: 'm', shape: 'openai-chat', messages: [], jsonMode: false,
+    tools: [{ name: 'get_weather', inputSchema }], toolChoice: { type: 'required' }, raw: {},
+  };
+}
+
+function refused(error, pattern) {
+  return error.statusCode === 502 && pattern.test(error.message);
+}
+
+test('row 8: a forced call whose arguments are not JSON is refused at completion', () => {
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo'), (e) => refused(e, /arguments that are not JSON/));
+  // A stop reason that is not the output limit is no excuse either.
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo', 'end_turn'), (e) => refused(e, /arguments that are not JSON/));
+  // Prose is not JSON once wrapped as `{"input":…}` — so it is JSON, and
+  // conforms to nothing the schema requires.
+  assert.throws(() => parseBackendOutput(forcedRequest(), 'Seoul please'), (e) => refused(e, /outside the tool's schema/));
+});
+
+test('row 8: the fragment is kept only when the output limit cut the call off', () => {
+  // Claude Code reports the Messages API name, the Codex transport the
+  // Responses API name; both are the direct APIs' `finish_reason: "length"`.
+  for (const stopReason of ['max_tokens', 'length']) {
+    const kept = parseBackendOutput(forcedRequest(), '{"city":"Seo', stopReason);
+    assert.deepEqual(kept.toolCalls, [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seo' }], stopReason);
+  }
+});
+
+test('row 8: arguments outside the forced tool\'s schema are refused; conforming ones pass', () => {
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":1}'), (e) => refused(e, /outside the tool's schema/));
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"town":"Seoul"}'), (e) => refused(e, /outside the tool's schema/));
+  assert.equal(parseBackendOutput(forcedRequest(), '{"city":"Seoul"}').toolCalls[0].arguments, '{"city":"Seoul"}');
+  // CONTROL: a schema Ajv cannot compile judges nothing, so the same answer
+  // that the weather schema refuses passes under it — the promise is
+  // unverifiable, not broken.
+  const uncompilable = { type: 'nonsense' };
+  assert.equal(parseBackendOutput(forcedRequest(uncompilable), '{"city":1}').toolCalls[0].arguments, '{"city":1}');
+  // CONTROL: no schema at all (a tool declared without one) is the same.
+  const schemaless = { ...forcedRequest(), tools: [{ name: 'get_weather' }] };
+  assert.equal(parseBackendOutput(schemaless, '{"city":1}').toolCalls[0].arguments, '{"city":1}');
+});
+
+function schemaRequest(jsonSchema) {
+  return { model: 'm', shape: 'openai-chat', messages: [], jsonMode: true, jsonSchema, tools: [], toolChoice: { type: 'auto' }, raw: {} };
+}
+
+test('row 10: text outside the client\'s json_schema is refused; conforming text passes', () => {
+  const request = schemaRequest(WEATHER_SCHEMA);
+  assert.throws(() => parseBackendOutput(request, 'Seoul is sunny.'), (e) => refused(e, /not JSON for a request that supplied a JSON schema/));
+  assert.throws(() => parseBackendOutput(request, '{"city":1}'), (e) => refused(e, /outside the request's JSON schema/));
+  // The proxy's own grammar as the client's answer (matrix §7 row 10).
+  assert.throws(() => parseBackendOutput(request, '{"status":"done","text":"Seoul","toolCalls":[]}'), (e) => refused(e, /outside the request's JSON schema/));
+  assert.equal(parseBackendOutput(request, '{"city":"Seoul"}').text, '{"city":"Seoul"}');
+  // A schema rooted at an array keeps its root: the object rule is
+  // `json_object`'s alone, and an array answer under this schema conforms.
+  const list = schemaRequest({ type: 'array', items: { type: 'integer' } });
+  assert.equal(parseBackendOutput(list, '[1,2,3]').text, '[1,2,3]');
+  assert.throws(() => parseBackendOutput(list, '{"0":1}'), (e) => refused(e, /outside the request's JSON schema/));
+  // CONTROL: an uncompilable client schema passes everything that is JSON.
+  assert.equal(parseBackendOutput(schemaRequest({ type: 'nonsense' }), '{"city":1}').text, '{"city":1}');
+  assert.throws(() => parseBackendOutput(schemaRequest({ type: 'nonsense' }), 'prose'), (e) => refused(e, /not JSON/));
+});
+
+test('CONTROL: json_object keeps the object rule and nothing more', () => {
+  const request = { ...schemaRequest(undefined), jsonSchema: undefined };
+  assert.throws(() => parseBackendOutput(request, '[1,2,3]'), (e) => refused(e, /not a JSON object/));
+  assert.equal(parseBackendOutput(request, '{"anything":true}').text, '{"anything":true}');
+});

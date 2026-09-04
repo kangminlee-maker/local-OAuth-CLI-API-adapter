@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "2db943c0954983af22a5d222d68c721fd1211c5634ad6378404978798558859d",
+    "matrixDigest": "9538c7859ff54728696caab64af8d8c8f84a1c9930c84fb5f7df3e6a06c757a2",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -760,7 +760,7 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported for `json_object` + `json_schema` (`normalizers.ts:35-38`); `strict` and schema `name` parsed. Both go through a **runtime schema**, not a prompt sentence: `json_schema` carries the client's schema and `json_object` carries `{\"type\":\"object\"}` — the direct API forces a top-level object here (asked for `[1,2,3]` it answered `{\"0\":1,\"1\":2,\"2\":3}`, measured 2026-09-02). Output that is not a JSON object is rejected at the response boundary rather than passed through — for `json_object` only, since a client `json_schema` declares its own root (a schema rooted at an array is handed to the runtime and its arrays are accepted back). **Sent together with `tools` the format is NOT enforced**: the one structured-output channel is carrying the tool wrapper, so the client's schema does not reach the runtime and the turn's `text` is returned as it stands. The direct API does serve the pair and honour the schema (measured 2026-09-03), so this is a divergence, declared here rather than faked — supporting it needs a second channel or a wrapper that isolates client data, which is a design change and not a bug fix. Numbers in a runtime-enforced answer are published as the bytes the runtime wrote — an id of `9007199254740993` is not rounded to `…992`",
+      "claimedNote": "supported for `json_object` + `json_schema` (`normalizers.ts:35-38`); `strict` and schema `name` parsed. Both go through a **runtime schema**, not a prompt sentence: `json_schema` carries the client's schema and `json_object` carries `{\"type\":\"object\"}` — the direct API forces a top-level object here (asked for `[1,2,3]` it answered `{\"0\":1,\"1\":2,\"2\":3}`, measured 2026-09-02). Output that is not a JSON object is rejected at the response boundary rather than passed through — for `json_object` only, since a client `json_schema` declares its own root (a schema rooted at an array is handed to the runtime and its arrays are accepted back). A `json_schema` answer is instead validated against the client's schema at the response boundary (`ajv`, draft 2020-12; §7 row 10) and refused outside it — the promise is kept or refused, never published as a near miss. **Sent together with `tools` the format is NOT enforced**: the one structured-output channel is carrying the tool wrapper, so the client's schema does not reach the runtime and the turn's `text` is returned as it stands. The direct API does serve the pair and honour the schema (measured 2026-09-03), so this is a divergence, declared here rather than faked — supporting it needs a second channel or a wrapper that isolates client data, which is a design change and not a bug fix. Numbers in a runtime-enforced answer are published as the bytes the runtime wrote — an id of `9007199254740993` is not rounded to `…992`",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (`openai.chat.json_schema.schema_exact`, `option-is-a-promise`)",
       "liveParityRow": true
@@ -1596,7 +1596,7 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported (`normalizers.ts:65-68`), through the same runtime schema as chat row 28 — `json_object` carries `{\"type\":\"object\"}` and non-object output is rejected; a client `json_schema` keeps its own root and is published with its numbers verbatim. **Not enforced together with `tools`**, same as chat row 28",
+      "claimedNote": "supported (`normalizers.ts:65-68`), through the same runtime schema as chat row 28 — `json_object` carries `{\"type\":\"object\"}` and non-object output is rejected; a client `json_schema` keeps its own root, is validated against that schema at the response boundary (chat row 28, §7 row 10) and is published with its numbers verbatim. **Not enforced together with `tools`**, same as chat row 28",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (`option-is-a-promise`, `wrapper-root-and-lexeme`)",
       "liveParityRow": true
@@ -3150,7 +3150,7 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported. It is no longer REFUSED together with tools — the provider serves that pair (measured 2026-09-03: `{\"verdict\": \"True\", \"score\": 0.95}` with tools present), so refusing a turn the backends can serve was itself a divergence — but it is **not enforced** there either, for the reason given in chat row 28. Accepted, echoed, and declared unenforced rather than silently dropped or falsely refused",
+      "claimedNote": "supported; without tools the answer is validated against the schema and refused outside it (chat row 28, §7 row 10). It is no longer REFUSED together with tools — the provider serves that pair (measured 2026-09-03: `{\"verdict\": \"True\", \"score\": 0.95}` with tools present), so refusing a turn the backends can serve was itself a divergence — but it is **not enforced** there either, for the reason given in chat row 28. Accepted, echoed, and declared unenforced rather than silently dropped or falsely refused",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (measured 2026-09-03)",
       "liveParityRow": true

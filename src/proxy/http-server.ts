@@ -1390,8 +1390,10 @@ function streamEvents(
   // A tool turn's first event IS its completed reading (or the refusal that
   // replaces it), so pulling it before the headers are written is what gives
   // the stream the same status the buffered path returns — a real 502, not a
-  // 200 with an error frame after zero content.
-  if (!honorRequestModel() && !hasToolDecisionSchema(request)) {
+  // 200 with an error frame after zero content. A JSON-format turn is held the
+  // same way: its text is not released until the response path has accepted
+  // it, so its first event is the same reading.
+  if (!honorRequestModel() && !hasToolDecisionSchema(request) && !request.jsonMode) {
     return Promise.resolve(events);
   }
   return withFirstEventSettled(events);

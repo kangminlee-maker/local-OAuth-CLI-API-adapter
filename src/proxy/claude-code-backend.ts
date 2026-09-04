@@ -482,7 +482,7 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     const rawText = turn.structuredOutput === undefined
       ? turn.text
       : turn.rawStructuredOutput ?? JSON.stringify(turn.structuredOutput);
-    const parsed = parseBackendOutput(request, rawText);
+    const parsed = parseBackendOutput(request, rawText, turn.stopReason);
     const usage = usageFromClaude(turn.usage) ?? usageFor(request, parsed.text, parsed.toolCalls);
     return {
       id: `local_${randomUUID()}`,

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -24,6 +24,9 @@ async function runScenario(scenario, honorRequestModel = true) {
   const root = await mkdtemp(join(tmpdir(), 'streaming-live-'));
   trees.push(root);
   await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  // `dist` resolves its runtime dependencies (`ajv`) from a `node_modules`
+  // beside it, the way an installed package does.
+  await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'));
   const settings = JSON.parse(await readFile(join(repoRoot, 'settings.json'), 'utf8'));
   await writeFile(
     join(root, 'settings.json'),
@@ -126,6 +129,9 @@ async function headerTiming(honorRequestModel) {
   const root = await mkdtemp(join(tmpdir(), 'stream-timing-'));
   trees.push(root);
   await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  // `dist` resolves its runtime dependencies (`ajv`) from a `node_modules`
+  // beside it, the way an installed package does.
+  await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'));
   const settings = JSON.parse(await readFile(join(repoRoot, 'settings.json'), 'utf8'));
   await writeFile(
     join(root, 'settings.json'),
@@ -193,6 +199,9 @@ test('honour-on: streaming chunks report the executed model, not the request ech
   const root = await mkdtemp(join(tmpdir(), 'stream-model-echo-'));
   trees.push(root);
   await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  // `dist` resolves its runtime dependencies (`ajv`) from a `node_modules`
+  // beside it, the way an installed package does.
+  await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'));
   const settings = JSON.parse(await readFile(join(repoRoot, 'settings.json'), 'utf8'));
   await writeFile(
     join(root, 'settings.json'),
@@ -262,6 +271,9 @@ test('honour-on: a fan-out turn that fails to start cancels its siblings', async
   const root = await mkdtemp(join(tmpdir(), 'fan-out-prefetch-'));
   trees.push(root);
   await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  // `dist` resolves its runtime dependencies (`ajv`) from a `node_modules`
+  // beside it, the way an installed package does.
+  await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'));
   const settings = JSON.parse(await readFile(join(repoRoot, 'settings.json'), 'utf8'));
   await writeFile(
     join(root, 'settings.json'),

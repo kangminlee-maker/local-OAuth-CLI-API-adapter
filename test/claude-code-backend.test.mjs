@@ -266,8 +266,8 @@ test('every schema-bearing turn is spawned with --json-schema, on every surface'
     toolChoice: { type: 'auto' },
     raw: {},
   };
-  const schema = { type: 'object', properties: { adapter: { type: 'string' } }, required: ['adapter'] };
-  const weather = { name: 'get_weather', description: 'w', inputSchema: { type: 'object', properties: { city: { type: 'string' } } } };
+  const schema = PROBE_SCHEMA;
+  const weather = { name: 'get_weather', description: 'w', inputSchema: PROBE_SCHEMA };
 
   for (const [label, request] of [
     ['an OpenAI response_format schema', { ...base, shape: 'openai-chat', jsonMode: true, jsonSchema: schema }],
@@ -317,7 +317,11 @@ function modelArgsIn(argv) {
 
 const PREFIX = 'claude model rejection (reported as 404): ';
 
-const PROBE_SCHEMA = { type: 'object', additionalProperties: false, properties: {}, required: [] };
+// The argv-echo double answers `{"argv": [...]}` whatever schema it was spawned
+// with, and the response path holds a schema-bearing answer to its schema
+// (conformance matrix §7 rows 8 and 10) — so the schema these argv probes send
+// is the one the echo satisfies. They measure the argv, not conformance.
+const PROBE_SCHEMA = { type: 'object', properties: { argv: { type: 'array', items: { type: 'string' } } }, required: ['argv'] };
 
 function anthropicTuningRequest(overrides) {
   return {
@@ -1852,7 +1856,7 @@ test('gates effort out for every Haiku spelling on a one-shot turn', async () =>
 });
 
 test('forwards output_config.format schema to claude --json-schema', async () => {
-  const schema = { type: 'object', additionalProperties: false, properties: {}, required: [] };
+  const schema = PROBE_SCHEMA;
   const argv = await spawnedArgv(anthropicTuningRequest({ jsonMode: true, jsonSchema: schema }));
   const i = argv.indexOf('--json-schema');
   assert.ok(i !== -1, `expected --json-schema in argv: ${argv.join(' ')}`);
@@ -1886,7 +1890,11 @@ test('forwards thinking on capable models and gates adaptive on Haiku', async ()
 
 test('forced tool + per-request effort: one-shot argv forwards both --json-schema and --effort', async () => {
   const argv = await spawnedArgv(
-    { ...toolRequest(), shape: 'anthropic-messages', effort: 'low', streamOptions: { includeUsage: false, includeObfuscation: false } },
+    {
+      ...toolRequest(),
+      tools: [{ ...toolRequest().tools[0], inputSchema: PROBE_SCHEMA }],
+      shape: 'anthropic-messages', effort: 'low', streamOptions: { includeUsage: false, includeObfuscation: false },
+    },
     'claude-opus-4-8',
   );
   assert.ok(argv.includes('--effort'), `expected --effort: ${argv.join(' ')}`);

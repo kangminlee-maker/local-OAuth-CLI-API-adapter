@@ -264,6 +264,11 @@ const chatCases = [
   ['tool_choice unknown string', { messages: M, tools: [TOOL], tool_choice: 'bogus' }],
   ['tool_choice object without function', { messages: M, tools: [TOOL], tool_choice: { type: 'bogus' } }],
   ['tool_choice function without name', { messages: M, tools: [TOOL], tool_choice: { type: 'function', function: {} } }],
+  // Conformance matrix §7 rows 11–12: the request boundary, measured before it is mirrored.
+  ['tools function with a blank name', { messages: M, tools: [{ type: 'function', function: { name: '', parameters: { type: 'object', properties: {} } } }] }],
+  // `reasoning_effort: 'none'`, because on this model the direct Chat API refuses function tools
+  // under any other effort BEFORE it looks the forced name up (measured 2026-09-04).
+  ['tool_choice naming an undeclared function', { messages: M, reasoning_effort: 'none', tools: [TOOL], tool_choice: { type: 'function', function: { name: 'never_declared' } } }],
   ['response_format as a string', { messages: M, response_format: 'json' }],
   ['response_format without type', { messages: M, response_format: {} }],
   ['response_format unknown type', { messages: M, response_format: { type: 'bogus' } }],
@@ -455,6 +460,8 @@ const responsesCases = [
   ['responses tools member without a type', { ...OUT, tools: [{}] }],
   ['responses tools function without a name', { ...OUT, tools: [{ type: 'function' }] }],
   ['responses chat-shaped tool', { ...OUT, tools: [{ type: 'function', function: { name: 'f', parameters: { type: 'object', properties: {} } } }] }],
+  ['responses tools function with a blank name', { ...OUT, tools: [{ type: 'function', name: '', parameters: { type: 'object', properties: {} } }] }],
+  ['responses tool_choice naming an undeclared function', { ...OUT, tools: [RTOOL], tool_choice: { type: 'function', name: 'never_declared' } }],
   // reasoning — its own enum, wider than Chat's.
   ['responses reasoning as a string', { ...OUT, reasoning: 'low' }],
   ['responses reasoning.effort unknown', { ...OUT, reasoning: { effort: 'bogus' } }],
@@ -671,6 +678,9 @@ const messagesCases = [
   ['messages tools as a string', { tools: 'x' }],
   ['messages tools null', { tools: null }],
   ['messages tools member not an object', { tools: [7] }],
+  ['messages tool with a blank name', { tools: [{ name: '', input_schema: { type: 'object', properties: {} } }] }],
+  ['messages tool without a name', { tools: [{ input_schema: { type: 'object', properties: {} } }] }],
+  ['messages tool_choice naming an undeclared tool', { tools: [{ name: 'f', input_schema: { type: 'object', properties: {} } }], tool_choice: { type: 'tool', name: 'never_declared' } }],
   ['messages system as an integer', { system: 7 }],
   ['messages system null', { system: null }],
   ['messages system member not an object', { system: [7] }],

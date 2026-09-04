@@ -97,6 +97,9 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   requireOpenAiChatMessages(input.messages);
   rejectUnknownOpenAiKeys(input, OPENAI_CHAT_KEYS);
   const { messages, reasoningEffort } = validateOpenAiChatFields(input);
+  const chatTools = readOpenAiTools(input.tools);
+  const chatToolChoice = readOpenAiToolChoice(input.tool_choice);
+  assertForcedToolDeclared('openai-chat', chatTools, chatToolChoice);
   return {
     shape: 'openai-chat',
     model,
@@ -115,8 +118,8 @@ export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
     // before this change, now with the direct envelopes. Carrying it into
     // `tools` would run the tools but answer in the modern shape, and a legacy
     // client reads `message.function_call`.
-    tools: readOpenAiTools(input.tools),
-    toolChoice: readOpenAiToolChoice(input.tool_choice),
+    tools: chatTools,
+    toolChoice: chatToolChoice,
     ...(typeof input.n === 'number' && input.n !== 1 ? { choices: input.n } : {}),
     raw: body,
   };
@@ -168,6 +171,7 @@ function validateOpenAiChatFields(
       const fn = asRecord(asRecord(tool)?.function);
       if (!fn) throw missingRequiredParameter(`tools[${index}].function`);
       if (typeof fn.name !== 'string') throw missingRequiredParameter(`tools[${index}].function.name`);
+      if (fn.name === '') throw emptyString(`tools[${index}].function.name`);
     });
   }
   if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice);
@@ -479,6 +483,41 @@ function missingRequiredParameter(field: string): ProxyRequestError {
   return new ProxyRequestError(`Missing required parameter: '${field}'.`, 400, 'openai', 'invalid_request_error', field, 'missing_required_parameter');
 }
 
+function emptyString(field: string): ProxyRequestError {
+  return new ProxyRequestError(
+    `Invalid '${field}': empty string. Expected a string with minimum length 1, but got an empty string instead.`,
+    400, 'openai', 'invalid_request_error', field, 'empty_string',
+  );
+}
+
+/**
+ * A forced `tool_choice` has to name a declared tool. Without this the lookup
+ * in `forcedSingleToolCall` found nothing, fell back to a generic argument
+ * schema, and every surface published a call to a tool the request never
+ * declared (conformance matrix §7 row 12). The three envelopes are the direct
+ * APIs' own, measured 2026-09-04 — Chat still words it in the deprecated
+ * `functions` vocabulary.
+ */
+function assertForcedToolDeclared(
+  shape: NormalizedRequest['shape'],
+  tools: readonly NormalizedTool[],
+  toolChoice: NormalizedToolChoice,
+): void {
+  if (toolChoice.type !== 'tool') return;
+  const name = toolChoice.name;
+  if (tools.some((tool) => tool.name === name)) return;
+  if (shape === 'openai-chat') {
+    throw new ProxyRequestError(
+      `Invalid value for 'function_call': no function named '${name}' was specified in the 'functions' parameter.`,
+      400, 'openai', 'invalid_request_error', 'function_call',
+    );
+  }
+  if (shape === 'openai-responses') {
+    throw new ProxyRequestError(`Tool choice '${name}' not found in 'tools' parameter.`, 400, 'openai', 'invalid_request_error', 'tool_choice');
+  }
+  throw anthropicFault(`Tool '${name}' not found in provided tools`);
+}
+
 function integerBelowMin(field: string, value: number, min: number): ProxyRequestError {
   return new ProxyRequestError(
     `Invalid '${field}': integer below minimum value. Expected a value >= ${min}, but got ${value} instead.`,
@@ -738,6 +777,9 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
   const text = asRecord(input.text);
   const format = asRecord(text?.format);
   const reasoning = asRecord(input.reasoning);
+  const responsesTools = readOpenAiTools(input.tools);
+  const responsesToolChoice = readOpenAiToolChoice(input.tool_choice, 'openai-responses');
+  assertForcedToolDeclared('openai-responses', responsesTools, responsesToolChoice);
   return {
     shape: 'openai-responses',
     model,
@@ -751,8 +793,8 @@ export function normalizeOpenAiResponsesRequest(body: unknown): NormalizedReques
     jsonSchema: format?.schema,
     jsonSchemaName: format?.type === 'json_schema' ? readOptionalString(format.name) : undefined,
     jsonSchemaStrict: format?.type === 'json_schema' ? readOptionalBoolean(format.strict) : undefined,
-    tools: readOpenAiTools(input.tools),
-    toolChoice: readOpenAiToolChoice(input.tool_choice, 'openai-responses'),
+    tools: responsesTools,
+    toolChoice: responsesToolChoice,
     raw: body,
   };
 }
@@ -840,6 +882,7 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
       if (record.type === 'function' && typeof record.name !== 'string') {
         throw missingRequiredParameter(`tools[${index}].name`);
       }
+      if (record.type === 'function' && record.name === '') throw emptyString(`tools[${index}].name`);
     });
   }
   if (present('tool_choice')) readOpenAiToolChoice(input.tool_choice, 'openai-responses');
@@ -1181,7 +1224,14 @@ function validateAnthropicMessagesFields(input: Record<string, unknown>): void {
   if (sent('tools')) {
     if (!Array.isArray(input.tools)) throw anthropicFault('tools: Input should be a valid array');
     input.tools.forEach((tool, index) => {
-      if (!asRecord(tool)) throw anthropicFault(`tools.${index}: Input should be an object`);
+      const record = asRecord(tool);
+      if (!record) throw anthropicFault(`tools.${index}: Input should be an object`);
+      // The direct API reports a tool's name under the `custom` member of its
+      // tool union (measured 2026-09-04, absent and empty). A tool without a
+      // name used to be run under the invented name `tool`.
+      if (record.name === undefined) throw anthropicFault(`tools.${index}.custom.name: Field required`);
+      if (typeof record.name !== 'string') throw anthropicFault(`tools.${index}.custom.name: Input should be a valid string`);
+      if (record.name === '') throw anthropicFault(`tools.${index}.custom.name: String should have at least 1 character`);
     });
   }
 
@@ -1457,6 +1507,7 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const outputFormat = readAnthropicOutputFormat(outputConfig?.format);
   const tools = readAnthropicTools(input.tools);
   const toolChoice = readAnthropicToolChoice(input.tool_choice);
+  assertForcedToolDeclared('anthropic-messages', tools, toolChoice);
   // ...unless the turn has taken the tools off. There is one structured-output
   // channel, so a tool schema and a format schema would collide — but with
   // `tool_choice: "none"` no tool schema is built, and refusing anyway left a

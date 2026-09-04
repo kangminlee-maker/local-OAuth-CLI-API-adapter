@@ -194,10 +194,14 @@ for (const [label, prefix] of [
   });
 }
 
-test('textMayBeRefused is true only for the format the backstop can refuse', () => {
+test('textMayBeRefused is true for every format the backstop can refuse', () => {
+  // `json_object` is refused by the object rule and `json_schema` by the
+  // client-schema assertion (matrix §7 row 10), so a streaming gate that
+  // released either turn's text early would release bytes the completion may
+  // refuse. A turn with no JSON format has nothing to be refused for.
   const base = { model: 'm', shape: 'openai-chat', messages: [], tools: [], toolChoice: { type: 'auto' }, raw: {} };
   assert.equal(textMayBeRefused({ ...base, jsonMode: true, jsonSchema: undefined }), true, 'json_object');
-  assert.equal(textMayBeRefused({ ...base, jsonMode: true, jsonSchema: { type: 'object' } }), false, 'json_schema');
+  assert.equal(textMayBeRefused({ ...base, jsonMode: true, jsonSchema: { type: 'object' } }), true, 'json_schema');
   assert.equal(textMayBeRefused({ ...base, jsonMode: false, jsonSchema: undefined }), false, 'no JSON format');
 });
 
@@ -206,11 +210,15 @@ test('textMayBeRefused is true only for the format the backstop can refuse', () 
  * apart, so a client whose schema is `{"type":"null"}` was handed the empty
  * fallback text instead of the `null` its runtime returned.
  */
-for (const [label, raw, expected] of [
-  ['a present null', 'null', 'null'],
-  ['CONTROL a present object', '{"a":1}', '{"a":1}'],
-  ['CONTROL a present false', 'false', 'false'],
-  ['CONTROL a present zero', '0', '0'],
+// Each answer is published under a client schema it conforms to: since
+// matrix §7 row 10 the response path refuses text outside the client's
+// `json_schema`, so a control that answered `{"a":1}` to `{"type":"null"}`
+// would now measure that refusal, not the `??`.
+for (const [label, raw, expected, jsonSchema] of [
+  ['a present null', 'null', 'null', { type: 'null' }],
+  ['CONTROL a present object', '{"a":1}', '{"a":1}', { type: 'object' }],
+  ['CONTROL a present false', 'false', 'false', { type: 'boolean' }],
+  ['CONTROL a present zero', '0', '0', { type: 'integer' }],
 ]) {
   test(`the Claude backend publishes ${label} as its own bytes`, async () => {
     process.env.STRUCTURED_RAW = raw;
@@ -219,7 +227,7 @@ for (const [label, raw, expected] of [
       const result = await backend.generate({
         shape: 'openai-chat', model: 'sonnet', stream: false,
         streamOptions: { includeUsage: false, includeObfuscation: false },
-        jsonMode: true, jsonSchema: { type: 'null' },
+        jsonMode: true, jsonSchema,
         tools: [], toolChoice: { type: 'auto' }, raw: {},
         messages: [{ role: 'user', content: 'x', images: [] }],
       });
