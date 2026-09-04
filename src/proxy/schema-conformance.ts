@@ -41,14 +41,15 @@ export function judgeJsonText(text: string, schema: unknown): SchemaJudgement {
   } catch {
     return 'not-json';
   }
-  // `JSON.parse` rounds `9007199254740993` to `…992`, and a constraint judged
-  // on the rounded value can refuse bytes that satisfy it. The client is
-  // promised the runtime's bytes (matrix chat row 28), so a text carrying a
-  // number lexeme the double cannot represent exactly is not judged.
-  if (hasInexactNumber(text)) return 'unjudged';
   const verdict = conformsToSchema(value, schema);
   if (verdict === null) return 'unjudged';
-  return verdict ? 'conforms' : 'violates';
+  if (verdict) return 'conforms';
+  // `JSON.parse` rounds: `9007199254740993` to `…992`, `0.3` to a double that
+  // is not a multiple of `0.1`'s, `1e-999` to zero. A violation judged on a
+  // rounded value may be the rounding's, not the runtime's, and the client is
+  // promised the runtime's bytes (matrix chat row 28) — so it is not a
+  // verdict. A conforming answer is delivered either way.
+  return hasInexactNumber(text) ? 'unjudged' : 'violates';
 }
 
 export function conformsToSchema(value: unknown, schema: unknown): boolean | null {
@@ -89,10 +90,12 @@ function validatorFor(schema: unknown): ValidateFunction | null {
 }
 
 /**
- * Whether the JSON text carries a number lexeme a double cannot hold exactly:
- * an integer beyond 2^53, or a decimal with more significant digits than a
- * double round-trips (15). Strings are skipped, so a digit inside one does
- * not count.
+ * Whether the JSON text carries a number lexeme whose mathematical value is
+ * not the value of the double `JSON.parse` makes of it — an integer past
+ * 2^53, a decimal such as `0.3`, an exponent that overflows or underflows.
+ * Decided by value, not by digit count (round 19): `9007199254740992` and
+ * `1e16` are exact and are judged; `0.3` is not, and a verdict that may rest
+ * on its rounding is not a verdict. Strings are skipped.
  */
 export function hasInexactNumber(text: string): boolean {
   let inString = false;
@@ -117,11 +120,37 @@ export function hasInexactNumber(text: string): boolean {
   return false;
 }
 
-function numberIsInexact(lexeme: string): boolean {
-  if (/^-?\d+$/.test(lexeme)) {
-    const digits = lexeme.replace('-', '').replace(/^0+(?=\d)/, '');
-    return digits.length > 16 || (digits.length === 16 && BigInt(digits) > BigInt(Number.MAX_SAFE_INTEGER));
-  }
-  const mantissa = lexeme.replace(/^-/, '').replace(/[eE].*$/, '').replace('.', '').replace(/^0+/, '');
-  return mantissa.length > 15;
+const NUMBER_LEXEME = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/;
+
+/** Whether the lexeme's exact value differs from the double it parses to. */
+export function numberIsInexact(lexeme: string): boolean {
+  const parts = NUMBER_LEXEME.exec(lexeme);
+  if (!parts) return true;
+  const value = Number(lexeme);
+  if (!Number.isFinite(value)) return true;
+  const [, sign, whole, fraction = '', exponent = '0'] = parts;
+  // The lexeme as D × 10^E.
+  let decimal = BigInt(whole + fraction);
+  if (sign === '-') decimal = -decimal;
+  const decimalExponent = Number(exponent) - fraction.length;
+  // The double as M × 2^P, exactly.
+  const { mantissa, exponent: binaryExponent } = decompose(value);
+  // D × 10^E = M × 2^P, cross-multiplied into integers.
+  const left = decimal * 10n ** BigInt(Math.max(decimalExponent, 0)) * 2n ** BigInt(Math.max(-binaryExponent, 0));
+  const right = mantissa * 2n ** BigInt(Math.max(binaryExponent, 0)) * 10n ** BigInt(Math.max(-decimalExponent, 0));
+  return left !== right;
+}
+
+function decompose(value: number): { mantissa: bigint; exponent: number } {
+  if (value === 0) return { mantissa: 0n, exponent: 0 };
+  const view = new DataView(new ArrayBuffer(8));
+  view.setFloat64(0, value);
+  const high = view.getUint32(0);
+  const low = view.getUint32(4);
+  const negative = high >>> 31 === 1;
+  const biased = (high >>> 20) & 0x7ff;
+  const fractionBits = (BigInt(high & 0xfffff) << 32n) | BigInt(low);
+  const mantissa = biased === 0 ? fractionBits : fractionBits | (1n << 52n);
+  const exponent = (biased === 0 ? 1 : biased) - 1075;
+  return { mantissa: negative ? -mantissa : mantissa, exponent };
 }

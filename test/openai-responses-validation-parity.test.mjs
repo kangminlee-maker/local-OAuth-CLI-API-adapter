@@ -133,6 +133,10 @@ const REJECTIONS = [
   ["tool_choice required with tools absent", { ...OUT, tool_choice: 'required' }, { param: "tool_choice", code: null, message: "Tool choice 'required' must be specified with 'tools' parameter." }],
   ["tool_choice function with tools absent", { ...OUT, tool_choice: { type: 'function', name: 'x' } }, { param: "tool_choice", code: null, message: "Tool choice 'function' not found in 'tools' parameter." }],
   ["tool_choice function with tools empty", { ...OUT, tools: [], tool_choice: { type: 'function', name: 'x' } }, { param: "tool_choice", code: null, message: "Tool choice 'function' not found in 'tools' parameter." }],
+  ["tool_choice required with tools empty", { ...OUT, tools: [], tool_choice: 'required' }, { param: "tool_choice", code: null, message: "Tool choice 'required' must be specified with 'tools' parameter." }],
+  // Not the direct API's envelope: the direct API SERVES its built-in tools. This proxy cannot, and
+  // refuses rather than running an invented function named `tool` (matrix §7 row 16).
+  ["a built-in tool type", { ...OUT, tools: [{ type: 'web_search' }] }, { param: "tools[0].type", code: null, message: "Unsupported tool type 'web_search': this proxy runs 'function' tools only." }],
   // reasoning — its own enum, wider than Chat's.
   ["reasoning as a string", { ...OUT, reasoning: 'low' }, { param: "reasoning", code: "invalid_type", message: "Invalid type for 'reasoning': expected an object, but got a string instead." }],
   ["reasoning.effort unknown", { ...OUT, reasoning: { effort: 'bogus' } }, { param: "reasoning.effort", code: "invalid_value", message: "Invalid value: 'bogus'. Supported values are: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'." }],

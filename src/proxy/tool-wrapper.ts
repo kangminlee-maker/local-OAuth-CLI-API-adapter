@@ -165,6 +165,39 @@ function* topLevelKeys(raw: string): Generator<{ keyIndex: number; key: string; 
  * published as `…992`. The bytes the backend wrote are the answer, so they are
  * the bytes that go out.
  */
+/**
+ * The complete top-level members of an object cut off mid-way — what the
+ * direct Messages API publishes as a `tool_use` block's `input` when
+ * `max_tokens` cut the call off (measured 2026-09-04: `{"title": "The Sea"}`
+ * with the `body` member dropped, `{}` when nothing had closed). A walk over a
+ * COMPLETED fragment, with the lexer that survived the incremental reader; not
+ * a stream reader. Anything that is not an object at all yields `{}`.
+ */
+export function completeTopLevelMembers(fragment: string): string {
+  const members: Record<string, unknown> = {};
+  let cursor = skipWhitespace(fragment, 0);
+  if (fragment[cursor] !== '{') return '{}';
+  cursor = skipWhitespace(fragment, cursor + 1);
+  while (cursor < fragment.length && fragment[cursor] === '"') {
+    const key = readJsonString(fragment, cursor);
+    if (!key.closed) break;
+    cursor = skipWhitespace(fragment, key.end + 1);
+    if (fragment[cursor] !== ':') break;
+    cursor = skipWhitespace(fragment, cursor + 1);
+    const valueEnd = skipJsonValue(fragment, cursor);
+    if (valueEnd === -1) break;
+    try {
+      members[key.value] = JSON.parse(fragment.slice(cursor, valueEnd)) as unknown;
+    } catch {
+      break;
+    }
+    cursor = skipWhitespace(fragment, valueEnd);
+    if (fragment[cursor] === ',') cursor = skipWhitespace(fragment, cursor + 1);
+    else break;
+  }
+  return JSON.stringify(members);
+}
+
 export function rawTopLevelValue(raw: string, key: string): string | undefined {
   for (const entry of topLevelKeys(raw)) {
     if (entry.key !== key) continue;

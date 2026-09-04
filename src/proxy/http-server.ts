@@ -30,7 +30,7 @@ import {
 import { unsupportedImageFileIds } from './multimodal.js';
 import { hasToolDecisionSchema } from './backend-contract.js';
 import { StopSequenceGate, truncateAtStopSequence } from './stop-sequences.js';
-import { missingToolCallArgumentDelta } from './tool-wrapper.js';
+import { completeTopLevelMembers, missingToolCallArgumentDelta } from './tool-wrapper.js';
 import { image2QualityToGpt55ReasoningEffort } from './image2-via-gpt55.js';
 import {
   jsonTypeName,
@@ -2198,7 +2198,7 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
     // STOPS is a separate question, and this changes nothing about it.
     ? orderedByEmission(
         textRunsFor(result, result.toolCalls.length),
-        result.toolCalls.map(anthropicToolUse),
+        result.toolCalls.map((call) => anthropicToolUse(call, responseCutOff(result))),
         (run) => ({ type: 'text', text: run.text }),
       )
     // Empty text is NO block, the same rule the two branches above already
@@ -3601,6 +3601,7 @@ async function writeAnthropicMessagesStream(
               // has none. `finish` reconciles that one and stops it first, and
               // skips every call it already closed.
               await closeOpenTextBlock();
+              toolState.cutOff = responseCutOff(result);
               await toolState.finish(result.toolCalls.slice(0, at));
             }
             // At the head: everything still queued was produced after this run.
@@ -3611,6 +3612,7 @@ async function writeAnthropicMessagesStream(
         }
         await settlePending(result.toolCalls);
         await closeOpenTextBlock();
+        toolState.cutOff = responseCutOff(result);
         await toolState.finish(result.toolCalls);
       } else {
         // Flush any final text not already streamed (covers schema/refusal results
@@ -3720,6 +3722,13 @@ interface AnthropicToolUseState {
 }
 
 class AnthropicToolUseStreamState {
+  /**
+   * The turn was cut off at the output limit: a block whose arguments are the
+   * cut fragment is left open — the direct API sends no `content_block_stop`
+   * for it (measured 2026-09-04, M6), only `message_delta` with
+   * `stop_reason: "max_tokens"`.
+   */
+  cutOff = false;
   private readonly states = new Map<number, AnthropicToolUseState>();
 
   /**
@@ -3807,6 +3816,9 @@ class AnthropicToolUseStreamState {
       const call = toolCalls[index];
       const rest = call ? missingToolCallArgumentDelta(state.arguments, call) : '';
       if (rest) await this.writeArgumentsDelta(index, state, rest);
+      // The block `finish` left open on purpose — a reported call cut off at
+      // the output limit — stays open here too.
+      if (call && this.cutOff && !parsesAsJson(call.arguments)) continue;
       await this.stop(state);
     }
   }
@@ -3836,6 +3848,7 @@ class AnthropicToolUseStreamState {
       if (state.closed) continue;
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);
+      if (this.cutOff && !parsesAsJson(call.arguments)) continue;
       await this.stop(state);
     }
   }
@@ -3910,19 +3923,37 @@ function openAiResponseToolCall(call: LocalToolCall, status: 'completed' | 'inco
   };
 }
 
-function anthropicToolUse(call: LocalToolCall): unknown {
+function anthropicToolUse(call: LocalToolCall, cutOff = false): unknown {
   return {
     type: 'tool_use',
     id: call.id,
     name: call.name,
-    input: parseToolArguments(call.arguments),
+    input: parseToolArguments(call.arguments, cutOff),
   };
 }
 
-function parseToolArguments(value: string): unknown {
+/**
+ * A call the runtime cut off at its output limit is published as the direct
+ * API publishes it: the complete top-level members parsed so far, the cut
+ * member dropped (measured 2026-09-04, `review-artifacts/stage2/report.md`
+ * M6). Arguments that are not JSON on a completed turn cannot reach this
+ * writer any more (matrix §7 row 8), so the `{"input": …}` shape below is a
+ * projection of a call the response path admitted, kept for that path.
+ */
+function parsesAsJson(value: string): boolean {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseToolArguments(value: string, cutOff = false): unknown {
   try {
     return JSON.parse(value);
   } catch {
+    if (cutOff) return JSON.parse(completeTopLevelMembers(value));
     return { input: value };
   }
 }

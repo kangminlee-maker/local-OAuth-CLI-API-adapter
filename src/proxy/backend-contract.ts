@@ -243,37 +243,19 @@ export function parseBackendOutput(
   }
   const forcedTool = forcedSingleToolCall(request);
   if (forcedTool) {
-    const args = normalizeToolArgumentsText(text);
+    // The whole answer IS the arguments, as the runtime wrote them. Leading
+    // whitespace only: trimming the tail changed `{"a":1}\n` between one
+    // reading and another for no gain.
+    const args = text.replace(/^\s+/, '');
     const call = { id: forcedTool.id, name: forcedTool.name, arguments: args };
-    if (cutOff) return { text: '', toolCalls: [call] };
-    // The direct API hands a client a fragment only when the output limit cut
-    // the call off; a fragment for any other reason is a runtime that ignored
-    // the schema it was handed, and the three writers would each project it
-    // differently (matrix §7 row 8). Arguments that parse but fall outside the
-    // tool's schema are refused only when the client asked for strict
-    // adherence (`strict: true`): without it the direct APIs deliver whatever
-    // the model wrote, and refusing would be stricter than the authority
-    // (r18-codex).
-    switch (judgeJsonText(args, forcedTool.inputSchema)) {
-      case 'not-json':
-        throw backendContractError(
-          'The local runtime answered a forced tool call with arguments that are not JSON.',
-          request.shape,
-        );
-      case 'violates':
-        if (forcedTool.strict !== true) return { text: '', toolCalls: [call] };
-        throw backendContractError(
-          "The local runtime answered a forced tool call with arguments outside the tool's schema.",
-          request.shape,
-        );
-      default:
-        return { text: '', toolCalls: [call] };
-    }
+    if (!cutOff) assertCallArguments(args, forcedTool, request.shape, 'answered a forced tool call with');
+    return { text: '', toolCalls: [call] };
   }
   // Every path below that yields no call breaks `required`, so the check sits
-  // once at the end rather than at each `return`.
-  const decided = parseToolDecision(request, text);
-  if (toolChoiceRequiresCall(request) && decided.toolCalls.length === 0) {
+  // once at the end rather than at each `return` — unless the runtime cut the
+  // turn off, when a missing call is the cap's doing, not the runtime's.
+  const decided = parseToolDecision(request, text, cutOff);
+  if (!cutOff && toolChoiceRequiresCall(request) && decided.toolCalls.length === 0) {
     throw backendContractError(
       'The local runtime answered without calling a tool for a request that required one.',
       request.shape,
@@ -294,6 +276,15 @@ export function parseBackendOutput(
   // `rawNames` is this backstop's evidence, not part of the answer.
   const { rawNames: _rawNames, ...answer } = decided;
   void _rawNames;
+  // Each call's arguments, by the same rule as a forced call's: the runtime
+  // was handed the tool's schema, and it used to be REPAIRED here — prose
+  // rewrapped as `{"input": …}` — which put an argument object the model never
+  // produced in front of the client (r18-codex). The backstop rejects instead.
+  if (!cutOff) {
+    for (const call of answer.toolCalls) {
+      assertCallArguments(call.arguments, request.tools.find((tool) => tool.name === call.name), request.shape, 'called a tool with');
+    }
+  }
   // No JSON-format rule here — neither the object rule nor the client's
   // schema — deliberately. The one structured-output channel is carrying the
   // tool wrapper on this path, so the format never reached the runtime and the
@@ -308,6 +299,7 @@ export function parseBackendOutput(
 function parseToolDecision(
   request: NormalizedRequest,
   text: string,
+  cutOff = false,
 ): {
   text: string;
   toolCalls: readonly LocalToolCall[];
@@ -323,6 +315,17 @@ function parseToolDecision(
   try {
     parsed = JSON.parse(text) as unknown;
   } catch {
+    // A turn the runtime cut off inside the wrapper cannot be projected: the
+    // fragment is this proxy's grammar, not the client's answer, and the
+    // direct APIs' fragment for a multi-tool turn is their own call's — there
+    // is nothing here to publish that is not a repair. Declared (matrix §7
+    // row 8); unreachable on the live runtimes, which never report the cap.
+    if (cutOff) {
+      throw backendContractError(
+        'The local runtime was cut off at its output limit inside the tool wrapper.',
+        request.shape,
+      );
+    }
     return { text, toolCalls: [] };
   }
   {
@@ -673,48 +676,36 @@ function normalizeToolCall(value: unknown, index: number): LocalToolCall {
       ? obj.id
       : `call_${index + 1}`,
     name,
-    arguments: ensureJsonString(args),
+    arguments: args,
   };
 }
 
-function ensureJsonString(value: string): string {
-  try {
-    JSON.parse(value);
-    return value;
-  } catch {
-    return JSON.stringify({ input: value });
-  }
-}
-
 /**
- * The forced-tool path's whole answer IS the arguments, and this decides what
- * shape it is reported in — by the OPENING CHARACTER, which is the only part
- * of the decision the streaming reader can know before the answer is complete.
- *
- * It used to decide by whether `JSON.parse` succeeded, and the streamed reader
- * approximated that from the outside with a first-character test. The two
- * agreed on every well-formed payload and came apart on a `{`-opening one that
- * does not parse — a truncated object, a trailing comma: the client
- * accumulated the raw fragment while the body reported
- * `{"input":"{\"city\":\"Seo"}`. Both are unusable, and the reconciler cannot
- * bridge them, so what matters is that one turn reads the same either way.
- *
- * A payload that opens as an object or array is therefore reported as it
- * stands, well-formed or not; only a JSON string (unwrapped) and an answer
- * that is not JSON-shaped at all (wrapped) are rewritten.
+ * The direct APIs' function-call channel yields a JSON OBJECT by construction,
+ * strict or not, so anything else is a runtime that ignored the schema it was
+ * handed: bytes that are not JSON, or JSON that is not an object, are refused
+ * (matrix §7 row 8). Inside the object the schema is enforced only where the
+ * client asked for strict adherence (`strict: true`): without it the direct
+ * APIs deliver whatever the model wrote, and refusing would be stricter than
+ * the authority (r18-codex). What cannot be judged passes (`judgeJsonText`).
  */
-function normalizeToolArgumentsText(value: string): string {
-  // Leading whitespace only. Trimming the tail as well changed `{"a":1}\n`
-  // between one reading of the turn and another for no gain: both parse to
-  // the same object, and the bytes the backend wrote are the answer.
-  const trimmed = value.replace(/^\s+/, '');
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) return trimmed;
-  const both = trimmed.trim();
+function assertCallArguments(
+  args: string,
+  tool: { readonly inputSchema?: unknown; readonly strict?: boolean } | undefined,
+  shape: NormalizedRequest['shape'],
+  what: string,
+): void {
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(both) as unknown;
-    return typeof parsed === 'string' ? ensureJsonString(parsed) : both;
+    parsed = JSON.parse(args) as unknown;
   } catch {
-    return ensureJsonString(both);
+    throw backendContractError(`The local runtime ${what} arguments that are not JSON.`, shape);
+  }
+  if (asRecord(parsed) === null) {
+    throw backendContractError(`The local runtime ${what} arguments that are not a JSON object.`, shape);
+  }
+  if (tool?.strict === true && judgeJsonText(args, tool.inputSchema) === 'violates') {
+    throw backendContractError(`The local runtime ${what} arguments outside the tool's schema.`, shape);
   }
 }
 

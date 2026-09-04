@@ -2,15 +2,20 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { conformsToSchema, hasInexactNumber, judgeJsonText } from '../dist/proxy/schema-conformance.js';
 
-test('hasInexactNumber: integers past 2^53 and decimals past 15 digits, and nothing inside a string', () => {
-  assert.equal(hasInexactNumber('{"id":9007199254740993}'), true);
-  assert.equal(hasInexactNumber('{"id":9007199254740991}'), false, 'MAX_SAFE_INTEGER is exact');
+test('hasInexactNumber: decided by value — what the double holds exactly is judged, nothing else (r19)', () => {
+  assert.equal(hasInexactNumber('{"id":9007199254740993}'), true, '2^53+1 rounds');
+  assert.equal(hasInexactNumber('{"id":9007199254740992}'), false, '2^53 is exact');
+  assert.equal(hasInexactNumber('{"id":10000000000000000}'), false, '1e16 is exact');
+  assert.equal(hasInexactNumber('{"id":9007199254740991}'), false);
   assert.equal(hasInexactNumber('{"id":-9007199254740993}'), true);
-  assert.equal(hasInexactNumber('{"x":0.1234567890123456}'), true, '16 significant digits');
-  assert.equal(hasInexactNumber('{"x":0.123456789012345}'), false, '15 significant digits');
-  assert.equal(hasInexactNumber('{"x":1.5e300}'), false);
+  assert.equal(hasInexactNumber('{"x":0.5}'), false, 'a dyadic fraction is exact');
+  assert.equal(hasInexactNumber('{"x":0.3}'), true, '0.3 is not');
+  assert.equal(hasInexactNumber('{"x":1e-999}'), true, 'underflows to zero');
+  assert.equal(hasInexactNumber('{"x":1e999}'), true, 'overflows');
+  assert.equal(hasInexactNumber('{"x":-0}'), false);
+  assert.equal(hasInexactNumber('{"x":2.5e3}'), false, '2500 is exact');
   assert.equal(hasInexactNumber('{"s":"9007199254740993","n":1}'), false, 'digits inside a string are text');
-  assert.equal(hasInexactNumber('{"s":"a\\"9007199254740993","n":1}'), false, 'an escaped quote does not end the string');
+  assert.equal(hasInexactNumber('{"s":"a\\"0.3","n":1}'), false, 'an escaped quote does not end the string');
   assert.equal(hasInexactNumber('[1,2,3]'), false);
 });
 
@@ -22,7 +27,15 @@ test('judgeJsonText: the four answers', () => {
   assert.equal(judgeJsonText('{"city":"Seoul"}', { type: 'nonsense' }), 'unjudged', 'uncompilable');
   assert.equal(judgeJsonText('{"city":"Seoul"}', undefined), 'unjudged', 'no schema');
   assert.equal(judgeJsonText('{"city":"Seoul"}', { $async: true, ...schema }), 'unjudged', '$async');
-  assert.equal(judgeJsonText('{"city":"Seoul","n":9007199254740993}', schema), 'unjudged', 'inexact number');
+  // An inexact number downgrades only a VIOLATION: a conforming answer is
+  // delivered, a violation that may be the rounding's is not a verdict.
+  assert.equal(judgeJsonText('{"city":"Seoul","n":9007199254740993}', schema), 'conforms');
+  assert.equal(judgeJsonText('{"city":1,"n":9007199254740993}', schema), 'unjudged');
+  assert.equal(judgeJsonText('{"id":9007199254740992}', { properties: { id: { maximum: 100 } } }), 'violates', '2^53 is exact and judged (r19 F3)');
+  assert.equal(judgeJsonText('{"x":0.3}', { properties: { x: { multipleOf: 0.1 } } }), 'unjudged', '0.3 % 0.1 on doubles is the rounding, not the runtime');
+  assert.equal(judgeJsonText('{"x":1e-999}', { properties: { x: { exclusiveMinimum: 0 } } }), 'unjudged', 'underflow');
+  assert.equal(judgeJsonText('{"x":0.5}', { properties: { x: { multipleOf: 0.25 } } }), 'conforms');
+  assert.equal(judgeJsonText('{"x":0.75}', { properties: { x: { multipleOf: 0.5 } } }), 'violates', 'exact and judged');
 });
 
 test('conformsToSchema: one instance per schema, so $id never crosses requests', () => {

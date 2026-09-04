@@ -169,8 +169,16 @@ function validateOpenAiChatFields(
   if (present('function_call')) {
     const choice = readOpenAiLegacyFunctionCall(input.function_call);
     // The deprecated pair is validated as the direct API validates it
-    // (measured 2026-09-04): a `function_call` naming a function `functions`
-    // never declared is the same envelope the modern `tool_choice` gets.
+    // (measured 2026-09-04): any `function_call` — a mode or a name, with
+    // `tools` declared or nothing at all — is refused without `functions`,
+    // and one naming a function `functions` never declared is the same
+    // envelope the modern `tool_choice` gets.
+    if (!present('functions')) {
+      throw new ProxyRequestError(
+        "Invalid value for 'function_call': 'function_call' is only allowed when 'functions' are specified.",
+        400, 'openai', 'invalid_request_error', 'function_call',
+      );
+    }
     if (choice.type === 'tool') {
       const declared = Array.isArray(input.functions) ? input.functions.map((fn) => asRecord(fn)?.name) : [];
       if (!declared.includes(choice.name)) throw undeclaredFunctionCall(choice.name);
@@ -194,6 +202,16 @@ function validateOpenAiChatFields(
     throw new ProxyRequestError(
       "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
       400, 'openai', 'invalid_request_error', 'tool_choice',
+    );
+  }
+  // `required` with `tools: []` passes the direct API's validation and fails
+  // at generation, deterministically, with this 500 (measured 2026-09-04,
+  // twice, with and without a cap). The proxy used to serve it as a plain
+  // text turn — an option that promised a call, silently undelivered.
+  if (input.tool_choice === 'required' && Array.isArray(input.tools) && input.tools.length === 0) {
+    throw new ProxyRequestError(
+      'The model produced invalid content. Consider modifying your prompt if you are seeing this error persistently.',
+      500, 'openai', 'model_error',
     );
   }
   if (present('parallel_tool_calls') && typeof input.parallel_tool_calls !== 'boolean') {
@@ -924,6 +942,17 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
       const record = asRecord(tool);
       if (!record) throw invalidType(`tools[${index}]`, 'an object', tool);
       if (record.type === undefined) throw missingRequiredParameter(`tools[${index}].type`);
+      // The direct API serves its built-in tools (`web_search`, `file_search`,
+      // …); this proxy runs `function` tools only, and a built-in used to be
+      // normalized into a function named `tool` the runtime could then "call"
+      // (r18/r19 reviews). An option the adapter cannot deliver is refused,
+      // not silently accepted — a declared divergence, matrix §7 row 16.
+      if (record.type !== 'function') {
+        throw new ProxyRequestError(
+          `Unsupported tool type '${String(record.type)}': this proxy runs 'function' tools only.`,
+          400, 'openai', 'invalid_request_error', `tools[${index}].type`,
+        );
+      }
       // A function tool with no name used to be run under the invented name
       // `tool` — a tool the caller never asked for.
       if (record.type === 'function' && typeof record.name !== 'string') {
@@ -936,7 +965,7 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
   // `auto` without tools is served; `required` is refused (measured
   // 2026-09-04). A forced function without tools is refused where the
   // declared-name check runs, with the envelope measured for that case.
-  if (input.tool_choice === 'required' && !present('tools')) {
+  if (input.tool_choice === 'required' && (!present('tools') || (Array.isArray(input.tools) && input.tools.length === 0))) {
     throw new ProxyRequestError(
       "Tool choice 'required' must be specified with 'tools' parameter.",
       400, 'openai', 'invalid_request_error', 'tool_choice',
@@ -1303,7 +1332,7 @@ function validateAnthropicMessagesFields(input: Record<string, unknown>): void {
   // `auto` without tools is served; `any` is refused (measured 2026-09-04). A
   // forced tool without tools answers the not-found envelope where the
   // declared-name check runs.
-  if (asRecord(input.tool_choice)?.type === 'any' && !sent('tools')) {
+  if (asRecord(input.tool_choice)?.type === 'any' && (!sent('tools') || (Array.isArray(input.tools) && input.tools.length === 0))) {
     throw anthropicFault('tool_choice.any may only be specified while providing tools');
   }
 

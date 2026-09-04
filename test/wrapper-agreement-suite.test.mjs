@@ -159,7 +159,9 @@ const CASES = [
     id: '7a-7 arguments that are not JSON (r17-codex F3, r14-codex F6)',
     raw: '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"Seoul"}]}',
     choice: 'required',
-    delivered: { text: '', calls: [{ id: 'c1', name: 'get_weather', arguments: '{"input":"Seoul"}' }] },
+    // Round 18: the reading used to REPAIR this into `{"input":"Seoul"}` and
+    // publish an executable call the model never made; the backstop rejects.
+    delivered: { refused: true },
   },
   {
     id: '7b-8 a forced tool answered with truncated arguments (r15-codex F5)',
@@ -182,10 +184,11 @@ const CASES = [
     backends: ['claude'],
     env: { WRAPPER_STOP_REASON: 'max_tokens' },
     // The direct API hands the client the fragment with `finish_reason:
-    // "length"`, so the proxy keeps it. The two /v1/messages writers still
-    // project one unparseable call differently — the direct envelope for a
-    // tool call cut off by `max_tokens` is unmeasured, so the disagreement is
-    // pinned, not resolved.
+    // "length"`, so the proxy keeps it. On /v1/messages the two writers
+    // project one unparseable call differently BY MEASUREMENT (M6, 2026-09-04):
+    // the body carries the complete members parsed so far (`{}` here), the
+    // stream the verbatim fragment in a block that is never closed. The
+    // disagreement is the direct API's own, pinned as such.
     expect: { messages: ['calls'] },
     delivered: { text: '', calls: [{ id: null, name: 'get_weather', arguments: '{"city":"Seo' }] },
   },

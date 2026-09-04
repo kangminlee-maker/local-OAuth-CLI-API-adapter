@@ -169,6 +169,10 @@ const REJECTIONS = [
   ['tool_choice required with tools absent', { tool_choice: 'required' }, { param: 'tool_choice', code: null, message: "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified." }],
   ['tool_choice function with tools absent', { tool_choice: { type: 'function', function: { name: 'x' } } }, { param: 'tool_choice', code: null, message: "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified." }],
   ['tool_choice function with tools empty', { tools: [], tool_choice: { type: 'function', function: { name: 'x' } } }, { param: 'function_call', code: null, message: "Invalid value for 'function_call': no function named 'x' was specified in the 'functions' parameter." }],
+  // Round 19 (measured 2026-09-04).
+  ['a legacy function_call with tools but no functions', { tools: [{ type: 'function', function: { name: 'f', parameters: {} } }], function_call: { name: 'f' } }, { param: 'function_call', code: null, message: "Invalid value for 'function_call': 'function_call' is only allowed when 'functions' are specified." }],
+  ['a legacy function_call alone', { function_call: { name: 'f' } }, { param: 'function_call', code: null, message: "Invalid value for 'function_call': 'function_call' is only allowed when 'functions' are specified." }],
+  ['a legacy function_call auto alone', { function_call: 'auto' }, { param: 'function_call', code: null, message: "Invalid value for 'function_call': 'function_call' is only allowed when 'functions' are specified." }],
   ['a function_call object with no name', { functions: [{ name: 'f', parameters: {} }], function_call: { __probe__: 'wrong type' } }, { param: 'function_call.name', code: 'missing_required_parameter', message: "Missing required parameter: 'function_call.name'." }],
   ['no messages at all', { messages: '__delete__' }, { param: 'messages', code: 'missing_required_parameter', message: "Missing required parameter: 'messages'." }],
   ['an empty messages array', { messages: [] }, { param: 'messages', code: 'empty_array', message: "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead." }],
@@ -513,4 +517,16 @@ test('responses resolves fast to priority, as the direct API does', async () => 
   const { status, payload } = await chat({ input: 'ping', messages: '__delete__', service_tier: 'fast' }, '/v1/responses');
   assert.equal(status, 200);
   assert.equal(payload.service_tier, 'priority');
+});
+
+test('chat: `required` with an empty tool list is the direct API\'s own 500, not a silent text turn (r19-fable F6)', async () => {
+  // The direct API accepts the request and fails at generation with this
+  // envelope, deterministically (measured 2026-09-04, twice). The proxy used to
+  // run it as a plain text turn — an option that promised a call, undelivered.
+  const { status, payload } = await chat({ tools: [], tool_choice: 'required' });
+  assert.equal(status, 500, JSON.stringify(payload));
+  assert.equal(payload.error.type, 'model_error');
+  assert.equal(payload.error.param, null);
+  assert.equal(payload.error.code, null);
+  assert.equal(payload.error.message, 'The model produced invalid content. Consider modifying your prompt if you are seeing this error persistently.');
 });

@@ -280,6 +280,11 @@ const chatCases = [
   ['tool_choice required with tools absent', { messages: M, reasoning_effort: 'none', tool_choice: 'required' }],
   ['tool_choice function with tools absent', { messages: M, reasoning_effort: 'none', tool_choice: { type: 'function', function: { name: 'x' } } }],
   ['tool_choice function with tools empty', { messages: M, reasoning_effort: 'none', tools: [], tool_choice: { type: 'function', function: { name: 'x' } } }],
+  // Round 19 (2026-09-04).
+  ['legacy function_call with tools but no functions', { messages: M, reasoning_effort: 'none', tools: [TOOL], function_call: { name: 'get_weather' } }],
+  ['legacy function_call alone', { messages: M, reasoning_effort: 'none', function_call: { name: 'f' } }],
+  ['legacy function_call auto alone', { messages: M, reasoning_effort: 'none', function_call: 'auto' }],
+  ['tool_choice required with tools empty', { messages: M, reasoning_effort: 'none', tools: [], tool_choice: 'required' }],
   ['response_format as a string', { messages: M, response_format: 'json' }],
   ['response_format without type', { messages: M, response_format: {} }],
   ['response_format unknown type', { messages: M, response_format: { type: 'bogus' } }],
@@ -479,6 +484,7 @@ const responsesCases = [
   ['responses tool_choice required with tools absent', { ...OUT, tool_choice: 'required' }],
   ['responses tool_choice function with tools absent', { ...OUT, tool_choice: { type: 'function', name: 'x' } }],
   ['responses tool_choice function with tools empty', { ...OUT, tools: [], tool_choice: { type: 'function', name: 'x' } }],
+  ['responses tool_choice required with tools empty', { ...OUT, tools: [], tool_choice: 'required' }],
   // reasoning — its own enum, wider than Chat's.
   ['responses reasoning as a string', { ...OUT, reasoning: 'low' }],
   ['responses reasoning.effort unknown', { ...OUT, reasoning: { effort: 'bogus' } }],
@@ -700,6 +706,7 @@ const messagesCases = [
   ['messages tool_choice naming an undeclared tool', { tools: [{ name: 'f', input_schema: { type: 'object', properties: {} } }], tool_choice: { type: 'tool', name: 'never_declared' } }],
   ['messages tool with a whitespace-only name', { tools: [{ name: '   ', input_schema: { type: 'object', properties: {} } }] }],
   ['messages tool_choice any with tools absent', { tool_choice: { type: 'any' } }],
+  ['messages tool_choice any with tools empty', { tools: [], tool_choice: { type: 'any' } }],
   ['messages tool_choice tool with tools absent', { tool_choice: { type: 'tool', name: 'x' } }],
   ['messages strict tool whose object schema is not closed', { tools: [{ name: 'f', input_schema: { type: 'object', properties: {} }, strict: true }] }],
   ['messages system as an integer', { system: 7 }],

@@ -18,7 +18,7 @@ import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
 const here = dirname(fileURLToPath(import.meta.url));
 const streamingClaude = resolve(here, 'fixtures/streaming-claude.cjs');
 const WEATHER = { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] };
-const FRAGMENT = '{"city":"Seo';
+const FRAGMENT = '{"city":"Seoul","country":"Ko';
 
 before(async () => { await chmod(streamingClaude, 0o755); });
 afterEach(() => {
@@ -102,17 +102,26 @@ test('responses: status incomplete, incomplete_details, an incomplete item, and 
   });
 });
 
-test('messages: stop_reason max_tokens with the tool_use block present, on both paths', async () => {
+test('messages: stop_reason max_tokens, the complete members in the body, the fragment left open on the stream', async () => {
+  // The direct API's two writers project a cut-off call differently by
+  // design (M6): the body carries the complete top-level members parsed so
+  // far, the stream the verbatim fragment with no `content_block_stop`.
   await withProxy('max_tokens', async (url) => {
     const buffered = await call(url, 'messages', false);
     assert.equal(buffered.status, 200);
     assert.equal(buffered.json.stop_reason, 'max_tokens');
-    assert.equal(buffered.json.content.some((b) => b.type === 'tool_use'), true);
+    const block = buffered.json.content.find((b) => b.type === 'tool_use');
+    assert.deepEqual(block.input, { city: 'Seoul' });
     const streamed = await call(url, 'messages', true);
     assert.equal(streamed.status, 200);
     const delta = streamed.events.find((e) => e.type === 'message_delta');
     assert.equal(delta.delta.stop_reason, 'max_tokens');
-    assert.equal(streamed.events.some((e) => e.type === 'content_block_start' && e.content_block.type === 'tool_use'), true);
+    const start = streamed.events.findIndex((e) => e.type === 'content_block_start' && e.content_block.type === 'tool_use');
+    assert.notEqual(start, -1);
+    const json = streamed.events.filter((e) => e.type === 'content_block_delta' && e.delta.type === 'input_json_delta').map((e) => e.delta.partial_json).join('');
+    assert.equal(json, FRAGMENT);
+    assert.equal(streamed.events.some((e) => e.type === 'content_block_stop' && e.index === streamed.events[start].index), false, 'the cut block is not closed');
+    assert.deepEqual(streamed.events.slice(-2).map((e) => e.type), ['message_delta', 'message_stop']);
   });
 });
 

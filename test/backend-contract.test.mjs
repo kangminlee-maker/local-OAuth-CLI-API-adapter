@@ -393,9 +393,45 @@ test('row 8: a forced call whose arguments are not JSON is refused at completion
   assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo'), (e) => refused(e, /arguments that are not JSON/));
   // A stop reason that is not the output limit is no excuse either.
   assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo', 'end_turn'), (e) => refused(e, /arguments that are not JSON/));
-  // Prose is not JSON once wrapped as `{"input":…}` — so it is JSON, and
-  // conforms to nothing the schema requires.
-  assert.throws(() => parseBackendOutput(forcedRequest(), 'Seoul please'), (e) => refused(e, /outside the tool's schema/));
+  // Prose used to be REPAIRED into `{"input":"Seoul please"}` and delivered as
+  // an executable call (r18-codex); it is not JSON, and it is refused as such.
+  assert.throws(() => parseBackendOutput(forcedRequest(), 'Seoul please'), (e) => refused(e, /not JSON/));
+  // JSON that is not an object is not a call's arguments on any direct API,
+  // strict or not.
+  assert.throws(() => parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '"Seoul"'), (e) => refused(e, /not a JSON object/));
+  assert.throws(() => parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '[1]'), (e) => refused(e, /not a JSON object/));
+  // …unless the runtime reports the output limit, when a bare fragment is
+  // delivered as it stands.
+  assert.equal(parseBackendOutput(forcedRequest(), '"Seo', 'max_tokens').toolCalls[0].arguments, '"Seo');
+});
+
+test('r19: the cut-off rule on the wrapper path — a missing call is the cap\'s, a cut wrapper is refused, never leaked', () => {
+  const two = { model: 'm', shape: 'openai-chat', messages: [], jsonMode: false, tools: [{ name: 'a', inputSchema: {} }, { name: 'b', inputSchema: {} }], toolChoice: { type: 'required' }, raw: {} };
+  // `required` answered with no call under the cap: delivered (the direct
+  // APIs deliver whatever the cap left, under `length`).
+  assert.equal(parseBackendOutput(two, '{"status":"message","text":"I was about to","toolCalls":[]}', 'max_tokens').text, 'I was about to');
+  assert.throws(() => parseBackendOutput(two, '{"status":"message","text":"I was about to","toolCalls":[]}'), (e) => refused(e, /without calling a tool/), 'CONTROL: the same wrapper completed is the refusal');
+  // A wrapper cut off mid-way is this proxy's grammar: refused, not published
+  // as the assistant's words (r19-fable F4b).
+  const fragment = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","na';
+  assert.throws(() => parseBackendOutput(two, fragment, 'max_tokens'), (e) => refused(e, /cut off at its output limit inside the tool wrapper/));
+  assert.throws(() => parseBackendOutput({ ...two, toolChoice: { type: 'auto' } }, fragment, 'max_tokens'), (e) => refused(e, /inside the tool wrapper/), 'on auto too');
+  // CONTROL: the same bytes with no cap reported are row 2\'s regime — prose.
+  assert.equal(parseBackendOutput({ ...two, toolChoice: { type: 'auto' } }, fragment).text, fragment);
+});
+
+test('r18: a wrapper call\'s arguments are judged by the same rule, never repaired', () => {
+  const tools = (strict) => [{ name: 'get_weather', inputSchema: WEATHER_SCHEMA, strict }];
+  const request = (strict) => ({ model: 'm', shape: 'openai-chat', messages: [], jsonMode: false, tools: tools(strict), toolChoice: { type: 'auto' }, raw: {} });
+  const wrapper = (args) => `{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":${JSON.stringify(args)}}]}`;
+  assert.throws(() => parseBackendOutput(request(false), wrapper('Seoul')), (e) => refused(e, /not JSON/), 'prose used to become {"input":"Seoul"}');
+  assert.throws(() => parseBackendOutput(request(false), wrapper('"Seoul"')), (e) => refused(e, /not a JSON object/));
+  assert.equal(parseBackendOutput(request(false), wrapper('{"city":1}')).toolCalls[0].arguments, '{"city":1}', 'non-strict: delivered');
+  assert.throws(() => parseBackendOutput(request(true), wrapper('{"city":1}')), (e) => refused(e, /outside the tool's schema/), 'strict: refused');
+  assert.equal(parseBackendOutput(request(true), wrapper('{"city":"Seoul"}')).toolCalls[0].arguments, '{"city":"Seoul"}');
+  // A wrapper `arguments` given as an object is the same call, stringified.
+  const objectArgs = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":{"city":"Seoul"}}]}';
+  assert.equal(parseBackendOutput(request(true), objectArgs).toolCalls[0].arguments, '{"city":"Seoul"}');
 });
 
 test('row 8: the fragment is kept only when the output limit cut the call off', () => {
