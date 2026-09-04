@@ -3759,10 +3759,12 @@ class AnthropicToolUseStreamState {
   }
 
   /**
-   * Whether a call still holds an open block. A block is stopped the moment the
-   * backend declares its arguments final, so an open one is always a call whose
-   * value the completed result still has to reconcile — and nothing else may
-   * open a block until it has.
+   * Whether a call still holds an open block. A block is stopped when the
+   * backend's finish signal arrives — the native transport sends it once the
+   * vendor moves on to a later item, or at the terminal frame — so an open one
+   * is a call whose value the completed result still has to reconcile, or the
+   * turn's last call awaiting that frame; nothing else may open a block until
+   * it has.
    */
   get hasOpenBlock(): boolean {
     for (const state of this.states.values()) if (!state.closed) return true;

@@ -196,7 +196,7 @@ function wrapperTextRuns(raw: string, text: string, callCount: number): readonly
  * A firing backstop means a backend ignored a schema it was handed, so this is
  * an upstream fault (502), reported in the shape of the surface that was called.
  */
-function backendContractError(message: string, shape: NormalizedRequest['shape']): ProxyRequestError {
+export function backendContractError(message: string, shape: NormalizedRequest['shape']): ProxyRequestError {
   return shape === 'anthropic-messages'
     ? new ProxyRequestError(message, 502, 'anthropic', 'api_error')
     : new ProxyRequestError(message, 502, 'openai', 'api_error');

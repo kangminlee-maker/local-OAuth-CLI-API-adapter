@@ -2,12 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { honorRequestModel } from '../settings.js';
-import {
-  baseInstructions,
-  developerInstructions,
-  requestInstructionText,
-  usageFor,
-} from './backend-contract.js';
+import { backendContractError, baseInstructions, declaredToolNames, developerInstructions, requestInstructionText, usageFor } from './backend-contract.js';
 import { assertCodexModelSupported, codexModels, sourceCodexHome } from './codex-model-catalog.js';
 import {
   image2QualityToGpt55ReasoningEffort,
@@ -241,9 +236,17 @@ class CodexBackendStreamState {
    * stream's own `output_index` as fallback. Argument deltas arrive once per
    * token, so a known id resolves before anything is allocated.
    */
-  private toolOrdinal(outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
+  private toolOrdinal(event: CodexBackendEvent, ...ids: ReadonlyArray<string | undefined>): number {
     const known = this.knownOrdinal(ids);
     if (known !== undefined) return known;
+    const outputIndex = readOutputIndex(event);
+    // An `output_index` the event actually carries names ONE item: an
+    // unfamiliar identifier arriving at a position a call already holds is
+    // that call's other identifier (`call_id` first, `item_id` later, or the
+    // reverse), and is bound to it. Splitting it off announced the same
+    // `call_id` twice, `{}` and `{"a":1}` (r24-codex F5/F6). The anti-merge
+    // rule below is for events that OMIT the index and read as 0.
+    const explicit = typeof event.output_index === 'number' && Number.isFinite(event.output_index);
     // An event that names an unfamiliar call is a new call: it must not INHERIT
     // the ordinal an earlier NAMED call bound to this position, or a stream
     // whose events omit `output_index` (`readOutputIndex` reports 0 for those)
@@ -259,7 +262,7 @@ class CodexBackendStreamState {
     const identified = ids.some((id) => typeof id === 'string');
     const positionKey = `#${outputIndex}`;
     const claimed = this.toolOrdinals.get(positionKey);
-    let ordinal = identified ? this.adoptableOrdinal(claimed) : claimed;
+    let ordinal = identified && !explicit ? this.adoptableOrdinal(claimed) : claimed;
     if (ordinal === undefined) {
       ordinal = this.nextToolOrdinal;
       this.nextToolOrdinal += 1;
@@ -332,6 +335,7 @@ class CodexBackendStreamState {
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
+      if (event.delta !== '') out.push(...this.announceFinished());
       // Recorded against the calls announced so far — the same instant, and the
       // same counter, the stream itself uses to place its items. Deltas that
       // arrive with no call between them are ONE run: they open one block on
@@ -367,7 +371,8 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
-      const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
+      const index = this.toolOrdinal(event, event.item.id, event.item.call_id);
+      out.push(...this.announceFinished(index));
       const id = event.item.call_id ?? event.item.id ?? `call_${index + 1}`;
       const named = event.item.id !== undefined || event.item.call_id !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name: event.item.name, anonymous: !named });
@@ -404,7 +409,8 @@ class CodexBackendStreamState {
       // without an `arguments` member. Left unread (r23-codex), a delta after
       // it was folded into every stream while the bodies kept the done value.
       const itemId = typeof event.item_id === 'string' ? event.item_id : undefined;
-      const index = this.toolOrdinal(readOutputIndex(event), itemId);
+      const index = this.toolOrdinal(event, itemId);
+      out.push(...this.announceFinished(index));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: itemId,
         anonymous: itemId === undefined,
@@ -418,7 +424,8 @@ class CodexBackendStreamState {
     }
     if (event.type === 'response.function_call_arguments.delta' && typeof event.delta === 'string') {
       const itemId = typeof event.item_id === 'string' ? event.item_id : undefined;
-      const index = this.toolOrdinal(readOutputIndex(event), itemId);
+      const index = this.toolOrdinal(event, itemId);
+      out.push(...this.announceFinished(index));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: itemId,
         anonymous: itemId === undefined,
@@ -439,7 +446,8 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
-      const index = this.toolOrdinal(readOutputIndex(event), event.item.id, event.item.call_id);
+      const index = this.toolOrdinal(event, event.item.id, event.item.call_id);
+      out.push(...this.announceFinished(index));
       const named = event.item.id !== undefined || event.item.call_id !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: event.item.call_id ?? event.item.id,
@@ -620,10 +628,17 @@ class CodexBackendStreamState {
    * contradicting itself (declared): no signal, the end of the turn reconciles.
    * A cut-off turn (`response.incomplete`) sends no signal: its calls are
    * fragments by the vendor's own account, and the writers project them.
+   *
+   * Also sent the moment the vendor moves on to a LATER item — narration, or
+   * another call's events — for every finished call but that item's own: the
+   * cut can only hit the turn's last item, so a call with something after it
+   * is finished for good, and waiting for the terminal frame held every later
+   * block of the Messages stream behind its open block (r27-fable F3).
    */
-  private announceFinished(): LocalStreamEvent[] {
+  private announceFinished(except?: number): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
     for (const [index, state] of [...this.toolStates.entries()].sort(([a], [b]) => a - b)) {
+      if (index === except) continue;
       if (!state.identified || !state.argumentsDone || state.announcedDone) continue;
       const complete = argumentsOrEmptyObject(state.arguments);
       out.push(...this.emitArgumentExtension(index, state, complete));
@@ -656,6 +671,19 @@ class CodexBackendStreamState {
 
   completed(): LocalCompletionResult {
     const toolCalls = this.toolCalls();
+    // The wrapper reading's rule, taken to the native channel: a call the
+    // client never declared is not a call it can answer. A call the vendor
+    // never named reaches here as the placeholder `tool` and is refused with
+    // it (r27-fable F1) — both paths, since the buffered result is the
+    // stream's completion too.
+    const declared = declaredToolNames(this.request);
+    if (declared) {
+      for (const call of toolCalls) {
+        if (!declared.has(call.name)) {
+          throw backendContractError('The local runtime called a tool the request never declared.', this.request.shape);
+        }
+      }
+    }
     return {
       id: this.responseId ?? this.id,
       model: this.model ?? this.request.model,
@@ -749,6 +777,19 @@ class CodexBackendStreamState {
           functionCallPosition += 1;
           continue;
         }
+        // An item whose `id` and `call_id` name two DIFFERENT calls the stream
+        // announced is the vendor contradicting itself; taking the first
+        // identifier it recognized cross-wired the two calls' arguments in
+        // the body behind a stream that had paired them right (r26-codex).
+        // Position is not proof of identity and neither is half an identity:
+        // the streamed state — what the client already acted on — wins, and
+        // the item is left alone (declared, matrix §7 row 8).
+        const itemOrdinal = typeof obj.id === 'string' ? this.toolOrdinals.get(obj.id) : undefined;
+        const callOrdinal = typeof obj.call_id === 'string' ? this.toolOrdinals.get(obj.call_id) : undefined;
+        if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
+          functionCallPosition += 1;
+          continue;
+        }
         const index = this.finalOutputOrdinal(
           functionCallPosition,
           typeof obj.id === 'string' ? obj.id : undefined,
@@ -791,10 +832,16 @@ class CodexBackendStreamState {
         // output that names a different one would have the client's
         // accumulation and the body's report describe the same call
         // differently.
+        // ...and for a call already finished by the vendor's own event, only a
+        // value that EXTENDS the finished one — a fragment finish event
+        // (`{"city":`) completed by the output's `{"city":"Seoul"}`; the
+        // signal has not gone out yet, so the stream can still carry the
+        // rest (r27-fable F2). Anything else keeps the finished value.
         if (
           typeof obj.arguments === 'string'
-          && !state.argumentsDone
-          && (mayReplace || obj.arguments.startsWith(state.arguments))
+          && (state.argumentsDone
+            ? obj.arguments.startsWith(state.arguments)
+            : (mayReplace || obj.arguments.startsWith(state.arguments)))
         ) {
           state.arguments = obj.arguments;
         }

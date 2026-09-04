@@ -547,7 +547,7 @@ test('calls with ids stay separate when the stream omits output_index', async ()
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
 
   assert.deepEqual(
     events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
@@ -599,7 +599,7 @@ test('a finished call with no arguments streams the value its result reports', a
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['now']))) events.push(event);
 
   const streamed = events
     .filter((event) => event.type === 'tool_call_delta')
@@ -692,7 +692,7 @@ test('a completed call the stream never announced is added, not swapped in', asy
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
 
   assert.deepEqual(
     events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
@@ -776,7 +776,7 @@ test('a tool call carrying no arguments reports an empty object', async () => {
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
-  const result = await backend.generate(toolRequest());
+  const result = await backend.generate(withDeclared(toolRequest(), ['get_time']));
   assert.deepEqual(result.toolCalls.map((call) => [call.name, call.arguments]), [['get_time', '{}']]);
 });
 
@@ -805,7 +805,7 @@ test('an anonymous completed call cannot rewrite what the stream already deliver
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
 
   assert.deepEqual(
     events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
@@ -869,7 +869,7 @@ test('an id-less completed call never overwrites a different streamed call', asy
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['delete_file']))) events.push(event);
 
   const toolCalls = events.at(-1).result.toolCalls;
   assert.deepEqual(
@@ -1677,6 +1677,15 @@ function textRequest() {
     maxTokens: 64,
     temperature: 0,
   };
+}
+
+/**
+ * The native channel refuses a call the request never declared (round 27,
+ * the wrapper reading's rule): a double that calls `get_time` or `now`
+ * declares it, since what these tests measure is elsewhere.
+ */
+function withDeclared(request, names) {
+  return { ...request, tools: [...request.tools, ...names.map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {}, additionalProperties: false } }))] };
 }
 
 function toolRequest() {
