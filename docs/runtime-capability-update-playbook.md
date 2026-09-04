@@ -108,12 +108,22 @@ live smoke 비용을 미리 제한하는 장치는 없다. report는 실제로 �
    ⑤ 두 본문을 diff하고 **관찰된 본문 건수를 아티팩트에 함께 기록한다**. 매 턴이 400으로 죽으므로 비용은 없다.
 5-4. **설정이 무엇을 한다는 주장은 켠 실행과 끈 실행이 실제로 달랐을 때만 관찰된 것이다.** 둘이 같으면
    그 항목은 효과 없음으로 기록하거나 미상으로 남긴다. 받아들여졌다는 사실을 효과로 승격하지 않는다.
+5-4-1. **짝 대조에서 필드를 신호로 읽기 전에 같은 arm을 반복해 그 필드가 고정인지 본다.** 2026-09-04
+   Claude 캡처에서 `tools` 배열 길이는 동일 arm 3회 반복에 117·166·164로 흔들렸다. 한 번씩만 재고
+   비교했다면 flag가 tool을 줄였다고 읽었을 것이다. 반복에서 고정된 필드만 판정에 쓴다.
 5-5. **runtime 버전이 바뀌면 이전 버전의 L5는 새 버전의 권위가 아니다.** 같은 sink 자가 검사와 짝 대조를
    새 버전에서 다시 실행하거나, 해당 효과를 「미결 효과 주장」으로 내린다. 대조군에서 기대 신호 자체가
    나타나지 않으면 양쪽이 같아도 "효과 없음"이 아니라 **inconclusive**다.
 6. Codex app-server method는 generated schema 기준으로 삭제/rename 여부를 먼저 확인한다.
 6-1. method는 각 request/notification union arm의 `properties.method.enum` discriminator에서만 수집한다.
    `openai/form`처럼 slash를 포함한 nested mode/값 enum은 method가 아니며, 이 반례를 negative control로 유지한다.
+6-2. **surface가 있느냐를 묻는 프로브는 native binary(`Scan target`)로 돌린다.** 동작 권위를 wrapper로
+   두는 규칙은 wrapper가 통과층일 때의 것이고, PATH를 선점한 shim이 인자를 삼키면 살아 있는 hidden
+   subcommand가 root help로 떨어져 `absent`로 읽힌다. 2026-09-04에 cmux shim이 `attach`·`logs`·
+   `stop`·`kill` 넷을 그렇게 만들었고, 그대로 믿었으면 맞는 문서 네 줄을 지웠을 것이다. alias 명령은
+   native에서도 원래 이름의 usage를 내므로 이름 일치 판정만으로는 위양성이 남는다.
+6-3. **프로브가 멈출 수 있는 명령은 자동 프로브에서 제외한다.** `claude remote-control --help`는
+   2.1.260에서 반환하지 않는다. `--help`를 붙였으니 안전하다는 가정은 버전이 바뀌면 깨진다.
 7. Claude flag는 local help와 official docs-only 후보를 분리한다.
 8. service-neutral runtime 설계를 유지한다. 특정 서비스 도메인 용어를 기본 catalog 용어로 넣지 않는다.
 9. 위험한 실행은 원본 catalog에 성공한 기능처럼 기록하지 않는다. schema/help smoke와 live execution을 분리한다.
