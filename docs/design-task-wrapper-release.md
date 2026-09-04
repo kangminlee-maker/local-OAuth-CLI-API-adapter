@@ -65,8 +65,12 @@ round's own patch.
 to `JSON.parse`, and emits calls and text from the parsed value — i.e. one reader. Rows 1–7 close by
 construction. Cost: no live argument streaming for any wrapper turn; a tool call arrives whole. The
 JSON-mode text gate already makes this trade for answer text. Question to settle: is live streaming
-of `arguments` a promise any client depends on, or a convenience? The forced-single-tool path
-(`KnownToolArgumentsDeltaExtractor`) is separate and can keep streaming.
+of `arguments` a promise any client depends on, or a convenience? The repo's answer so far is split:
+`README.md:134` and `docs/api-interface-contract.md:121,213` list argument deltas as a wire feature,
+while the contract's "Streamed tool identity" row already **holds** arguments until the call's id
+arrives — a precedent that holding is acceptable when releasing would publish something the turn
+cannot honour. The forced-single-tool path (`KnownToolArgumentsDeltaExtractor`) is separate and can
+keep streaming — unless 7b row 8 is fixed, whose precondition takes that away too.
 
 **B. A validating incremental lexer.** Keep releasing early, but only while the prefix so far is a
 valid prefix of a JSON text under the wrapper schema — strict whitespace, strict escapes, strict
