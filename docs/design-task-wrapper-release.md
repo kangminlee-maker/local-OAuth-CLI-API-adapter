@@ -174,7 +174,7 @@ the paths (status code vs in-band error) goes with it.
 |---|---|---|
 | 0 | **landed 2026-09-04** — `test/wrapper-agreement-suite.test.mjs`: 19 inputs × both wrapper backends × three surfaces, buffered vs streamed; 13 inputs pinned to the disagreement they show today (plus row 8 on `/v1/messages` only), 5 agreeing inputs assert what was delivered or that nothing was released before the refusal. Both backends read identically on every input. Discovery corrected two expectations before pinning: the BOM input is agreement on a *refusal*, and the forced-tool fragment disagrees on `/v1/messages` (`{"input":…}` vs the raw fragment) | no behaviour change; the instrument was run on inputs whose answer is known to be the opposite, and it read them so |
 | 1 | **landed 2026-09-04** — `holdToolTurnsUntilComplete` (`settings.json`, default off). On: neither backend constructs an incremental reader for a tool turn, the HTTP layer pulls the first event before writing headers (so a refusal is a real 502 on the stream), and Chat's predicted forced-call announcement is skipped; the completion reconcilers project the one reading. The agreement suite runs both arms per input: off, every pin holds; on, every pin flips to agreement on both backends and all three surfaces and the buffered reading is byte-identical to the off arm's. One pin survives the key — row 8 on `/v1/messages`, a writer-side projection difference on an unparseable forced call, which row 8's own 502 closes. No per-backend switch | one config flip |
-| 2 | the measurements below, then canary on; docs describe the opt-in, not a default that has not flipped | docs-only plus a flip |
+| 2 | **measured 2026-09-04** (table above); canary = the operator's own installed instance with the key on. Docs describe the opt-in (README, matrix §7) | docs-only plus a flip |
 | 3 | default on; `false` rollback kept one release; contract rows (`README.md:134`, `api-interface-contract.md:121,213,452`) and matrix §7 rewritten in the same commit | one config flip |
 | 4 | delete the key, both extractor classes, `PredictableToolStart`, the retired extractor tests; rename `tool-call-stream.ts` to what remains. Removal condition attached at stage 1: one release with no revert criterion firing | git revert of one deletion commit |
 | separate | row 8's 502 at completion (`JSON.parse` minimum); the validator dependency for rows 8-full and 10; row 2's 502 | each its own flip and revert |
@@ -183,14 +183,14 @@ the paths (status code vs in-band error) goes with it.
 text or call-set difference between the paths; parity not 431/431; a supported client broken by
 held frames; the p95 first-frame or peak-buffer ceiling exceeded.
 
-### Needs measurement before stage 2
+### Measured 2026-09-04 (`review-artifacts/stage2/report.md`)
 
-| question | probe | outcome → response |
+| question | result | consequence |
 |---|---|---|
-| does a real client depend on live argument deltas (the pre-fixed change condition) | inventory consumers; run each unmodified against the off and on builds with a delayed double | dependence found → A stops here and C's frame probe runs |
-| idle-gap tolerance on Chat | delayed double, longest gap per surface | intolerant → keepalive, which flips the prologue decision |
-| real latency cost | live: `firstToolCallDeltaMs` vs `totalMs` per backend (the app-server backend already records both) | seconds → accept; tens of seconds → C as a follow-up on measured enforcement only |
-| bare-prose `auto` answers on Claude (row 2 upgrade) | live capture, count non-wrapper artefacts under `auto` | near zero → 502 adoptable; otherwise keep deliver |
+| does a real client depend on live argument deltas | the one consumer code search finds uses Images and buffered `/v1/messages`; none reads argument deltas. **On the Claude runtime the incremental reader is never fed on real wrapper turns**: the CLI streams the wrapper as `tool_use` `input_json_delta` and returns `structured_output`, and the backend forwards text deltas only — so live argument streaming for wrapper turns has not existed there | change condition not triggered by any known consumer; unknown consumers stay the owner's call |
+| idle-gap tolerance | silent window under the key = the whole turn, 2.8–7.5 s measured | no keepalive; the real-status property stays |
+| real latency cost (n = 5 per arm) | claude: **0 ms** (first frame was already at completion, both arms, ~3.0 s). app-server: **~293 ms** per turn (276–300), the tail between the incremental reader's call announcement and `turn/completed`, on ~4.5 s turns | accept; C is not needed for latency |
+| bare-prose `auto` answers on Claude (n = 12) | **0 / 12**; every answer came through `structured_output`. 1/12 double-wrapped (a wrapper JSON string inside the wrapper's `text`) — a schema-echo behaviour, not a reader defect | row 2's 502 upgrade has no observed cost; small sample |
 
 Parity cannot move on its own: every default row runs against a backend that throws if reached,
 and `--generate` rows carry no tools (both drafts, verified against the script).
