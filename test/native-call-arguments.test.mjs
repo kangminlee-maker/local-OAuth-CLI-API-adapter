@@ -618,3 +618,85 @@ test('the Messages stream stays live after a finished call: narration goes out b
     assert.ok(types.includes('message_stop'));
   });
 });
+
+test('reversed arrival: an anonymous delta at output_index 1 is adopted by the completed item at that position — two calls, not three (r27-codex)', async () => {
+  const vendor = [
+    { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"a":1}' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta', arguments: '{"b":2}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta', arguments: '{"b":2}' },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ];
+  const TOOLS = ['alpha', 'beta'].map((name) => ({ type: 'function', function: { name, parameters: { type: 'object' } } }));
+  const CHAT2 = { ...CHAT, tools: TOOLS, tool_choice: 'auto' };
+  const MESSAGES2 = { ...MESSAGES, tools: ['alpha', 'beta'].map((name) => ({ name, input_schema: { type: 'object' } })), tool_choice: { type: 'any' } };
+  await withProxyEvents(vendor, async (url) => {
+    const body = JSON.parse((await post(`${url}/v1/chat/completions`, OPENAI, CHAT2)).text).choices[0].message.tool_calls.map((call) => [call.id, call.function.name, call.function.arguments]);
+    assert.deepEqual(body, [['call_b', 'beta', '{"b":2}'], ['call_a', 'alpha', '{"a":1}']]);
+    const announced = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT2, stream: true })).text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id).map((call) => call.function.name);
+    assert.deepEqual(announced, ['beta', 'alpha']);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES2);
+    assert.equal(messages.status, 200, messages.text);
+    assert.deepEqual(JSON.parse(messages.text).content.filter((item) => item.type === 'tool_use').map((block) => block.name), ['beta', 'alpha']);
+  });
+});
+
+test('an identity whose id and name arrive on different frames is announced where the backend finished the call — before the narration that followed (r27-codex)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', name: 'alpha', arguments: '{"a":1}' } },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' }] } },
+  ];
+  const MESSAGES2 = { ...MESSAGES, tools: [{ name: 'alpha', input_schema: { type: 'object' } }], tool_choice: { type: 'auto' } };
+  await withProxyEvents(vendor, async (url) => {
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES2);
+    assert.equal(messages.status, 200, messages.text);
+    assert.deepEqual(JSON.parse(messages.text).content.map((item) => item.type), ['tool_use', 'text']);
+    const frames = events((await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES2, stream: true })).text);
+    assert.deepEqual(frames.filter((frame) => frame.type === 'content_block_start').map((frame) => frame.content_block.type), ['tool_use', 'text']);
+    assert.equal(frames.find((frame) => frame.type === 'content_block_start').content_block.name, 'alpha');
+  });
+});
+
+test('a rejected cancel of the unread body after the terminal frame does not overturn the completed answer (r27-codex)', async () => {
+  const encoder = new TextEncoder();
+  let cancels = 0;
+  const body = () => {
+    let pulled = false;
+    return new ReadableStream({
+      pull(controller) {
+        // After the terminal frame the body never closes on its own, so
+        // ending the read is the only way out — and cancel() rejects.
+        if (pulled) return new Promise(() => {});
+        pulled = true;
+        controller.enqueue(encoder.encode(sse([
+          { type: 'response.output_text.delta', delta: 'complete answer' },
+          { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [], usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18 } } },
+        ])));
+      },
+      cancel() { cancels += 1; throw new Error('fixture cancel failed after terminal'); },
+    });
+  };
+  const TEXT = { model: 'm', messages: [{ role: 'user', content: 'w' }] };
+  await withProxyResponse(() => new Response(body(), { status: 200 }), async (url) => {
+    const buffered = await post(`${url}/v1/chat/completions`, OPENAI, TEXT);
+    assert.equal(buffered.status, 200, buffered.text);
+    const parsed = JSON.parse(buffered.text);
+    assert.equal(parsed.choices[0].message.content, 'complete answer');
+    assert.equal(parsed.usage.prompt_tokens, 11);
+    const streamed = await post(`${url}/v1/chat/completions`, OPENAI, { ...TEXT, stream: true });
+    const chunks = events(streamed.text);
+    assert.ok(chunks.some((chunk) => chunk.choices?.[0]?.finish_reason === 'stop'), streamed.text);
+    assert.ok(!chunks.some((chunk) => chunk.error), streamed.text);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }] });
+    assert.equal(messages.status, 200, messages.text);
+    const frames = events((await post(`${url}/v1/messages`, ANTHROPIC, { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }], stream: true })).text);
+    assert.ok(frames.some((frame) => frame.type === 'message_stop'), JSON.stringify(frames.map((frame) => frame.type)));
+  });
+  assert.ok(cancels >= 1, 'the unread body was released');
+});

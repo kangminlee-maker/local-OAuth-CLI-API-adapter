@@ -175,6 +175,15 @@ interface ToolState {
    */
   named: boolean;
   /**
+   * Whether the backend has supplied the client-facing `call_id`. Latched
+   * like `named`: the two halves of an identity may arrive on different
+   * frames (the id on `output_item.added`, the name on `output_item.done`
+   * without the id repeated), and deriving identification from the CURRENT
+   * frame alone left such a call unannounced until the completed result —
+   * behind narration the backend produced after it (r27-codex).
+   */
+  hasCallId: boolean;
+  /**
    * Whether this state was opened by events carrying no id at all. Such a state
    * holds its output position on nothing but that position, so the call that
    * later names the position owns it — see `toolOrdinal`.
@@ -304,9 +313,21 @@ class CodexBackendStreamState {
    * Without an id, the dense function-call position is what the stream ordinals
    * already mean.
    */
-  private finalOutputOrdinal(position: number, ...ids: ReadonlyArray<string | undefined>): number {
+  private finalOutputOrdinal(position: number, outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
     const known = this.knownOrdinal(ids);
     if (known !== undefined) return known;
+    // The completed output is in `output_index` order, so the item's array
+    // index is the position the live events named — and an anonymous holder
+    // bound to that position (argument deltas that carried only the index)
+    // is this call. The dense function-call position below is not the same
+    // coordinate: with the events arriving out of order the holder for
+    // backend position 1 lived at ordinal 0, and inspecting ordinal 1 instead
+    // invented a third call (r27-codex).
+    const byPosition = this.adoptableOrdinal(this.toolOrdinals.get(`#${outputIndex}`));
+    if (byPosition !== undefined) {
+      this.bindOrdinal(byPosition, ids);
+      return byPosition;
+    }
     // An item that names an unfamiliar call is a call the stream never
     // announced, and it still belongs to the client: taking a position some
     // other call already holds would replace that call instead of adding this
@@ -398,7 +419,8 @@ class CodexBackendStreamState {
       // the buffer, since only an announced call is ever flushed.
       // Identity is a `call_id` AND a name: announcing on the id alone told
       // the client a call named `tool` (r25-codex).
-      if (event.item.call_id !== undefined && state.named) state.identified = true;
+      if (event.item.call_id !== undefined) state.hasCallId = true;
+      if (state.hasCallId && state.named) state.identified = true;
       this.toolStates.set(index, state);
       if (state.identified) out.push(...this.emitPending(index, state));
       return out;
@@ -464,7 +486,8 @@ class CodexBackendStreamState {
         if (event.item.name !== undefined) state.named = true;
       }
       if (named) state.anonymous = false;
-      if (event.item.call_id !== undefined && state.named) state.identified = true;
+      if (event.item.call_id !== undefined) state.hasCallId = true;
+      if (state.hasCallId && state.named) state.identified = true;
       // A call already announced as finished keeps the value it was finished
       // on; an item that names a different one afterwards is the vendor
       // contradicting itself, and the stream closed on the first value.
@@ -526,6 +549,7 @@ class CodexBackendStreamState {
       started: false,
       identified: false,
       named: seed.name !== undefined,
+      hasCallId: false,
       anonymous: seed.anonymous ?? false,
       argumentsDone: false,
       announcedDone: false,
@@ -769,7 +793,7 @@ class CodexBackendStreamState {
     // acted on, so it wins.
     const alignable = this.toolStates.size === 0 || finalCalls.length === this.toolStates.size;
     let functionCallPosition = 0;
-    for (const item of output) {
+    for (const [outputIndex, item] of output.entries()) {
       const obj = asRecord(item);
       if (obj?.type === 'function_call') {
         const anonymous = typeof obj.id !== 'string' && typeof obj.call_id !== 'string';
@@ -792,6 +816,7 @@ class CodexBackendStreamState {
         }
         const index = this.finalOutputOrdinal(
           functionCallPosition,
+          outputIndex,
           typeof obj.id === 'string' ? obj.id : undefined,
           typeof obj.call_id === 'string' ? obj.call_id : undefined,
         );
@@ -803,6 +828,7 @@ class CodexBackendStreamState {
             name: typeof obj.name === 'string' ? obj.name : undefined,
           }),
           started: true,
+          hasCallId: typeof obj.call_id === 'string',
           identified: typeof obj.call_id === 'string' && typeof obj.name === 'string',
         };
         // An anonymous item is matched by position alone, and position is not
@@ -816,7 +842,10 @@ class CodexBackendStreamState {
         // that reported `call_1`/`probe` from the stream cannot be handed
         // `call_2`/`other` by the body (r23-codex). The completed output may
         // supply identity to a call never announced, not rename one.
-        if (typeof obj.call_id === 'string' && !state.started) state.id = obj.call_id;
+        if (typeof obj.call_id === 'string' && !state.started) {
+          state.id = obj.call_id;
+          state.hasCallId = true;
+        }
         if (typeof obj.name === 'string' && !state.started && (mayReplace || !state.named)) {
           state.name = obj.name;
           state.named = true;
@@ -1056,12 +1085,27 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
   ): AsyncIterable<LocalStreamEvent> {
     const startedAt = Date.now();
     const state = new CodexBackendStreamState(request, startedAt);
-    for await (const event of this.responseEvents(request, signal)) {
-      for (const local of state.push(event)) yield local;
-      // The terminal frame ends the read: nothing after it changes a settled
-      // turn (r24), and a transport failure after it overturned a completed
-      // answer into a 500 (r25-codex).
-      if (state.isSettled()) break;
+    const events = this.responseEvents(request, signal)[Symbol.asyncIterator]();
+    try {
+      for (;;) {
+        const next = await events.next();
+        if (next.done) break;
+        for (const local of state.push(next.value)) yield local;
+        // The terminal frame ends the read: nothing after it changes a settled
+        // turn (r24), and a transport failure after it overturned a completed
+        // answer into a 500 (r25-codex).
+        if (state.isSettled()) break;
+      }
+    } finally {
+      // Ownership of the unread body ends here either way. Once the backend's
+      // terminal frame has settled the turn, a rejection from cancelling what
+      // was left unread is teardown noise, not the turn's outcome — it turned
+      // a completed answer into a 500 with the usage lost (r27-codex).
+      try {
+        await events.return?.(undefined);
+      } catch (err) {
+        if (!state.isSettled()) throw err;
+      }
     }
     // A turn only finished if the backend said so. A reported failure, or a
     // stream that simply stopped, was previously yielded as a completed result
