@@ -70,8 +70,12 @@ async function withProxy(args, run) {
 }
 
 async function withProxyEvents(vendorEvents, run) {
+  return withProxyResponse(() => new Response(sse(vendorEvents), { status: 200 }), run);
+}
+
+async function withProxyResponse(respond, run) {
   const codexHome = await createCodexHome();
-  globalThis.fetch = async () => new Response(sse(vendorEvents), { status: 200 });
+  globalThis.fetch = async () => respond();
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
   try {
@@ -325,4 +329,138 @@ test('an announced identity is frozen at every door: output_item.done and a repe
       assert.deepEqual(blocks.map((block) => [block.id, block.name]), [['call_1', 'probe']]);
     });
   }
+});
+
+test('anonymous argument deltas belong to the call that names their position: the completed output does not leave a second call named tool (r25-codex)', async () => {
+  const vendor = [
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_2', call_id: 'call_2', name: 'other', arguments: '{}' }] } },
+  ];
+  const TWO = { ...CHAT, tools: [...CHAT.tools, { type: 'function', function: { name: 'other', parameters: { type: 'object' } } }] };
+  const TWO_MESSAGES = { ...MESSAGES, tools: [...MESSAGES.tools, { name: 'other', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } };
+  await withProxyEvents(vendor, async (url) => {
+    const chat = JSON.parse((await post(`${url}/v1/chat/completions`, OPENAI, TWO)).text).choices[0].message.tool_calls;
+    assert.deepEqual(chat.map((call) => [call.id, call.function.name, call.function.arguments]), [['call_2', 'other', '{}']]);
+    const announced = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO, stream: true })).text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
+    assert.deepEqual(announced.map((call) => [call.id, call.function.name]), [['call_2', 'other']]);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, TWO_MESSAGES);
+    assert.equal(messages.status, 200, messages.text);
+    assert.deepEqual(JSON.parse(messages.text).content.filter((item) => item.type === 'tool_use').map((block) => [block.id, block.name]), [['call_2', 'other']]);
+  });
+});
+
+test('the terminal frame ends the read: a transport failure after response.completed does not overturn the completed answer (r25-codex)', async () => {
+  const encoder = new TextEncoder();
+  const body = () => new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(sse([
+        { type: 'response.output_text.delta', delta: 'complete answer' },
+        { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+      ])));
+      setTimeout(() => { try { controller.error(new Error('post-terminal transport failure')); } catch {} }, 20);
+    },
+  });
+  const TEXT = { model: 'm', messages: [{ role: 'user', content: 'w' }] };
+  await withProxyResponse(() => new Response(body(), { status: 200 }), async (url) => {
+    const buffered = await post(`${url}/v1/chat/completions`, OPENAI, TEXT);
+    assert.equal(buffered.status, 200, buffered.text);
+    const choice = JSON.parse(buffered.text).choices[0];
+    assert.equal(choice.message.content, 'complete answer');
+    assert.equal(choice.finish_reason, 'stop');
+    const streamed = await post(`${url}/v1/chat/completions`, OPENAI, { ...TEXT, stream: true });
+    const chunks = events(streamed.text);
+    assert.equal(chunks.map((chunk) => chunk.choices?.[0]?.delta?.content ?? '').join(''), 'complete answer');
+    assert.ok(chunks.some((chunk) => chunk.choices?.[0]?.finish_reason === 'stop'), streamed.text);
+    assert.ok(!chunks.some((chunk) => chunk.error), streamed.text);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }] });
+    assert.equal(messages.status, 200, messages.text);
+    assert.equal(JSON.parse(messages.text).stop_reason, 'end_turn');
+  });
+});
+
+test('a call is announced on a call_id AND a name: one named only by the completed output is reported as probe on every path, never as tool (r25-codex)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', arguments: '{}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '{}' }] } },
+  ];
+  await withProxyEvents(vendor, async (url) => {
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, CHAT);
+    assert.equal(chat.status, 200, chat.text);
+    assert.deepEqual(JSON.parse(chat.text).choices[0].message.tool_calls.map((call) => [call.id, call.function.name]), [['call_1', 'probe']]);
+    const announced = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, stream: true })).text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
+    assert.deepEqual(announced.map((call) => [call.id, call.function.name]), [['call_1', 'probe']]);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES);
+    assert.equal(messages.status, 200, messages.text);
+    const frames = events((await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, stream: true })).text);
+    const starts = frames.filter((frame) => frame.type === 'content_block_start' && frame.content_block?.type === 'tool_use').map((frame) => [frame.content_block.id, frame.content_block.name]);
+    assert.deepEqual(starts, [['call_1', 'probe']]);
+  });
+});
+
+test('the finish signal waits for the terminal frame: a call the vendor finished inside a cut-off turn keeps its bytes and its open block (r24-codex F4)', async () => {
+  const cutAfterDone = (value) => [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    ...(value === '' ? [] : [{ type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: value }]),
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: value },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.incomplete', response: { id: 'r', model: 'gpt-5.5', output: [], incomplete_details: { reason: 'max_output_tokens' } } },
+  ];
+  for (const value of ['', '[1, 2]']) {
+    await withProxyEvents(cutAfterDone(value), async (url) => {
+      const chat = await post(`${url}/v1/chat/completions`, OPENAI, CHAT);
+      const choice = JSON.parse(chat.text).choices[0];
+      assert.equal(choice.message.tool_calls[0].function.arguments, value, 'the bytes the vendor wrote, empty included');
+      assert.equal(choice.finish_reason, 'length');
+      const chatStream = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, stream: true })).text);
+      assert.equal(chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).map((call) => call.function?.arguments ?? '').join(''), value);
+      const messages = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES);
+      assert.equal(messages.status, 200, messages.text);
+      assert.ok(messages.text.includes('"input":{}'), messages.text);
+      assert.equal(JSON.parse(messages.text).stop_reason, 'max_tokens');
+      const frames = events((await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, stream: true })).text);
+      const block = frames.find((frame) => frame.type === 'content_block_start' && frame.content_block?.type === 'tool_use');
+      assert.equal(frames.filter((frame) => frame.type === 'content_block_delta' && frame.delta?.type === 'input_json_delta').map((frame) => frame.delta.partial_json).join(''), value, 'no invented `{}` on the stream');
+      assert.ok(!frames.some((frame) => frame.type === 'content_block_stop' && frame.index === block.index), 'the cut call\'s block stays open');
+      assert.equal(frames.find((frame) => frame.type === 'message_delta')?.delta?.stop_reason, 'max_tokens');
+    });
+  }
+});
+
+test('one coordinate system: a call identified late keeps the block the stream opened for it — the cut call\'s block stays open and Chat indices follow the body (r26-fable F2)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"x":' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.incomplete', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"x":' }, { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta', arguments: '{"b":2}' }], incomplete_details: { reason: 'max_output_tokens' } } },
+  ];
+  const TOOLS = [{ type: 'function', function: { name: 'alpha', parameters: { type: 'object' } } }, { type: 'function', function: { name: 'beta', parameters: { type: 'object' } } }];
+  const CHAT2 = { ...CHAT, tools: TOOLS, tool_choice: 'auto' };
+  const MESSAGES2 = { ...MESSAGES, tools: [{ name: 'alpha', input_schema: { type: 'object' } }, { name: 'beta', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } };
+  await withProxyEvents(vendor, async (url) => {
+    const body = JSON.parse((await post(`${url}/v1/chat/completions`, OPENAI, CHAT2)).text).choices[0].message.tool_calls.map((call) => [call.id, call.function.arguments]);
+    assert.deepEqual(body, [['call_b', '{"b":2}'], ['call_a', '{"x":']], 'announcement order');
+    const chunks = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT2, stream: true })).text);
+    const byIndex = new Map();
+    for (const call of chunks.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? [])) {
+      const entry = byIndex.get(call.index) ?? { id: undefined, args: '' };
+      if (call.id) entry.id = call.id;
+      entry.args += call.function?.arguments ?? '';
+      byIndex.set(call.index, entry);
+    }
+    assert.deepEqual([...byIndex.entries()].sort(([a], [b]) => a - b).map(([index, entry]) => [index, entry.id, entry.args]), [[0, 'call_b', '{"b":2}'], [1, 'call_a', '{"x":']]);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES2);
+    assert.equal(messages.status, 200, messages.text);
+    assert.deepEqual(JSON.parse(messages.text).content.filter((item) => item.type === 'tool_use').map((block) => [block.id, JSON.stringify(block.input)]), [['call_b', '{"b":2}'], ['call_a', '{}']]);
+    const frames = events((await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES2, stream: true })).text);
+    const starts = frames.filter((frame) => frame.type === 'content_block_start' && frame.content_block?.type === 'tool_use').map((frame) => [frame.index, frame.content_block.id]);
+    assert.deepEqual(starts.map(([, id]) => id), ['call_b', 'call_a']);
+    const cutIndex = starts[1][0];
+    assert.equal(frames.filter((frame) => frame.type === 'content_block_delta' && frame.index === cutIndex).map((frame) => frame.delta.partial_json).join(''), '{"x":');
+    assert.ok(!frames.some((frame) => frame.type === 'content_block_stop' && frame.index === cutIndex), 'the cut call\'s block stays open');
+    assert.ok(frames.some((frame) => frame.type === 'content_block_stop' && frame.index === starts[0][0]), 'the completed call\'s block closes');
+  });
 });
