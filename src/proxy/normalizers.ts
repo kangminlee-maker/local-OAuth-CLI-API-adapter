@@ -1508,17 +1508,15 @@ export function normalizeAnthropicMessagesRequest(body: unknown): NormalizedRequ
   const tools = readAnthropicTools(input.tools);
   const toolChoice = readAnthropicToolChoice(input.tool_choice);
   assertForcedToolDeclared('anthropic-messages', tools, toolChoice);
-  // ...unless the turn has taken the tools off. There is one structured-output
-  // channel, so a tool schema and a format schema would collide — but with
-  // `tool_choice: "none"` no tool schema is built, and refusing anyway left a
-  // client that asked for its own format on such a turn with nowhere to go.
-  // `output_config.format` WITH tools used to be refused here, because the one
-  // structured-output channel was already carrying the tool wrapper and the
-  // client's format schema would have been dropped in silence. The wrapper now
-  // carries that schema in its own `json` field, so the collision is gone and
-  // the refusal with it — the provider serves this pair and honours the schema
-  // (measured 2026-09-03), so refusing a turn the backends can serve was the
-  // divergence, not the safeguard.
+  // `output_config.format` together with tools is accepted and NOT enforced.
+  // There is one structured-output channel; on a tool turn it carries the tool
+  // wrapper, so the client's schema does not reach the runtime and the turn's
+  // text is published as it stands — declared in the conformance matrix (chat
+  // row 28, A-24) rather than refused here as it once was: the provider serves
+  // the pair and honours the schema (measured 2026-09-03), so refusing a turn
+  // the backends can serve was the divergence, not the safeguard. With
+  // `tool_choice: "none"` no tool schema is built and the format takes the
+  // channel, so that turn is enforced like any schema turn.
   const model = input.model as string;
   const effort = readAnthropicEffort(outputConfig?.effort);
   const taskBudgetTokens = readAnthropicTaskBudget(outputConfig?.task_budget);
