@@ -304,6 +304,11 @@ class CodexBackendStreamState {
 
   push(event: CodexBackendEvent): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
+    // A settled turn is finished, whatever noise follows: a delta after the
+    // terminal frame used to extend the completed answer and change whether
+    // the request succeeded (r23-codex). Failure frames after settlement
+    // were already ignored below; every event is now.
+    if (this.settled) return out;
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
@@ -713,8 +718,12 @@ class CodexBackendStreamState {
         // answering the wrong call. It may fill in what the stream never
         // delivered; it may not replace what it did.
         const mayReplace = !anonymous || existing === undefined;
-        if (typeof obj.call_id === 'string') state.id = obj.call_id;
-        if (typeof obj.name === 'string' && (mayReplace || state.name === 'tool')) state.name = obj.name;
+        // An identity the client has already been told is a promise: a client
+        // that reported `call_1`/`probe` from the stream cannot be handed
+        // `call_2`/`other` by the body (r23-codex). The completed output may
+        // supply identity to a call never announced, not rename one.
+        if (typeof obj.call_id === 'string' && !state.started) state.id = obj.call_id;
+        if (typeof obj.name === 'string' && !state.started && (mayReplace || state.name === 'tool')) state.name = obj.name;
         // An anonymous item may still COMPLETE what the stream started: a turn
         // that ended mid-argument leaves a prefix that parses as nothing, and
         // arguments the streamed text is a prefix of are that same call's
