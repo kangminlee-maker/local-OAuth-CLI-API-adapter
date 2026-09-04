@@ -497,6 +497,9 @@ export interface ProxyServerOptions {
   readonly host: string;
   readonly port: number;
   readonly requestTimeoutMs: number;
+  // Left undefined in production so the server reads settings.json; tests pass
+  // it explicitly to drive both arms without rewriting settings.
+  readonly holdToolTurnsUntilComplete?: boolean;
   // When set, every request must present this key via `Authorization: Bearer <key>`
   // or `x-api-key: <key>`. The key gates proxy access only; the local CLI backend
   // still authenticates with its own OAuth session.

@@ -166,6 +166,24 @@ live image model names (`gpt-image-2` and its siblings; `dall-e-*` and the
 former `image-2` are refused as the direct API refuses them), and the Codex
 model that actually runs image turns is `codexProxy.imageModel`.
 
+## Tool Turns and Streaming
+
+A turn with `tools` on the `claude` and `app-server` runtimes is answered
+through a private JSON wrapper that the proxy reads twice — once incrementally
+for a stream, once whole for a buffered body — and the two readings can
+disagree on malformed output (conformance matrix §7). `holdToolTurnsUntilComplete`
+in `settings.json` selects which reader the stream trusts:
+
+- absent or `false` (default): the stream releases narration and tool-call
+  deltas as the runtime produces them, with the disagreements the matrix lists.
+- `true`: a tool turn streams nothing until the runtime has finished and the
+  completed answer has been read; the stream then carries that one reading, and
+  a refused turn is an HTTP 502 on the stream as on the buffered body. Plain
+  text turns and the `codex-backend` transport still stream live.
+
+The key is temporary — stage 1 of `docs/design-task-wrapper-release.md` — and
+goes away with the incremental reader once a release has run with it on.
+
 ## Important Differences From Full Provider APIs
 
 This adapter is compatible with a focused subset, not a full clone of the

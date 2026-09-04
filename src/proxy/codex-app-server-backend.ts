@@ -7,6 +7,7 @@ import readline from 'node:readline';
 import {
   codexProxyFallbackReasoningEffort,
   codexProxyFallbackVerbosity,
+  holdToolTurnsUntilComplete,
   honorRequestModel,
 } from '../settings.js';
 import { AsyncQueue } from './async-queue.js';
@@ -60,6 +61,7 @@ interface CodexAppServerBackendOptions {
   readonly proxyMode?: CodexAppServerProxyMode;
   readonly onTiming?: (timing: CodexTurnTiming) => void;
   readonly honorRequestModel?: boolean;
+  readonly holdToolTurnsUntilComplete?: boolean;
 }
 
 interface PendingRequest {
@@ -185,6 +187,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
   private readonly cwd: string;
   private readonly configuredModel?: string;
   private readonly honorRequestModel: boolean;
+  private readonly holdToolTurnsUntilComplete: boolean;
   private readonly timeoutMs: number;
   private readonly reasoningEffort: CodexReasoningEffort;
   private readonly verbosity: CodexVerbosity;
@@ -208,6 +211,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
     this.model = options.model ?? 'codex-app-server';
     this.configuredModel = options.model;
     this.honorRequestModel = options.honorRequestModel ?? honorRequestModel();
+    this.holdToolTurnsUntilComplete = options.holdToolTurnsUntilComplete ?? holdToolTurnsUntilComplete();
     this.timeoutMs = options.timeoutMs;
     this.reasoningEffort = options.reasoningEffort ?? codexProxyFallbackReasoningEffort();
     this.verbosity = options.verbosity ?? codexProxyFallbackVerbosity();
@@ -251,8 +255,13 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       return;
     }
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const forcedTool = forcedSingleToolCall(request);
-    const toolExtractor = forcedTool
+    // A held tool turn has no incremental reader at all: nothing is released
+    // until `completed` carries the one reading the buffered path also makes.
+    const held = this.holdToolTurnsUntilComplete && hasToolDecisionSchema(request);
+    const forcedTool = held ? null : forcedSingleToolCall(request);
+    const toolExtractor = held
+      ? null
+      : forcedTool
       ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
       : hasToolDecisionSchema(request)
       ? new ToolCallDeltaExtractor({
@@ -267,6 +276,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       request,
       signal,
       (delta, elapsedMs) => {
+        if (held) return;
         if (toolExtractor) {
           for (const event of toolExtractor.push(delta)) {
             if (firstToolCallDeltaMs === undefined) firstToolCallDeltaMs = elapsedMs;

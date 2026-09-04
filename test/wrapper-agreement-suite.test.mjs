@@ -180,6 +180,11 @@ const CASES = [
     // row-7 normalization gap, on the forced path. Matrix §7b row 8.
     expect: AGREE,
     expectBySurface: { messages: ['calls'] },
+    // Held, the disagreement on /v1/messages remains: it is between the two
+    // WRITERS' projections of one completed call whose arguments do not parse,
+    // not between two readers. Row 8's own fix — refuse the forced turn at
+    // completion — is what flips this pin; the switch made that fix safe.
+    expectHeld: { messages: ['calls'] },
     delivered: { text: '', calls: [{ id: null, name: 'get_weather', arguments: '{"city":"Seo' }] },
   },
   {
@@ -383,18 +388,18 @@ async function readBothWays(url, surfaceName, body) {
   const bufferedRes = await post({});
   const bufferedBody = await bufferedRes.json();
   const buffered = bufferedRes.status === 200
-    ? { status: 'ok', ...BUFFERED[surfaceName](bufferedBody) }
-    : { status: 'error', text: '', calls: [], error: bufferedBody.error?.message ?? JSON.stringify(bufferedBody) };
+    ? { status: 'ok', httpStatus: 200, ...BUFFERED[surfaceName](bufferedBody) }
+    : { status: 'error', httpStatus: bufferedRes.status, text: '', calls: [], error: bufferedBody.error?.message ?? JSON.stringify(bufferedBody) };
 
   const streamedRes = await post({ stream: true });
   const streamedText = await streamedRes.text();
   let streamed;
   if (streamedRes.status !== 200) {
     let parsed; try { parsed = JSON.parse(streamedText); } catch { parsed = {}; }
-    streamed = { status: 'error', text: '', calls: [], releasedBeforeError: 0, error: parsed.error?.message ?? streamedText };
+    streamed = { status: 'error', httpStatus: streamedRes.status, text: '', calls: [], releasedBeforeError: 0, error: parsed.error?.message ?? streamedText };
   } else {
     const read = STREAMED[surfaceName](sseEvents(streamedText));
-    streamed = { status: read.error === undefined ? 'ok' : 'error', ...read };
+    streamed = { status: read.error === undefined ? 'ok' : 'error', httpStatus: 200, ...read };
   }
   return { buffered, streamed };
 }
@@ -417,11 +422,13 @@ function disagreements({ buffered, streamed }) {
 // ---------------------------------------------------------------------------
 
 const BACKENDS = {
-  claude: async (raw) => {
+  claude: async (raw, hold) => {
     process.env.WRAPPER_RAW = raw;
-    return new ClaudeCodeBackend({ command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
+    return new ClaudeCodeBackend({
+      command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000, holdToolTurnsUntilComplete: hold,
+    });
   },
-  'app-server': async (raw) => {
+  'app-server': async (raw, hold) => {
     const dir = await mkdtemp(join(tmpdir(), 'codex-agreement-home-'));
     tempDirs.push(dir);
     await writeFile(join(dir, 'auth.json'), '{"token":"local"}\n');
@@ -429,66 +436,100 @@ const BACKENDS = {
     process.env.CODEX_HOME = dir;
     process.env.FAKE_CODEX_RAW_TEXT = raw;
     process.env.FAKE_CODEX_RAW_TEXT_DELTAS = 'chars';
-    return new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000 });
+    return new CodexAppServerBackend({ command: fakeCodex, cwd: process.cwd(), timeoutMs: 30_000, holdToolTurnsUntilComplete: hold });
   },
 };
 
 const PRINT = process.env.WRAPPER_AGREEMENT_PRINT === '1';
 
+/** One arm: every surface read both ways through one backend, held or not. */
+async function readArm(kase, makeBackend, hold) {
+  const backend = await makeBackend(kase.raw, hold);
+  const server = await startLocalApiProxy({
+    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000, holdToolTurnsUntilComplete: hold,
+  });
+  try {
+    const readings = {};
+    for (const surfaceName of Object.keys(SURFACES)) {
+      const body = SURFACES[surfaceName].body(kase);
+      if (!body) continue;
+      readings[surfaceName] = await readBothWays(server.url, surfaceName, body);
+    }
+    return readings;
+  } finally {
+    await server.close();
+    await backend.close();
+  }
+}
+
+function printArm(kase, backendName, arm, readings) {
+  for (const [surfaceName, both] of Object.entries(readings)) {
+    const { buffered, streamed } = both;
+    console.log(`${kase.id} | ${backendName} | ${arm} | ${surfaceName} | ${disagreements(both).join(',') || 'AGREE'} | b=${buffered.httpStatus}:${JSON.stringify(buffered.text).slice(0, 30)}/${buffered.calls.length} s=${streamed.httpStatus}:${JSON.stringify(streamed.text).slice(0, 30)}/${streamed.calls.length} rel=${streamed.releasedBeforeError}`);
+  }
+}
+
 for (const kase of CASES) {
   for (const [backendName, makeBackend] of Object.entries(BACKENDS)) {
     test(`${kase.id} — ${backendName}`, async () => {
-      const backend = await makeBackend(kase.raw);
-      const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
-      try {
-        const verdicts = {};
-        const readings = {};
-        for (const surfaceName of Object.keys(SURFACES)) {
-          const body = SURFACES[surfaceName].body(kase);
-          if (!body) continue;
-          const both = await readBothWays(server.url, surfaceName, body);
-          readings[surfaceName] = both;
-          verdicts[surfaceName] = disagreements(both);
-        }
-        if (PRINT) {
-          for (const [surfaceName, kinds] of Object.entries(verdicts)) {
-            const { buffered, streamed } = readings[surfaceName];
-            console.log(`${kase.id} | ${backendName} | ${surfaceName} | ${kinds.join(',') || 'AGREE'} | b=${buffered.status}:${JSON.stringify(buffered.text).slice(0, 30)}/${buffered.calls.length} s=${streamed.status}:${JSON.stringify(streamed.text).slice(0, 30)}/${streamed.calls.length} rel=${streamed.releasedBeforeError}`);
-          }
-          return;
-        }
-        const expectFor = (surfaceName) => kase.expectByBackend?.[backendName]?.[surfaceName]
-          ?? kase.expectBySurface?.[surfaceName]
-          ?? kase.expect;
-        for (const [surfaceName, kinds] of Object.entries(verdicts)) {
-          const expected = expectFor(surfaceName);
+      // Arm 1 — today's readers (`holdToolTurnsUntilComplete` off): the pins.
+      const today = await readArm(kase, makeBackend, false);
+      // Arm 2 — the turn held until its completed reading (the key on).
+      const held = await readArm(kase, makeBackend, true);
+      if (PRINT) {
+        printArm(kase, backendName, 'off', today);
+        printArm(kase, backendName, 'on', held);
+        return;
+      }
+
+      const expectFor = (surfaceName) => kase.expectByBackend?.[backendName]?.[surfaceName]
+        ?? kase.expectBySurface?.[surfaceName]
+        ?? kase.expect;
+      for (const [surfaceName, both] of Object.entries(today)) {
+        const kinds = disagreements(both);
+        const expected = expectFor(surfaceName);
+        assert.deepEqual(
+          kinds,
+          expected,
+          `off/${surfaceName}: the readers ${expected.length === 0 ? 'disagree' : 'no longer disagree as pinned'} — ${JSON.stringify(both)}`,
+        );
+        if (expected.length === 0 && kase.delivered?.refused) {
+          // Agreement on a refusal is only agreement if the stream refused
+          // BEFORE releasing anything — the verdict already checked that; the
+          // denominator here is that the turn was in fact refused.
+          assert.equal(both.buffered.status, 'error', `off/${surfaceName}: expected a refusal, got ${JSON.stringify(both.buffered)}`);
+          assert.equal(both.streamed.releasedBeforeError, 0, `off/${surfaceName}: the stream released before refusing`);
+        } else if (expected.length === 0 && kase.delivered) {
+          // The denominator: agreement on nothing delivered proves nothing.
+          assert.equal(both.buffered.status, 'ok', `off/${surfaceName}: ${both.buffered.error}`);
+          assert.equal(both.buffered.text, kase.delivered.text, `off/${surfaceName}: buffered text`);
           assert.deepEqual(
-            kinds,
-            expected,
-            `${surfaceName}: the readers ${expected.length === 0 ? 'disagree' : 'no longer disagree as pinned'} — ${JSON.stringify(readings[surfaceName])}`,
+            both.buffered.calls.map((call) => ({ ...call, id: kase.delivered.calls[0]?.id === null ? null : call.id })),
+            kase.delivered.calls,
+            `off/${surfaceName}: buffered calls`,
           );
-          if (expected.length === 0 && kase.delivered?.refused) {
-            // Agreement on a refusal is only agreement if the stream refused
-            // BEFORE releasing anything — the verdict already checked that; the
-            // denominator here is that the turn was in fact refused.
-            const { buffered, streamed } = readings[surfaceName];
-            assert.equal(buffered.status, 'error', `${surfaceName}: expected a refusal, got ${JSON.stringify(buffered)}`);
-            assert.equal(streamed.releasedBeforeError, 0, `${surfaceName}: the stream released before refusing`);
-          } else if (expected.length === 0 && kase.delivered) {
-            // The denominator: agreement on nothing delivered proves nothing.
-            const { buffered } = readings[surfaceName];
-            assert.equal(buffered.status, 'ok', `${surfaceName}: ${buffered.error}`);
-            assert.equal(buffered.text, kase.delivered.text, `${surfaceName}: buffered text`);
-            assert.deepEqual(
-              buffered.calls.map((call) => ({ ...call, id: kase.delivered.calls[0]?.id === null ? null : call.id })),
-              kase.delivered.calls,
-              `${surfaceName}: buffered calls`,
-            );
-          }
         }
-      } finally {
-        await server.close();
-        await backend.close();
+      }
+
+      // Held, every pin flips to agreement — and the buffered reading is the
+      // SAME reading as with the key off, so the switch changed the stream
+      // only. A refusal is then a real HTTP status on both paths, not a 200
+      // carrying an error frame.
+      for (const [surfaceName, both] of Object.entries(held)) {
+        const expectedHeld = kase.expectHeld?.[surfaceName] ?? AGREE;
+        assert.deepEqual(
+          disagreements(both),
+          expectedHeld,
+          `on/${surfaceName}: ${expectedHeld.length === 0 ? 'the readers still disagree' : 'no longer disagrees as pinned'} — ${JSON.stringify(both)}`,
+        );
+        const { error: _todayError, ...todayBuffered } = today[surfaceName].buffered;
+        const { error: _heldError, ...heldBuffered } = both.buffered;
+        assert.deepEqual(heldBuffered, todayBuffered, `on/${surfaceName}: the key changed the buffered reading`);
+        assert.equal(both.streamed.httpStatus, both.buffered.httpStatus, `on/${surfaceName}: the stream's HTTP status is not the buffered path's`);
+        if (both.buffered.status === 'ok') {
+          const nonEmpty = both.buffered.text !== '' || both.buffered.calls.length > 0;
+          assert.ok(nonEmpty, `on/${surfaceName}: a held answer delivered nothing`);
+        }
       }
     });
   }
