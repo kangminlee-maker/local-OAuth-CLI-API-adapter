@@ -2203,3 +2203,24 @@ test('an id-less completed item is placed by its position, not by arrival order:
   assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
   assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
 });
+
+test('a state the completed output created is not announced until it is: a fold into it announces once, at a real wire index (r32-codex)', async () => {
+  // The first completed item creates `call_a` (identity frozen, never on the
+  // wire); the second folds the finished holder at position 1 into it.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.done', output_index: 1, item_id: 'fc_b', arguments: '{"city":"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'get_weather' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+  const tool = events.filter((event) => event.type === 'tool_call_delta').map((event) => [event.id, event.index, event.argumentsDelta ?? null, event.argumentsDone ?? false]);
+  assert.ok(!tool.some(([, index]) => index < 0), `no wire index below zero: ${JSON.stringify(tool)}`);
+  assert.equal(tool.filter(([id, , delta]) => id === 'call_a' && delta === '').length, 1, `announced once: ${JSON.stringify(tool)}`);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+});

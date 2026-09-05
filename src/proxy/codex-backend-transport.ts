@@ -836,7 +836,12 @@ class CodexBackendStreamState {
 
   private emitPending(index: number, state: ToolState): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
-    if (!state.started) {
+    // Announced means told to the client (`announcedAt`), not `started`: a
+    // state the completed output created is `started` — its identity frozen
+    // — without a frame ever having gone out, and reading `started` as
+    // announced signalled it finished at wire index -1 while the writers
+    // then announced it again from the result (r32-codex).
+    if (state.announcedAt === undefined) {
       state.started = true;
       // Counted HERE, at the first thing the client is told about a tool, not
       // when the backend opened state for one: arguments held until the call is
@@ -936,7 +941,7 @@ class CodexBackendStreamState {
       // at completion — has not been announced: the identity and the bytes go
       // first, or the finish signal names a wire index the client never saw
       // (r31-fable F1).
-      if (!state.started) out.push(...this.emitPending(index, state));
+      if (state.announcedAt === undefined) out.push(...this.emitPending(index, state));
       const complete = argumentsOrEmptyObject(state.arguments);
       out.push(...this.emitArgumentExtension(index, state, complete));
       if (state.streamed !== complete) continue;
