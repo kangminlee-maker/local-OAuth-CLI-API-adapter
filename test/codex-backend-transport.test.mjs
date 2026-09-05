@@ -2694,19 +2694,80 @@ test('the dense slot does not re-adopt the holder the name doors declined: a nam
   }, /missing its call_id/);
 });
 
-test('a call once named keeps that name before its announcement too: a later frame naming another tool for the same item is kept out (r39-fable)', async () => {
+test('a call once named keeps that name before its announcement too: a later frame naming another tool for the same item is the vendor contradicting itself, refused (r39-fable, r39-codex)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
     { type: 'response.output_item.done', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"a":1}' } },
+    // The completed output agrees with the FIRST name, so only the live
+    // door can refuse this turn.
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
-      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a completed item naming another tool for a known call is refused, not its arguments delivered under the announced name (r39-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"belongs":"beta"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('an identified item is the call its ids name wherever the array lists it: a known call listed at another index is completed by it and adopts nothing there (declared; r39-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'message', role: 'assistant', content: [] },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
     ] } },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   const events = [];
-  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
   assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"a":1}']]);
-  const announced = events.filter((event) => event.type === 'tool_call_delta' && event.name !== undefined).map((event) => event.name);
-  assert.ok(announced.every((name) => name === 'alpha'), JSON.stringify(announced));
+});
+
+test('the dense slot adopts a holder only at the item\'s own position: position 1\'s bytes are not the item at index 0 (r39-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"position":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"position":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /missing its call_id/);
+});
+
+test('the fold door takes exactly the value the call already holds: a second listing extending the first is another value, refused (r39-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
 });

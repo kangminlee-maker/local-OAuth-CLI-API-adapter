@@ -279,7 +279,7 @@ test('the terminal frame settles the turn: a delta after response.completed chan
   });
 });
 
-test('an identity the stream announced is kept by the body: the completed output cannot rename call_1/probe (r23-codex)', async () => {
+test('an identity the stream announced is a promise: a completed item renaming call_1/probe is the vendor contradicting itself, refused (r23-codex; refused since round 39)', async () => {
   const vendor = [
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
     { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{}' },
@@ -288,23 +288,26 @@ test('an identity the stream announced is kept by the body: the completed output
   ];
   const TWO = { ...CHAT, tools: [...CHAT.tools, { type: 'function', function: { name: 'other', parameters: { type: 'object' } } }] };
   const TWO_MESSAGES = { ...MESSAGES, tools: [...MESSAGES.tools, { name: 'other', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } };
+  // Round 39: the rename is the vendor contradicting itself — refused, not
+  // the announced identity kept with the renamed item's arguments under it.
+  // The stream has announced `call_1`/`probe` before the completed output
+  // arrives, so the refusal is in-band there; buffered readings are a 502.
   await withProxyEvents(vendor, async (url) => {
-    const chat = JSON.parse((await post(`${url}/v1/chat/completions`, OPENAI, TWO)).text).choices[0].message.tool_calls[0];
-    assert.equal(chat.id, 'call_1');
-    assert.equal(chat.function.name, 'probe');
-    const chatStream = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO, stream: true })).text);
-    const announced = chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).find((call) => call.id);
-    assert.equal(announced.id, 'call_1');
-    assert.equal(announced.function.name, 'probe');
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, TWO);
+    assert.equal(chat.status, 502, chat.text);
+    assert.match(JSON.parse(chat.text).error.message, /named two tool calls as one/);
+    const chatStream = await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO, stream: true });
+    const announced = events(chatStream.text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
+    assert.deepEqual(announced.map((call) => [call.id, call.function.name]), [['call_1', 'probe']], chatStream.text);
+    assert.match(chatStream.text, /named two tool calls as one/);
+    assert.ok(!chatStream.text.includes('"finish_reason":"tool_calls"'), chatStream.text);
     const messages = await post(`${url}/v1/messages`, ANTHROPIC, TWO_MESSAGES);
-    assert.equal(messages.status, 200, messages.text);
-    const block = JSON.parse(messages.text).content.find((item) => item.type === 'tool_use');
-    assert.equal(block.id, 'call_1');
-    assert.equal(block.name, 'probe');
+    assert.equal(messages.status, 502, messages.text);
+    assert.match(JSON.parse(messages.text).error.message, /named two tool calls as one/);
   });
 });
 
-test('an announced identity is frozen at every door: output_item.done and a repeated output_item.added cannot rename call_1/probe either (r25-fable)', async () => {
+test('an announced identity is a promise at every door: output_item.done and a repeated output_item.added renaming call_1/probe are refused too (r25-fable; refused since round 39)', async () => {
   const renameBy = (frame) => [
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
     { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{}' },
@@ -318,15 +321,16 @@ test('an announced identity is frozen at every door: output_item.done and a repe
   const doneOnly = { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{}' };
   for (const frame of [repeatedAdded, doneOnly]) {
     await withProxyEvents(renameBy(frame), async (url) => {
-      const chat = JSON.parse((await post(`${url}/v1/chat/completions`, OPENAI, TWO)).text).choices[0].message.tool_calls[0];
-      assert.equal(chat.id, 'call_1');
-      assert.equal(chat.function.name, 'probe');
-      const announced = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO, stream: true })).text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
-      assert.deepEqual(announced.map((call) => [call.id, call.function.name]), [['call_1', 'probe']]);
+      const chat = await post(`${url}/v1/chat/completions`, OPENAI, TWO);
+      assert.equal(chat.status, 502, chat.text);
+      assert.match(JSON.parse(chat.text).error.message, /named two tool calls as one/);
+      const chatStream = await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO, stream: true });
+      const announced = events(chatStream.text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
+      assert.deepEqual(announced.map((call) => [call.id, call.function.name]), [['call_1', 'probe']], chatStream.text);
+      assert.match(chatStream.text, /named two tool calls as one/);
+      assert.ok(!chatStream.text.includes('"finish_reason":"tool_calls"'), chatStream.text);
       const messages = await post(`${url}/v1/messages`, ANTHROPIC, TWO_MESSAGES);
-      assert.equal(messages.status, 200, messages.text);
-      const blocks = JSON.parse(messages.text).content.filter((item) => item.type === 'tool_use');
-      assert.deepEqual(blocks.map((block) => [block.id, block.name]), [['call_1', 'probe']]);
+      assert.equal(messages.status, 502, messages.text);
     });
   }
 });
