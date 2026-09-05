@@ -212,6 +212,17 @@ interface ToolState {
   announcedAt?: number;
 }
 
+/** One `function_call` item of the completed output, as `captureFinalOutput` reads it. */
+interface FinalCallItem {
+  readonly outputIndex: number;
+  /** Its position among the function-call items — the dense coordinate. */
+  readonly position: number;
+  readonly arguments: string | undefined;
+  readonly itemId: string | undefined;
+  readonly callId: string | undefined;
+  readonly name: string | undefined;
+}
+
 class CodexBackendStreamState {
   readonly id = `local_${randomUUID()}`;
   responseId?: string;
@@ -499,7 +510,7 @@ class CodexBackendStreamState {
    * Without an id, the dense function-call position is what the stream ordinals
    * already mean.
    */
-  private finalOutputOrdinal(position: number, outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
+  private finalOutputOrdinal(slot: number | undefined, outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
     const known = this.knownOrdinal(ids);
     if (known !== undefined) {
       // A call known by id whose frames never carried a position is placed
@@ -533,34 +544,15 @@ class CodexBackendStreamState {
       this.bindOrdinal(holder, ids);
       return holder;
     }
-    // An item that names no id at all is placed by the protocol's own
-    // correlation first: `output[i]` is the item announced at `output_index:
-    // i`, and the state holding that position is the call, whatever order
-    // the calls arrived in. The dense slot below counts first-arrival
-    // ordinals, and with two calls announced in reverse order it paired each
-    // with the other's completed arguments — both shared the streamed prefix,
-    // so the prefix gate accepted the swap (r31-codex F6).
-    const identified = ids.some((id) => typeof id === 'string');
-    if (!identified && holder !== undefined && this.toolStates.has(holder)) return holder;
     // An item that names an unfamiliar call is a call the stream never
     // announced, and it still belongs to the client: taking a position some
     // other call already holds would replace that call instead of adding this
-    // one. An anonymous item has nothing but its position, so there the dense
-    // position IS the correlation — `captureFinalOutput` only reaches here for
-    // one when the two views agree on how many calls there are, and only when
-    // no state holds the item's position.
-    // ...unless the occupant is an anonymous holder — argument deltas that
-    // arrived with no id at all, which belong to the call that names their
-    // position (the rule `toolOrdinal` applies live). Taking a new ordinal
+    // one — unless the occupant of its dense slot (the streamed calls in
+    // order, the caller's coordinate) is an anonymous holder: argument deltas
+    // that arrived with no id at all belong to the call that names their
+    // position (the rule `toolOrdinal` applies live), and taking a new ordinal
     // beside the holder invented a second call named `tool` (r25-codex).
-    // The dense position counts the STREAMED calls in order; it is not the
-    // ordinal itself once a holder has been adopted and its ordinal retired.
-    const slot = [...this.toolStates.keys()].sort((a, b) => a - b)[position];
-    const occupant = slot === undefined ? undefined : this.adoptableOrdinal(slot);
-    let ordinal: number;
-    if (slot === undefined) ordinal = this.nextToolOrdinal;
-    else if (identified && occupant === undefined) ordinal = this.nextToolOrdinal;
-    else ordinal = slot;
+    const ordinal = this.adoptableOrdinal(slot) ?? this.nextToolOrdinal;
     this.bindOrdinal(ordinal, ids);
     if (ordinal >= this.nextToolOrdinal) this.nextToolOrdinal = ordinal + 1;
     return ordinal;
@@ -1079,128 +1071,157 @@ class CodexBackendStreamState {
 
   private captureFinalOutput(output: readonly unknown[] | undefined): void {
     if (!Array.isArray(output)) return;
-    const finalCalls = output.filter((item) => asRecord(item)?.type === 'function_call');
-    // Positional alignment is only meaningful when the two views agree on how
-    // many calls there are. When they disagree, an id-less final item would
-    // land on whichever streamed call happens to share its position and
-    // overwrite that call's name and arguments — turning one tool call into a
-    // second copy of another. The streamed state is the one the client already
-    // acted on, so it wins.
-    //
-    // Judged per item against the streamed calls still standing: a fold
-    // earlier in this loop (a completed item joining two states) retires a
-    // state, and a count taken once before the loop then disagreed with two
-    // views that had come to agree — the anonymous item completing ANOTHER
-    // call was discarded, and that call went out as its fragment (r32-fable
-    // F1). Only the states the stream opened count; a call this loop adds
-    // for an item the stream never showed is not one of the streamed calls.
-    const streamed = new Set(this.toolStates.keys());
-    let functionCallPosition = 0;
+    const items: FinalCallItem[] = [];
     for (const [outputIndex, item] of output.entries()) {
       const obj = asRecord(item);
-      if (obj?.type === 'function_call') {
-        const finalArguments = argumentsText(obj.arguments, this.request.shape);
-        const finalItemId = identityText(obj.id, this.request.shape);
-        const finalCallId = identityText(obj.call_id, this.request.shape);
-        const finalName = identityText(obj.name, this.request.shape);
-        const anonymous = finalItemId === undefined && finalCallId === undefined;
-        const standing = [...streamed].filter((ordinal) => this.toolStates.has(ordinal)).length;
-        const alignable = standing === 0 || finalCalls.length === standing;
-        if (anonymous && !alignable) {
-          functionCallPosition += 1;
-          continue;
-        }
-        // An item whose `id` and `call_id` name two DIFFERENT calls the stream
-        // announced is the vendor contradicting itself; taking the first
-        // identifier it recognized cross-wired the two calls' arguments in
-        // the body behind a stream that had paired them right (r26-codex).
-        // Position is not proof of identity and neither is half an identity:
-        // the streamed state — what the client already acted on — wins, and
-        // the item is left alone (declared, matrix §7 row 8).
-        const itemOrdinal = finalItemId === undefined ? undefined : this.toolOrdinals.get(finalItemId);
-        const callOrdinal = finalCallId === undefined ? undefined : this.toolOrdinals.get(finalCallId);
-        if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
-          // ...unless one of the two is a state the client was never told
-          // about: then the item is where the split identity meets, and it
-          // folds into the one the client knows, as a live frame carrying
-          // both would (r31-fable F2). Two announced states stay apart.
-          const itemState = this.toolStates.get(itemOrdinal);
-          const callState = this.toolStates.get(callOrdinal);
-          const foldable = (itemState !== undefined && this.absorbable(itemState)) || (callState !== undefined && this.absorbable(callState));
-          if (!foldable) {
-            functionCallPosition += 1;
-            continue;
-          }
-          this.coalesce([itemOrdinal, callOrdinal]);
-        }
-        const index = this.finalOutputOrdinal(
-          functionCallPosition,
-          outputIndex,
-          finalItemId,
-          finalCallId,
-        );
-        functionCallPosition += 1;
-        const existing = this.toolStates.get(index);
-        const state = existing ?? {
-          ...this.newToolState(index, {
-            id: finalCallId,
-            name: finalName,
-          }),
-          started: true,
-          hasCallId: finalCallId !== undefined,
-          identified: finalCallId !== undefined && finalName !== undefined,
-        };
-        // An anonymous item is matched by position alone, and position is not
-        // proof of identity: with two calls listed in an order the stream did
-        // not use, overwriting here gave each streamed call the OTHER call's
-        // name and arguments under its own id, so tool results came back
-        // answering the wrong call. It may fill in what the stream never
-        // delivered; it may not replace what it did.
-        const mayReplace = !anonymous || existing === undefined;
-        // An identity the client has already been told is a promise: a client
-        // that reported `call_1`/`probe` from the stream cannot be handed
-        // `call_2`/`other` by the body (r23-codex). The completed output may
-        // supply identity to a call never announced, not rename one.
-        if (finalCallId !== undefined && !state.started) {
-          state.id = finalCallId;
-          state.hasCallId = true;
-        }
-        if (finalName !== undefined && !state.started && (mayReplace || !state.named)) {
-          state.name = finalName;
-          state.named = true;
-        }
-        if (!anonymous) state.anonymous = false;
-        // An anonymous item may still COMPLETE what the stream started: a turn
-        // that ended mid-argument leaves a prefix that parses as nothing, and
-        // arguments the streamed text is a prefix of are that same call's
-        // finished value, not another call's payload. Anything that
-        // contradicts the prefix is refused, as before.
-        // ...and never for a call already announced as finished. The stream
-        // closed on the value it sent and cannot take it back, so a completed
-        // output that names a different one would have the client's
-        // accumulation and the body's report describe the same call
-        // differently.
-        // ...and for a call already finished by the vendor's own event, only a
-        // value that EXTENDS the finished one — a fragment finish event
-        // (`{"city":`) completed by the output's `{"city":"Seoul"}` — and only
-        // while the finish signal has not gone out, so the stream can still
-        // carry the rest (r27-fable F2). Once it has (the vendor moved on
-        // before completing: `announcedDone`), the closed block cannot take
-        // the rest, and taking it into the body split the two paths (r28:
-        // Fable F1, codex F1): the finished value is kept, and the turn falls
-        // into the declared contradiction lane. Anything else keeps the
-        // finished value.
-        if (
-          finalArguments !== undefined
-          && (state.argumentsDone
-            ? (!state.announcedDone && finalArguments.startsWith(state.arguments))
-            : (mayReplace || finalArguments.startsWith(state.arguments)))
-        ) {
-          state.arguments = finalArguments;
-        }
-        this.toolStates.set(index, state);
-      }
+      if (obj?.type !== 'function_call') continue;
+      items.push({
+        outputIndex,
+        position: items.length,
+        arguments: argumentsText(obj.arguments, this.request.shape),
+        itemId: identityText(obj.id, this.request.shape),
+        callId: identityText(obj.call_id, this.request.shape),
+        name: identityText(obj.name, this.request.shape),
+      });
     }
+    const anonymous = (item: FinalCallItem): boolean => item.itemId === undefined && item.callId === undefined;
+    // Two passes. The items that name a call are placed first — with the
+    // folds a completed item performs, which retire states — and only then
+    // the items that name nothing, against the calls still standing. Judged
+    // per item in array order, an anonymous item BEFORE the fold was
+    // discarded by a count the fold had not yet corrected (r33-fable F2), as
+    // it was by a count taken once before the loop (r32-fable F1).
+    const streamed = new Set(this.toolStates.keys());
+    const placed = new Set<number>();
+    for (const item of items) {
+      if (anonymous(item)) continue;
+      // An item whose `id` and `call_id` name two DIFFERENT calls the stream
+      // announced is the vendor contradicting itself; taking the first
+      // identifier it recognized cross-wired the two calls' arguments in
+      // the body behind a stream that had paired them right (r26-codex).
+      // Position is not proof of identity and neither is half an identity:
+      // the streamed state — what the client already acted on — wins, and
+      // the item is left alone (declared, matrix §7 row 8).
+      const itemOrdinal = item.itemId === undefined ? undefined : this.toolOrdinals.get(item.itemId);
+      const callOrdinal = item.callId === undefined ? undefined : this.toolOrdinals.get(item.callId);
+      if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
+        // ...unless one of the two is a state the client was never told
+        // about: then the item is where the split identity meets, and it
+        // folds into the one the client knows, as a live frame carrying
+        // both would (r31-fable F2). Two announced states stay apart.
+        const itemState = this.toolStates.get(itemOrdinal);
+        const callState = this.toolStates.get(callOrdinal);
+        const foldable = (itemState !== undefined && this.absorbable(itemState)) || (callState !== undefined && this.absorbable(callState));
+        if (!foldable) continue;
+        this.coalesce([itemOrdinal, callOrdinal]);
+      }
+      // The dense slot — the streamed calls in order — is where an
+      // unfamiliar item goes when an anonymous holder sits there.
+      const slot = [...this.toolStates.keys()].sort((a, b) => a - b)[item.position];
+      const index = this.finalOutputOrdinal(slot, item.outputIndex, item.itemId, item.callId);
+      placed.add(index);
+      this.applyFinalItem(item, index);
+    }
+    // An anonymous item has nothing but its position, and the position is the
+    // protocol's own correlation: `output[i]` is the item announced at
+    // `output_index: i`, and the call holding that position is this call
+    // whatever the two views count — the prefix gate below still protects the
+    // value (r31-codex F6). Every item a position places is placed before any
+    // is aligned by count, so the count cannot book that call again.
+    const unplaced: FinalCallItem[] = [];
+    for (const item of items.filter(anonymous)) {
+      const holder = this.toolOrdinals.get(`#${item.outputIndex}`);
+      if (holder === undefined || !this.toolStates.has(holder)) {
+        unplaced.push(item);
+        continue;
+      }
+      placed.add(holder);
+      this.applyFinalItem(item, holder);
+    }
+    // The rest align by count, and only when the two views agree on how many
+    // calls there are: the streamed calls still standing after the folds
+    // above — a state this capture added for an item the stream never showed
+    // is not one of them — against the completed items. When they disagree an
+    // anonymous item would land on whichever call shares its slot and
+    // overwrite it, turning one call into a second copy of another; the
+    // streamed state, the one the client already acted on, wins. When they
+    // agree the alignment is one to one: the k-th item no position placed is
+    // the k-th standing call no item placed, in order — not the k-th streamed
+    // call, a slot a position may already have taken, which booked one call
+    // twice and stranded the position-less one (r33-fable F1). With nothing
+    // streamed, every item is a call of its own.
+    const standing = [...streamed].filter((ordinal) => this.toolStates.has(ordinal));
+    if (standing.length !== 0 && items.length !== standing.length) return;
+    const unmatched = standing.filter((ordinal) => !placed.has(ordinal)).sort((a, b) => a - b);
+    for (const item of unplaced) {
+      const index = unmatched.shift() ?? this.nextToolOrdinal;
+      if (index >= this.nextToolOrdinal) this.nextToolOrdinal = index + 1;
+      this.applyFinalItem(item, index);
+    }
+  }
+
+  /** Applies one completed item to the state at `index`, creating it for a call the stream never showed. */
+  private applyFinalItem(item: FinalCallItem, index: number): void {
+    const anonymous = item.itemId === undefined && item.callId === undefined;
+    const existing = this.toolStates.get(index);
+    const state = existing ?? {
+      ...this.newToolState(index, {
+        id: item.callId,
+        name: item.name,
+      }),
+      started: true,
+      hasCallId: item.callId !== undefined,
+      identified: item.callId !== undefined && item.name !== undefined,
+    };
+    // An anonymous item is matched by position alone, and position is not
+    // proof of identity: with two calls listed in an order the stream did
+    // not use, overwriting here gave each streamed call the OTHER call's
+    // name and arguments under its own id, so tool results came back
+    // answering the wrong call. It may fill in what the stream never
+    // delivered; it may not replace what it did.
+    const mayReplace = !anonymous || existing === undefined;
+    // An identity the client has already been told is a promise: a client
+    // that reported `call_1`/`probe` from the stream cannot be handed
+    // `call_2`/`other` by the body (r23-codex). The completed output may
+    // supply identity to a call never announced, not rename one.
+    if (item.callId !== undefined && !state.started) {
+      state.id = item.callId;
+      state.hasCallId = true;
+    }
+    if (item.name !== undefined && !state.started && (mayReplace || !state.named)) {
+      state.name = item.name;
+      state.named = true;
+    }
+    if (!anonymous) state.anonymous = false;
+    // An anonymous item may still COMPLETE what the stream started: a turn
+    // that ended mid-argument leaves a prefix that parses as nothing, and
+    // arguments the streamed text is a prefix of are that same call's
+    // finished value, not another call's payload. Anything that
+    // contradicts the prefix is refused, as before.
+    // ...and never for a call already announced as finished. The stream
+    // closed on the value it sent and cannot take it back, so a completed
+    // output that names a different one would have the client's
+    // accumulation and the body's report describe the same call
+    // differently.
+    // ...and for a call already finished by the vendor's own event, only a
+    // value that EXTENDS the finished one — a fragment finish event
+    // (`{"city":`) completed by the output's `{"city":"Seoul"}` — and only
+    // while the finish signal has not gone out, so the stream can still
+    // carry the rest (r27-fable F2). Once it has (the vendor moved on
+    // before completing: `announcedDone`), the closed block cannot take
+    // the rest, and taking it into the body split the two paths (r28:
+    // Fable F1, codex F1): the finished value is kept, and the turn falls
+    // into the declared contradiction lane. Anything else keeps the
+    // finished value.
+    if (
+      item.arguments !== undefined
+      && (state.argumentsDone
+        ? (!state.announcedDone && item.arguments.startsWith(state.arguments))
+        : (mayReplace || item.arguments.startsWith(state.arguments)))
+    ) {
+      state.arguments = item.arguments;
+    }
+    this.toolStates.set(index, state);
   }
 }
 

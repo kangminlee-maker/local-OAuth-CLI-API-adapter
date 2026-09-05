@@ -2224,3 +2224,94 @@ test('a state the completed output created is not announced until it is: a fold 
   assert.equal(tool.filter(([id, , delta]) => id === 'call_a' && delta === '').length, 1, `announced once: ${JSON.stringify(tool)}`);
   assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
 });
+
+test('an anonymous completed item at a position no call holds completes the one standing call no item has placed, not the call a position already placed (r33-fable F1)', async () => {
+  // `call_a` was announced index-less and never learned a position; `call_b`
+  // holds `#0`. `output[0]` is `call_b` by position, so `output[1]` can only
+  // be `call_a` — the dense arrival-order slot booked `call_b` twice.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"tz":"KST"}' },
+      { type: 'function_call', arguments: '{"city":"Seoul"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
+});
+
+test('an anonymous completed item is placed by the call holding its position before any count, and the count is judged after every fold the completed output performs (r33-fable F2)', async () => {
+  // The anonymous item comes FIRST and the fold (fc_b into call_a) second:
+  // judged per item in array order, the count still read three standing
+  // calls against two items and discarded the item that completes `call_c`.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_c', delta: '{"c' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"c":3}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_c'), ['beta', '{"c":3}'], JSON.stringify([...calls]));
+});
+
+test('a fold across two positions leaves no alias at the retired position: the real call arriving there is its own (r32-codex, the third)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_b', arguments: '{"b":2}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'probe' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'other' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_c', delta: '{"c":3}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'other', arguments: '{"c":3}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'probe', arguments: '{"b":2}' },
+      { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'other', arguments: '{"c":3}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['probe', 'other']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['probe', '{"b":2}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_c'), ['other', '{"c":3}'], JSON.stringify([...calls]));
+});
+
+test('an anonymous completed item at a position a call holds completes that call whatever the two views count; only the count-aligned rest is gated (r33-fable F2)', async () => {
+  // Two calls streamed, one completed item: the counts disagree, and the
+  // item at `output_index: 0` is still the call holding `#0`.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"tz":"KST"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"city":"Seoul"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
+});
