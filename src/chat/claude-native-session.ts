@@ -15,8 +15,8 @@ type JsonObject = Record<string, unknown>;
 interface Turn {
   readonly queue: AsyncQueue<LocalCliChatRuntimeEvent>;
   /**
-   * The turn's own deadline — a SILENCE budget, restarted by every line the
-   * child writes, like the session manager's: armed once at the turn's start
+   * The turn's own deadline — a SILENCE budget, restarted by every JSON line
+   * the child writes, like the session manager's: armed once at the turn's start
    * it cut a turn that was streaming past the budget while the manager's
    * deadline, and the contract, let it run (round 51). It is retired with the turn: an abandoned
    * generator never reaches its `finally`, so a turn stopped any other way

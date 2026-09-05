@@ -282,6 +282,36 @@ test('the claude runtime\'s deadline bounds silence, not duration: a turn stream
   }
 });
 
+test('the manager\'s deadline restarts on every event: with the runtime\'s own timer out of the way, a turn streaming past the budget completes and a silent one ends at it (r52-fable mutant)', { timeout: 20_000 }, async () => {
+  // The only silence bound the codex runtime has is this re-arm; without it
+  // the manager's deadline was a duration cap, and no fixture said otherwise.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: cwd,
+    runtimes: {
+      claude: async (input) => ClaudeNativeCliChatSession.create({
+        command: fakeClaude,
+        cwd: input.cwd,
+        model: 'claude-opus-4-8',
+        timeoutMs: 20_000,
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'claude' });
+  const startedAt = Date.now();
+  const slow = await manager.runTurn(session.id, { input: 'SLOW' }, { timeoutMs: 300 });
+  assert.equal(slow.status, 'completed');
+  assert.equal(slow.final.text, '0 1 2 3 4 5 ');
+  assert.ok(Date.now() - startedAt >= 600, `the turn ran its whole length: ${Date.now() - startedAt} ms`);
+  const silentAt = Date.now();
+  const partial = await manager.runTurn(session.id, { input: 'PARTIAL' }, { timeoutMs: 300 });
+  assert.equal(partial.status, 'error');
+  assert.match(partial.events.at(-1).raw.message, /interrupted/);
+  assert.ok(Date.now() - silentAt < 1000, `silence ended at the budget: ${Date.now() - silentAt} ms`);
+});
+
 test('an interrupted claude turn leaves a session that still answers', { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
   tempDirs.push(cwd);
