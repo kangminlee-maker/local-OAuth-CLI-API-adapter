@@ -609,8 +609,9 @@ class CodexBackendStreamState {
    * call, which records NO position — the array lists each index once, so
    * nothing resolves to it by position afterwards and `captureFinalOutput`
    * refuses a later item resolving to it by id as that call listed twice;
-   * a position recorded here would count toward `progress()` on a cut turn
-   * and close a block the vendor left open. An item that names nothing is placed by
+   * a position recorded here would decide nothing the array has not, only
+   * which door refuses that second listing (the fold's position check
+   * instead of the listed-twice door). An item that names nothing is placed by
    * `captureFinalOutput` itself: by the call holding its position first; then,
    * only when exactly one such item and one standing call no item placed
    * remain and their names do not conflict, as that pair; every other one is
@@ -1454,6 +1455,12 @@ class CodexBackendImageState {
   imageGenerating = false;
   textDeltaCount = 0;
   textSample = '';
+  // The same terminal discipline as the text turn: the backend says how the
+  // turn ended, and only then is it a result. Without it an image item
+  // followed by `response.failed` — or by nothing — went out as a successful
+  // image on every surface (r47-codex).
+  private settled = false;
+  private failure?: string;
 
   constructor(
     private readonly request: OpenAiImageGenerationRequest,
@@ -1470,6 +1477,14 @@ class CodexBackendImageState {
       ...(event.item?.status ? { itemStatus: event.item.status } : {}),
       ...(imageGenerationFromResponseItem(event.item) ? { hasImageResult: true } : {}),
     });
+    // A settled turn is finished, whatever noise follows: recorded for the
+    // diagnostic, consumed by nothing.
+    if (this.settled) return out;
+    if ((event.type === 'response.failed' || event.type === 'error')) {
+      this.failure = terminalFailureMessage(event);
+      this.settled = true;
+      return out;
+    }
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
     if (typeof event.delta === 'string' && event.type === 'response.output_text.delta') {
@@ -1512,11 +1527,20 @@ class CodexBackendImageState {
           usage,
         });
       }
+      this.settled = true;
     }
+    // A cut-off turn is a finished turn with a reason; whether it produced
+    // an image is judged like any other.
+    if (event.type === 'response.incomplete') this.settled = true;
     return out;
   }
 
   completed(): CodexBackendImageTurnResult {
+    // A reported failure, or a stream that simply stopped, is not a result —
+    // not even with an image already collected; only a turn that finished
+    // without an image is the retryable no-result case.
+    if (this.failure) throw new Error(this.failure);
+    if (!this.settled) throw new Error('codex backend image stream ended without a terminal event');
     if (this.images.length === 0) throw new NoImageResultError();
     return {
       images: this.images,

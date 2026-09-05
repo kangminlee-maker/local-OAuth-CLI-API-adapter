@@ -984,6 +984,61 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
   assert.equal(result.usage.source, 'provider');
 });
 
+test('an image item followed by response.failed is a failed turn, not a successful image: buffered (r47-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'offline upstream failed after image item' } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest()), /codex backend turn failed: offline upstream failed after image item/);
+  // A failed turn is the backend's answer, not the retryable "no image" turn.
+  assert.equal(calls.length, 1);
+});
+
+test('...and streamed: the image event already written is followed by the failure, not by success (r47-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'offline upstream failed after image item' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  }, /codex backend turn failed: offline upstream failed after image item/);
+  assert.deepEqual(events.map((event) => event.type), ['completed']);
+});
+
+test('an image stream that ends without a terminal event is a failure, image or no image (r47-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest()), /image stream ended without a terminal event/);
+});
+
+test('a settled image turn is finished, whatever follows: a failure frame after response.completed changes nothing (r47-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'noise after the terminal' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+});
+
 // The backend has a `size` slot and does not always honour it (a 256×256
 // source edited at `1024x1024` came back 1254×1254, measured 2026-08-29). The
 // direct API returns the requested canvas; so does this transport, on the
