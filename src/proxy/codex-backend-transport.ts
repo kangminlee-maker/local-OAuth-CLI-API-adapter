@@ -1171,20 +1171,23 @@ class CodexBackendStreamState {
     // stream never showed is not one of them — against the items no position
     // placed. Counted whole, an item that ADDS a call the stream never showed
     // outnumbered the standing calls and the item completing the index-less
-    // streamed call was discarded (r34-fable F1). When the remainders
-    // disagree an anonymous item would land on whichever call shares its
-    // slot and overwrite it, turning one call into a second copy of another;
-    // the streamed state, the one the client already acted on, wins. When
-    // they agree the alignment is one to one: the k-th item no position
-    // placed is the k-th standing call no item placed, in order — not the
-    // k-th streamed call, a slot a position may already have taken, which
-    // booked one call twice and stranded the position-less one (r33-fable
-    // F1). With nothing streamed, every item is a call of its own.
+    // streamed call was discarded (r34-fable F1). When they agree the
+    // alignment is one to one: the k-th item no position placed is the k-th
+    // standing call no item placed, in order — not the k-th streamed call, a
+    // slot a position may already have taken, which booked one call twice
+    // and stranded the position-less one (r33-fable F1). When they disagree
+    // which call an item completes is not knowable — aligned anyway, an item
+    // would land on whichever call shares its slot and overwrite it, turning
+    // one call into a second copy of another — and each item left is a call
+    // of its own: one the completed output reports without an identity,
+    // refused at `completed()` as a call missing its `call_id`. Discarded
+    // instead, two calls the runtime wrote vanished under a 200 (r34-codex).
+    // With nothing streamed, every item is a call of its own the same way.
     const standing = [...streamed].filter((ordinal) => this.toolStates.has(ordinal));
     const unmatched = standing.filter((ordinal) => !placed.has(ordinal)).sort((a, b) => a - b);
-    if (standing.length !== 0 && unplaced.length !== unmatched.length) return;
+    const paired = unplaced.length === unmatched.length;
     for (const item of unplaced) {
-      const index = unmatched.shift() ?? this.nextToolOrdinal;
+      const index = (paired ? unmatched.shift() : undefined) ?? this.nextToolOrdinal;
       if (index >= this.nextToolOrdinal) this.nextToolOrdinal = index + 1;
       this.applyFinalItem(item, index);
     }

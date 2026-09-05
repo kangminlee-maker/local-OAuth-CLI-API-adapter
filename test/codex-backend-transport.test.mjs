@@ -2432,3 +2432,22 @@ test('the count-aligned rest is judged on what is left: an item that adds a call
   assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
   assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
 });
+
+test('an anonymous completed item no position places and no remainder pairs is a call without an identity: refused, not dropped under a 200 (r34-codex)', async () => {
+  // One index-less streamed call, two anonymous completed items: which call
+  // either completes is not knowable, and the runtime wrote two calls.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', item_id: 'fc_a', arguments: '{"a":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"dropped":1}' },
+      { type: 'function_call', arguments: '{"dropped":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
