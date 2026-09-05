@@ -29,7 +29,7 @@ pnpm pack:adapter
 The command writes and verifies a standalone package:
 
 ```text
-artifacts/local-oauth-cli-api-adapter-0.2.1.tgz
+artifacts/local-oauth-cli-api-adapter-0.4.0.tgz
 ```
 
 Install that tarball from any other repository:
