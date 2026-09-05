@@ -2200,7 +2200,7 @@ test('an id-less completed item is placed by its position, not by arrival order:
   assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
 });
 
-test('one call_id under two completed items is that call listed twice: the r32 fold refuses (r32-codex; refused since round 45 — a created call claims its index)', async () => {
+test('one call_id under two completed items is that call listed twice: the r32 fold refuses (r32-codex; refused since round 45 — the second listing resolves to a call already placed)', async () => {
   // The first completed item creates `call_a` at index 0; the second lists
   // `call_a` again at index 1, folding the finished holder in. Rounds 31–44
   // kept this door open as the split identity meeting (announced once, at a
@@ -2655,7 +2655,7 @@ test('two nameless anonymous items against two index-less streamed calls are not
   }, /missing its call_id/);
 });
 
-test('a call listed twice through the fold door must carry the call\'s own value: a second listing folding a byteless state under another value is refused (r39-fable)', async () => {
+test('a second listing folding a byteless state in under another value is refused — as every second listing is since round 45 (r39-fable: the fold door then passed only the call\'s own value)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
@@ -2733,7 +2733,7 @@ test('a known call listed at an index other than its accepted position is the ve
   }, /cannot place/);
 });
 
-test('the dense slot adopts a holder only at the item\'s own position: position 1\'s bytes are not the item at index 0 (r39-codex)', async () => {
+test('a holder at position 1 is not the completed item at index 0: the item is a call of its own and the holder is refused at completion as a call missing its identity (r39-codex: the dense slot adopted position 1\'s bytes for the item at index 0; the slot is gone since round 45)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', name: 'alpha' } },
@@ -3015,6 +3015,39 @@ test('...and with the holder surviving: a call_id holder at 1 joined to an item-
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   await assert.rejects(async () => {
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
+});
+
+test('two calls the client knows at one position are two items at one index: a live frame placing an index-less announced call at a position another announced call holds is refused, not two calls delivered (r46-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /cannot place/);
+});
+
+test('...and from the completed output: the index-less announced call listed at the index another announced call holds is refused the same way (r46-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
   }, /cannot place/);
 });
 

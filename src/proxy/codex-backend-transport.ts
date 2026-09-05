@@ -442,12 +442,6 @@ class CodexBackendStreamState {
     if (position !== undefined && !this.positions.has(ordinal)) this.positions.set(ordinal, position);
   }
 
-  /** The ordinal at a position, when nothing named has claimed it yet. */
-  private adoptableOrdinal(claimed: number | undefined): number | undefined {
-    if (claimed === undefined) return undefined;
-    return this.toolStates.get(claimed)?.anonymous ? claimed : undefined;
-  }
-
   /**
    * Claims a position for a call the stream already knows by id. An
    * anonymous holder there — argument deltas that carried only the position,
@@ -461,13 +455,13 @@ class CodexBackendStreamState {
    */
   private adoptHolder(known: number, position: number): number {
     // The call claims only its accepted position — from the completed output
-    // as from a live frame. An item at another index naming this call still
-    // completes it by its ids (declared), but adopts nothing there: adopting
-    // the holder handed the call that position's anonymous arguments under a
-    // 200 (r36-codex); left apart, whatever holds that position — an
-    // anonymous holder, a call known by an item id alone — stays a call of
-    // its own, refused at completion unless a frame identifies it. A call
-    // with no position yet takes this one: its first evidence.
+    // as from a live frame. A completed item at another index naming this
+    // call adopts nothing there (adopting the holder handed the call that
+    // position's anonymous arguments under a 200 — r36-codex) and is refused
+    // by `captureFinalOutput` once the listed-twice door has had its say
+    // (round 41); a live frame at another position is refused before this
+    // is reached (round 45). A call with no position yet takes this one: its
+    // first evidence.
     const accepted = this.positions.get(known);
     if (accepted !== undefined && accepted !== position) return known;
     if (accepted === undefined) this.positions.set(known, position);
@@ -481,13 +475,17 @@ class CodexBackendStreamState {
     // the caller arrived from: the holder may be the call the client knows —
     // announced under its `call_id` — and the known state its item-id half,
     // and absorbing only one way refused the turn the position joined
-    // (r31-codex F3). Two states the client knows at one position are left
-    // apart (declared).
+    // (r31-codex F3). Two states the client knows at one position are two
+    // items at one index — the vendor contradicting its own positions,
+    // refused; left apart, both went out as executable calls at two wire
+    // indices from the one backend position (r46-codex).
     const holderState = this.toolStates.get(holder);
     const state = this.toolStates.get(known);
     const holderAbsorbable = holderState !== undefined && this.absorbable(holderState);
     const knownAbsorbable = state !== undefined && this.absorbable(state);
-    if (!holderAbsorbable && !knownAbsorbable) return known;
+    if (!holderAbsorbable && !knownAbsorbable) {
+      throw backendContractError('The local runtime wrote tool arguments the transport cannot place.', this.request.shape);
+    }
     return this.coalesce([known, holder]);
   }
 
