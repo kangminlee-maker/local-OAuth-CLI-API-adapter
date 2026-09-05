@@ -2806,3 +2806,76 @@ test('a repeated output_item.added renaming a call before its announcement is re
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
   }, /named two tool calls as one/);
 });
+
+test('the name is heard on the fold\'s survivor: an unnamed call adopting a holder of another name past a frame naming a third is refused, live (r42-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"b":2}' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    // The completed output agrees with the name the survivor would wrongly
+    // take (`beta`), so only the live door can refuse this turn.
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('the name is heard on the fold\'s survivor: a completed item naming alpha for an unnamed call at a beta holder\'s position is refused (r42-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"b":2}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', call_id: 'call_a', name: 'alpha', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('the meeting exception counts the fold adoptHolder performs while placing the item: a second listing folding the holder in with the call\'s own value is one call (r42-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    // The first listing places the item-id-only holder `fc_b` (at position
+    // 1); the second names `call_a` — index-less so far — at index 1, and
+    // `adoptHolder` folds the holder in while placing it: one call, the
+    // holder's bytes, listed twice with the same value.
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"e":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', name: 'alpha', arguments: '{"e":1}' },
+      { type: 'function_call', call_id: 'call_a', name: 'alpha', arguments: '{"e":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"e":1}']]);
+});
+
+test('...and with another value through that door the second listing is refused, not applied (r42-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"e":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', name: 'alpha', arguments: '{"e":1}' },
+      { type: 'function_call', call_id: 'call_a', name: 'alpha', arguments: '{"z":9}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
