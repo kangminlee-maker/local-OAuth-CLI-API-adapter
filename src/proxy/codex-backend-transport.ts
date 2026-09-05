@@ -2095,11 +2095,16 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       // writer advanced meanwhile: the codex CLI rewrites this file too, and
       // the holder check alone overwrote its rotation and dropped its fields
       // (r54-fable). What is saved is merged onto the file as re-read, so
-      // what such a writer added stays.
+      // what such a writer added stays. And the caller of a refresh that is
+      // not saved uses what IS current: the file's generation when another
+      // writer advanced it — the server honours that lineage, and the
+      // unsaved one earned a 401, a forced refresh of a revoked token and a
+      // "sign in again" over a valid session (r54-codex) — and its own
+      // unsaved refresh when only the lease moved, since the file is still
+      // the stale generation the holder is about to replace.
       const latest = await this.loadAuthFile();
-      if (!(await stillHeld()) || latest.tokens?.refresh_token !== current.refreshToken) {
-        return authFromFile(mergeRefreshedAuth(parsed, refreshResponse));
-      }
+      if (latest.tokens?.refresh_token !== current.refreshToken) return authFromFile(latest);
+      if (!(await stillHeld())) return authFromFile(mergeRefreshedAuth(parsed, refreshResponse));
       const updated = mergeRefreshedAuth(latest, refreshResponse);
       await saveAuthFile(this.codexHome, updated);
       return authFromFile(updated);

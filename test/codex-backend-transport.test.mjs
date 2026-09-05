@@ -1554,6 +1554,47 @@ test('a writer outside the lease — the codex CLI rewriting auth.json during a 
   assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false);
 });
 
+test('...and the caller of that refresh uses the file\'s current generation, not its own unsaved one: the backend honours the CLI\'s lineage (r54-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const externalAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 7200, lineage: 'external' });
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600, lineage: 'proxy' });
+  let release;
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      await new Promise((resolve) => { release = resolve; });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    if (init.headers.authorization !== `Bearer ${externalAccess}`) {
+      return new Response(JSON.stringify({ error: { message: 'token superseded', code: 'token_expired' } }), { status: 401 });
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const caller = backend.generate(imageRequest());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(release, 'the refresh is in flight');
+  const cli = JSON.parse(await readFile(authPath, 'utf8'));
+  cli.tokens.refresh_token = 'cli-new';
+  cli.tokens.access_token = externalAccess;
+  await writeFile(authPath, JSON.stringify(cli), { mode: 0o600 });
+  release();
+  const result = await caller;
+  assert.equal(result.images.length, 1);
+  assert.deepEqual(bearers, [`Bearer ${externalAccess}`], 'one backend call, on the CLI\'s generation — no 401, no forced refresh of a revoked token');
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'cli-new');
+});
+
 test('a refresh fetch is bounded below its lease: a token endpoint that never answers fails the refresh at the budget and releases the lock (r52-codex)', async () => {
   const codexHome = await createCodexHome({
     accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
