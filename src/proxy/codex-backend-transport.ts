@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { honorRequestModel } from '../settings.js';
@@ -1451,16 +1451,17 @@ class CodexBackendImageState {
   responseId?: string;
   model?: string;
   usage?: LocalUsage;
-  // The turn's result: the first image the backend produced, by bytes,
-  // enriched by a later record of the same bytes (the terminal output
-  // carries the rewrite the item frame did not — r49-codex). Every other
-  // image is counted and not retained — not even its digest: the turn was
-  // asked for one, the cap on `n` skips the rest, and holding them pinned
-  // every runaway payload until the terminal (r49-codex); a set of digests
-  // still grew by the runaway's count (r50-fable). Only the result's digest
-  // is kept, to recognise the result again.
+  // The turn's result: the first image an item frame produced, replaced by
+  // the terminal output's record of the turn's image when the terminal
+  // lists one — the backend's final word, carrying the rewrite the item
+  // frame did not (r49-codex), a re-encoding, or a corrected rewrite
+  // (r50-codex). Every other image is counted and not retained — not even
+  // a digest: the turn was asked for one, the cap on `n` skips the rest,
+  // and holding them pinned every runaway payload until the terminal
+  // (r49-codex); a set of digests still grew by the runaway's count
+  // (r50-fable).
   private result?: OpenAiGeneratedImage;
-  private resultDigest?: string;
+  private terminalRecorded = false;
   private otherImages = 0;
   eventCount = 0;
   readonly eventTypes: string[] = [];
@@ -1523,7 +1524,7 @@ class CodexBackendImageState {
     }
     if (event.type === 'response.image_generation_call.generating') this.imageGenerating = true;
     const itemImage = imageGenerationFromResponseItem(event.item);
-    if (itemImage) this.record(itemImage);
+    if (itemImage) this.record(itemImage, false);
     // The terminal frame's output is read the same way whether the turn
     // completed or was cut off at its output limit: a cut-off turn is a
     // finished turn with a reason, and whether it produced an image is
@@ -1532,14 +1533,15 @@ class CodexBackendImageState {
     // The result goes out here, once, with what only the terminal knows:
     // emitted at the item frame, the streamed event carried no usage and
     // the terminal's rewrite of the prompt was dropped on both paths
-    // (r49-codex).
+    // (r49-codex); the terminal's record of the image replaces the item
+    // frame's, whatever its bytes (r50-codex).
     if (event.type === 'response.completed' || event.type === 'response.incomplete') {
       const usage = usageFromResponses(event.response?.usage);
       if (usage) this.usage = usage;
       for (const type of responseOutputTypes(event.response?.output)) {
         if (this.completedOutputTypes.length < IMAGE_DIAGNOSTIC_HISTORY) this.completedOutputTypes.push(type);
       }
-      for (const image of imageGenerationsFromOutput(event.response?.output)) this.record(image);
+      for (const image of imageGenerationsFromOutput(event.response?.output)) this.record(image, true);
       this.settled = true;
       if (this.result) {
         out.push({
@@ -1557,21 +1559,24 @@ class CodexBackendImageState {
     return out;
   }
 
-  /** An image the backend produced: the turn's result if it is the first, its enrichment if it is the result again, a count otherwise. */
-  private record(image: OpenAiGeneratedImage): void {
-    const digest = createHash('sha256').update(image.b64Json).digest('hex');
-    if (this.result === undefined) {
-      this.result = image;
-      this.resultDigest = digest;
+  /**
+   * An image the backend produced. From an item frame: the turn's result if
+   * it is the first, a count otherwise. From the terminal output: the first
+   * replaces the result — its members over the item frame's, so a terminal
+   * record without a rewrite keeps the item's — and the rest are counted.
+   */
+  private record(image: OpenAiGeneratedImage, terminal: boolean): void {
+    if (!terminal) {
+      if (this.result === undefined) this.result = image;
+      else this.otherImages += 1;
       return;
     }
-    if (digest !== this.resultDigest) {
+    if (this.terminalRecorded) {
       this.otherImages += 1;
       return;
     }
-    if (this.result.revisedPrompt === undefined && image.revisedPrompt !== undefined) {
-      this.result = { ...this.result, revisedPrompt: image.revisedPrompt };
-    }
+    this.terminalRecorded = true;
+    this.result = this.result === undefined ? image : { ...this.result, ...image };
   }
 
   /** Whether the backend ever said how the turn ended. */
@@ -1930,7 +1935,12 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       else signal.addEventListener('abort', abortFromSignal, { once: true });
     }
     try {
-      let auth = await this.readAuth();
+      // The abort reaches the credential work too: a caller already gone
+      // refreshed a token it would never use, and one that left during the
+      // refresh, or while waiting for its lock, was held until it finished
+      // (r50-codex). The refresh itself runs to completion and is persisted —
+      // a refresh token may be single-use — and only the wait ends.
+      let auth = await untilAborted(this.readAuth(controller.signal), controller.signal);
       let response: Response | null = null;
       for (let attempt = 0; attempt <= TRANSIENT_BACKEND_RETRY_DELAYS_MS.length; attempt += 1) {
         try {
@@ -1943,7 +1953,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         if (response.ok) break;
         const raw = await response.text().catch(() => '');
         if (shouldRefreshAfterBackendError(response.status, raw)) {
-          auth = await this.refreshAuth({ force: true, previousAccessToken: auth.accessToken });
+          auth = await untilAborted(this.refreshAuth({ force: true, previousAccessToken: auth.accessToken }, controller.signal), controller.signal);
           response = await this.postBackendRequest(auth, body, controller.signal);
           if (response.ok) break;
         } else if (shouldRetryTransientBackendError(response.status, raw, attempt)) {
@@ -1995,17 +2005,18 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     });
   }
 
-  private async readAuth(): Promise<CodexBackendAuth> {
+  private async readAuth(signal?: AbortSignal): Promise<CodexBackendAuth> {
+    if (signal?.aborted) throw abortError();
     const parsed = await this.loadAuthFile();
     const auth = authFromFile(parsed);
-    return shouldRefreshAuth(parsed) ? await this.refreshAuth() : auth;
+    return shouldRefreshAuth(parsed) ? await this.refreshAuth({}, signal) : auth;
   }
 
   private async refreshAuth(options: {
     force?: boolean;
     previousAccessToken?: string;
-  } = {}): Promise<CodexBackendAuth> {
-    return await withRefreshLock(this.codexHome, async () => {
+  } = {}, signal?: AbortSignal): Promise<CodexBackendAuth> {
+    return await withRefreshLock(this.codexHome, signal, async () => {
       const parsed = await this.loadAuthFile();
       const current = authFromFile(parsed);
       if (options.force && options.previousAccessToken && current.accessToken !== options.previousAccessToken) {
@@ -2166,6 +2177,7 @@ function shouldRefreshAuth(parsed: CodexAuthFile): boolean {
 
 async function withRefreshLock<T>(
   codexHome: string,
+  signal: AbortSignal | undefined,
   fn: () => Promise<T>,
 ): Promise<T> {
   const lockPath = join(codexHome, 'auth.json.refresh.lock');
@@ -2191,9 +2203,39 @@ async function withRefreshLock<T>(
       if (Date.now() - startedAt > REFRESH_LOCK_TIMEOUT_MS) {
         throw codexRefreshError('Timed out waiting for Codex OAuth token refresh lock.');
       }
-      await sleep(50);
+      // A caller that has gone stops waiting for the lock (r50-codex).
+      await sleep(50, signal);
+      if (signal?.aborted) throw abortError();
     }
   }
+}
+
+/** The error an aborted fetch throws, for the waits the abort ends before a fetch. */
+function abortError(): Error {
+  return Object.assign(new Error('This operation was aborted'), { name: 'AbortError' });
+}
+
+/**
+ * Waits for `promise` only until the signal aborts: the work behind it runs
+ * on — a token refresh must complete and be persisted — and the caller's
+ * wait ends with the abort (r50-codex).
+ */
+async function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) {
+    promise.catch(() => undefined);
+    throw abortError();
+  }
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      promise.catch(() => undefined);
+      reject(abortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then(
+      (value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', onAbort); reject(err); },
+    );
+  });
 }
 
 async function removeStaleLock(lockPath: string): Promise<boolean> {

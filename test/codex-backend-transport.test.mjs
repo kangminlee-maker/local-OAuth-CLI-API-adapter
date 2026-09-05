@@ -1202,7 +1202,7 @@ test('an abort during the no-image retry backoff ends the wait: the request fail
   await assert.rejects(() => backend.generate(imageRequest(), controller.signal));
   const elapsed = Date.now() - startedAt;
   assert.ok(elapsed < 400, `the deadline was 80 ms and the backoff 500 ms; failed after ${elapsed} ms`);
-  assert.deepEqual(calls, [false, true], 'the second attempt was entered with the signal aborted and refused at once');
+  assert.deepEqual(calls, [false], 'the second attempt was refused before any credential work or fetch (round 50)');
 });
 
 test('the terminal frame enriches the result: usage and the terminal\'s revised_prompt reach the one image event, streamed and buffered alike (r49-codex)', async () => {
@@ -1299,6 +1299,91 @@ test('usage the no-image attempts reported is carried on the streamed lane too: 
   assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
   assert.equal(events[1].usage?.inputTokens, 8);
   assert.equal(events[1].usage?.outputTokens, 10);
+});
+
+test('the terminal output\'s record of the image replaces the item frame\'s: a re-encoding with a rewrite is the result, with the rewrite, counted once (r50-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const itemBytes = tinyPngBase64();
+  const terminalBytes = `${itemBytes}AA==`;
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: itemBytes } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: terminalBytes, revised_prompt: 'terminal rewrite for the re-encoded image' },
+    ] } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(result.images[0].b64Json, terminalBytes);
+  assert.equal(result.images[0].revisedPrompt, 'terminal rewrite for the re-encoded image');
+  assert.equal(diagnostics.at(-1).imageResultCount, 1);
+});
+
+test('...and a corrected rewrite on the terminal replaces the item frame\'s; a terminal record without one keeps it (r50-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const image = tinyPngBase64();
+  const turn = (terminalPrompt) => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image, revised_prompt: 'item rewrite' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image, ...(terminalPrompt ? { revised_prompt: terminalPrompt } : {}) },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  globalThis.fetch = async () => new Response(turn('terminal rewrite'));
+  assert.equal((await backend.generate(imageRequest())).images[0].revisedPrompt, 'terminal rewrite');
+  globalThis.fetch = async () => new Response(turn(undefined));
+  assert.equal((await backend.generate(imageRequest())).images[0].revisedPrompt, 'item rewrite');
+});
+
+test('a caller already gone does no credential work: an aborted signal at the call refreshes no token and starts no turn (r50-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const urls = [];
+  globalThis.fetch = async (url, init) => {
+    urls.push(String(url));
+    if (init?.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: 'new' });
+  };
+  const controller = new AbortController();
+  controller.abort();
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal), /aborted/);
+  // The caller's wait ends at once either way; the credential work must not
+  // go on behind it.
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(urls, [], 'neither the refresh nor the backend was called');
+});
+
+test('a caller that leaves while the refresh lock is held stops waiting for it: rejected at the abort, not at the lock timeout (r50-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  // Another process holds the lock, freshly.
+  await writeFile(join(codexHome, 'auth.json.refresh.lock'), JSON.stringify({ pid: 1, created_at: new Date().toISOString() }));
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    throw new Error('must not be reached');
+  };
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 20);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const startedAt = Date.now();
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal), /aborted/);
+  assert.ok(Date.now() - startedAt < 500, `the wait ended with the abort, not the lock timeout: ${Date.now() - startedAt} ms`);
+  // The lock wait behind the caller stopped too: with the lock released, a
+  // wait still spinning would take it and refresh for a caller that had gone.
+  await rm(join(codexHome, 'auth.json.refresh.lock'));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(urls, []);
 });
 
 // The backend has a `size` slot and does not always honour it (a 256×256
