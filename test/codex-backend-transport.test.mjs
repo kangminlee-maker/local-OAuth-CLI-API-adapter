@@ -1253,7 +1253,7 @@ test('usage the no-image attempts reported is carried into the result: the reque
   assert.equal(result.usage?.outputTokens, 10);
 });
 
-test('a runaway backend is counted, not retained — not even by digest: one result image, the rest a count, diagnostics bounded (r49-codex, r50-fable)', async () => {
+test('a runaway backend is refused past the bound, not retained: no image, diagnostics bounded (r49-codex, r50-fable, r53-codex)', async () => {
   const codexHome = await createCodexHome();
   const diagnostics = [];
   // 100 distinct one-pixel-ish payloads: the same PNG with a distinct tail.
@@ -1266,10 +1266,11 @@ test('a runaway backend is counted, not retained — not even by digest: one res
   globalThis.fetch = async () => new Response(sse(frames));
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
   const events = [];
-  for await (const event of backend.stream(imageRequest())) events.push(event);
-  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
-  assert.equal(events[1].image.b64Json, base, 'the first image is the result');
-  assert.equal(diagnostics.at(-1).imageResultCount, 100);
+  await assert.rejects((async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  })(), /more than 64 image calls/);
+  assert.deepEqual(events.map((event) => event.type), ['started'], 'the stream committed, then carried the failure — no image');
+  assert.equal(diagnostics.at(-1).imageResultCount, 64, 'the calls the state could pair by');
   assert.equal(diagnostics.at(-1).eventCount, 102);
   assert.equal(diagnostics.at(-1).eventTypes.length, 64, 'the history is bounded');
   assert.equal(diagnostics.at(-1).eventTimeline.length, 64);
@@ -1529,7 +1530,7 @@ test('a re-encoding of the same call on the terminal stands as the terminal reco
   const codexHome = await createCodexHome();
   const diagnostics = [];
   const itemBytes = tinyPngBase64();
-  const terminalBytes = `${itemBytes}AA==`;
+  const terminalBytes = redPngBase64();
   const turn = () => sse([
     { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
     { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: itemBytes, revised_prompt: 'item rewrite' } },
@@ -1539,13 +1540,13 @@ test('a re-encoding of the same call on the terminal stands as the terminal reco
   ]);
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
   globalThis.fetch = async () => new Response(turn());
-  const buffered = await backend.generate(imageRequest());
+  const buffered = await backend.generate(unrealized());
   assert.equal(buffered.images[0].b64Json, terminalBytes);
   assert.equal(buffered.images[0].revisedPrompt, undefined);
   assert.equal(diagnostics.at(-1).imageResultCount, 1);
   globalThis.fetch = async () => new Response(turn());
   const events = [];
-  for await (const event of backend.stream(imageRequest())) events.push(event);
+  for await (const event of backend.stream(unrealized())) events.push(event);
   assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
   assert.equal(events[1].image.b64Json, terminalBytes);
   assert.equal(events[1].image.revisedPrompt, undefined);
@@ -1555,7 +1556,7 @@ test('a terminal record of a call counted at its item frame is that call: counte
   const codexHome = await createCodexHome();
   const diagnostics = [];
   const one = tinyPngBase64();
-  const two = `${one}AA==`;
+  const two = redPngBase64();
   const turn = (terminalBytes) => sse([
     { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
     { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: one, revised_prompt: 'item one' } },
@@ -1566,35 +1567,38 @@ test('a terminal record of a call counted at its item frame is that call: counte
   ]);
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
   globalThis.fetch = async () => new Response(turn(two));
-  const same = await backend.generate(imageRequest());
+  const same = await backend.generate(unrealized());
   assert.equal(same.images[0].b64Json, two);
   assert.equal(same.images[0].revisedPrompt, 'item two');
   assert.equal(diagnostics.at(-1).imageResultCount, 2, 'two calls, not three records');
-  globalThis.fetch = async () => new Response(turn(`${two}BB==`));
-  const reencoded = await backend.generate(imageRequest());
-  assert.equal(reencoded.images[0].b64Json, `${two}BB==`);
+  globalThis.fetch = async () => new Response(turn(greenPngBase64()));
+  const reencoded = await backend.generate(unrealized());
+  assert.equal(reencoded.images[0].b64Json, greenPngBase64());
   assert.equal(reencoded.images[0].revisedPrompt, undefined);
   assert.equal(diagnostics.at(-1).imageResultCount, 2);
 });
 
-test('within the bound a call is one whatever names it, past it the rest are counted without identity: seventy item frames, the terminal naming the third (r52-codex mutant)', async () => {
+test('at the bound a call is one whatever names it: sixty-four item frames, the terminal naming the third; a sixty-fifth call is the turn\'s failure (r52-codex mutant, r53-codex)', async () => {
   const codexHome = await createCodexHome();
   const diagnostics = [];
   const base = tinyPngBase64();
-  const bytesOf = (i) => (i === 0 ? base : `${base}${'A'.repeat(i)}`);
-  const frames = [{ type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } }];
-  for (let i = 0; i < 70; i += 1) {
-    frames.push({ type: 'response.output_item.done', output_index: i, item: { type: 'image_generation_call', id: `ig_${i}`, status: 'completed', result: bytesOf(i), ...(i === 3 ? { revised_prompt: 'third' } : {}) } });
-  }
-  frames.push({ type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
-    { type: 'image_generation_call', id: 'ig_3', status: 'completed', result: bytesOf(3) },
-  ] } });
-  globalThis.fetch = async () => new Response(sse(frames));
+  const frames = (count) => {
+    const out = [{ type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } }];
+    for (let i = 0; i < count; i += 1) {
+      out.push({ type: 'response.output_item.done', output_index: i, item: { type: 'image_generation_call', id: `ig_${i}`, status: 'completed', result: base, ...(i === 3 ? { revised_prompt: 'third' } : {}) } });
+    }
+    out.push({ type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_3', status: 'completed', result: base },
+    ] } });
+    return out;
+  };
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(sse(frames(64)));
   const result = await backend.generate(imageRequest());
-  assert.equal(result.images[0].b64Json, bytesOf(3), 'the turn\'s image is the one the terminal names');
-  assert.equal(result.images[0].revisedPrompt, 'third', 'its own rewrite, its own bytes');
-  assert.equal(diagnostics.at(-1).imageResultCount, 70, 'seventy calls: the map holds sixty-four, six are counted without identity, and the third is not counted again');
+  assert.equal(result.images[0].revisedPrompt, 'third', 'the turn\'s image is the call the terminal names, with its own rewrite');
+  assert.equal(diagnostics.at(-1).imageResultCount, 64, 'sixty-four calls, the third not counted again');
+  globalThis.fetch = async () => new Response(sse(frames(65)));
+  await assert.rejects(() => backend.generate(imageRequest()), /more than 64 image calls/);
 });
 
 test('the terminal listing the turn\'s image call twice is one record or a contradiction: an identical repeat is counted once, different bytes or a different rewrite are refused (r52-codex)', async () => {
@@ -1617,7 +1621,7 @@ test('the terminal listing the turn\'s image call twice is one record or a contr
   assert.equal(repeated.images[0].b64Json, first);
   assert.equal(repeated.images[0].revisedPrompt, 'terminal one');
   assert.equal(diagnostics.at(-1).imageResultCount, 1, 'one call, listed twice');
-  globalThis.fetch = async () => new Response(turn(record({ result: `${first}BB==`, revised_prompt: 'terminal one' })));
+  globalThis.fetch = async () => new Response(turn(record({ result: redPngBase64(), revised_prompt: 'terminal one' })));
   await assert.rejects(() => backend.generate(imageRequest()), /twice with different records/);
   globalThis.fetch = async () => new Response(turn(record({ result: first, revised_prompt: 'terminal two' })));
   const events = [];
@@ -1625,6 +1629,28 @@ test('the terminal listing the turn\'s image call twice is one record or a contr
     for await (const event of backend.stream(imageRequest())) events.push(event);
   })(), /twice with different records/);
   assert.deepEqual(events.map((event) => event.type), ['started'], 'the stream committed and then carried the failure, no image');
+});
+
+test('the same bytes in another spelling are the same image: a terminal record without padding lends and repeats as one call (r53-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const padded = tinyPngBase64();
+  const unpadded = padded.replace(/=+$/, '');
+  assert.notEqual(padded, unpadded);
+  const record = (members) => ({ type: 'image_generation_call', id: 'ig_1', status: 'completed', ...members });
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: record({ result: padded, revised_prompt: 'item one' }) },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      record({ result: unpadded }),
+      record({ result: padded }),
+    ] } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images[0].b64Json, unpadded, 'the terminal\'s own spelling goes out');
+  assert.equal(result.images[0].revisedPrompt, 'item one', 'the same bytes lend the rewrite');
+  assert.equal(diagnostics.at(-1).imageResultCount, 1, 'one call, listed in two spellings');
 });
 
 // The backend has a `size` slot and does not always honour it (a 256×256
@@ -2363,8 +2389,22 @@ function imageRequest() {
   };
 }
 
+/** An image request with no concrete size: the bytes go out as the backend wrote them, unrealized. */
+function unrealized() {
+  return { ...imageRequest(), size: 'auto' };
+}
+
 function tinyPngBase64() {
   return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
+}
+
+/** A one-pixel PNG whose BYTES differ from `tinyPngBase64()`'s — a base64 suffix past the padding decodes to the same image. */
+function redPngBase64() {
+  return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
+}
+
+function greenPngBase64() {
+  return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWNgOMHwHwADXAHIv/99XgAAAABJRU5ErkJggg==';
 }
 
 // The two tool turns below carry a `tool` field because that is what the

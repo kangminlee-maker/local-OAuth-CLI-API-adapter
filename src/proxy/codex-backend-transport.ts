@@ -1464,14 +1464,16 @@ class CodexBackendImageState {
   // the cap on `n` skips the rest, and holding them pinned every runaway
   // payload until the terminal (r49-codex). What is kept per call is a
   // digest and the rewrite, in a map bounded like the histories (a set of
-  // digests once grew by the runaway's count, r50-fable).
+  // digests once grew by the runaway's count, r50-fable) — and a turn with
+  // more calls than the map pairs by is refused, not counted past what the
+  // state can verify (r53-codex: the first call past the bound was counted
+  // twice and lent nothing).
   private result?: OpenAiGeneratedImage;
   /** The terminal record the result came from — id, bytes by digest, its own rewrite. */
   private terminal?: CodexBackendImageCallRecord & { readonly id?: string };
   /**
    * The calls the backend produced an image for, by item id. A record
-   * without an id, or one past the bound, is counted in `uncorrelated` and
-   * paired with nothing.
+   * without an id is counted in `uncorrelated` and paired with nothing.
    */
   private readonly calls = new Map<string, CodexBackendImageCallRecord>();
   private uncorrelated = 0;
@@ -1610,11 +1612,15 @@ class CodexBackendImageState {
     };
   }
 
-  /** Counts a call once — a known id is nothing new, even with the map at its bound. */
+  /** Counts a call once — a known id is nothing new; a call past the bound is the turn's failure. */
   private remember(id: string | undefined, image: OpenAiGeneratedImage): void {
     if (id !== undefined && this.calls.has(id)) return;
-    if (id === undefined || this.calls.size >= IMAGE_DIAGNOSTIC_HISTORY) {
+    if (id === undefined) {
       this.uncorrelated += 1;
+      return;
+    }
+    if (this.calls.size >= IMAGE_DIAGNOSTIC_HISTORY) {
+      this.failure = `codex backend produced more than ${IMAGE_DIAGNOSTIC_HISTORY} image calls in one turn`;
       return;
     }
     this.calls.set(id, {
@@ -2549,8 +2555,9 @@ interface CodexBackendImageCallRecord {
   readonly revisedPrompt?: string;
 }
 
+/** The image's bytes, not their spelling: two base64 encodings of one payload are one image (r53-codex). */
 function imageDigest(b64Json: string): string {
-  return createHash('sha256').update(b64Json).digest('hex');
+  return createHash('sha256').update(Buffer.from(b64Json, 'base64')).digest('hex');
 }
 
 function imageGenerationFromResponseItem(
