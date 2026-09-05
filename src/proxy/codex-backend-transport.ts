@@ -598,10 +598,12 @@ class CodexBackendStreamState {
     // were already ignored below; every event is now.
     if (this.settled) return out;
     // Progress from a frame that names no call — narration, a reasoning or
-    // message item. A tool event's position counts only once correlated
-    // (`toolOrdinal`): a duplicate frame for a known call, mislabelled with
-    // a higher position, advanced progress past the call itself and closed
-    // the block `response.incomplete` then had to leave open (r31-codex F5).
+    // message item. A tool event's position is not retained here: it counts
+    // through `progress()`, from the accepted position of a call that can no
+    // longer fold into another. Retained raw, a duplicate frame for a known
+    // call, mislabelled with a higher position, advanced progress past the
+    // call itself and closed the block `response.incomplete` then had to
+    // leave open (r31-codex F5).
     if (!isToolEvent(event)) this.advance(explicitOutputIndex(event));
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
@@ -1164,20 +1166,23 @@ class CodexBackendStreamState {
       this.applyFinalItem(item, holder);
     }
     // The rest align by count, and only when the two views agree on how many
-    // calls there are: the streamed calls still standing after the folds
-    // above — a state this capture added for an item the stream never showed
-    // is not one of them — against the completed items. When they disagree an
-    // anonymous item would land on whichever call shares its slot and
-    // overwrite it, turning one call into a second copy of another; the
-    // streamed state, the one the client already acted on, wins. When they
-    // agree the alignment is one to one: the k-th item no position placed is
-    // the k-th standing call no item placed, in order — not the k-th streamed
-    // call, a slot a position may already have taken, which booked one call
-    // twice and stranded the position-less one (r33-fable F1). With nothing
-    // streamed, every item is a call of its own.
+    // calls are left: the streamed calls still standing after the folds
+    // above that no item placed — a state this capture added for an item the
+    // stream never showed is not one of them — against the items no position
+    // placed. Counted whole, an item that ADDS a call the stream never showed
+    // outnumbered the standing calls and the item completing the index-less
+    // streamed call was discarded (r34-fable F1). When the remainders
+    // disagree an anonymous item would land on whichever call shares its
+    // slot and overwrite it, turning one call into a second copy of another;
+    // the streamed state, the one the client already acted on, wins. When
+    // they agree the alignment is one to one: the k-th item no position
+    // placed is the k-th standing call no item placed, in order — not the
+    // k-th streamed call, a slot a position may already have taken, which
+    // booked one call twice and stranded the position-less one (r33-fable
+    // F1). With nothing streamed, every item is a call of its own.
     const standing = [...streamed].filter((ordinal) => this.toolStates.has(ordinal));
-    if (standing.length !== 0 && items.length !== standing.length) return;
     const unmatched = standing.filter((ordinal) => !placed.has(ordinal)).sort((a, b) => a - b);
+    if (standing.length !== 0 && unplaced.length !== unmatched.length) return;
     for (const item of unplaced) {
       const index = unmatched.shift() ?? this.nextToolOrdinal;
       if (index >= this.nextToolOrdinal) this.nextToolOrdinal = index + 1;
