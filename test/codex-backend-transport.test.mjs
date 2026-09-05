@@ -1968,3 +1968,108 @@ test('a call whose first frame carried no output_index learns its position from 
   assert.ok(narration >= 0);
   assert.ok(finished < narration, `finish signal at ${finished} must precede the narration at ${narration}: ${JSON.stringify(events.map((event) => event.type))}`);
 });
+
+test('a finish event without its arguments member still names its position: the finished call below it is announced on it (r29-codex)', async () => {
+  // alpha finished at 0; beta added at 1; beta's `function_call_arguments.done`
+  // arrives WITHOUT `arguments` (the captured absent-member shape). Returning
+  // before correlating it lost the event's position, so alpha's finish signal
+  // waited for the terminal frame — and on Messages beta's block waited
+  // behind alpha's. The vendor is released only after alpha's signal is seen.
+  const codexHome = await createCodexHome();
+  const encoder = new TextEncoder();
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    async pull(controller) {
+      if (!pull.first) {
+        pull.first = true;
+        controller.enqueue(encoder.encode(sse([
+          { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+          { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+          // beta is added while alpha is still open, so nothing releases alpha
+          // here; alpha then finishes on its own frame (position 0 proves
+          // nothing); beta's value-less finish at position 1 is the first
+          // event that does.
+          { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+          { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+          { type: 'response.function_call_arguments.done', output_index: 1, item_id: 'fc_b' },
+        ])));
+        return;
+      }
+      await released;
+      controller.enqueue(encoder.encode(sse([
+        { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+      ])));
+      controller.close();
+    },
+  }), { status: 200 });
+  const pull = {};
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  let alphaFinishedBeforeRelease = false;
+  let timedOut = false;
+  // The fallback release keeps a failing run terminating; a signal that
+  // arrives only after it — at the terminal frame — must not count.
+  const timer = setTimeout(() => { timedOut = true; release(); }, 2_000);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) {
+    events.push(event);
+    if (event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true) {
+      if (!timedOut) alphaFinishedBeforeRelease = true;
+      release();
+    }
+  }
+  clearTimeout(timer);
+  assert.ok(alphaFinishedBeforeRelease, `alpha's finish signal must arrive before the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.arguments]), [['call_a', '{"city":"Seoul"}'], ['call_b', '{}']]);
+});
+
+// A vendor stream that pauses before its terminal frame: the test releases
+// it once the awaited signal is seen, or on a fallback timer (which then
+// disqualifies any later signal).
+async function releasedAfter(frames, request, awaited) {
+  const encoder = new TextEncoder();
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  let first = true;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    async pull(controller) {
+      if (first) { first = false; controller.enqueue(encoder.encode(sse(frames))); return; }
+      await released;
+      controller.enqueue(encoder.encode(sse([{ type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } }])));
+      controller.close();
+    },
+  }), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome: await createCodexHome(), timeoutMs: 30_000 });
+  const events = [];
+  let early = false;
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; release(); }, 2_000);
+  for await (const event of backend.stream(request)) {
+    events.push(event);
+    if (awaited(event)) { if (!timedOut) early = true; release(); }
+  }
+  clearTimeout(timer);
+  return { events, early };
+}
+
+test('a call that learns its position after the vendor moved past it is released on that frame, not at the terminal (r30-codex)', async () => {
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true);
+  assert.ok(early, `finish signal must precede the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+});
+
+test('a call that finishes after the vendor moved past it is released on its own finish frame (r30-codex)', async () => {
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true);
+  assert.ok(early, `finish signal must precede the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+});

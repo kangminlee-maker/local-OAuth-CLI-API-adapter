@@ -560,11 +560,11 @@ test('a call the vendor never gives a call_id is refused on both paths: its item
   // hands the client an identifier the backend never issued, which its tool
   // result then answers.
   const vendor = [
-    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', name: 'probe' } },
-    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":1}' },
-    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"a":1}' },
-    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', name: 'probe', arguments: '{"a":1}' } },
-    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_a', name: 'probe', arguments: '{"a":1}' }] } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'backend_item_a', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'backend_item_a', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'backend_item_a', arguments: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'backend_item_a', name: 'probe', arguments: '{"a":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'backend_item_a', name: 'probe', arguments: '{"a":1}' }] } },
   ];
   await withProxyEvents(vendor, async (url) => {
     for (const [path, headers, body] of [
@@ -575,12 +575,12 @@ test('a call the vendor never gives a call_id is refused on both paths: its item
       const buffered = await post(`${url}${path}`, headers, body);
       assert.equal(buffered.status, 502, `${path}: ${buffered.text}`);
       assert.match(JSON.parse(buffered.text).error.message, /missing its call_id or its name/);
-      assert.ok(!buffered.text.includes('fc_a') && !buffered.text.includes('call_1'), buffered.text);
+      assert.ok(!buffered.text.includes('backend_item_a') && !buffered.text.includes('call_1'), buffered.text);
       // The call was never identified, so nothing was announced: the stream
       // is uncommitted when the completion refuses.
       const streamed = await post(`${url}${path}`, headers, { ...body, stream: true });
       assert.equal(streamed.status, 502, `${path} stream: ${streamed.text}`);
-      assert.ok(!streamed.text.includes('fc_a') && !streamed.text.includes('call_1'), streamed.text);
+      assert.ok(!streamed.text.includes('backend_item_a') && !streamed.text.includes('call_1'), streamed.text);
     }
   });
 });
@@ -898,19 +898,24 @@ test('a request that permits no call refuses every call: no tools declared, or t
       const buffered = await post(`${url}${path}`, headers, body);
       assert.equal(buffered.status, 502, `${label}: ${buffered.text}`);
       assert.match(JSON.parse(buffered.text).error.message, /called a tool the request never declared/, label);
+      // Refused at the FIRST tool event, before the call is announced: no
+      // call frame precedes the refusal — a client that dispatches on the
+      // block cannot take it back (r29-codex). (A tool-free Chat stream has
+      // already committed its role chunk, so the envelope is in-band there.)
       const streamed = await post(`${url}${path}`, headers, { ...body, stream: true });
       assert.match(streamed.text, /called a tool the request never declared/, `${label} stream: ${streamed.text}`);
       assert.ok(!streamed.text.includes(terminal), `${label} stream completed: ${streamed.text}`);
+      assert.ok(!/"tool_calls"|"type":"function_call"|"type":"tool_use"/.test(streamed.text), `${label} stream published the call: ${streamed.text}`);
     }
   });
 });
 
 test('a call_id supplied only by the completed item binds to the holder at its position: one call, never two (r28-codex F7)', async () => {
   const vendor = [
-    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', name: 'probe' } },
-    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"a":1}' },
-    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"a":1}' },
-    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', name: 'probe', arguments: '{"a":1}' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'backend_item_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'backend_item_1', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'backend_item_1', arguments: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'backend_item_1', name: 'probe', arguments: '{"a":1}' } },
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', call_id: 'call_1', name: 'probe', arguments: '{"a":1}' }] } },
   ];
   await withProxyEvents(vendor, async (url) => {
@@ -930,7 +935,7 @@ test('a call_id supplied only by the completed item binds to the holder at its p
     assert.deepEqual(JSON.parse(messages.text).content.filter((block) => block.type === 'tool_use').map((block) => block.id), ['call_1']);
     const { starts } = messagesBlocks((await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, stream: true })).text);
     assert.deepEqual(starts, [[0, 'tool_use']]);
-    for (const text of [chat.text, chatStream, responses.text, responsesStream, messages.text]) assert.ok(!text.includes('fc_1'), text);
+    for (const text of [chat.text, chatStream, responses.text, responsesStream, messages.text]) assert.ok(!text.includes('backend_item_1'), text);
   });
 });
 
@@ -1070,4 +1075,190 @@ test('a present identity member that is not text is refused: an object call_id, 
       }
     });
   }
+});
+
+test('an anonymous holder at the position a known call is placed at is that call\'s own prefix: delivered whole, never refused as half an identity (r30-fable F1)', async () => {
+  const ADDED = { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } };
+  const anon = (index) => ({ type: 'response.function_call_arguments.delta', output_index: index, delta: '{"a"' });
+  const rest = (index) => ({ type: 'response.function_call_arguments.delta', output_index: index, item_id: 'fc_1', delta: ':1}' });
+  const done = (index) => ({ type: 'response.output_item.done', output_index: index, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '{"a":1}' } });
+  const completed = (output) => ({ type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output } });
+  const FULL = [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '{"a":1}' }];
+  const variants = [
+    ['anonymous delta, then the index-less added, then the id frames at 0', [anon(0), ADDED, rest(0), done(0), completed(FULL)]],
+    ['index-less added, then the anonymous delta, then the id frames at 0', [ADDED, anon(0), rest(0), done(0), completed(FULL)]],
+    ['the same at position 2', [{ type: 'response.output_text.delta', output_index: 1, delta: 'first' }, ADDED, anon(2), rest(2), done(2), completed([{ type: 'message', id: 'm', content: [{ type: 'output_text', text: 'first' }] }, ...FULL])]],
+    // No id frame ever carries a position: the completed output places the call, and the holder there is its own.
+    ['index-less id frames, placed by the completed output', [ADDED, { ...anon(0), delta: '{"a":1}' }, completed(FULL)]],
+    // After the holder is adopted its ordinal is retired; an id-less completed item still aligns to the one streamed call.
+    ['id-less completed item after the adoption', [anon(0), ADDED, rest(0), completed([{ type: 'function_call', name: 'probe', arguments: '{"a":1}' }])]],
+  ];
+  for (const [where, vendor] of variants) {
+    await withProxyEvents(vendor, async (url) => {
+      const chat = await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, tool_choice: 'auto' });
+      assert.equal(chat.status, 200, `${where}, chat: ${chat.text}`);
+      assert.deepEqual(JSON.parse(chat.text).choices[0].message.tool_calls.map((call) => [call.id, call.function.name, call.function.arguments]), [['call_1', 'probe', '{"a":1}']], where);
+      const chatStream = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, tool_choice: 'auto', stream: true })).text);
+      const streamedCalls = new Map();
+      for (const call of chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? [])) {
+        const key = call.index ?? 0;
+        streamedCalls.set(key, { id: streamedCalls.get(key)?.id ?? call.id, args: `${streamedCalls.get(key)?.args ?? ''}${call.function?.arguments ?? ''}` });
+      }
+      assert.deepEqual([...streamedCalls.values()], [{ id: 'call_1', args: '{"a":1}' }], `${where}, chat stream`);
+      const responses = await post(`${url}/v1/responses`, OPENAI, { ...RESPONSES_PROBE, tool_choice: 'auto' });
+      assert.equal(responses.status, 200, `${where}, responses: ${responses.text}`);
+      assert.deepEqual(JSON.parse(responses.text).output.filter((item) => item.type === 'function_call').map((item) => [item.call_id, item.arguments]), [['call_1', '{"a":1}']], where);
+      const messages = await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, tool_choice: { type: 'auto' } });
+      assert.equal(messages.status, 200, `${where}, messages: ${messages.text}`);
+      assert.deepEqual(JSON.parse(messages.text).content.filter((block) => block.type === 'tool_use').map((block) => [block.id, JSON.stringify(block.input)]), [['call_1', '{"a":1}']], where);
+      const { starts, partial } = messagesBlocks((await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, tool_choice: { type: 'auto' }, stream: true })).text);
+      assert.deepEqual(starts.filter(([, type]) => type === 'tool_use').length, 1, `${where}, messages stream`);
+      assert.equal(partial, '{"a":1}', `${where}, messages stream bytes`);
+    });
+  }
+});
+
+test('a holder whose bytes cannot be ordered against the call\'s own is refused, not guessed (r30)', async () => {
+  // The call already carries bytes from an index-less delta when the holder
+  // at its position is found: which came first is not reconstructible.
+  const vendor = [
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_1', delta: '{"a"' },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: ':1}' },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: '{"a":1}' }] } },
+  ];
+  await withProxyEvents(vendor, async (url) => {
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, CHAT);
+    assert.equal(chat.status, 502, chat.text);
+    assert.match(JSON.parse(chat.text).error.message, /tool arguments the transport cannot place/);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, MESSAGES);
+    assert.equal(messages.status, 502, messages.text);
+  });
+});
+
+test('a non-text arguments member on output_item.added is refused like everywhere else, not read past into {} (r29-codex)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe', arguments: { a: 1 } } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' }] } },
+  ];
+  await withProxyEvents(vendor, async (url) => {
+    for (const [path, headers, body] of [['/v1/chat/completions', OPENAI, CHAT], ['/v1/responses', OPENAI, RESPONSES_PROBE], ['/v1/messages', ANTHROPIC, MESSAGES]]) {
+      const buffered = await post(`${url}${path}`, headers, body);
+      assert.equal(buffered.status, 502, `${path}: ${buffered.text}`);
+      assert.match(JSON.parse(buffered.text).error.message, /tool arguments that are not text/);
+      // Nothing announced before the refusal: a clean 502 on the stream too.
+      const streamed = await post(`${url}${path}`, headers, { ...body, stream: true });
+      assert.equal(streamed.status, 502, `${path} stream: ${streamed.text}`);
+      assert.ok(!streamed.text.includes('"arguments":"{}"') && !streamed.text.includes('"partial_json":"{}"'), streamed.text);
+    }
+  });
+});
+
+test('a known call claims only its accepted position: a later frame naming another one leaves that position to its real call (r30-codex)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' } },
+    // A late duplicate of alpha's finish, carrying position 1 — not alpha's position.
+    { type: 'response.function_call_arguments.done', output_index: 1, item_id: 'fc_a', arguments: '{"a":1}' },
+    { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"b":2}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta', arguments: '{"b":2}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ];
+  const TWO_CHAT = { ...CHAT, tools: [{ type: 'function', function: { name: 'alpha', parameters: { type: 'object' } } }, { type: 'function', function: { name: 'beta', parameters: { type: 'object' } } }] };
+  const TWO_RESPONSES = { model: 'm', input: 'w', tools: [{ type: 'function', name: 'alpha', parameters: { type: 'object' } }, { type: 'function', name: 'beta', parameters: { type: 'object' } }], tool_choice: 'required' };
+  const TWO_MESSAGES = { ...MESSAGES, tools: [{ name: 'alpha', input_schema: { type: 'object' } }, { name: 'beta', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } };
+  const BOTH = [['call_a', 'alpha', '{"a":1}'], ['call_b', 'beta', '{"b":2}']];
+  await withProxyEvents(vendor, async (url) => {
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, TWO_CHAT);
+    assert.equal(chat.status, 200, chat.text);
+    assert.deepEqual(JSON.parse(chat.text).choices[0].message.tool_calls.map((call) => [call.id, call.function.name, call.function.arguments]), BOTH);
+    const chatStream = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO_CHAT, stream: true })).text);
+    assert.deepEqual(chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id).map((call) => [call.id, call.function.name]), BOTH.map(([id, name]) => [id, name]));
+    const responses = await post(`${url}/v1/responses`, OPENAI, TWO_RESPONSES);
+    assert.equal(responses.status, 200, responses.text);
+    assert.deepEqual(JSON.parse(responses.text).output.filter((item) => item.type === 'function_call').map((item) => [item.call_id, item.name, item.arguments]), BOTH);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, TWO_MESSAGES);
+    assert.equal(messages.status, 200, messages.text);
+    assert.deepEqual(JSON.parse(messages.text).content.filter((block) => block.type === 'tool_use').map((block) => [block.id, block.name, JSON.stringify(block.input)]), BOTH);
+    const { starts } = messagesBlocks((await post(`${url}/v1/messages`, ANTHROPIC, { ...TWO_MESSAGES, stream: true })).text);
+    assert.deepEqual(starts, [[0, 'tool_use'], [1, 'tool_use']]);
+  });
+});
+
+test('a call_id and an item_id that first meet on a later frame are one call: announced once, never twice (r30-codex)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' }] } },
+  ];
+  const ONE_CHAT = { ...CHAT, tools: [{ type: 'function', function: { name: 'alpha', parameters: { type: 'object' } } }] };
+  const ONE_RESPONSES = { model: 'm', input: 'w', tools: [{ type: 'function', name: 'alpha', parameters: { type: 'object' } }], tool_choice: 'required' };
+  const ONE_MESSAGES = { ...MESSAGES, tools: [{ name: 'alpha', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } };
+  await withProxyEvents(vendor, async (url) => {
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, ONE_CHAT);
+    assert.equal(chat.status, 200, chat.text);
+    assert.deepEqual(JSON.parse(chat.text).choices[0].message.tool_calls.map((call) => [call.id, call.function.name, call.function.arguments]), [['call_a', 'alpha', '{"a":1}']]);
+    const chatStream = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...ONE_CHAT, stream: true })).text);
+    const announced = chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
+    assert.deepEqual(announced.map((call) => call.id), ['call_a'], chatStream.map((c) => JSON.stringify(c.choices?.[0]?.delta?.tool_calls)).join('\n'));
+    assert.equal(chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).map((call) => call.function?.arguments ?? '').join(''), '{"a":1}');
+    const responses = await post(`${url}/v1/responses`, OPENAI, ONE_RESPONSES);
+    assert.equal(responses.status, 200, responses.text);
+    assert.deepEqual(JSON.parse(responses.text).output.filter((item) => item.type === 'function_call').map((item) => [item.call_id, item.arguments]), [['call_a', '{"a":1}']]);
+    assert.equal(events((await post(`${url}/v1/responses`, OPENAI, { ...ONE_RESPONSES, stream: true })).text).filter((frame) => frame.type === 'response.output_item.done' && frame.item?.type === 'function_call').length, 1);
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, ONE_MESSAGES);
+    assert.equal(messages.status, 200, messages.text);
+    assert.deepEqual(JSON.parse(messages.text).content.filter((block) => block.type === 'tool_use').map((block) => [block.id, JSON.stringify(block.input)]), [['call_a', '{"a":1}']]);
+    const { starts, partial } = messagesBlocks((await post(`${url}/v1/messages`, ANTHROPIC, { ...ONE_MESSAGES, stream: true })).text);
+    assert.deepEqual(starts, [[0, 'tool_use']]);
+    assert.equal(partial, '{"a":1}');
+  });
+});
+
+test('a cancellation that never settles does not hold back a decided outcome: the refusal, and a completed answer, reach the client (r30-codex)', async () => {
+  const encoder = new TextEncoder();
+  const hung = (frames) => () => {
+    let pulled = false;
+    return new ReadableStream({
+      pull(controller) {
+        if (pulled) return new Promise(() => {});
+        pulled = true;
+        controller.enqueue(encoder.encode(sse(frames)));
+      },
+      cancel() { return new Promise(() => {}); },
+    });
+  };
+  const within = (promise, label) => Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}: no response within 3s`)), 3_000))]);
+  // A refusal thrown from the pump, the body still open, its cancel hung.
+  await withProxyResponse(() => new Response(hung([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: { not: 'text' } },
+  ])(), { status: 200 }), async (url) => {
+    const buffered = await within(post(`${url}/v1/chat/completions`, OPENAI, CHAT), 'refusal, buffered');
+    assert.equal(buffered.status, 502, buffered.text);
+    assert.match(JSON.parse(buffered.text).error.message, /tool arguments that are not text/);
+    const streamed = await within(post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, stream: true }), 'refusal, stream');
+    assert.match(streamed.text, /tool arguments that are not text/);
+  });
+  // A completed answer, the body still open after the terminal frame, its cancel hung.
+  await withProxyResponse(() => new Response(hung([
+    { type: 'response.output_text.delta', delta: 'complete answer' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [], usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18 } } },
+  ])(), { status: 200 }), async (url) => {
+    const TEXT = { model: 'm', messages: [{ role: 'user', content: 'w' }] };
+    const buffered = await within(post(`${url}/v1/chat/completions`, OPENAI, TEXT), 'completed, buffered');
+    assert.equal(buffered.status, 200, buffered.text);
+    assert.equal(JSON.parse(buffered.text).choices[0].message.content, 'complete answer');
+    const streamed = await within(post(`${url}/v1/messages`, ANTHROPIC, { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }], stream: true }), 'completed, stream');
+    assert.ok(events(streamed.text).some((frame) => frame.type === 'message_stop'), streamed.text);
+  });
 });

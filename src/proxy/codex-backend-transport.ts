@@ -230,6 +230,13 @@ class CodexBackendStreamState {
    * LATER item proves a finished call is not the one a cut will hit.
    */
   private readonly positions = new Map<number, number>();
+  /**
+   * The highest output position any event has carried: the vendor has moved
+   * past everything below it. A fact, not a trigger — a call that learns its
+   * position, or finishes, after the vendor moved on is released on that
+   * frame, not at the terminal (r30-codex).
+   */
+  private highestPosition = -1;
   private nextToolOrdinal = 0;
   private failure?: string;
   private settled = false;
@@ -245,10 +252,15 @@ class CodexBackendStreamState {
   private announcedCalls = 0;
   private reasoning?: LocalReasoningItem;
 
+  /** Whether the request permits any tool call at all (`declaredToolNames`). */
+  private readonly callsPermitted: boolean;
+
   constructor(
     private readonly request: NormalizedRequest,
     private readonly startedAt: number,
-  ) {}
+  ) {
+    this.callsPermitted = declaredToolNames(request) !== null;
+  }
 
   /**
    * The ordinal for a tool call seen in the STREAM, keyed by item id with the
@@ -256,18 +268,41 @@ class CodexBackendStreamState {
    * token, so a known id resolves before anything is allocated.
    */
   private toolOrdinal(event: CodexBackendEvent, ...ids: ReadonlyArray<string | undefined>): number {
-    const known = this.knownOrdinal(ids);
+    // A request that permits no call — no tools, or `tool_choice: none`; the
+    // vendor is sent none — is refused at its first tool event, before
+    // anything is correlated or announced: refusing at completion published
+    // the call on the stream first, and a client that dispatches on the block
+    // cannot take it back (r29-codex). `completed()` keeps its check for a
+    // call that appears only in the completed output.
+    if (!this.callsPermitted) {
+      throw backendContractError('The local runtime called a tool the request never declared.', this.request.shape);
+    }
+    // Every identifier the event carries is looked up, not the first that
+    // resolves: a `call_id` bound on an index-less first frame and an
+    // `item_id` bound by a positioned delta are one call, and the frame that
+    // carries both is where they meet — taking the first match announced
+    // the one invocation twice (r30-codex).
+    const bound = [...new Set(ids.flatMap((id) => {
+      const ordinal = typeof id === 'string' ? this.toolOrdinals.get(id) : undefined;
+      return ordinal === undefined ? [] : [ordinal];
+    }))];
+    const known = bound.length > 1 ? this.coalesce(bound) : bound[0];
     const position = explicitOutputIndex(event);
     const explicit = position !== undefined;
     if (known !== undefined) {
+      this.bindOrdinal(known, ids);
       // A call bound by id on a frame that carried no position learns it from
       // the first later frame that does. Returning before the recording left
       // such a call positionless, and the early finish signal never fired for
       // it — the r27 held-blocks defect back for one input family (r29-fable
-      // F1). That frame also claims the position for the call, so the
-      // anonymous deltas that follow at it reach the call.
+      // F1). That frame also claims the position for the call — adopting the
+      // holder already there, if any — so the anonymous deltas that arrived
+      // at it, and those that follow, reach the call. Only the call's ACCEPTED
+      // position is claimed: a later frame naming another one claimed that
+      // too, and the real call there was bound to this one and vanished
+      // (r30-codex).
       this.recordPosition(known, event);
-      if (explicit && !this.toolOrdinals.has(`#${position}`)) this.toolOrdinals.set(`#${position}`, known);
+      if (explicit && this.positions.get(known) === position) this.adoptHolder(known, position);
       return known;
     }
     // An `output_index` the event actually carries names ONE item: an
@@ -320,6 +355,95 @@ class CodexBackendStreamState {
     return this.toolStates.get(claimed)?.anonymous ? claimed : undefined;
   }
 
+  /**
+   * Claims a position for a call the stream already knows by id. An
+   * anonymous holder there — argument deltas that carried only the position,
+   * before any frame with the call's id named it — is the call's own earlier
+   * bytes: a delta with the id at that position would have claimed it first,
+   * so the holder's bytes precede the call's own. Left apart, the holder
+   * stranded that prefix and the turn was refused as a call missing its
+   * identity, after a/ had delivered it (r30-fable F1). When the call already
+   * carries bytes the order of the two is not reconstructible, and the turn
+   * is refused rather than guessed.
+   */
+  private adoptHolder(known: number, position: number): void {
+    const holder = this.toolOrdinals.get(`#${position}`);
+    if (holder === undefined) {
+      this.toolOrdinals.set(`#${position}`, known);
+      return;
+    }
+    if (holder === known) return;
+    const holderState = this.toolStates.get(holder);
+    if (holderState === undefined || !this.absorbable(holderState)) return;
+    this.absorb(known, holder);
+  }
+
+  /**
+   * Whether a state can be folded into another as the same call: the client
+   * has never been told about it, and it carries no client-facing identity
+   * (`call_id`) of its own — an anonymous holder, or a state opened by an
+   * item id alone.
+   */
+  private absorbable(state: ToolState): boolean {
+    return !state.started && !state.hasCallId;
+  }
+
+  /**
+   * Two ordinals one frame names as the same call. The one the client knows
+   * — announced, or carrying the `call_id` — survives; the others must be
+   * absorbable, or the vendor has bridged two calls into one and the turn
+   * is refused.
+   */
+  private coalesce(bound: readonly number[]): number {
+    const survivor = bound.find((ordinal) => {
+      const state = this.toolStates.get(ordinal);
+      return state !== undefined && !this.absorbable(state);
+    }) ?? bound[0];
+    for (const other of bound) {
+      if (other === survivor) continue;
+      const otherState = this.toolStates.get(other);
+      if (otherState !== undefined && !this.absorbable(otherState)) {
+        throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
+      }
+      this.absorb(survivor, other);
+    }
+    return survivor;
+  }
+
+  /**
+   * Folds `other` into `survivor`: they are one call. `other`'s bytes precede
+   * the survivor's own (see `adoptHolder`); when both carry bytes the order
+   * is not reconstructible and the turn is refused rather than guessed. Every
+   * alias of `other` — ids and positions — names the survivor afterwards, and
+   * the retired ordinal leaves the map (the dense position of a completed
+   * item counts the streamed calls in order, not ordinals).
+   */
+  private absorb(survivor: number, other: number): void {
+    const state = this.toolStates.get(survivor);
+    const otherState = this.toolStates.get(other);
+    if (state !== undefined && otherState !== undefined) {
+      if (otherState.arguments !== '' || otherState.argumentsDone) {
+        if (state.arguments !== '' || state.argumentsDone) {
+          throw backendContractError('The local runtime wrote tool arguments the transport cannot place.', this.request.shape);
+        }
+        state.arguments = otherState.arguments;
+        if (otherState.argumentsDone) state.argumentsDone = true;
+      }
+      if (!state.named && otherState.named) {
+        state.name = otherState.name;
+        state.named = true;
+      }
+      if (state.hasCallId && state.named) state.identified = true;
+    }
+    for (const [key, ordinal] of this.toolOrdinals) {
+      if (ordinal === other) this.toolOrdinals.set(key, survivor);
+    }
+    const position = this.positions.get(other);
+    if (position !== undefined && !this.positions.has(survivor)) this.positions.set(survivor, position);
+    this.positions.delete(other);
+    this.toolStates.delete(other);
+  }
+
   private knownOrdinal(ids: ReadonlyArray<string | undefined>): number | undefined {
     for (const id of ids) {
       if (typeof id === 'string') {
@@ -348,7 +472,13 @@ class CodexBackendStreamState {
    */
   private finalOutputOrdinal(position: number, outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
     const known = this.knownOrdinal(ids);
-    if (known !== undefined) return known;
+    if (known !== undefined) {
+      // A call known by id whose frames never carried a position is placed
+      // by the completed output; the anonymous holder at that position is
+      // its own (the rule `toolOrdinal` applies live — r30-fable F1).
+      this.adoptHolder(known, outputIndex);
+      return known;
+    }
     // The completed output is in `output_index` order, so the item's array
     // index is the position the live events named — and an anonymous holder
     // bound to that position (argument deltas that carried only the index)
@@ -386,24 +516,41 @@ class CodexBackendStreamState {
     // arrived with no id at all, which belong to the call that names their
     // position (the rule `toolOrdinal` applies live). Taking a new ordinal
     // beside the holder invented a second call named `tool` (r25-codex).
-    const occupant = this.toolStates.has(position) ? this.adoptableOrdinal(position) : position;
-    const ordinal = identified && occupant === undefined ? this.nextToolOrdinal : position;
+    // The dense position counts the STREAMED calls in order; it is not the
+    // ordinal itself once a holder has been adopted and its ordinal retired.
+    const slot = [...this.toolStates.keys()].sort((a, b) => a - b)[position];
+    const occupant = slot === undefined ? undefined : this.adoptableOrdinal(slot);
+    let ordinal: number;
+    if (slot === undefined) ordinal = this.nextToolOrdinal;
+    else if (identified && occupant === undefined) ordinal = this.nextToolOrdinal;
+    else ordinal = slot;
     this.bindOrdinal(ordinal, ids);
     if (ordinal >= this.nextToolOrdinal) this.nextToolOrdinal = ordinal + 1;
     return ordinal;
   }
 
   push(event: CodexBackendEvent): LocalStreamEvent[] {
+    const out = this.consume(event);
+    // Whatever the event changed — a call finished, identified, or placed —
+    // is judged against the vendor's progress once more, so a call released
+    // by a position it learned late goes out on this frame.
+    if (!this.settled) out.push(...this.announceFinished('moved'));
+    return out;
+  }
+
+  private consume(event: CodexBackendEvent): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
     // A settled turn is finished, whatever noise follows: a delta after the
     // terminal frame used to extend the completed answer and change whether
     // the request succeeded (r23-codex). Failure frames after settlement
     // were already ignored below; every event is now.
     if (this.settled) return out;
+    const seen = explicitOutputIndex(event);
+    if (seen !== undefined && seen > this.highestPosition) this.highestPosition = seen;
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
-      if (event.delta !== '') out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
+      if (event.delta !== '') out.push(...this.announceFinished('moved'));
       // Recorded against the calls announced so far — the same instant, and the
       // same counter, the stream itself uses to place its items. Deltas that
       // arrive with no call between them are ONE run: they open one block on
@@ -442,8 +589,13 @@ class CodexBackendStreamState {
       const itemId = identityText(event.item.id, this.request.shape);
       const callId = identityText(event.item.call_id, this.request.shape);
       const name = identityText(event.item.name, this.request.shape);
+      // Validated, not consumed: a present member that is not text is refused
+      // here like everywhere else (read past, the call went out as `{}` —
+      // r29-codex); whether the added snapshot's string is cumulative or
+      // authoritative is unmeasured, so a string is left to the later frames.
+      argumentsText(event.item.arguments, this.request.shape);
       const index = this.toolOrdinal(event, itemId, callId);
-      out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
+      out.push(...this.announceFinished('moved'));
       const id = callId ?? itemId ?? `call_${index + 1}`;
       const named = itemId !== undefined || callId !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name: name, anonymous: !named });
@@ -476,22 +628,25 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.function_call_arguments.done') {
-      const finished = argumentsText(event.arguments, this.request.shape);
-      if (finished === undefined) return out;
       // The vendor's own finish event for a call's arguments, carrying the
       // whole value; it precedes `output_item.done`, which may then arrive
       // without an `arguments` member. Left unread (r23-codex), a delta after
       // it was folded into every stream while the bodies kept the done value.
+      // One WITHOUT the member finishes nothing — but it still names its call
+      // and its position, and the finished calls below that position are
+      // announced on it like on any other event: returning before that held
+      // the Messages stream behind the earlier call (r29-codex).
+      const finished = argumentsText(event.arguments, this.request.shape);
       const itemId = identityText(event.item_id, this.request.shape);
       const index = this.toolOrdinal(event, itemId);
-      out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
+      out.push(...this.announceFinished('moved'));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: itemId,
         anonymous: itemId === undefined,
       });
-      if (!state.argumentsDone) state.arguments = finished;
+      if (finished !== undefined && !state.argumentsDone) state.arguments = finished;
       this.toolStates.set(index, state);
-      this.finishArguments(state);
+      if (finished !== undefined) this.finishArguments(state);
       if (!state.identified) return out;
       out.push(...this.emitPending(index, state));
       return out;
@@ -501,7 +656,7 @@ class CodexBackendStreamState {
       if (delta === undefined) return out;
       const itemId = identityText(event.item_id, this.request.shape);
       const index = this.toolOrdinal(event, itemId);
-      out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
+      out.push(...this.announceFinished('moved'));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: itemId,
         anonymous: itemId === undefined,
@@ -526,7 +681,7 @@ class CodexBackendStreamState {
       const callId = identityText(event.item.call_id, this.request.shape);
       const name = identityText(event.item.name, this.request.shape);
       const index = this.toolOrdinal(event, itemId, callId);
-      out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
+      out.push(...this.announceFinished('moved'));
       const named = itemId !== undefined || callId !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: callId ?? itemId,
@@ -713,23 +868,26 @@ class CodexBackendStreamState {
    * A cut-off turn (`response.incomplete`) sends no signal: its calls are
    * fragments by the vendor's own account, and the writers project them.
    *
-   * Also sent the moment the vendor moves on to a LATER item — narration, or
+   * Also sent once the vendor has moved on to a LATER item — narration, or
    * another call's events, at a higher output position — for every finished
    * call below it: the cut can only hit the turn's last item, so a call with
    * something after it is finished for good, and waiting for the terminal
    * frame held every later block of the Messages stream behind its open block
    * (r27-fable F3). Positions, not "any other item": a late frame for an
    * EARLIER item closed the block of the very call the cut then hit
-   * (r28-fable F2). An event carrying no position proves nothing, and a call
-   * whose position is unknown waits for the terminal frame.
+   * (r28-fable F2). The vendor's progress is the retained `highestPosition`,
+   * not the frame at hand: compared against the frame alone, a call that
+   * learned its position — or finished — after the vendor had moved on
+   * waited for the terminal frame (r30-codex). An event carrying no position
+   * proves nothing, and a call whose position is unknown waits.
    */
-  private announceFinished(scope: 'terminal' | { readonly before: number | undefined }): LocalStreamEvent[] {
+  private announceFinished(scope: 'terminal' | 'moved'): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
     for (const [index, state] of [...this.toolStates.entries()].sort(([a], [b]) => a - b)) {
       if (!state.identified || !state.argumentsDone || state.announcedDone) continue;
-      if (scope !== 'terminal') {
+      if (scope === 'moved') {
         const position = this.positions.get(index);
-        if (scope.before === undefined || position === undefined || position >= scope.before) continue;
+        if (position === undefined || position >= this.highestPosition) continue;
       }
       const complete = argumentsOrEmptyObject(state.arguments);
       out.push(...this.emitArgumentExtension(index, state, complete));
@@ -1194,18 +1352,21 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       unwinding = true;
       throw err;
     } finally {
-      // Ownership of the unread body ends here either way. Once the backend's
-      // terminal frame has settled the turn, a rejection from cancelling what
-      // was left unread is teardown noise, not the turn's outcome — it turned
-      // a completed answer into a 500 with the usage lost (r27-codex). The
-      // same when an error is already unwinding: a refusal thrown from the
-      // pump (`push`) holds the outcome, and a rejection thrown from here
-      // replaced it — a declared 502 became a 500 carrying the body's
-      // teardown message (r29-fable F2).
-      try {
-        await events.return?.(undefined);
-      } catch (err) {
-        if (!state.isSettled() && !unwinding) throw err;
+      // Ownership of the unread body ends here either way. Once the turn's
+      // outcome is decided — the terminal frame settled it, or a refusal
+      // thrown from the pump (`push`) is unwinding — teardown must not gate
+      // its delivery: a rejection from cancelling what was left unread is
+      // noise (it turned a completed answer into a 500 with the usage lost,
+      // r27-codex, and a declared 502 into a 500 carrying the body's teardown
+      // message, r29-fable F2), and a cancellation that never settled held a
+      // decided outcome back indefinitely (r30-codex). The cancellation still
+      // runs; its result is consumed. A consumer-driven end with no outcome
+      // awaits it, and its rejection is that end's.
+      const teardown = events.return?.(undefined);
+      if (state.isSettled() || unwinding) {
+        void Promise.resolve(teardown).catch(() => undefined);
+      } else {
+        await teardown;
       }
     }
     // A turn only finished if the backend said so. A reported failure, or a
