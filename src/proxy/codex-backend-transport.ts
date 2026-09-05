@@ -2102,12 +2102,27 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       // "sign in again" over a valid session (r54-codex) — and its own
       // unsaved refresh when only the lease moved, since the file is still
       // the stale generation the holder is about to replace.
-      const latest = await this.loadAuthFile();
+      const refreshed = mergeRefreshedAuth(parsed, refreshResponse);
+      // A re-read that fails — another writer mid-write — is tried once more;
+      // one that still fails leaves the caller its refreshed auth, unsaved:
+      // nothing is written over a file that cannot be read, and nothing is
+      // thrown away either (r55-codex: the rotation was lost to the read's
+      // error before any backend call).
+      const latest = await this.loadAuthFile().catch(async () => {
+        await sleep(50);
+        return this.loadAuthFile().catch(() => null);
+      });
+      if (latest === null) return authFromFile(refreshed);
       if (latest.tokens?.refresh_token !== current.refreshToken) return authFromFile(latest);
-      if (!(await stillHeld())) return authFromFile(mergeRefreshedAuth(parsed, refreshResponse));
-      const updated = mergeRefreshedAuth(latest, refreshResponse);
+      if (!(await stillHeld())) return authFromFile(refreshed);
+      // Merged onto the re-read, with the identity the re-read may have lost
+      // taken from the generation this refresh consumed, and validated before
+      // it is saved — a file this transport cannot read back is not saved
+      // (r55-codex: a re-read without `account_id` was saved and then refused).
+      const updated = mergeRefreshedAuth(withIdentityFrom(latest, parsed), refreshResponse);
+      const auth = authFromFile(updated);
       await saveAuthFile(this.codexHome, updated);
-      return authFromFile(updated);
+      return auth;
     });
   }
 
@@ -2389,6 +2404,19 @@ async function requestChatgptTokenRefresh(refreshToken: string, budgetMs: number
   }
   const raw = await response.text().catch(() => '');
   throw codexRefreshError(refreshFailureMessage(raw), refreshFailureCode(raw));
+}
+
+/** `file` with the identity members it lacks taken from `source`. */
+function withIdentityFrom(file: CodexAuthFile, source: CodexAuthFile): CodexAuthFile {
+  const tokens = file.tokens ?? {};
+  return {
+    ...file,
+    tokens: {
+      ...tokens,
+      ...(tokens.id_token === undefined && source.tokens?.id_token !== undefined ? { id_token: source.tokens.id_token } : {}),
+      ...(tokens.account_id === undefined && source.tokens?.account_id !== undefined ? { account_id: source.tokens.account_id } : {}),
+    },
+  };
 }
 
 function mergeRefreshedAuth(

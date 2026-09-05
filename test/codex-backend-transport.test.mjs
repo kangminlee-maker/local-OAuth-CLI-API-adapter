@@ -1595,6 +1595,69 @@ test('...and the caller of that refresh uses the file\'s current generation, not
   assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'cli-new');
 });
 
+test('a re-read that fails after the token fetch loses nothing: the caller keeps its refreshed auth, unsaved, and the lock is released (r55-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      // Another writer mid-write: the file is not JSON when the refresh lands.
+      await writeFile(authPath, '{', { mode: 0o600 });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.deepEqual(bearers, [`Bearer ${proxyAccess}`], 'the request went on with the rotation it got');
+  assert.equal(await readFile(authPath, 'utf8'), '{', 'nothing was written over a file that could not be read');
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false);
+});
+
+test('a re-read that lost the identity is saved with the identity the refresh consumed, validated before it is written (r55-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+  globalThis.fetch = async (url) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      // The same generation, rewritten without its identity members, plus a member of its own.
+      const file = JSON.parse(await readFile(authPath, 'utf8'));
+      delete file.tokens.account_id;
+      delete file.tokens.id_token;
+      file.writer_note = 'must-survive';
+      await writeFile(authPath, JSON.stringify(file), { mode: 0o600 });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  const persisted = JSON.parse(await readFile(authPath, 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'proxy-new');
+  assert.equal(persisted.tokens.account_id, 'account-1', 'the identity the refresh consumed');
+  assert.equal(persisted.writer_note, 'must-survive', 'and what the writer added');
+});
+
 test('a refresh fetch is bounded below its lease: a token endpoint that never answers fails the refresh at the budget and releases the lock (r52-codex)', async () => {
   const codexHome = await createCodexHome({
     accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),

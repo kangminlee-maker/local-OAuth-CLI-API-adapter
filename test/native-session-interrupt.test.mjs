@@ -330,6 +330,101 @@ test('a turn waiting for a child replacement is the session\'s: it occupies the 
   assert.equal(manager.get(session.id).status, 'ready');
 });
 
+test('a stop that lands while the turn waits for the replacement ends the wait, not the replacement: the caller hears within the stop (r55-codex)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager } = await startCodexManager(300);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '250';
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  assert.equal(first.status, 'error');
+  const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
+  const outcome = waiting.next().catch((err) => ({ error: err }));
+  await delay(30);
+  const interruptedAt = Date.now();
+  await manager.interrupt(session.id);
+  const result = await outcome;
+  assert.ok(Date.now() - interruptedAt < 150, `the wait ended with the stop, not the startup: ${Date.now() - interruptedAt} ms`);
+  assert.ok('error' in result || result.value?.event === 'cli.error');
+});
+
+test('a close that lands while a turn waits for the replacement ends the child being started, not the wait: the close returns within its own work and no turn reaches any child (r55-codex)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '1250';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(1000);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // The replacement's handshake would take two seconds.
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '2000';
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 1000 });
+  assert.equal(first.status, 'error');
+  const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
+  const outcome = waiting.next().catch((err) => ({ error: err }));
+  await delay(100);
+  const closingAt = Date.now();
+  const closed = await manager.close(session.id);
+  assert.ok(Date.now() - closingAt < 800, `the close did not wait out the handshake: ${Date.now() - closingAt} ms`);
+  assert.equal(closed.status, 'closed');
+  const result = await outcome;
+  assert.ok('error' in result || result.value?.event === 'cli.error', 'the waiting caller heard the close');
+  await delay(300);
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'turn/start').length, 1, 'the waiting turn reached no child');
+});
+
+test('a replacement whose handshake fails leaves no child: the waiting turn reports not running and reaches nothing on the old thread (r55-codex)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(300);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // Slower than the RPC budget: the replacement's `initialize` times out.
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '850';
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  assert.equal(first.status, 'error');
+  // A deadline longer than the failing handshake: what ends this turn is the
+  // replacement's failure, not the idle budget.
+  const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 2000 });
+  assert.equal(second.status, 'error');
+  assert.match(second.events.at(-1).raw.message, /not running/);
+  await delay(200);
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'turn/start').length, 1, 'nothing reached the partial child');
+  assert.equal(methods.filter((method) => method === 'thread/start').length, 1, 'no thread was ever started on it');
+});
+
+test('closeAll reports a teardown that left a credentials copy on disk, after every session is torn down (r55-codex)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager } = await startCodexManager(300);
+  const privateTmp = await mkdtemp(join(tmpdir(), 'interrupt-isolation-'));
+  const originalTmp = process.env.TMPDIR;
+  process.env.TMPDIR = privateTmp;
+  let isolationRoot;
+  try {
+    const session = await manager.create({ runtime: 'codex' });
+    delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+    delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+    [isolationRoot] = (await readdir(privateTmp)).map((name) => join(privateTmp, name));
+    await chmod(isolationRoot, 0o000);
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+    assert.equal(first.status, 'error');
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
+    assert.equal(second.status, 'completed');
+    await assert.rejects(manager.closeAll(), /credentials copy could not be removed/);
+    assert.throws(() => manager.get(session.id), /Unknown local CLI chat session/, 'torn down and gone all the same');
+  } finally {
+    if (originalTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmp;
+    if (isolationRoot) await chmod(isolationRoot, 0o700).catch(() => undefined);
+    tempDirs.push(privateTmp);
+  }
+});
+
 test('a session being deleted admits no turn: the DELETE\'s archive grace is not a window (r54-codex)', { timeout: 20_000 }, async () => {
   process.env.FAKE_CODEX_ARCHIVE_DELAY_MS = '600';
   const { manager, methodLog } = await startCodexManager();
@@ -530,9 +625,9 @@ test('an abandoned turn does not release the turn that replaced it', { timeout: 
     'running',
     'the replacement still owns the session',
   );
-  const third = manager.streamTurn(session.id, { input: 'third' })[Symbol.asyncIterator]();
-  await assert.rejects(
-    third.next(),
+  // Admission is decided at the call, before anything is committed (r55-codex).
+  assert.throws(
+    () => manager.streamTurn(session.id, { input: 'third' }),
     /already has a running turn/i,
     'a third turn must still be refused while the replacement runs',
   );

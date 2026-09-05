@@ -23,6 +23,9 @@ Two of those rules are check-then-act on a pathname, not atomic:
    the read and the unlink removes the taker's lock.
 2. The save reads `auth.json` and the lock's owner, then renames the new file into place. A
    takeover, or another writer, landing between the checks and the rename is overwritten.
+3. `removeStaleLock` decides staleness from `stat` and then unlinks by path: a fresh owner
+   that replaced the pathname between the two is removed, and the waiter takes a lease over
+   a refresh already in flight (codex round 55).
 
 Both need a takeover — a lease older than 60 s — to land inside a microsecond window of an
 owner whose fetch is bounded to 30 s: on the live path that means a process stalled longer

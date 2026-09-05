@@ -4033,6 +4033,16 @@ function streamErrorPayload(err: unknown): unknown {
 }
 
 function rawStreamErrorPayload(err: unknown): unknown {
+  if (err instanceof LocalCliChatError) {
+    return {
+      error: {
+        message: boundedErrorMessage(err.message),
+        type: 'local_cli_chat_error',
+        param: null,
+        code: err.code,
+      },
+    };
+  }
   if (err instanceof ProxyRequestError) {
     return {
       error: {

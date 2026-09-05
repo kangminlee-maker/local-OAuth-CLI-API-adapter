@@ -101,6 +101,30 @@ test('local CLI chat session lifecycle and non-stream turn', async () => {
   assert.equal(closed, 1);
 });
 
+test('a streamed turn is admitted before any SSE commits: an unknown session is a 404 in the native envelope, a busy one a 409 (r55-codex)', async () => {
+  const missing = await postJson('/local/cli/sessions/sess_nope/turns', { input: 'x', stream: true });
+  assert.equal(missing.status, 404);
+  assert.match(missing.headers.get('content-type') ?? '', /application\/json/);
+  const body = await missing.json();
+  assert.equal(body.error.type, 'local_cli_chat_error');
+  assert.equal(body.error.code, 'session_not_found');
+  const { server } = await startHangingChatProxy(10_000);
+  try {
+    const created = await fetch(`${server.url}/local/cli/sessions`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ runtime: 'codex' }) });
+    const session = await created.json();
+    const running = await fetch(`${server.url}/local/cli/sessions/${session.id}/turns`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ input: 'one', stream: true }) });
+    assert.equal(running.status, 200);
+    const busy = await fetch(`${server.url}/local/cli/sessions/${session.id}/turns`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ input: 'two', stream: true }) });
+    assert.equal(busy.status, 409, 'refused before any SSE, in the native envelope');
+    const refused = await busy.json();
+    assert.equal(refused.error.type, 'local_cli_chat_error');
+    assert.equal(refused.error.code, 'turn_already_running');
+    await running.body?.cancel().catch(() => undefined);
+  } finally {
+    await server.close().catch(() => undefined);
+  }
+});
+
 test('local CLI chat stream emits native SSE envelope', async () => {
   const created = await postJson('/local/cli/sessions', { runtime: 'codex' });
   const session = await created.json();

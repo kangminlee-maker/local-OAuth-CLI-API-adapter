@@ -201,7 +201,12 @@ never reaches the new child — and a session being closed admits no turn: it is
 from the manager before the runtime's teardown is awaited (round 54). A close whose
 teardown leaves a credentials directory it could not remove is an error to its caller,
 after the session is gone and the child killed — not a success, and not a session
-kept listed (round 54). A turn requested in that window
+kept listed (round 54) — and the server's own close hears it through `closeAll`. A stop
+that lands while a turn waits for the replacement ends the wait, not the replacement; a
+close during a replacement ends the child being started rather than waiting out its
+handshake; a replacement whose handshake fails leaves no child and no thread; and a
+streamed turn is admitted before any SSE commits, so a 404, 409 or 410 arrives in the
+native envelope on that path too (round 55). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
 is the runtime's own answer about whether a turn occupies it, not separate
 bookkeeping — the two used to disagree, so a session could report `ready` while
