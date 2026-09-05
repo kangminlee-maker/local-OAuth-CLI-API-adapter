@@ -1280,6 +1280,17 @@ class CodexBackendStreamState {
         unplaced.push(item);
         continue;
       }
+      // An anonymous item at the position of a call an item already placed
+      // is that call listed twice, like an identified one: no value, or
+      // exactly the value the call holds — an extension of the identified
+      // listing's fragment was applied through the prefix gate under a 200
+      // (r41-fable).
+      if (placed(holder)) {
+        const current = this.toolStates.get(holder)?.arguments ?? '';
+        if (item.arguments !== undefined && item.arguments !== current) {
+          throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
+        }
+      }
       this.applyFinalItem(item, holder);
       this.toolStates.get(holder)!.placed = true;
     }
