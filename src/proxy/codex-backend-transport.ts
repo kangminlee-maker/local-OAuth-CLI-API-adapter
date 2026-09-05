@@ -533,13 +533,22 @@ class CodexBackendStreamState {
       this.bindOrdinal(holder, ids);
       return holder;
     }
+    // An item that names no id at all is placed by the protocol's own
+    // correlation first: `output[i]` is the item announced at `output_index:
+    // i`, and the state holding that position is the call, whatever order
+    // the calls arrived in. The dense slot below counts first-arrival
+    // ordinals, and with two calls announced in reverse order it paired each
+    // with the other's completed arguments — both shared the streamed prefix,
+    // so the prefix gate accepted the swap (r31-codex F6).
+    const identified = ids.some((id) => typeof id === 'string');
+    if (!identified && holder !== undefined && this.toolStates.has(holder)) return holder;
     // An item that names an unfamiliar call is a call the stream never
     // announced, and it still belongs to the client: taking a position some
     // other call already holds would replace that call instead of adding this
     // one. An anonymous item has nothing but its position, so there the dense
     // position IS the correlation — `captureFinalOutput` only reaches here for
-    // one when the two views agree on how many calls there are.
-    const identified = ids.some((id) => typeof id === 'string');
+    // one when the two views agree on how many calls there are, and only when
+    // no state holds the item's position.
     // ...unless the occupant is an anonymous holder — argument deltas that
     // arrived with no id at all, which belong to the call that names their
     // position (the rule `toolOrdinal` applies live). Taking a new ordinal

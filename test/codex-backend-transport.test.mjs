@@ -2183,3 +2183,23 @@ test('a retired state\'s position alias survives only at the survivor\'s accepte
   for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
   assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}'], ['call_b', 'get_time', '{"tz":"KST"}']]);
 });
+
+test('an id-less completed item is placed by its position, not by arrival order: reversed arrival does not swap the two calls\' arguments (r31-codex F6)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+      { type: 'function_call', name: 'get_time', arguments: '{"tz":"KST"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
+});
