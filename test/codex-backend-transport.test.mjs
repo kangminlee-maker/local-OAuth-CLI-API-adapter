@@ -1152,6 +1152,20 @@ test('the backend\'s first event is surfaced as a payload-less started signal, s
   assert.deepEqual(events.map((event) => event.type), ['started']);
 });
 
+test('a failure as the backend\'s first and only frame is still a started stream: the started signal precedes the latched failure (r49-fable mutant)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'failed as the first frame' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  }, /codex backend turn failed: failed as the first frame/);
+  // The writer commits on the signal, so the failure is in-band, not an HTTP error.
+  assert.deepEqual(events.map((event) => event.type), ['started']);
+});
+
 // The backend has a `size` slot and does not always honour it (a 256×256
 // source edited at `1024x1024` came back 1254×1254, measured 2026-08-29). The
 // direct API returns the requested canvas; so does this transport, on the
