@@ -1253,7 +1253,7 @@ test('usage the no-image attempts reported is carried into the result: the reque
   assert.equal(result.usage?.outputTokens, 10);
 });
 
-test('a runaway backend is counted, not retained: one result image, the rest counted by digest, diagnostics bounded (r49-codex)', async () => {
+test('a runaway backend is counted, not retained — not even by digest: one result image, the rest a count, diagnostics bounded (r49-codex, r50-fable)', async () => {
   const codexHome = await createCodexHome();
   const diagnostics = [];
   // 100 distinct one-pixel-ish payloads: the same PNG with a distinct tail.
@@ -1273,6 +1273,32 @@ test('a runaway backend is counted, not retained: one result image, the rest cou
   assert.equal(diagnostics.at(-1).eventCount, 102);
   assert.equal(diagnostics.at(-1).eventTypes.length, 64, 'the history is bounded');
   assert.equal(diagnostics.at(-1).eventTimeline.length, 64);
+});
+
+test('usage the no-image attempts reported is carried on the streamed lane too: the one image event reports what the request consumed (r50-fable mutant)', async () => {
+  const codexHome = await createCodexHome();
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      return new Response(sse([
+        { type: 'response.created', response: { id: 'resp_1', model: 'gpt-5.5' } },
+        { type: 'response.completed', response: { id: 'resp_1', model: 'gpt-5.5', usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 } } },
+      ]));
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_2', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_2', model: 'gpt-5.5', usage: { input_tokens: 5, output_tokens: 6, total_tokens: 11 } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.equal(attempts, 2);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].usage?.inputTokens, 8);
+  assert.equal(events[1].usage?.outputTokens, 10);
 });
 
 // The backend has a `size` slot and does not always honour it (a 256×256

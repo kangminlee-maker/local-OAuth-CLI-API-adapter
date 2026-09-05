@@ -78,7 +78,7 @@ export interface CodexBackendImageAttemptDiagnostic {
   readonly eventTypes: readonly string[];
   readonly outputItemTypes: readonly string[];
   readonly completedOutputTypes: readonly string[];
-  /** Distinct images the backend produced — counted, not retained: one is the turn's result. */
+  /** Images the backend produced — the result once, every other record counted, none retained. */
   readonly imageResultCount: number;
   readonly imageItemAdded: boolean;
   readonly imageGenerating: boolean;
@@ -1454,11 +1454,14 @@ class CodexBackendImageState {
   // The turn's result: the first image the backend produced, by bytes,
   // enriched by a later record of the same bytes (the terminal output
   // carries the rewrite the item frame did not — r49-codex). Every other
-  // distinct image is counted by digest and not retained: the turn was asked
-  // for one, the cap on `n` skips the rest, and holding them pinned every
-  // runaway payload until the terminal (r49-codex).
+  // image is counted and not retained — not even its digest: the turn was
+  // asked for one, the cap on `n` skips the rest, and holding them pinned
+  // every runaway payload until the terminal (r49-codex); a set of digests
+  // still grew by the runaway's count (r50-fable). Only the result's digest
+  // is kept, to recognise the result again.
   private result?: OpenAiGeneratedImage;
-  private readonly imageDigests = new Set<string>();
+  private resultDigest?: string;
+  private otherImages = 0;
   eventCount = 0;
   readonly eventTypes: string[] = [];
   readonly outputItemTypes: string[] = [];
@@ -1557,14 +1560,16 @@ class CodexBackendImageState {
   /** An image the backend produced: the turn's result if it is the first, its enrichment if it is the result again, a count otherwise. */
   private record(image: OpenAiGeneratedImage): void {
     const digest = createHash('sha256').update(image.b64Json).digest('hex');
-    const known = this.imageDigests.has(digest);
-    this.imageDigests.add(digest);
     if (this.result === undefined) {
       this.result = image;
+      this.resultDigest = digest;
       return;
     }
-    if (known && this.result.revisedPrompt === undefined && image.revisedPrompt !== undefined
-      && createHash('sha256').update(this.result.b64Json).digest('hex') === digest) {
+    if (digest !== this.resultDigest) {
+      this.otherImages += 1;
+      return;
+    }
+    if (this.result.revisedPrompt === undefined && image.revisedPrompt !== undefined) {
       this.result = { ...this.result, revisedPrompt: image.revisedPrompt };
     }
   }
@@ -1607,7 +1612,7 @@ class CodexBackendImageState {
       eventTypes: [...this.eventTypes],
       outputItemTypes: [...this.outputItemTypes],
       completedOutputTypes: [...this.completedOutputTypes],
-      imageResultCount: this.imageDigests.size,
+      imageResultCount: (this.result === undefined ? 0 : 1) + this.otherImages,
       imageItemAdded: this.imageItemAdded,
       imageGenerating: this.imageGenerating,
       textDeltaCount: this.textDeltaCount,
