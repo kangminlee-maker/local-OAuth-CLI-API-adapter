@@ -242,10 +242,13 @@ class CodexBackendStreamState {
    */
   private readonly positions = new Map<number, number>();
   /**
-   * The highest output position any event has carried: the vendor has moved
-   * past everything below it. A fact, not a trigger — a call that learns its
-   * position, or finishes, after the vendor moved on is released on that
-   * frame, not at the terminal (r30-codex).
+   * The highest output position a NON-TOOL event has carried — narration,
+   * reasoning, the other items: the vendor has moved past everything below
+   * it. Tool events contribute through `progress()`, from the accepted
+   * positions of the calls that can no longer fold into another. A fact, not
+   * a trigger — a call that learns its position, or finishes, after the
+   * vendor moved on is released on that frame, not at the terminal
+   * (r30-codex).
    */
   private highestPosition = -1;
   private nextToolOrdinal = 0;
@@ -463,9 +466,10 @@ class CodexBackendStreamState {
    * Folds `other` into `survivor`: they are one call. `other`'s bytes precede
    * the survivor's own (see `adoptHolder`); when both carry bytes the order
    * is not reconstructible and the turn is refused rather than guessed. Every
-   * alias of `other` — ids and positions — names the survivor afterwards, and
-   * the retired ordinal leaves the map (the dense position of a completed
-   * item counts the streamed calls in order, not ordinals).
+   * id alias of `other` names the survivor afterwards; of its position
+   * aliases only the one at the survivor's accepted position survives (the
+   * others would bind the real call arriving there to the survivor —
+   * r31-codex F4), and the retired ordinal leaves the map.
    */
   private absorb(survivor: number, other: number): void {
     const state = this.toolStates.get(survivor);
@@ -518,14 +522,16 @@ class CodexBackendStreamState {
   }
 
   /**
-   * The ordinal for a tool call seen in the COMPLETED output, which is a
-   * different coordinate system: its positions count function calls in an array
-   * that also holds reasoning and message items, while the stream's
-   * `output_index` counts every item. Feeding an array position into the
-   * stream's positional keyspace mints a second ordinal for a call already
-   * streamed, so an id-less final item would duplicate its own tool call.
-   * Without an id, the dense function-call position is what the stream ordinals
-   * already mean.
+   * The ordinal for an item of the COMPLETED output that names a call — by
+   * id, by the anonymous holder at its `output_index`, or, for an unfamiliar
+   * id, by the anonymous holder at its dense `slot` (the caller's coordinate:
+   * the streamed calls in order). Two coordinate systems meet here: the
+   * completed array's index is the stream's `output_index` (both count every
+   * item), while the dense slot counts function calls only. Feeding an array
+   * position into the stream's positional keyspace minted a second ordinal for
+   * a call already streamed. An item that names nothing is placed by
+   * `captureFinalOutput` itself — by position first, then one to one with the
+   * standing calls no item placed.
    */
   private finalOutputOrdinal(slot: number | undefined, outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
     const known = this.knownOrdinal(ids);
