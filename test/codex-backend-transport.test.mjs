@@ -2645,3 +2645,68 @@ test('a call_id the completed output supplies names the call from then on: a sec
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
   }, /named two tool calls as one/);
 });
+
+test('two nameless anonymous items against two index-less streamed calls are not paired by arrival order either: refused (r39-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"b":2}' },
+      { type: 'function_call', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('a call listed twice through the fold door must carry the call\'s own value: a second listing folding a byteless state under another value is refused (r39-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_x', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"evil":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('the dense slot does not re-adopt the holder the name doors declined: a named anonymous holder stays a call of its own (r39-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"belongs":"beta"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_x', call_id: 'call_x', name: 'alpha', arguments: '{"belongs":"beta"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('a call once named keeps that name before its announcement too: a later frame naming another tool for the same item is kept out (r39-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.output_item.done', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"a":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"a":1}']]);
+  const announced = events.filter((event) => event.type === 'tool_call_delta' && event.name !== undefined).map((event) => event.name);
+  assert.ok(announced.every((name) => name === 'alpha'), JSON.stringify(announced));
+});

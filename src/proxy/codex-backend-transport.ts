@@ -629,7 +629,10 @@ class CodexBackendStreamState {
     // that arrived with no id at all belong to the call that names their
     // position (the rule `toolOrdinal` applies live), and taking a new ordinal
     // beside the holder invented a second call named `tool` (r25-codex).
-    const ordinal = this.adoptableOrdinal(slot) ?? this.nextToolOrdinal;
+    // ...and only a holder of the same name: the slot re-adopted the holder
+    // the two routes above had just declined for its name (r39-fable).
+    const occupant = this.adoptableOrdinal(slot);
+    const ordinal = occupant !== undefined && this.namesAgree(ids.name, occupant) ? occupant : this.nextToolOrdinal;
     this.bindOrdinal(ordinal, ids);
     if (ordinal >= this.nextToolOrdinal) this.nextToolOrdinal = ordinal + 1;
     return ordinal;
@@ -721,8 +724,14 @@ class CodexBackendStreamState {
       if (!state.started) {
         if (callId !== undefined) state.id = callId;
         else if (!state.identified) state.id = id;
-        state.name = name ?? state.name;
-        if (name !== undefined) state.named = true;
+      }
+      // A call once named keeps that name, announced or not: a later frame
+      // for the same call naming another tool is the vendor's contradiction,
+      // kept out like a contradicting value — adopted, the last name won
+      // before the announcement (r39-fable).
+      if (name !== undefined && !state.named) {
+        state.name = name;
+        state.named = true;
       }
       if (named) state.anonymous = false;
       // `call_id` is the identity the client echoes back with the tool result;
@@ -806,10 +815,10 @@ class CodexBackendStreamState {
       // this value back, and the two surfaces would disagree about the call.
       // An identity the client has been told is frozen (`started`), as in
       // `captureFinalOutput` (r25-fable).
-      if (!state.started) {
-        state.id = callId ?? state.id;
-        state.name = name ?? state.name;
-        if (name !== undefined) state.named = true;
+      if (!state.started) state.id = callId ?? state.id;
+      if (name !== undefined && !state.named) {
+        state.name = name;
+        state.named = true;
       }
       if (named) state.anonymous = false;
       if (callId !== undefined) state.hasCallId = true;
@@ -1202,13 +1211,18 @@ class CodexBackendStreamState {
       // unfamiliar item goes when an anonymous holder sits there.
       const slot = [...this.toolStates.keys()].sort((a, b) => a - b)[item.position];
       const index = this.finalOutputOrdinal(slot, item.outputIndex, item);
-      // An item resolving to a call an earlier item already placed — without
-      // folding a streamed state into it — is that call listed twice: two
-      // array positions for one identity. Applied again it silently
-      // collapsed into one call, a repair; minting a second call put the
-      // same `call_id` on the wire twice (r37-codex).
-      if (placed.has(index) && !folded) {
-        throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
+      // An item resolving to a call an earlier item already placed is that
+      // call listed twice: two array positions for one identity. Applied
+      // again it silently collapsed into one call, a repair; minting a second
+      // call put the same `call_id` on the wire twice (r37-codex). The one
+      // exception is the split identity meeting: the listing that folds a
+      // streamed state into the call and carries the call's own value (the
+      // r32 fold) — a different value through that door replaced the first
+      // listing's under a 200 (r39-fable).
+      if (placed.has(index)) {
+        const current = this.toolStates.get(index)?.arguments ?? '';
+        const meeting = folded && (item.arguments === undefined || item.arguments.startsWith(current));
+        if (!meeting) throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
       placed.add(index);
       this.applyFinalItem(item, index);
@@ -1318,7 +1332,7 @@ class CodexBackendStreamState {
       state.id = item.callId;
       state.hasCallId = true;
     }
-    if (item.name !== undefined && !state.started && (mayReplace || !state.named)) {
+    if (item.name !== undefined && !state.named) {
       state.name = item.name;
       state.named = true;
     }
