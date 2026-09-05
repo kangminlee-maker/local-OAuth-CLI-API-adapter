@@ -1160,7 +1160,7 @@ test('a non-text arguments member on output_item.added is refused like everywher
   });
 });
 
-test('a known call claims only its accepted position: a later frame naming another one leaves that position to its real call (r30-codex)', async () => {
+test('a known call holds one position: a later frame naming it at another one is the vendor contradicting its positions, refused on every surface (r30-codex left that position to its real call; refused since round 45)', async () => {
   const vendor = [
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
     { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":1}' },
@@ -1178,21 +1178,23 @@ test('a known call claims only its accepted position: a later frame naming anoth
   const TWO_CHAT = { ...CHAT, tools: [{ type: 'function', function: { name: 'alpha', parameters: { type: 'object' } } }, { type: 'function', function: { name: 'beta', parameters: { type: 'object' } } }] };
   const TWO_RESPONSES = { model: 'm', input: 'w', tools: [{ type: 'function', name: 'alpha', parameters: { type: 'object' } }, { type: 'function', name: 'beta', parameters: { type: 'object' } }], tool_choice: 'required' };
   const TWO_MESSAGES = { ...MESSAGES, tools: [{ name: 'alpha', input_schema: { type: 'object' } }, { name: 'beta', input_schema: { type: 'object' } }], tool_choice: { type: 'any' } };
-  const BOTH = [['call_a', 'alpha', '{"a":1}'], ['call_b', 'beta', '{"b":2}']];
+  // The stream has announced `call_a` before the mislabelled frame arrives,
+  // so the refusal is in-band there; buffered readings are a 502.
   await withProxyEvents(vendor, async (url) => {
     const chat = await post(`${url}/v1/chat/completions`, OPENAI, TWO_CHAT);
-    assert.equal(chat.status, 200, chat.text);
-    assert.deepEqual(JSON.parse(chat.text).choices[0].message.tool_calls.map((call) => [call.id, call.function.name, call.function.arguments]), BOTH);
-    const chatStream = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO_CHAT, stream: true })).text);
-    assert.deepEqual(chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id).map((call) => [call.id, call.function.name]), BOTH.map(([id, name]) => [id, name]));
+    assert.equal(chat.status, 502, chat.text);
+    assert.match(JSON.parse(chat.text).error.message, /cannot place/);
+    const chatStream = await post(`${url}/v1/chat/completions`, OPENAI, { ...TWO_CHAT, stream: true });
+    const announced = events(chatStream.text).flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []).filter((call) => call.id);
+    assert.deepEqual(announced.map((call) => [call.id, call.function.name]), [['call_a', 'alpha']], chatStream.text);
+    assert.match(chatStream.text, /cannot place/);
+    assert.ok(!chatStream.text.includes('"finish_reason":"tool_calls"'), chatStream.text);
     const responses = await post(`${url}/v1/responses`, OPENAI, TWO_RESPONSES);
-    assert.equal(responses.status, 200, responses.text);
-    assert.deepEqual(JSON.parse(responses.text).output.filter((item) => item.type === 'function_call').map((item) => [item.call_id, item.name, item.arguments]), BOTH);
+    assert.equal(responses.status, 502, responses.text);
+    assert.match(JSON.parse(responses.text).error.message, /cannot place/);
     const messages = await post(`${url}/v1/messages`, ANTHROPIC, TWO_MESSAGES);
-    assert.equal(messages.status, 200, messages.text);
-    assert.deepEqual(JSON.parse(messages.text).content.filter((block) => block.type === 'tool_use').map((block) => [block.id, block.name, JSON.stringify(block.input)]), BOTH);
-    const { starts } = messagesBlocks((await post(`${url}/v1/messages`, ANTHROPIC, { ...TWO_MESSAGES, stream: true })).text);
-    assert.deepEqual(starts, [[0, 'tool_use'], [1, 'tool_use']]);
+    assert.equal(messages.status, 502, messages.text);
+    assert.match(JSON.parse(messages.text).error.message, /cannot place/);
   });
 });
 
@@ -1296,7 +1298,7 @@ test('a call identified by folding a finished holder into it is one call on ever
   });
 });
 
-test('a duplicate frame for a known call, mislabelled with a higher position, is not the vendor moving on: the cut call\'s block stays open (r31-codex F5)', async () => {
+test('a duplicate frame for a known call, mislabelled with a higher position, is the vendor contradicting its positions: refused (r31-codex F5 kept the cut call\'s block open past it; refused since round 45)', async () => {
   const vendor = [
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'probe' } },
     { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":' },
@@ -1305,12 +1307,14 @@ test('a duplicate frame for a known call, mislabelled with a higher position, is
     { type: 'response.incomplete', response: { id: 'r', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [{ type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'probe', arguments: '{"a":' }] } },
   ];
   await withProxyEvents(vendor, async (url) => {
+    const buffered = await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, tool_choice: { type: 'auto' } });
+    assert.equal(buffered.status, 502, buffered.text);
+    assert.match(JSON.parse(buffered.text).error.message, /cannot place/);
     const streamed = await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, tool_choice: { type: 'auto' }, stream: true });
-    const { frames, starts, stops, partial } = messagesBlocks(streamed.text);
+    const { starts } = messagesBlocks(streamed.text);
     assert.deepEqual(starts, [[0, 'tool_use']]);
-    assert.equal(partial, '{"a":');
-    assert.deepEqual(stops, [], 'the cut call\'s block is left open');
-    assert.equal(frames.find((frame) => frame.type === 'message_delta')?.delta?.stop_reason, 'max_tokens');
+    assert.match(streamed.text, /cannot place/);
+    assert.ok(!streamed.text.includes('"stop_reason":"max_tokens"'), streamed.text);
   });
 });
 

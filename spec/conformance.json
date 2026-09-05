@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "d2227e6870ecd2901d7c73153e485d0306817ca3d9c0eda390f3636d9a4d84ef",
+    "matrixDigest": "0e90c611bda919bdb4378c9a32b5483acd1dc8c63f70a6c0eaf9652f759a0c8c",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {

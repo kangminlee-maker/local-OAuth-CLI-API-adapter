@@ -241,8 +241,6 @@ interface ToolIds {
 /** One `function_call` item of the completed output, as `captureFinalOutput` reads it. */
 interface FinalCallItem {
   readonly outputIndex: number;
-  /** Its position among the function-call items — the dense coordinate. */
-  readonly position: number;
   readonly arguments: string | undefined;
   readonly itemId: string | undefined;
   readonly callId: string | undefined;
@@ -264,8 +262,6 @@ class CodexBackendStreamState {
   private readonly callOrdinals = new Map<string, number>();
   /** The ordinal holding each backend output position: its first claimant, or the survivor of a fold. */
   private readonly holders = new Map<number, number>();
-  /** How many folds `absorb` has performed: a caller compares before and after to learn whether placing an item folded a state. */
-  private absorbed = 0;
   /**
    * Each call's backend output position, from the first event that carried
    * one. The early finish signal compares positions: only an event for a
@@ -344,10 +340,16 @@ class CodexBackendStreamState {
       // too, and the real call there was bound to this one and vanished
       // (r30-codex).
       this.recordPosition(known, event);
-      // The call claims only its accepted position: a frame naming this
-      // call at some other position is a mislabel, not a later item
-      // (r31-codex F5).
-      const survivor = explicit && this.positions.get(known) === position ? this.adoptHolder(known, position) : known;
+      // The call holds one position: a frame naming this call at some other
+      // position is the vendor contradicting its own positions — a mislabel,
+      // not a later item (r31-codex F5) — and is refused as arguments the
+      // transport cannot place, as the completed item is. Adopting nothing
+      // there but consuming the frame delivered its bytes under the call
+      // (r45-codex).
+      if (explicit && this.positions.get(known) !== position) {
+        throw backendContractError('The local runtime wrote tool arguments the transport cannot place.', this.request.shape);
+      }
+      const survivor = explicit ? this.adoptHolder(known, position) : known;
       // A frame for a call already named, naming another tool, is the vendor
       // contradicting itself: refused, not the new name adopted and not its
       // arguments delivered under the old one — the announced identity was
@@ -390,8 +392,12 @@ class CodexBackendStreamState {
     let ordinal = explicit ? this.holders.get(position) : undefined;
     // ...and only when the names agree: a named event at a position held by
     // a state of another name is two calls named as one, refused here before
-    // the holder's bytes go out under this event's name (r37-codex).
-    if (ordinal !== undefined && !this.namesAgree(ids.name, ordinal)) {
+    // the holder's bytes go out under this event's name (r37-codex). The
+    // `call_id` is heard here like the name: this door heard only the name,
+    // and a frame at the call's position naming another `call_id` had its
+    // arguments ratified under the latched id — or, before the announcement,
+    // replaced the id the client would echo (r45-fable).
+    if (ordinal !== undefined && (!this.namesAgree(ids.name, ordinal) || !this.callIdAgrees(ids.callId, ordinal))) {
       throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
     }
     if (ordinal === undefined) {
@@ -531,7 +537,6 @@ class CodexBackendStreamState {
    * r31-codex F4), and the retired ordinal leaves the map.
    */
   private absorb(survivor: number, other: number): void {
-    this.absorbed += 1;
     const state = this.toolStates.get(survivor);
     const otherState = this.toolStates.get(other);
     if (state !== undefined && otherState !== undefined) {
@@ -549,21 +554,29 @@ class CodexBackendStreamState {
       if (state.hasCallId && state.named) state.identified = true;
       if (otherState.placed) state.placed = true;
     }
+    // Two states at two accepted positions are two items: folding them moved
+    // the retired position's bytes under the survivor's call whichever side
+    // survived, live and from the completed output (r45-codex). Only a state
+    // with no position yet inherits the other's.
     const position = this.positions.get(other);
-    if (position !== undefined && !this.positions.has(survivor)) this.positions.set(survivor, position);
+    const accepted = this.positions.get(survivor);
+    if (accepted !== undefined && position !== undefined && accepted !== position) {
+      throw backendContractError('The local runtime wrote tool arguments the transport cannot place.', this.request.shape);
+    }
+    if (position !== undefined && accepted === undefined) this.positions.set(survivor, position);
     this.positions.delete(other);
     // Id aliases follow the survivor; a POSITION alias follows it only at the
     // survivor's accepted position. Carrying every `#N` over left a stale
     // alias at the retired state's other position, and the real call that
     // later arrived there was bound to the survivor and vanished (r31-codex
     // F4).
-    const accepted = this.positions.get(survivor);
+    const kept = this.positions.get(survivor);
     for (const aliases of [this.itemOrdinals, this.callOrdinals]) {
       for (const [id, ordinal] of aliases) if (ordinal === other) aliases.set(id, survivor);
     }
     for (const [position, ordinal] of this.holders) {
       if (ordinal !== other) continue;
-      if (position === accepted) this.holders.set(position, survivor);
+      if (position === kept) this.holders.set(position, survivor);
       else this.holders.delete(position);
     }
     this.toolStates.delete(other);
@@ -590,20 +603,18 @@ class CodexBackendStreamState {
 
   /**
    * The ordinal for an item of the COMPLETED output that names a call — by
-   * id; by the anonymous holder at its `output_index`; by the holder there
-   * the stream knows by its item id alone, when the item names no other item
-   * (r28-codex F7); or, for an unfamiliar id, by the anonymous holder at its
-   * dense `slot` (the caller's coordinate: the streamed calls in order). Two coordinate systems meet here: the
-   * completed array's index is the stream's `output_index` (both count every
-   * item), while the dense slot counts function calls only. Feeding an array
-   * position into the stream's positional keyspace minted a second ordinal for
-   * a call already streamed. An item that names nothing is placed by
+   * id; else by the call holding its `output_index`, the array index being
+   * the stream's position (both count every item — a dense function-call
+   * coordinate fed into the positional keyspace minted a second ordinal for a
+   * call already streamed, r27-codex, and re-adopted holders the doors above
+   * had declined, r39-fable/r39-codex, until round 45 removed it); else a new
+   * call claiming that index. An item that names nothing is placed by
    * `captureFinalOutput` itself: by the call holding its position first; then,
    * only when exactly one such item and one standing call no item placed
    * remain and their names do not conflict, as that pair; every other one is
    * a call without an identity, refused at completion.
    */
-  private finalOutputOrdinal(slot: number | undefined, outputIndex: number, ids: ToolIds): number {
+  private finalOutputOrdinal(outputIndex: number, ids: ToolIds): number {
     const known = this.knownOrdinal(ids);
     if (known !== undefined) {
       // Every id the item carries names the call from here on, as on a live
@@ -628,46 +639,36 @@ class CodexBackendStreamState {
       return survivor;
     }
     // The completed output is in `output_index` order, so the item's array
-    // index is the position the live events named — and an anonymous holder
-    // bound to that position (argument deltas that carried only the index)
-    // is this call. The dense function-call position below is not the same
-    // coordinate: with the events arriving out of order the holder for
-    // backend position 1 lived at ordinal 0, and inspecting ordinal 1 instead
-    // invented a third call (r27-codex).
+    // index is the position the live events named, and the call holding that
+    // position IS this item — the position is the protocol's own correlation
+    // (`output[i]` is the item announced at `output_index: i`) — when its
+    // name and `call_id` agree, as at the live door at a held position; an
+    // unfamiliar item id on it binds, as on a live frame (refused at
+    // completion as a call missing its `call_id` while the live equivalent
+    // was accepted — r45-codex). Another name, or another `call_id`, is two
+    // calls named as one: allocated beside the holder, a second call went
+    // out at the one position (r45-codex), as an item-id-only holder's call
+    // once went out twice, under the item id and under the `call_id`
+    // (r28-codex F7). The holder is looked up by the item's array index, not
+    // by its dense function-call position: with the events arriving out of
+    // order the holder for backend position 1 lived at ordinal 0, and
+    // inspecting ordinal 1 instead invented a third call (r27-codex).
     const holder = this.holders.get(outputIndex);
-    const byPosition = this.adoptableOrdinal(holder);
-    if (byPosition !== undefined && this.namesAgree(ids.name, byPosition)) {
-      this.bindOrdinal(byPosition, ids);
-      return byPosition;
-    }
-    // A holder at that position the stream identified by its ITEM id alone —
-    // no `call_id` yet — is this item when the item names no other item: the
-    // position is the protocol's own correlation (`output[i]` is the item
-    // announced at `output_index: i`). Allocating beside it published the one
-    // invocation twice, under the item id and under the `call_id` (r28-codex
-    // F7). A holder that already has a `call_id` is not adopted: an item
-    // naming a different one is the vendor contradicting itself (declared).
-    const holderState = holder === undefined ? undefined : this.toolStates.get(holder);
-    if (holder !== undefined && holderState !== undefined && !holderState.hasCallId && ids.itemId === undefined && this.namesAgree(ids.name, holder)) {
+    if (holder !== undefined && this.toolStates.has(holder)) {
+      if (!this.namesAgree(ids.name, holder) || !this.callIdAgrees(ids.callId, holder)) {
+        throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
+      }
       this.bindOrdinal(holder, ids);
       return holder;
     }
-    // An item that names an unfamiliar call is a call the stream never
-    // announced, and it still belongs to the client: taking a position some
-    // other call already holds would replace that call instead of adding this
-    // one — unless the occupant of its dense slot (the streamed calls in
-    // order, the caller's coordinate) is an anonymous holder: argument deltas
-    // that arrived with no id at all belong to the call that names their
-    // position (the rule `toolOrdinal` applies live), and taking a new ordinal
-    // beside the holder invented a second call named `tool` (r25-codex).
-    // ...and only a holder of the same name: the slot re-adopted the holder
-    // the two routes above had just declined for its name (r39-fable).
-    // ...and only a holder at the item's own position: the slot adopted a
-    // holder at position 1 for the item at index 0 (r39-codex).
-    const occupant = this.adoptableOrdinal(slot);
-    const ordinal = occupant !== undefined && this.namesAgree(ids.name, occupant) && this.positionAgrees(outputIndex, occupant) ? occupant : this.nextToolOrdinal;
+    // An item that names an unfamiliar call at a position nothing holds is a
+    // call the stream never announced, and it still belongs to the client. It
+    // records no position: the array lists each index once, so nothing can
+    // resolve to it by position afterwards, and a later item resolving to it
+    // by id is that call listed twice (`captureFinalOutput`).
+    const ordinal = this.nextToolOrdinal;
+    this.nextToolOrdinal = ordinal + 1;
     this.bindOrdinal(ordinal, ids);
-    if (ordinal >= this.nextToolOrdinal) this.nextToolOrdinal = ordinal + 1;
     return ordinal;
   }
 
@@ -1206,7 +1207,6 @@ class CodexBackendStreamState {
       if (obj?.type !== 'function_call') continue;
       items.push({
         outputIndex,
-        position: items.length,
         arguments: argumentsText(obj.arguments, this.request.shape),
         itemId: identityText(obj.id, this.request.shape),
         callId: identityText(obj.call_id, this.request.shape),
@@ -1233,7 +1233,6 @@ class CodexBackendStreamState {
       // the item is left alone (declared, matrix §7 row 8).
       const itemOrdinal = item.itemId === undefined ? undefined : this.itemOrdinals.get(item.itemId);
       const callOrdinal = item.callId === undefined ? undefined : this.callOrdinals.get(item.callId);
-      const before = this.absorbed;
       if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
         // ...unless one of the two is a state the client was never told
         // about: then the item is where the split identity meets, and it
@@ -1245,32 +1244,17 @@ class CodexBackendStreamState {
         if (!foldable) continue;
         this.coalesce([itemOrdinal, callOrdinal]);
       }
-      // The dense slot — the streamed calls in order — is where an
-      // unfamiliar item goes when an anonymous holder sits there.
-      const slot = [...this.toolStates.keys()].sort((a, b) => a - b)[item.position];
-      const index = this.finalOutputOrdinal(slot, item.outputIndex, item);
-      // Every fold placing this item performed counts — the two-id fold above
-      // and the holder `adoptHolder` folded in on the way: counted alone, the
-      // two-id fold left the other door's equal-value listing refused and its
-      // other-value twin unrecorded (r42-fable).
-      const folded = this.absorbed > before;
+      const index = this.finalOutputOrdinal(item.outputIndex, item);
       // An item resolving to a call an earlier item already placed is that
       // call listed twice: two array positions for one identity. Applied
       // again it silently collapsed into one call, a repair; minting a second
-      // call put the same `call_id` on the wire twice (r37-codex). The one
-      // exception is the split identity meeting: the listing that folds a
-      // streamed state into the call and carries no value, or exactly the
-      // value the call already holds (the r32 fold) — another value through
-      // that door replaced the first listing's under a 200 (r39-fable,
-      // r39-codex).
-      // The value is compared as published: `""` and `{}` are the one empty
-      // call at the boundary (`argumentsOrEmptyObject`), and the raw-byte
-      // equality refused the `{}` spelling of a call the runtime itself
-      // publishes as `{}` (r44-fable).
+      // call put the same `call_id` on the wire twice (r37-codex). No door is
+      // left open: the split identity meeting rounds 31–44 kept — a second
+      // listing folding a streamed state into the call with no value or the
+      // call's own — was one `call_id` at two indices, moving the call across
+      // the array, and is that call listed twice (r45-codex).
       if (placed(index)) {
-        const current = argumentsOrEmptyObject(this.toolStates.get(index)?.arguments ?? '');
-        const meeting = folded && (item.arguments === undefined || argumentsOrEmptyObject(item.arguments) === current);
-        if (!meeting) throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
+        throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
       // `output[i]` is the item announced at `output_index: i`: an
       // identified item listed at an index other than its call's accepted
@@ -1321,8 +1305,8 @@ class CodexBackendStreamState {
     // when it leaves nothing to choose: ONE item no position placed and ONE
     // standing call no item placed, agreeing on the name when the item gives
     // one and on the position when the call has one (`positionAgrees`,
-    // r37-fable) — not the k-th to the k-th, a slot a position may already have
-    // taken (r33-fable F1), and not two to two in arrival order, which handed
+    // r37-fable) — not the k-th to the k-th, a call a position may already have
+    // placed (r33-fable F1), and not two to two in arrival order, which handed
     // each call the other's arguments when both had streamed `{` and the
     // completed output listed them the other way round (r35-codex). Every
     // other item left is a call of its own: one the completed output reports

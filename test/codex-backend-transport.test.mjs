@@ -2158,7 +2158,7 @@ test('the fold\'s survivor is chosen by the one rule wherever two states meet: a
   assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
 });
 
-test('a retired state\'s position alias survives only at the survivor\'s accepted position: the real call at the other position is its own (r31-codex F4)', async () => {
+test('a frame joining a call\'s two halves at two positions is the vendor contradicting its positions: refused (r31-codex F4 folded them and left the other position to its real call; refused since round 45)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_x', call_id: 'call_a', name: 'get_weather' } },
@@ -2173,10 +2173,11 @@ test('a retired state\'s position alias survives only at the survivor\'s accepte
       { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time', arguments: '{"tz":"KST"}' },
     ] } },
   ]), { status: 200 });
+  // The fold across positions moved position 1's bytes under `call_a` at 0.
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-  const events = [];
-  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
-  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}'], ['call_b', 'get_time', '{"tz":"KST"}']]);
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) void event;
+  }, /cannot place/);
 });
 
 test('an id-less completed item is placed by its position, not by arrival order: reversed arrival does not swap the two calls\' arguments (r31-codex F6)', async () => {
@@ -2199,9 +2200,11 @@ test('an id-less completed item is placed by its position, not by arrival order:
   assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
 });
 
-test('a state the completed output created is not announced until it is: a fold into it announces once, at a real wire index (r32-codex)', async () => {
-  // The first completed item creates `call_a` (identity frozen, never on the
-  // wire); the second folds the finished holder at position 1 into it.
+test('one call_id under two completed items is that call listed twice: the r32 fold refuses (r32-codex; refused since round 45 — a created call claims its index)', async () => {
+  // The first completed item creates `call_a` at index 0; the second lists
+  // `call_a` again at index 1, folding the finished holder in. Rounds 31–44
+  // kept this door open as the split identity meeting (announced once, at a
+  // real wire index — the r32 finding); it was one `call_id` at two indices.
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'get_weather' } },
@@ -2212,12 +2215,9 @@ test('a state the completed output created is not announced until it is: a fold 
     ] } },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-  const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
-  const tool = events.filter((event) => event.type === 'tool_call_delta').map((event) => [event.id, event.index, event.argumentsDelta ?? null, event.argumentsDone ?? false]);
-  assert.ok(!tool.some(([, index]) => index < 0), `no wire index below zero: ${JSON.stringify(tool)}`);
-  assert.equal(tool.filter(([id, , delta]) => id === 'call_a' && delta === '').length, 1, `announced once: ${JSON.stringify(tool)}`);
-  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(toolRequest())) void event;
+  }, /named two tool calls as one/);
 });
 
 test('an anonymous completed item at a position no call holds completes the one standing call no item has placed, not the call a position already placed (r33-fable F1)', async () => {
@@ -2266,7 +2266,11 @@ test('an anonymous completed item is placed by the call holding its position bef
   assert.deepEqual(calls.get('call_c'), ['beta', '{"c":3}'], JSON.stringify([...calls]));
 });
 
-test('a fold across two positions leaves no alias at the retired position: the real call arriving there is its own (r32-codex, the third)', async () => {
+test('a frame carrying both ids of a call at a position other than the call_id\'s accepted one is the vendor contradicting its positions: refused (r32-codex, the third; refused since round 45)', async () => {
+  // `call_a` was added at position 1; the done frame at position 0 says the
+  // item there IS `call_a`. Rounds 32–44 folded the two and left position 0
+  // to the real call arriving there; the fold moved `call_a` to a second
+  // position, and a frame naming a known call elsewhere is refused now.
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'call_a' } },
@@ -2274,21 +2278,14 @@ test('a fold across two positions leaves no alias at the retired position: the r
     { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
     { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_b', arguments: '{"b":2}' },
     { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'probe' } },
-    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'other' } },
-    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_c', delta: '{"c":3}' },
-    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'other', arguments: '{"c":3}' } },
-    // Each call at its accepted position: `call_c` claimed 0, `call_a` 1.
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
-      { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'other', arguments: '{"c":3}' },
       { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'probe', arguments: '{"b":2}' },
     ] } },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-  const events = [];
-  for await (const event of backend.stream(withDeclared(toolRequest(), ['probe', 'other']))) events.push(event);
-  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
-  assert.deepEqual(calls.get('call_a'), ['probe', '{"b":2}'], JSON.stringify([...calls]));
-  assert.deepEqual(calls.get('call_c'), ['other', '{"c":3}'], JSON.stringify([...calls]));
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['probe', 'other']))) void event;
+  }, /cannot place/);
 });
 
 test('an anonymous completed item at a position a call holds completes that call whatever the two views count; only the count-aligned rest is gated (r33-fable F2)', async () => {
@@ -2350,7 +2347,7 @@ test('the count-aligned rest never takes a call a position placed: a positioned 
   assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
 });
 
-test('the position of a state that can still fold into another is not progress: an item-id half at a later position does not close the cut call it then folds into (r33-codex F3)', async () => {
+test('an item-id half at a later position joined to the cut call at 0 is the vendor contradicting its positions: refused (r33-codex F3 folded it without counting its position as progress; refused since round 45)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
@@ -2362,13 +2359,12 @@ test('the position of a state that can still fold into another is not progress: 
       { type: 'function_call', id: 'fc_shadow', call_id: 'call_a', name: 'alpha', arguments: '{"a":' },
     ] } },
   ]), { status: 200 });
+  // Two accepted positions, one call: the fold is refused before progress
+  // or the cut call's block is in question.
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-  const events = [];
-  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
-  const finished = events.filter((event) => event.type === 'tool_call_delta' && event.argumentsDone);
-  assert.deepEqual(finished, [], `a cut call is never signalled finished: ${JSON.stringify(finished)}`);
-  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"a":']]);
-  assert.equal(events.at(-1).result.stopReason, 'max_tokens');
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /cannot place/);
 });
 
 test('an anonymous item before the item whose fold settles the count is judged after that fold, whatever the split halves\' positions (r33-codex F4)', async () => {
@@ -2674,7 +2670,7 @@ test('a call listed twice through the fold door must carry the call\'s own value
   }, /named two tool calls as one/);
 });
 
-test('the dense slot does not re-adopt the holder the name doors declined: a named anonymous holder stays a call of its own (r39-fable)', async () => {
+test('an item at a held position naming another tool than the anonymous holder there is two calls named as one (r39-fable: the dense slot re-adopted the holder the name door declined; since round 45 the holder at the item\'s index is the one door, and it refuses)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
@@ -2686,7 +2682,7 @@ test('the dense slot does not re-adopt the holder the name doors declined: a nam
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   await assert.rejects(async () => {
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
-  }, /missing its call_id/);
+  }, /named two tool calls as one/);
 });
 
 test('a call once named keeps that name before its announcement too: a later frame naming another tool for the same item is the vendor contradicting itself, refused (r39-fable, r39-codex)', async () => {
@@ -2841,15 +2837,9 @@ test('the name is heard on the fold\'s survivor: a completed item naming alpha f
   }, /named two tool calls as one/);
 });
 
-test('a second listing folding the holder in with the call\'s own value is the split identity meeting: one call (r42-fable)', async () => {
+test('a second listing folding the holder in is that call listed twice, own value or not: refused (r42-fable kept the own-value meeting open; refused since round 45)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
-    // The first listing creates `call_a` (never streamed, no position, no
-    // bytes yet); the second folds the streamed holder `fc_b` into it at the
-    // holder's position and carries exactly the holder's bytes: the r32
-    // fold, valued. (A first listing that already carried bytes meets the
-    // holder's bytes in `absorb` and is refused as arguments the transport
-    // cannot place, before this door.)
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
     { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"e":1}' },
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
@@ -2858,26 +2848,11 @@ test('a second listing folding the holder in with the call\'s own value is the s
     ] } },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-  const events = [];
-  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
-  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"e":1}']]);
-});
-
-test('...and with another value through that door the second listing is refused, not applied (r42-fable)', async () => {
-  const codexHome = await createCodexHome();
-  globalThis.fetch = async () => new Response(sse([
-    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
-    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"e":1}' },
-    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
-      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' },
-      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"z":9}' },
-    ] } },
-  ]), { status: 200 });
-  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   await assert.rejects(async () => {
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
   }, /named two tool calls as one/);
 });
+
 
 
 
@@ -2904,21 +2879,143 @@ test('a name-bearing frame joining a fold\'s survivor that owns the call_id does
   assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_h', 'alpha', '{"h":1}']]);
 });
 
-test('the split identity meeting compares the value as published: the `{}` spelling of a call the runtime publishes as `{}` is one call (r44-fable)', async () => {
+
+test('the call_id latch is heard at the position-resolved door: a frame at an announced call\'s position naming another call_id is refused, not ratified under the latched id (r45-fable)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
-    // The holder at 1 streamed no bytes (published as `{}`); the fold item
-    // spells that same empty call `{}`.
-    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_h', name: 'alpha' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', call_id: 'call_x', name: 'alpha', arguments: '{"x":1}' } },
+    // The completed output agrees with the latched id, so only the live door
+    // hears the contradiction.
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
-      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' },
-      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{}' },
+      { type: 'function_call', call_id: 'call_h', name: 'alpha', arguments: '{"x":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('...and before the announcement: a second frame at the position carrying another call_id does not replace the first (r45-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    // `call_h` at 0 without a name: not announced yet. The second frame at 0
+    // says `call_x` — the completed output agrees with IT, so a door that
+    // let it through would deliver `call_x` under a 200.
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_h' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_x', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', call_id: 'call_x', name: 'alpha', arguments: '{}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+
+
+test('a live frame naming a known call at another position is the vendor contradicting its positions: refused as arguments the transport cannot place, not delivered (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_a', delta: '{"from":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 1, item_id: 'fc_a', arguments: '{"from":1}' },
+    // The completed output is coherent with the announcement, so only the
+    // live door hears the contradiction.
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"from":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
+});
+
+test('a completed item at a held position carrying another call_id is two calls named as one, not a second call at the one position (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_first', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"first":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_first', name: 'alpha', arguments: '{"first":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', call_id: 'call_late', name: 'alpha', arguments: '{"late":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a completed item at a held position carrying only an item id binds to the call holding it, as the live frame does: one call under the latched call_id (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"x":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', name: 'alpha', arguments: '{"x":1}' },
     ] } },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   const events = [];
   for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
-  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{}']]);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"x":1}']]);
+});
+
+test('a second listing of a created call\'s call_id at another index, folding a byte-bearing holder in with no value, is that call listed twice — it moved the call across the array (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"held":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a frame joining two states at two accepted positions is the vendor contradicting its positions: refused, not the retired position\'s bytes moved under the survivor (r45-codex, known survives)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"from":1}' },
+    // At the survivor's own position, so the position door hears nothing;
+    // the fold itself must.
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"from":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"from":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
+});
+
+test('...and with the holder surviving: a call_id holder at 1 joined to an item-id state at 0 is refused the same way (r45-codex, holder survives)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'call_h', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"from":0}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_a', call_id: 'call_h', name: 'alpha', arguments: '{"from":0}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_h', name: 'alpha', arguments: '{"from":0}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
 });
 
 test('the first call_id is latched like the name: a live frame naming another call_id for the same item is refused (r41-codex)', async () => {
