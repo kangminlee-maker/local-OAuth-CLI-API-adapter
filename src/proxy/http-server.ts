@@ -1838,12 +1838,16 @@ async function writeOpenAiImageStream(
   };
   // The event count is backend-controlled; `n` is the request's. A runaway
   // stream must not emit more images than were asked for — nor pin more.
+  // The excess is skipped, not the rest of the turn: breaking out here
+  // closed the transport's read before it judged the terminal frame, and a
+  // turn that failed after over-producing was published as a successful
+  // stream (r48-codex). The buffered path keeps the first `n` the same way.
   let completedEmitted = 0;
   try {
     for await (const event of events) {
       commit();
-      if (event.type === 'partial_image') continue;
-      if (completedEmitted >= (request.n ?? 1)) break;
+      if (event.type === 'started' || event.type === 'partial_image') continue;
+      if (completedEmitted >= (request.n ?? 1)) continue;
       completedEmitted += 1;
       const type = imageStreamEventType(request.operation, event.type);
       const payload = {

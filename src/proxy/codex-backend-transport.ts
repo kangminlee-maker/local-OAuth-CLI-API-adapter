@@ -1461,6 +1461,7 @@ class CodexBackendImageState {
   // image on every surface (r47-codex).
   private settled = false;
   private failure?: string;
+  private started = false;
 
   constructor(
     private readonly request: OpenAiImageGenerationRequest,
@@ -1480,6 +1481,14 @@ class CodexBackendImageState {
     // A settled turn is finished, whatever noise follows: recorded for the
     // diagnostic, consumed by nothing.
     if (this.settled) return out;
+    // The backend's first event commits the stream (the Images stream
+    // commit-point row): surfaced only with the first image, a failure
+    // before any image was an HTTP error after the backend had started
+    // (r48-codex).
+    if (!this.started) {
+      this.started = true;
+      out.push({ type: 'started' });
+    }
     if ((event.type === 'response.failed' || event.type === 'error')) {
       this.failure = terminalFailureMessage(event);
       this.settled = true;
@@ -1509,7 +1518,12 @@ class CodexBackendImageState {
         size: this.request.size,
       });
     }
-    if (event.type === 'response.completed') {
+    // The terminal frame's output is read the same way whether the turn
+    // completed or was cut off at its output limit: a cut-off turn is a
+    // finished turn with a reason, and whether it produced an image is
+    // judged like any other — an image present only in the cut turn's
+    // output was discarded and the turn retried as one without (r48-codex).
+    if (event.type === 'response.completed' || event.type === 'response.incomplete') {
       const usage = usageFromResponses(event.response?.usage);
       if (usage) this.usage = usage;
       this.completedOutputTypes.push(...responseOutputTypes(event.response?.output));
@@ -1529,9 +1543,6 @@ class CodexBackendImageState {
       }
       this.settled = true;
     }
-    // A cut-off turn is a finished turn with a reason; whether it produced
-    // an image is judged like any other.
-    if (event.type === 'response.incomplete') this.settled = true;
     return out;
   }
 
@@ -1771,6 +1782,10 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     signal?: AbortSignal,
   ): AsyncIterable<OpenAiImageGenerationStreamEvent> {
     await prepareRequestedSize(request);
+    // The stream commits once: the first backend event of the first turn.
+    // Every later turn — a retry, the next image of `n` — starts behind a
+    // commit already made.
+    let committed = false;
     for (let index = 0; index < request.n; index += 1) {
       for (let attempt = 0; attempt <= IMAGE_NO_RESULT_RETRY_DELAYS_MS.length; attempt += 1) {
         const state = new CodexBackendImageState(request, Date.now());
@@ -1780,6 +1795,13 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
             signal,
           );
           for await (const local of this.pump(events, state)) {
+            if (local.type === 'started') {
+              if (!committed) {
+                committed = true;
+                yield local;
+              }
+              continue;
+            }
             yield {
               ...local,
               image: postprocessFlatGraphicImageIfNeeded(request, await realizeRequestedSize(request, local.image)),

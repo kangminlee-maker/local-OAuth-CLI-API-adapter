@@ -675,6 +675,78 @@ test('a failed image stream still ends with data: [DONE]', async () => {
   }
 });
 
+// The cap on `n` skips the excess; it does not stop reading the turn. Breaking
+// out of the stream at the (n+1)th image closed the transport's read before it
+// judged the terminal frame, and a turn that failed after over-producing was
+// published as a successful stream (r48-codex).
+test('a turn that fails after producing more images than n is a failed stream: one image event, then the in-band error and [DONE]', async () => {
+  const image = { b64Json: 'iVBORw0KGgo=', revisedPrompt: null };
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { throw new Error('unused'); },
+    async *stream() {
+      yield { type: 'completed', created: 0, image, partialImageIndex: 0 };
+      yield { type: 'completed', created: 0, image, partialImageIndex: 0 };
+      throw new Error('failed after over-producing');
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'x', n: 1, stream: true }),
+    });
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
+    assert.equal(frames.filter((frame) => frame.startsWith('event: image_generation.completed')).length, 1, text);
+    assert.match(text, /event: error/);
+    assert.match(text, /failed after over-producing/);
+    assert.equal(frames.at(-1), 'data: [DONE]', text);
+  } finally {
+    await started.close();
+  }
+});
+
+// The backend's first event commits the stream even when it carries no image:
+// the transport surfaces it as a payload-less `started` signal, and a failure
+// after it is in-band (r48-codex: surfaced only with the first image, that
+// failure was an HTTP error after the backend had started).
+test('a started signal commits the stream: a failure after it is the in-band error and [DONE], with no image event', async () => {
+  const backend = {
+    name: 'test', model: 'configured-model',
+    async generate() { throw new Error('unused'); },
+    async *stream() {
+      yield { type: 'started' };
+      throw new Error('failed before any image');
+    },
+    async close() {},
+  };
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend,
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${GEN}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'x', stream: true }),
+    });
+    assert.equal(res.status, 200, 'the started signal committed the stream');
+    const text = await res.text();
+    const frames = text.split('\n\n').map((b) => b.trim()).filter(Boolean);
+    assert.ok(!text.includes('image_generation.completed'), text);
+    assert.match(text, /event: error/);
+    assert.match(text, /failed before any image/);
+    assert.equal(frames.at(-1), 'data: [DONE]', text);
+  } finally {
+    await started.close();
+  }
+});
+
 // The backend refuses a request it will not run — an option its image model
 // does not support — before any stream byte. That refusal is an HTTP error to
 // the client, streamed or not: the SSE stream commits on the first backend

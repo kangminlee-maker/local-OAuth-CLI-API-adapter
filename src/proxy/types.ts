@@ -405,7 +405,7 @@ export interface OpenAiImageGenerationResult {
   readonly raw?: unknown;
 }
 
-export interface OpenAiImageGenerationStreamEvent {
+export interface OpenAiImageGenerationImageEvent {
   readonly type: 'partial_image' | 'completed';
   readonly created: number;
   readonly image: OpenAiGeneratedImage;
@@ -416,6 +416,17 @@ export interface OpenAiImageGenerationStreamEvent {
   readonly size?: string;
   readonly usage?: unknown;
 }
+
+/**
+ * The backend has produced its first event for the turn: the stream is
+ * committed from here on, and a failure after it is in-band. Carries no
+ * payload and is never written to the client.
+ */
+export interface OpenAiImageGenerationStartedEvent {
+  readonly type: 'started';
+}
+
+export type OpenAiImageGenerationStreamEvent = OpenAiImageGenerationImageEvent | OpenAiImageGenerationStartedEvent;
 
 export interface OpenAiImageGenerationClient {
   generate(

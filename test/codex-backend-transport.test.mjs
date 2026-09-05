@@ -1013,7 +1013,7 @@ test('...and streamed: the image event already written is followed by the failur
   await assert.rejects(async () => {
     for await (const event of backend.stream(imageRequest())) events.push(event);
   }, /codex backend turn failed: offline upstream failed after image item/);
-  assert.deepEqual(events.map((event) => event.type), ['completed']);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
 });
 
 test('an image stream that ends without a terminal event is a failure, image or no image (r47-codex)', async () => {
@@ -1090,7 +1090,7 @@ test('...and streamed: the image event, then completion — no in-band error for
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
   const events = [];
   for await (const event of backend.stream(imageRequest())) events.push(event);
-  assert.deepEqual(events.map((event) => event.type), ['completed']);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
 });
 
 test('...and a body that never closes after the terminal frame does not hold the settled image until the timeout (r48-fable)', async () => {
@@ -1118,6 +1118,38 @@ test('a cut-off image turn (response.incomplete) is a finished turn: an image it
   const result = await backend.generate(imageRequest());
   assert.equal(result.images.length, 1);
   assert.equal(calls.length, 1);
+});
+
+test('an image present only in the cut turn\'s output is the result: response.incomplete is read like response.completed, without a retry (r48-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async () => {
+    calls.push(1);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.incomplete', response: { id: 'resp_image', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [
+        { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() },
+      ] } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(calls.length, 1);
+});
+
+test('the backend\'s first event is surfaced as a payload-less started signal, so a failure before any image is in-band on the stream, not an HTTP error (r48-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'failed before any image' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  }, /codex backend turn failed: failed before any image/);
+  assert.deepEqual(events.map((event) => event.type), ['started']);
 });
 
 // The backend has a `size` slot and does not always honour it (a 256×256
@@ -1436,10 +1468,10 @@ test('CodexBackendTransport streams completed image_generation results', async (
   const events = [];
   for await (const event of backend.stream({ ...imageRequest(), stream: true })) events.push(event);
 
-  assert.equal(events.length, 1);
-  assert.equal(events[0].type, 'completed');
-  assert.equal(events[0].image.b64Json, image);
-  assert.equal(events[0].partialImageIndex, 0);
+  // The backend's first event is the payload-less started signal; then the image.
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, image);
+  assert.equal(events[1].partialImageIndex, 0);
 });
 
 test('CodexBackendTransport retries streamed backend image completions before emitting an error', async () => {
@@ -1473,10 +1505,10 @@ test('CodexBackendTransport retries streamed backend image completions before em
   for await (const event of backend.stream({ ...imageRequest(), stream: true })) events.push(event);
 
   assert.equal(calls.length, 2);
-  assert.equal(events.length, 1);
-  assert.equal(events[0].type, 'completed');
-  assert.equal(events[0].image.b64Json, image);
-  assert.equal(events[0].image.revisedPrompt, 'A green leaf icon.');
+  // One started signal for the stream, not one per attempt.
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, image);
+  assert.equal(events[1].image.revisedPrompt, 'A green leaf icon.');
 });
 
 test('CodexBackendTransport forwards provider-style backend errors', async () => {
