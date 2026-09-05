@@ -783,7 +783,12 @@ test('a tool call carrying no arguments reports an empty object', async () => {
 test('an anonymous completed call cannot rewrite what the stream already delivered', async () => {
   // Position is not identity. With two calls listed in an order the stream did
   // not use, overwriting gave each streamed call the other call's name and
-  // arguments under its own id, so a client answered the wrong call.
+  // arguments under its own id, so a client answered the wrong call. The item
+  // at index 1 names `get_time` where the stream put `get_weather` — that
+  // call's contradiction, kept out; the item at index 0 correlates with
+  // nothing (the one call left sits at position 2), and an item correlated
+  // with nothing is a call without an identity: the turn is refused rather
+  // than guessed (round 37).
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
@@ -803,14 +808,9 @@ test('an anonymous completed call cannot rewrite what the stream already deliver
     },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-
-  const events = [];
-  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
-
-  assert.deepEqual(
-    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
-    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_2', 'get_time', '{"tz":"KST"}']],
-  );
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) void event;
+  }, /missing its call_id/);
 });
 
 test('a call is announced with the id the client must echo, not a placeholder', async () => {
@@ -2552,6 +2552,22 @@ test('the completed output cannot move a known call to another position: the ano
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
       { type: 'message', role: 'assistant', content: [] },
       { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"belongs":"position-1"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('the one remaining pair keeps the call at its accepted position: the one item at another index is not that call, refused (r37-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'message', role: 'assistant', content: [] },
+      { type: 'function_call', arguments: '{"evil":1}' },
     ] } },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });

@@ -426,8 +426,10 @@ class CodexBackendStreamState {
     // as from a live frame. An item at another index naming this call is the
     // vendor contradicting itself, and adopting the holder there handed the
     // call that position's anonymous arguments under a 200 (r36-codex); left
-    // apart, the holder is a call without an identity, refused at completion.
-    // A call with no position yet takes this one: its first evidence.
+    // apart, whatever holds that position — an anonymous holder, a call
+    // known by an item id alone — stays a call of its own, refused at
+    // completion unless a frame identifies it. A call with no position yet
+    // takes this one: its first evidence.
     const accepted = this.positions.get(known);
     if (accepted !== undefined && accepted !== position) return known;
     if (accepted === undefined) this.positions.set(known, position);
@@ -1216,10 +1218,22 @@ class CodexBackendStreamState {
     const unmatched = standing.filter((ordinal) => !placed.has(ordinal));
     const only = unplaced.length === 1 && unmatched.length === 1 ? unmatched[0] : undefined;
     for (const item of unplaced) {
-      const index = only !== undefined && this.namesAgree(item, only) ? only : this.nextToolOrdinal;
+      const index = only !== undefined && this.namesAgree(item, only) && this.positionAgrees(item, only) ? only : this.nextToolOrdinal;
       if (index >= this.nextToolOrdinal) this.nextToolOrdinal = index + 1;
       this.applyFinalItem(item, index);
     }
+  }
+
+  /**
+   * Whether the call at `index` may sit at the item's output position: it
+   * has no accepted position yet, or that is the one. The pair is bound by
+   * the rule `adoptHolder` applies to a call named by id — a call claims
+   * only its accepted position — or the one remaining item at another index
+   * handed the call that index's arguments under a 200 (r37-fable).
+   */
+  private positionAgrees(item: FinalCallItem, index: number): boolean {
+    const accepted = this.positions.get(index);
+    return accepted === undefined || accepted === item.outputIndex;
   }
 
   /** Whether the item's name, when it gives one, is the name the call at `index` already carries. */
