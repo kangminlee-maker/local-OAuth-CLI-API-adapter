@@ -193,7 +193,9 @@ started ahead of that interrupt, so the session stays `running` until the
 acknowledgement arrives (or that request fails). A child that never names the
 turn within the budget is replaced, thread and all — the way the claude runtime
 replaces a child that stopped answering — rather than the session released to a
-next turn ahead of work nobody can interrupt (round 52). A turn requested in that window
+next turn ahead of work nobody can interrupt (round 52); a session closed while that
+replacement is in flight gets no new child, and the close tears down whatever the
+replacement left (round 53). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
 is the runtime's own answer about whether a turn occupies it, not separate
 bookkeeping — the two used to disagree, so a session could report `ready` while

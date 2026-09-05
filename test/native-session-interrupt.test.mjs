@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -200,6 +200,76 @@ test('a turn/start the child never names within the budget replaces the child: t
   const methods = await receivedMethods(methodLog);
   assert.equal(methods.filter((method) => method === 'turn/start').length, 2);
   assert.equal(methods.filter((method) => method === 'thread/start').length, 2, 'a fresh thread on a fresh child');
+});
+
+test('a session closed while its child is being replaced gets no new child: nothing outlives the close, no credentials directory either (r53-fable)', { timeout: 20_000 }, async () => {
+  // The replacement, between its cleanup and its `start()`, outran a close:
+  // the new child and its isolation directory belonged to nobody.
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const privateTmp = await mkdtemp(join(tmpdir(), 'interrupt-isolation-'));
+  tempDirs.push(privateTmp);
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-codex-cwd-'));
+  tempDirs.push(cwd);
+  const methodLog = join(privateTmp, '..', `${privateTmp.split('/').pop()}-methods.log`);
+  process.env.FAKE_CODEX_METHOD_LOG = methodLog;
+  const originalTmp = process.env.TMPDIR;
+  process.env.TMPDIR = privateTmp;
+  let session;
+  try {
+    session = await CodexNativeCliChatSession.create({ command: fakeCodex, cwd, timeoutMs: 300 });
+    openSessions.push(() => session.close());
+    delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+    delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+    assert.equal((await readdir(privateTmp)).length, 1, 'one isolation directory for the child');
+    await assert.rejects(turnText(session, 'hello'), /turn\/start timed out after 300ms/);
+    // The replacement is in flight; the close lands on it.
+    await session.close();
+    await delay(1500);
+    assert.deepEqual(await readdir(privateTmp), [], 'no isolation directory outlives the close');
+    const methods = await receivedMethods(methodLog);
+    assert.equal(methods.filter((method) => method === 'thread/start').length, 1, 'no second child was started');
+  } finally {
+    if (originalTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmp;
+    await rm(methodLog, { force: true });
+  }
+});
+
+test('a credentials directory the replacement cannot remove stops nothing and escapes nowhere: the session goes on with a fresh child (r53-fable)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager } = await startCodexManager(300);
+  const privateTmp = await mkdtemp(join(tmpdir(), 'interrupt-isolation-'));
+  const originalTmp = process.env.TMPDIR;
+  process.env.TMPDIR = privateTmp;
+  let isolationRoot;
+  const rejections = [];
+  const onRejection = (err) => rejections.push(err);
+  try {
+    const session = await manager.create({ runtime: 'codex' });
+    delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+    delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+    [isolationRoot] = (await readdir(privateTmp)).map((name) => join(privateTmp, name));
+    assert.ok(isolationRoot, 'the child\'s isolation directory');
+    // Unreadable: the replacement's `rm` of it rejects.
+    await chmod(isolationRoot, 0o000);
+    process.on('unhandledRejection', onRejection);
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+    assert.equal(first.status, 'error');
+    assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
+    assert.equal(second.status, 'completed', 'the replacement went on');
+    assert.match(second.final.text, /OK$/);
+    await delay(200);
+    assert.deepEqual(rejections, [], 'nothing escaped');
+  } finally {
+    process.off('unhandledRejection', onRejection);
+    if (originalTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmp;
+    if (isolationRoot) await chmod(isolationRoot, 0o700).catch(() => undefined);
+    tempDirs.push(privateTmp);
+  }
 });
 
 test('a stop between the request and its acknowledgement still precedes the next turn', { timeout: 20_000 }, async () => {

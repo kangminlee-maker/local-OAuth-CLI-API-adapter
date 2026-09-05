@@ -113,6 +113,8 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private threadId = '';
   /** The in-flight child replacement, so a turn waits for it instead of racing it. */
   private restarting: Promise<void> | null = null;
+  /** Set by `close()`: a replacement in flight must not start a child the session will never close. */
+  private closed = false;
 
   private constructor(options: Required<CodexNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -276,6 +278,9 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
    */
   private async replaceChild(): Promise<void> {
     if (this.restarting) return this.restarting;
+    // Nothing in here may reject: the caller does not wait for a replacement,
+    // and a rejection nobody awaits is the whole proxy's (r53-fable: a
+    // credentials directory that could not be removed escaped as one).
     const restart = (async () => {
       const previous = this.child;
       this.child = null;
@@ -290,10 +295,20 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       this.bufferedNotifications = [];
       this.stderr = '';
       if (this.isolation) {
-        const { rm } = await import('node:fs/promises');
-        await rm(this.isolation.rootDir, { recursive: true, force: true });
+        const isolation = this.isolation;
         this.isolation = null;
+        try {
+          const { rm } = await import('node:fs/promises');
+          await rm(isolation.rootDir, { recursive: true, force: true });
+        } catch {
+          // A directory that will not go stops nothing; the replacement's own
+          // isolation is a fresh one.
+        }
       }
+      // A session closed while its child was being replaced gets no new child:
+      // one started here outlived the close, with a credentials directory of
+      // its own, and nothing would ever kill it (r53-fable).
+      if (this.closed) return;
       try {
         await this.start();
       } catch {
@@ -342,6 +357,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   }
 
   async close(): Promise<void> {
+    // The replacement in flight finishes its cleanup and starts nothing more;
+    // what it leaves is torn down below.
+    this.closed = true;
+    if (this.restarting) await this.restarting;
     if (this.turn) {
       // Failed, not closed: a closed queue reads as a turn that FINISHED, and
       // the caller was streaming an answer that will now never come.

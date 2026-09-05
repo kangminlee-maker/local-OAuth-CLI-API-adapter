@@ -2066,7 +2066,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     force?: boolean;
     previousAccessToken?: string;
   } = {}, signal?: AbortSignal): Promise<CodexBackendAuth> {
-    return await withRefreshLock(this.codexHome, signal, async () => {
+    return await withRefreshLock(this.codexHome, signal, async (stillHeld) => {
       const parsed = await this.loadAuthFile();
       const current = authFromFile(parsed);
       if (options.force && options.previousAccessToken && current.accessToken !== options.previousAccessToken) {
@@ -2087,13 +2087,13 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         current.refreshToken,
         Math.min(this.timeoutMs, REFRESH_FETCH_BUDGET_MS),
       );
-      // Persisted only onto the generation this refresh consumed: a lease
-      // taken over mid-refresh means another refresh may have advanced the
-      // file since, and the older rotation overwrote the newer (r52-codex).
-      const latest = await this.loadAuthFile();
-      const advanced = authFromFile(latest);
-      if (advanced.refreshToken !== current.refreshToken) return advanced;
-      const updated = mergeRefreshedAuth(latest, refreshResponse);
+      // Persisted by the lease's holder only. A refresh whose lease was taken
+      // over mid-flight returns what it got, unsaved — the holder's is the
+      // one on disk. Comparing generations instead let two taken-over
+      // refreshes finishing together both persist, the survivor by chance
+      // (r52-codex, r53-fable).
+      const updated = mergeRefreshedAuth(parsed, refreshResponse);
+      if (!(await stillHeld())) return authFromFile(updated);
       await saveAuthFile(this.codexHome, updated);
       return authFromFile(updated);
     });
@@ -2244,7 +2244,7 @@ function shouldRefreshAuth(parsed: CodexAuthFile): boolean {
 async function withRefreshLock<T>(
   codexHome: string,
   signal: AbortSignal | undefined,
-  fn: () => Promise<T>,
+  fn: (stillHeld: () => Promise<boolean>) => Promise<T>,
 ): Promise<T> {
   const lockPath = join(codexHome, 'auth.json.refresh.lock');
   const startedAt = Date.now();
@@ -2262,7 +2262,7 @@ async function withRefreshLock<T>(
         owner,
       }));
       try {
-        return await fn();
+        return await fn(async () => (await lockOwner(lockPath)) === owner);
       } finally {
         await handle.close().catch(() => undefined);
         await unlinkOwnLock(lockPath, owner);
@@ -2309,15 +2309,20 @@ async function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promis
   });
 }
 
-/** Removes the lock only while it is still this owner's. */
-async function unlinkOwnLock(lockPath: string, owner: string): Promise<void> {
+/** Who holds the lock now — nobody when it is gone or not a lock this code wrote. */
+async function lockOwner(lockPath: string): Promise<string | undefined> {
   try {
     const current = JSON.parse(await readFile(lockPath, 'utf8')) as { owner?: unknown };
-    if (current?.owner !== owner) return;
-    await unlink(lockPath);
+    return typeof current?.owner === 'string' ? current.owner : undefined;
   } catch {
-    // Gone, or unreadable: not this owner's to remove.
+    return undefined;
   }
+}
+
+/** Removes the lock only while it is still this owner's. */
+async function unlinkOwnLock(lockPath: string, owner: string): Promise<void> {
+  if ((await lockOwner(lockPath)) !== owner) return;
+  await unlink(lockPath).catch(() => undefined);
 }
 
 async function removeStaleLock(lockPath: string): Promise<boolean> {

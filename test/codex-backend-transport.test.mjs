@@ -1431,7 +1431,7 @@ test('a caller that leaves during an in-flight refresh stops waiting for it, and
   assert.deepEqual(urls, ['https://auth.openai.com/oauth/token']);
 });
 
-test('a lease taken over mid-refresh: the first owner removes only its own lock and persists only onto the generation it consumed (r52-codex)', async () => {
+test('a lease taken over mid-refresh: the first owner removes only its own lock and persists nothing — the holder\'s refresh is the one on disk (r52-codex, r53-fable)', async () => {
   const codexHome = await createCodexHome({
     accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
     refreshToken: 'old-refresh-token',
@@ -1468,16 +1468,55 @@ test('a lease taken over mid-refresh: the first owner removes only its own lock 
   await assert.rejects(callerB, /aborted/);
   assert.equal(refreshes, 2);
   const takerLock = await readFile(lockPath, 'utf8');
-  // A finishes late: the file is still on the generation it consumed, so it persists — and leaves B's lock alone.
+  // A finishes late: its lease is B's now, so it persists nothing — and leaves B's lock alone.
   gates[1]();
   await new Promise((resolve) => setTimeout(resolve, 80));
-  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'a-new');
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'old-refresh-token', 'a taken-over refresh is not the one on disk');
   assert.equal(await readFile(lockPath, 'utf8'), takerLock, "the taker's lock is still there");
-  // B finishes: the file has advanced past the generation it consumed, so it persists nothing — and removes its own lock.
+  // B finishes holding the lease: its refresh is the one on disk — and it removes its own lock.
   gates[2]();
   await new Promise((resolve) => setTimeout(resolve, 80));
-  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'a-new', 'the older rotation did not overwrite the newer');
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'b-from-old', "the holder's rotation");
   assert.equal(existsSync(lockPath), false);
+});
+
+test('two refreshes of a taken-over lease finishing in the same tick: exactly one persists, the holder\'s (r53-fable)', async () => {
+  for (let run = 0; run < 3; run += 1) {
+    const codexHome = await createCodexHome({
+      accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+      refreshToken: 'old-refresh-token',
+      lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    const lockPath = join(codexHome, 'auth.json.refresh.lock');
+    const gates = [];
+    let refreshes = 0;
+    globalThis.fetch = async (url, init) => {
+      if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+      refreshes += 1;
+      const order = refreshes;
+      await new Promise((resolve) => { gates[order] = resolve; });
+      return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: order === 1 ? 'a-new' : 'b-from-old' });
+    };
+    const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+    const a = new AbortController();
+    const callerA = backend.generate(imageRequest(), a.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    a.abort();
+    await assert.rejects(callerA, /aborted/);
+    const past = new Date(Date.now() - 61_000);
+    await utimes(lockPath, past, past);
+    const b = new AbortController();
+    const callerB = backend.generate(imageRequest(), b.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    b.abort();
+    await assert.rejects(callerB, /aborted/);
+    assert.equal(refreshes, 2);
+    gates[1]();
+    gates[2]();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(JSON.parse(await readFile(join(codexHome, 'auth.json'), 'utf8')).tokens.refresh_token, 'b-from-old', `run ${run}: the holder's rotation, not whichever landed last`);
+    assert.equal(existsSync(lockPath), false);
+  }
 });
 
 test('a refresh fetch is bounded below its lease: a token endpoint that never answers fails the refresh at the budget and releases the lock (r52-codex)', async () => {
