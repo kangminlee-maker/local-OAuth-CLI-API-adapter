@@ -50,7 +50,7 @@ afterEach(async () => {
 const delay = (ms) => new Promise((resolve_) => setTimeout(resolve_, ms).unref());
 
 /** A manager whose codex runtime is the real session over the fake child. */
-async function startCodexManager() {
+async function startCodexManager(timeoutMs = 20_000) {
   const sourceHome = await mkdtemp(join(tmpdir(), 'interrupt-codex-home-'));
   tempDirs.push(sourceHome);
   await writeFile(join(sourceHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 't' } }), { mode: 0o600 });
@@ -65,7 +65,7 @@ async function startCodexManager() {
       codex: async (input) => CodexNativeCliChatSession.create({
         command: fakeCodex,
         cwd: input.cwd,
-        timeoutMs: 20_000,
+        timeoutMs,
       }),
     },
   });
@@ -177,6 +177,29 @@ test('the child is told to stop before it is asked for the next turn', { timeout
     ['turn/start', 'turn/interrupt', 'turn/start'],
     'the interrupt must reach the child before the next turn does',
   );
+});
+
+test('a turn/start the child never names within the budget replaces the child: the next turn runs on a fresh thread, not ahead of work nobody can interrupt (r52-codex)', { timeout: 20_000 }, async () => {
+  // The request's expiry used to release the session as if the turn had
+  // failed; the child kept the accepted turn, its late acknowledgement was
+  // dropped with the pending entry, and the next `turn/start` reached the
+  // thread with no interrupt between them.
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(300);
+  const session = await manager.create({ runtime: 'codex' });
+  // The child already spawned keeps its environment; its replacement will not.
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  assert.equal(first.status, 'error');
+  assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
+  const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
+  assert.equal(second.status, 'completed', 'the next turn ran on the replacement');
+  assert.match(second.final.text, /OK$/);
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'turn/start').length, 2);
+  assert.equal(methods.filter((method) => method === 'thread/start').length, 2, 'a fresh thread on a fresh child');
 });
 
 test('a stop between the request and its acknowledgement still precedes the next turn', { timeout: 20_000 }, async () => {

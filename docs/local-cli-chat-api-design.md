@@ -190,7 +190,10 @@ The endpoint answers as soon as the turn is over for its caller; it does not
 wait for the session to be free again. A turn the child has been asked for but
 has not yet named cannot be interrupted until it is named, and nothing may be
 started ahead of that interrupt, so the session stays `running` until the
-acknowledgement arrives (or that request fails). A turn requested in that window
+acknowledgement arrives (or that request fails). A child that never names the
+turn within the budget is replaced, thread and all — the way the claude runtime
+replaces a child that stopped answering — rather than the session released to a
+next turn ahead of work nobody can interrupt (round 52). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
 is the runtime's own answer about whether a turn occupies it, not separate
 bookkeeping — the two used to disagree, so a session could report `ready` while

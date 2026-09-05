@@ -65,6 +65,14 @@ interface Turn {
 
 type JsonRpcMessage = Record<string, unknown>;
 
+/** A request the child never answered within the budget: its outcome is unknown, not failed. */
+class CodexRpcTimeoutError extends Error {
+  constructor(method: string, timeoutMs: number) {
+    super(`${method} timed out after ${timeoutMs}ms`);
+    this.name = 'CodexRpcTimeoutError';
+  }
+}
+
 export interface CodexNativeCliChatSessionOptions {
   readonly command?: string;
   readonly cwd: string;
@@ -103,6 +111,8 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private bufferedNotifications: LocalCliChatRuntimeEvent[] = [];
   private isolation: Awaited<ReturnType<typeof createCodexIsolation>> | null = null;
   private threadId = '';
+  /** The in-flight child replacement, so a turn waits for it instead of racing it. */
+  private restarting: Promise<void> | null = null;
 
   private constructor(options: Required<CodexNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -144,6 +154,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     input: LocalCliChatTurnInput,
     signal?: AbortSignal,
   ): AsyncIterable<LocalCliChatRuntimeEvent> {
+    if (this.restarting) await this.restarting;
     if (!this.child) throw new Error('codex native chat session is not running');
     if (this.turn) throw new Error('codex native chat session already has a running turn');
     // A caller that has already left gets no turn at all. Failing the queue and
@@ -172,18 +183,30 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       preparedInput = await prepareCodexInput(request, chatPromptText(input));
       turn.cleanup = preparedInput.cleanup;
       if (turn.stopped) throw new Error('local CLI chat turn aborted');
-      const response = await this.send('turn/start', {
-        threadId: this.threadId,
-        cwd: this.cwd,
-        runtimeWorkspaceRoots: [this.cwd],
-        environments: [],
-        input: preparedInput.input,
-        model: this.model,
-        effort: this.reasoningEffort,
-        summary: 'none',
-        outputSchema: null,
-        personality: 'none',
-      });
+      let response: JsonRpcMessage;
+      try {
+        response = await this.send('turn/start', {
+          threadId: this.threadId,
+          cwd: this.cwd,
+          runtimeWorkspaceRoots: [this.cwd],
+          environments: [],
+          input: preparedInput.input,
+          model: this.model,
+          effort: this.reasoningEffort,
+          summary: 'none',
+          outputSchema: null,
+          personality: 'none',
+        });
+      } catch (err) {
+        // A turn the child never named within the budget may be running on
+        // it, and nothing can interrupt what has no id. The request's expiry
+        // used to release the session as if the turn had failed, and the
+        // next turn reached the thread ahead of that work with no interrupt
+        // between them (r52-codex). The child is replaced instead — the way
+        // the sibling claude session replaces one that stopped answering.
+        if (err instanceof CodexRpcTimeoutError) void this.replaceChild();
+        throw err;
+      }
       turn.turnId = readPath<string>(response, ['result', 'turn', 'id']) ?? '';
       if (!turn.turnId) throw new Error('codex app-server did not return a turn id');
       // The stop may have come while this acknowledgement was in flight, when
@@ -244,6 +267,46 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // can be asked for anything else. Do not put an `await` in between.
     this.retire(turn);
     await this.sendTurnInterrupt(turn);
+  }
+
+  /**
+   * Replaces the child, thread and all: the one that stopped answering may
+   * still be working, and a turn on the new thread cannot land on it. One
+   * replacement at a time; the next turn waits for it.
+   */
+  private async replaceChild(): Promise<void> {
+    if (this.restarting) return this.restarting;
+    const restart = (async () => {
+      const previous = this.child;
+      this.child = null;
+      this.lineReader?.close();
+      this.lineReader = null;
+      previous?.kill('SIGTERM');
+      for (const pending of this.pending.values()) {
+        clearTimeout(pending.timer);
+        pending.reject(new Error('codex app-server replaced'));
+      }
+      this.pending.clear();
+      this.bufferedNotifications = [];
+      this.stderr = '';
+      if (this.isolation) {
+        const { rm } = await import('node:fs/promises');
+        await rm(this.isolation.rootDir, { recursive: true, force: true });
+        this.isolation = null;
+      }
+      try {
+        await this.start();
+      } catch {
+        // Left not-running: the next turn reports that plainly rather than
+        // hanging against a child that no longer exists.
+      }
+    })();
+    this.restarting = restart;
+    try {
+      await restart;
+    } finally {
+      if (this.restarting === restart) this.restarting = null;
+    }
   }
 
   /** The one place a turn stops being the session's. */
@@ -338,21 +401,29 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    this.child.stderr.setEncoding('utf8');
-    this.child.stderr.on('data', (chunk) => {
-      this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
+    // Every handler checks it still belongs to the session's child: a replaced
+    // child's exit must not fail the turn on its successor, or null it.
+    const child = this.child;
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      if (this.child === child) this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
     });
-    this.child.on('error', (err) => this.failActive(err));
+    child.on('error', (err) => {
+      if (this.child === child) this.failActive(err);
+    });
     // An `error` event with no listener is an uncaught exception: one racing
     // write to a child that has just died would take the whole proxy down
     // rather than the turn. The sibling claude session guards the same pipe.
-    this.child.stdin.on('error', (err) => this.failActive(err));
-    this.child.on('close', (code, signal) => {
+    child.stdin.on('error', (err) => {
+      if (this.child === child) this.failActive(err);
+    });
+    child.on('close', (code, signal) => {
+      if (this.child !== child) return;
       this.failActive(new Error(`codex app-server exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`));
       this.child = null;
       this.lineReader = null;
     });
-    this.lineReader = readline.createInterface({ input: this.child.stdout });
+    this.lineReader = readline.createInterface({ input: child.stdout });
     this.lineReader.on('line', (line) => this.handleLine(line));
 
     await this.send('initialize', {
@@ -407,7 +478,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`${method} timed out after ${this.timeoutMs}ms`));
+        reject(new CodexRpcTimeoutError(method, this.timeoutMs));
       }, this.timeoutMs);
       this.pending.set(id, { method, resolve, reject, timer });
     });
