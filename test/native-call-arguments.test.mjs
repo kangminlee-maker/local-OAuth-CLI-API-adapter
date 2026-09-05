@@ -1091,7 +1091,7 @@ test('an anonymous holder at the position a known call is placed at is that call
   const variants = [
     ['anonymous delta, then the index-less added, then the id frames at 0', [anon(0), ADDED, rest(0), done(0), completed(FULL)]],
     ['index-less added, then the anonymous delta, then the id frames at 0', [ADDED, anon(0), rest(0), done(0), completed(FULL)]],
-    ['the same at position 2', [{ type: 'response.output_text.delta', output_index: 1, delta: 'first' }, ADDED, anon(2), rest(2), done(2), completed([{ type: 'message', id: 'm', content: [{ type: 'output_text', text: 'first' }] }, ...FULL])]],
+    ['the same at position 2', [{ type: 'response.output_text.delta', output_index: 1, delta: 'first' }, ADDED, anon(2), rest(2), done(2), completed([{ type: 'reasoning', id: 'rs' }, { type: 'message', id: 'm', content: [{ type: 'output_text', text: 'first' }] }, ...FULL])]],
     // No id frame ever carries a position: the completed output places the call, and the holder there is its own.
     ['index-less id frames, placed by the completed output', [ADDED, { ...anon(0), delta: '{"a":1}' }, completed(FULL)]],
     // After the holder is adopted its ordinal is retired; an id-less completed item still aligns to the one streamed call.
@@ -1275,7 +1275,10 @@ test('a call identified by folding a finished holder into it is one call on ever
     { type: 'response.function_call_arguments.done', output_index: 2, arguments: '{"a":1}' },
     { type: 'response.function_call_arguments.delta', output_index: 2, item_id: 'fc_a', delta: '' },
     { type: 'response.output_text.delta', output_index: 3, delta: 'after' },
+    // The completed array at the live positions: the call at 2, the text at 3.
     { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'reasoning', id: 'rs_0' },
+      { type: 'reasoning', id: 'rs_1' },
       { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'probe', arguments: '{"a":1}' },
       { type: 'message', id: 'm', content: [{ type: 'output_text', text: 'after' }] },
     ] } },

@@ -354,8 +354,8 @@ class CodexBackendStreamState {
       // kept and the frame's bytes went out under it (r39-codex). Heard on
       // the SURVIVOR, after the fold: checked against the known state alone,
       // an unnamed call adopting a `beta` holder took that name past a frame
-      // that said `alpha` (r42-fable).
-      if (!this.namesAgree(ids.name, survivor)) {
+      // that said `alpha` (r42-fable). The `call_id` is heard the same way.
+      if (!this.namesAgree(ids.name, survivor) || !this.callIdAgrees(ids.callId, survivor)) {
         throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
       return survivor;
@@ -614,16 +614,15 @@ class CodexBackendStreamState {
       this.bindOrdinal(known, ids);
       // A call known by id whose frames never carried a position is placed
       // by the completed output; the anonymous holder at that position is
-      // its own (the rule `toolOrdinal` applies live — r30-fable F1). Its
-      // index is not consulted for identity — an identified item is the call
-      // its ids name wherever the array lists it (the stream and the array
-      // may order the calls differently; declared) — only for what it may
-      // adopt.
+      // its own (the rule `toolOrdinal` applies live — r30-fable F1). An
+      // item at another index adopts nothing there, and `captureFinalOutput`
+      // refuses it once the listed-twice door has had its say (r41-codex).
       const survivor = this.adoptHolder(known, outputIndex);
-      // The completed item hears the name like a live frame, on the survivor
-      // after the fold: another name for a known call is two calls named as
-      // one (r39-codex, r42-fable).
-      if (!this.namesAgree(ids.name, survivor)) {
+      // The completed item hears the name and the `call_id` like a live
+      // frame, on the survivor after the fold: another name, or another
+      // `call_id`, for a known call is two calls named as one (r39-codex,
+      // r42-fable, r41-codex).
+      if (!this.namesAgree(ids.name, survivor) || !this.callIdAgrees(ids.callId, survivor)) {
         throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
       return survivor;
@@ -1264,6 +1263,16 @@ class CodexBackendStreamState {
         const meeting = folded && (item.arguments === undefined || item.arguments === current);
         if (!meeting) throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
+      // `output[i]` is the item announced at `output_index: i`: an
+      // identified item listed at an index other than its call's accepted
+      // position is the vendor contradicting its own positions, refused as
+      // arguments the transport cannot place. Correlated by its ids wherever
+      // the array listed it, the answer was repaired into the stream's order
+      // (r41-codex; the wire-positions row decides, and five round-26
+      // fixtures that reordered the array now refuse).
+      if (!this.positionAgrees(item.outputIndex, index)) {
+        throw backendContractError('The local runtime wrote tool arguments the transport cannot place.', this.request.shape);
+      }
       this.applyFinalItem(item, index);
       this.toolStates.get(index)!.placed = true;
     }
@@ -1280,17 +1289,16 @@ class CodexBackendStreamState {
         unplaced.push(item);
         continue;
       }
-      // An anonymous item at the position of a call an item already placed
-      // is that call listed twice, like an identified one: no value, or
-      // exactly the value the call holds — an extension of the identified
-      // listing's fragment was applied through the prefix gate under a 200
-      // (r41-fable).
-      if (placed(holder)) {
-        const current = this.toolStates.get(holder)?.arguments ?? '';
-        if (item.arguments !== undefined && item.arguments !== current) {
-          throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
-        }
+      // An anonymous item naming a DIFFERENT tool than the call at its
+      // position is two calls named as one — refused, like every other
+      // door. Kept out, the streamed calls stood and a call the runtime
+      // wrote vanished under a 200 (r41-codex; rounds 26–35 kept it out).
+      if (!this.namesAgree(item.name, holder)) {
+        throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
+      // (A call holds one position, and an identified listing of it sits at
+      // that position or is refused above — so no anonymous item can find a
+      // placed call here; the position pass needs no listed-twice door.)
       this.applyFinalItem(item, holder);
       this.toolStates.get(holder)!.placed = true;
     }
@@ -1335,6 +1343,18 @@ class CodexBackendStreamState {
     return accepted === undefined || accepted === outputIndex;
   }
 
+  /**
+   * Whether `callId`, when given, is the `call_id` the call at `index` already
+   * carries. Latched like the name: the client echoes it back, and a frame
+   * or item naming another for the same call — the name unchanged, so the
+   * name doors heard nothing — kept the announced id and delivered, a
+   * repair (r41-codex; rounds 23–25 declared it).
+   */
+  private callIdAgrees(callId: string | undefined, index: number): boolean {
+    const state = this.toolStates.get(index);
+    return callId === undefined || state === undefined || !state.hasCallId || state.id === callId;
+  }
+
   /** Whether `name`, when given, is the name the call at `index` already carries. */
   private namesAgree(name: string | undefined, index: number): boolean {
     const state = this.toolStates.get(index);
@@ -1355,12 +1375,6 @@ class CodexBackendStreamState {
   private applyFinalItem(item: FinalCallItem, index: number): void {
     const anonymous = item.itemId === undefined && item.callId === undefined;
     const existing = this.toolStates.get(index);
-    // An anonymous item that names a DIFFERENT tool than the call it was
-    // correlated with is not that call's account: the vendor contradicting
-    // itself, kept out like a contradicting value (declared). Applied anyway,
-    // its arguments went out under the streamed call's name whenever they
-    // extended the prefix — always, when the prefix was `{` (r35-codex).
-    if (anonymous && existing !== undefined && !this.namesAgree(item.name, index)) return;
     const state = existing ?? {
       ...this.newToolState(index, {
         id: item.callId,
