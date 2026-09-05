@@ -312,9 +312,6 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       this.pending.clear();
       this.bufferedNotifications = [];
       this.stderr = '';
-      // No thread until the new child names one: a waiting turn sent to a
-      // partial child on the old thread's id ran there (r55-codex).
-      this.threadId = '';
       if (this.isolation) {
         const isolation = this.isolation;
         this.isolation = null;

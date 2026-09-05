@@ -1595,6 +1595,42 @@ test('...and the caller of that refresh uses the file\'s current generation, not
   assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'cli-new');
 });
 
+test('a logout under the refresh is not a generation to use: the caller keeps the token it fetched, unsaved, and the logout is not written over (r56-fable)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600, lineage: 'proxy' });
+  let release;
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      await new Promise((resolve) => { release = resolve; });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const caller = backend.generate(imageRequest());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(release, 'the refresh is in flight');
+  // The codex CLI logs out: a JSON file with no tokens — another generation
+  // by the refresh-token test, and one `authFromFile` refuses.
+  await writeFile(authPath, JSON.stringify({ note: 'logged out' }), { mode: 0o600 });
+  release();
+  const result = await caller;
+  assert.equal(result.images.length, 1, 'the request the refresh was for completes');
+  assert.deepEqual(bearers, [`Bearer ${proxyAccess}`], 'on the token the refresh fetched — not thrown away with the logout\'s error');
+  assert.deepEqual(JSON.parse(await readFile(authPath, 'utf8')), { note: 'logged out' }, 'and the logout is not written over');
+});
+
 test('a re-read that fails after the token fetch loses nothing: the caller keeps its refreshed auth, unsaved, and the lock is released (r55-codex)', async () => {
   const codexHome = await createCodexHome({
     accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),

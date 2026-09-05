@@ -204,7 +204,7 @@ after the session is gone and the child killed — not a success, and not a sess
 kept listed (round 54) — and the server's own close hears it through `closeAll`. A stop
 that lands while a turn waits for the replacement ends the wait, not the replacement; a
 close during a replacement ends the child being started rather than waiting out its
-handshake; a replacement whose handshake fails leaves no child and no thread; and a
+handshake; a replacement whose handshake fails leaves no child; and a
 streamed turn is admitted before any SSE commits, so a 404, 409 or 410 arrives in the
 native envelope on that path too (round 55). A close stops the turn it finds — one
 still preparing its input ends without writing to the child being archived, and one

@@ -2113,7 +2113,19 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         return this.loadAuthFile().catch(() => null);
       });
       if (latest === null) return authFromFile(refreshed);
-      if (latest.tokens?.refresh_token !== current.refreshToken) return authFromFile(latest);
+      if (latest.tokens?.refresh_token !== current.refreshToken) {
+        // Another generation — or none. A logout under the refresh leaves a
+        // file with no tokens: not a generation to use, and not one to write
+        // over. The caller of that refresh keeps what it fetched, unsaved
+        // (r56-fable: the logout's file went to `authFromFile` and the fetched
+        // token was thrown away with its error — the one not-saved cell whose
+        // caller got no token).
+        try {
+          return authFromFile(latest);
+        } catch {
+          return authFromFile(refreshed);
+        }
+      }
       if (!(await stillHeld())) return authFromFile(refreshed);
       // Merged onto the re-read, with the identity the re-read may have lost
       // taken from the generation this refresh consumed, and validated before
