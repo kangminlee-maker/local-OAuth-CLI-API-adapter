@@ -2576,3 +2576,72 @@ test('the one remaining pair keeps the call at its accepted position: the one it
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
   }, /missing its call_id/);
 });
+
+test('a call known by id does not adopt a holder of another name: the two are two calls, refused (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"belongs":"beta"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, arguments: '{"belongs":"beta"}' },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('an identified event at a position held by a state of another name is refused before that holder\'s bytes go out under the new name (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"belongs":"beta"}' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"belongs":"beta"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  }, /named two tool calls as one/);
+  assert.equal(events.filter((event) => event.type === 'tool_call_delta').length, 0, 'nothing announced before the refusal');
+});
+
+test('a split identity whose halves carry different names does not fold: two calls named as one, refused (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"b":2}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a call_id the completed output supplies names the call from then on: a second item carrying it is the call listed twice, refused — not a second call under the same id (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'alias_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_alias', call_id: 'alias_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});

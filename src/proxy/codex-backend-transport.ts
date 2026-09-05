@@ -222,6 +222,13 @@ interface ToolState {
 interface ToolIds {
   readonly itemId?: string;
   readonly callId?: string;
+  /**
+   * The tool's name when the frame gives one. Not an identifier, but a
+   * witness every correlation must hear: two pieces carrying different
+   * names are two calls, whatever id or position says — bound or folded
+   * anyway, one call's arguments went out under the other's name (r37-codex).
+   */
+  readonly name?: string;
 }
 
 /** One `function_call` item of the completed output, as `captureFinalOutput` reads it. */
@@ -362,6 +369,12 @@ class CodexBackendStreamState {
       throw backendContractError('The local runtime wrote a tool event that names no call.', this.request.shape);
     }
     let ordinal = explicit ? this.holders.get(position) : undefined;
+    // ...and only when the names agree: a named event at a position held by
+    // a state of another name is two calls named as one, refused here before
+    // the holder's bytes go out under this event's name (r37-codex).
+    if (ordinal !== undefined && !this.namesAgree(ids.name, ordinal)) {
+      throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
+    }
     if (ordinal === undefined) {
       ordinal = this.nextToolOrdinal;
       this.nextToolOrdinal += 1;
@@ -477,7 +490,11 @@ class CodexBackendStreamState {
     for (const other of bound) {
       if (other === survivor) continue;
       const otherState = this.toolStates.get(other);
-      if (otherState !== undefined && !this.absorbable(otherState)) {
+      // Two pieces carrying different names are two calls, however the ids
+      // or the position join them: folded, the absorbed piece's bytes went
+      // out under the survivor's name (r37-codex).
+      const contradicts = otherState !== undefined && otherState.named && !this.namesAgree(otherState.name, survivor);
+      if (otherState !== undefined && (!this.absorbable(otherState) || contradicts)) {
         throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
       this.absorb(survivor, other);
@@ -568,6 +585,12 @@ class CodexBackendStreamState {
   private finalOutputOrdinal(slot: number | undefined, outputIndex: number, ids: ToolIds): number {
     const known = this.knownOrdinal(ids);
     if (known !== undefined) {
+      // Every id the item carries names the call from here on, as on a live
+      // frame: a `call_id` the item supplied to a call the stream knew by its
+      // item id alone was copied into the state but bound to nothing, and a
+      // second item carrying that `call_id` minted a second call under the
+      // same client identity (r37-codex).
+      this.bindOrdinal(known, ids);
       // A call known by id whose frames never carried a position is placed
       // by the completed output; the anonymous holder at that position is
       // its own (the rule `toolOrdinal` applies live — r30-fable F1).
@@ -582,7 +605,7 @@ class CodexBackendStreamState {
     // invented a third call (r27-codex).
     const holder = this.holders.get(outputIndex);
     const byPosition = this.adoptableOrdinal(holder);
-    if (byPosition !== undefined) {
+    if (byPosition !== undefined && this.namesAgree(ids.name, byPosition)) {
       this.bindOrdinal(byPosition, ids);
       return byPosition;
     }
@@ -594,7 +617,7 @@ class CodexBackendStreamState {
     // F7). A holder that already has a `call_id` is not adopted: an item
     // naming a different one is the vendor contradicting itself (declared).
     const holderState = holder === undefined ? undefined : this.toolStates.get(holder);
-    if (holder !== undefined && holderState !== undefined && !holderState.hasCallId && ids.itemId === undefined) {
+    if (holder !== undefined && holderState !== undefined && !holderState.hasCallId && ids.itemId === undefined && this.namesAgree(ids.name, holder)) {
       this.bindOrdinal(holder, ids);
       return holder;
     }
@@ -683,7 +706,7 @@ class CodexBackendStreamState {
       // r29-codex); whether the added snapshot's string is cumulative or
       // authoritative is unmeasured, so a string is left to the later frames.
       argumentsText(event.item.arguments, this.request.shape);
-      const index = this.toolOrdinal(event, { itemId, callId });
+      const index = this.toolOrdinal(event, { itemId, callId, name });
       out.push(...this.announceFinished('moved'));
       const id = callId ?? itemId ?? `call_${index + 1}`;
       const named = itemId !== undefined || callId !== undefined;
@@ -771,7 +794,7 @@ class CodexBackendStreamState {
       const itemId = identityText(event.item.id, this.request.shape);
       const callId = identityText(event.item.call_id, this.request.shape);
       const name = identityText(event.item.name, this.request.shape);
-      const index = this.toolOrdinal(event, { itemId, callId });
+      const index = this.toolOrdinal(event, { itemId, callId, name });
       out.push(...this.announceFinished('moved'));
       const named = itemId !== undefined || callId !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
@@ -1162,6 +1185,7 @@ class CodexBackendStreamState {
       // the item is left alone (declared, matrix §7 row 8).
       const itemOrdinal = item.itemId === undefined ? undefined : this.itemOrdinals.get(item.itemId);
       const callOrdinal = item.callId === undefined ? undefined : this.callOrdinals.get(item.callId);
+      let folded = false;
       if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
         // ...unless one of the two is a state the client was never told
         // about: then the item is where the split identity meets, and it
@@ -1172,11 +1196,20 @@ class CodexBackendStreamState {
         const foldable = (itemState !== undefined && this.absorbable(itemState)) || (callState !== undefined && this.absorbable(callState));
         if (!foldable) continue;
         this.coalesce([itemOrdinal, callOrdinal]);
+        folded = true;
       }
       // The dense slot — the streamed calls in order — is where an
       // unfamiliar item goes when an anonymous holder sits there.
       const slot = [...this.toolStates.keys()].sort((a, b) => a - b)[item.position];
       const index = this.finalOutputOrdinal(slot, item.outputIndex, item);
+      // An item resolving to a call an earlier item already placed — without
+      // folding a streamed state into it — is that call listed twice: two
+      // array positions for one identity. Applied again it silently
+      // collapsed into one call, a repair; minting a second call put the
+      // same `call_id` on the wire twice (r37-codex).
+      if (placed.has(index) && !folded) {
+        throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
+      }
       placed.add(index);
       this.applyFinalItem(item, index);
     }
@@ -1219,7 +1252,7 @@ class CodexBackendStreamState {
     const unmatched = standing.filter((ordinal) => !placed.has(ordinal));
     const only = unplaced.length === 1 && unmatched.length === 1 ? unmatched[0] : undefined;
     for (const item of unplaced) {
-      const index = only !== undefined && this.namesAgree(item, only) && this.positionAgrees(item, only) ? only : this.nextToolOrdinal;
+      const index = only !== undefined && this.namesAgree(item.name, only) && this.positionAgrees(item, only) ? only : this.nextToolOrdinal;
       if (index >= this.nextToolOrdinal) this.nextToolOrdinal = index + 1;
       this.applyFinalItem(item, index);
     }
@@ -1237,10 +1270,10 @@ class CodexBackendStreamState {
     return accepted === undefined || accepted === item.outputIndex;
   }
 
-  /** Whether the item's name, when it gives one, is the name the call at `index` already carries. */
-  private namesAgree(item: FinalCallItem, index: number): boolean {
+  /** Whether `name`, when given, is the name the call at `index` already carries. */
+  private namesAgree(name: string | undefined, index: number): boolean {
     const state = this.toolStates.get(index);
-    return item.name === undefined || state === undefined || !state.named || state.name === item.name;
+    return name === undefined || state === undefined || !state.named || state.name === name;
   }
 
   /**
@@ -1262,7 +1295,7 @@ class CodexBackendStreamState {
     // itself, kept out like a contradicting value (declared). Applied anyway,
     // its arguments went out under the streamed call's name whenever they
     // extended the prefix — always, when the prefix was `{` (r35-codex).
-    if (anonymous && existing !== undefined && !this.namesAgree(item, index)) return;
+    if (anonymous && existing !== undefined && !this.namesAgree(item.name, index)) return;
     const state = existing ?? {
       ...this.newToolState(index, {
         id: item.callId,
