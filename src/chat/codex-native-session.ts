@@ -388,9 +388,16 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.child = null;
     this.lineReader = null;
     if (this.isolation) {
-      const { rm } = await import('node:fs/promises');
-      await rm(this.isolation.rootDir, { recursive: true, force: true });
+      const isolation = this.isolation;
       this.isolation = null;
+      try {
+        const { rm } = await import('node:fs/promises');
+        await rm(isolation.rootDir, { recursive: true, force: true });
+      } catch {
+        // A directory that will not go does not keep a closed session listed:
+        // a close that rejected here left the manager's entry, `ready` over a
+        // dead child, for good (r54-fable).
+      }
     }
   }
 

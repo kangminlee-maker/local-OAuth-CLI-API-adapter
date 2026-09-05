@@ -272,6 +272,28 @@ test('a credentials directory the replacement cannot remove stops nothing and es
   }
 });
 
+test('a credentials directory the close cannot remove does not keep the session listed: the close resolves and the session is gone (r54-fable)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager();
+  const privateTmp = await mkdtemp(join(tmpdir(), 'interrupt-isolation-'));
+  const originalTmp = process.env.TMPDIR;
+  process.env.TMPDIR = privateTmp;
+  let isolationRoot;
+  try {
+    const session = await manager.create({ runtime: 'codex' });
+    [isolationRoot] = (await readdir(privateTmp)).map((name) => join(privateTmp, name));
+    assert.ok(isolationRoot, 'the child\'s isolation directory');
+    await chmod(isolationRoot, 0o000);
+    const closed = await manager.close(session.id);
+    assert.equal(closed.status, 'closed');
+    assert.throws(() => manager.get(session.id), /not found|unknown|no such/i);
+  } finally {
+    if (originalTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmp;
+    if (isolationRoot) await chmod(isolationRoot, 0o700).catch(() => undefined);
+    tempDirs.push(privateTmp);
+  }
+});
+
 test('a stop between the request and its acknowledgement still precedes the next turn', { timeout: 20_000 }, async () => {
   // The third window a stop can land in. The invariant was pinned for a stop
   // AFTER the child names the turn, and asserted for one before the request is

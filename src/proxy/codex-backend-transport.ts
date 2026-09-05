@@ -2087,13 +2087,20 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         current.refreshToken,
         Math.min(this.timeoutMs, REFRESH_FETCH_BUDGET_MS),
       );
-      // Persisted by the lease's holder only. A refresh whose lease was taken
-      // over mid-flight returns what it got, unsaved — the holder's is the
-      // one on disk. Comparing generations instead let two taken-over
-      // refreshes finishing together both persist, the survivor by chance
-      // (r52-codex, r53-fable).
-      const updated = mergeRefreshedAuth(parsed, refreshResponse);
-      if (!(await stillHeld())) return authFromFile(updated);
+      // Persisted by the lease's holder, onto the generation it consumed. A
+      // refresh whose lease was taken over mid-flight saves nothing — the
+      // holder's is the one on disk (r52-codex; r53-fable: comparing
+      // generations alone let two taken-over refreshes finishing together
+      // both persist) — and neither does one whose generation another
+      // writer advanced meanwhile: the codex CLI rewrites this file too, and
+      // the holder check alone overwrote its rotation and dropped its fields
+      // (r54-fable). What is saved is merged onto the file as re-read, so
+      // what such a writer added stays.
+      const latest = await this.loadAuthFile();
+      if (!(await stillHeld()) || latest.tokens?.refresh_token !== current.refreshToken) {
+        return authFromFile(mergeRefreshedAuth(parsed, refreshResponse));
+      }
+      const updated = mergeRefreshedAuth(latest, refreshResponse);
       await saveAuthFile(this.codexHome, updated);
       return authFromFile(updated);
     });

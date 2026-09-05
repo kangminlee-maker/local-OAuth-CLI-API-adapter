@@ -1519,6 +1519,41 @@ test('two refreshes of a taken-over lease finishing in the same tick: exactly on
   }
 });
 
+test('a writer outside the lease — the codex CLI rewriting auth.json during a refresh — is not overwritten: the refresh saves nothing and the CLI\'s generation stays, its own fields with it (r54-fable)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  let release;
+  globalThis.fetch = async (url, init) => {
+    if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+    assert.equal(JSON.parse(init.body).refresh_token, 'old-refresh-token');
+    await new Promise((resolve) => { release = resolve; });
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: 'proxy-new' });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const controller = new AbortController();
+  const caller = backend.generate(imageRequest(), controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  controller.abort();
+  await assert.rejects(caller, /aborted/);
+  assert.ok(release, 'the refresh is in flight');
+  // The operator's own `codex` run rotates the file meanwhile, lease or no lease.
+  const cli = JSON.parse(await readFile(authPath, 'utf8'));
+  cli.tokens.refresh_token = 'cli-new';
+  cli.tokens.access_token = jwt({ exp: Math.floor(Date.now() / 1000) + 7200 });
+  cli.cli_note = 'mine';
+  await writeFile(authPath, JSON.stringify(cli), { mode: 0o600 });
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const persisted = JSON.parse(await readFile(authPath, 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'cli-new', 'the generation the refresh consumed is gone; it saves nothing over the CLI\'s');
+  assert.equal(persisted.cli_note, 'mine', 'and what the CLI wrote stays');
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false);
+});
+
 test('a refresh fetch is bounded below its lease: a token endpoint that never answers fails the refresh at the budget and releases the lock (r52-codex)', async () => {
   const codexHome = await createCodexHome({
     accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
