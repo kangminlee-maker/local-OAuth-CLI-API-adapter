@@ -747,16 +747,21 @@ class CodexBackendStreamState {
       const id = callId ?? itemId ?? `call_${index + 1}`;
       const named = itemId !== undefined || callId !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name: name, anonymous: !named });
-      // Same rule the `.done` branch states: never downgrade an announced
-      // `call_id` to an item id. A repeat of the item that omits it would
-      // otherwise rename a call the client has already reported under — and
-      // once the client has been told an identity (`started`), no later
+      // Same rule the `.done` branch states: never downgrade a `call_id` to
+      // an item id — announced or not. A repeat of the item that omits it
+      // would otherwise rename a call the client has already reported under,
+      // and once the client has been told an identity (`started`), no later
       // frame changes it at all (r25-fable: a repeat carrying `call_2`/`other`
       // renamed the body's call behind a stream that had announced
-      // `call_1`/`probe`).
+      // `call_1`/`probe`). The item-id fallback stands in only while the
+      // call has no `call_id`: gated on `identified` — a `call_id` AND a
+      // name — a name-bearing frame joining a fold's survivor that owned the
+      // `call_id` but no name yet put its item id where the `call_id` stood,
+      // and the client was told to echo an id the backend never supplied as
+      // one (r43-codex).
       if (!state.started) {
         if (callId !== undefined) state.id = callId;
-        else if (!state.identified) state.id = id;
+        else if (!state.hasCallId) state.id = id;
       }
       // A call once named keeps that name, announced or not: a later frame
       // for the same call naming another tool is the vendor's contradiction,
@@ -1258,9 +1263,13 @@ class CodexBackendStreamState {
       // value the call already holds (the r32 fold) — another value through
       // that door replaced the first listing's under a 200 (r39-fable,
       // r39-codex).
+      // The value is compared as published: `""` and `{}` are the one empty
+      // call at the boundary (`argumentsOrEmptyObject`), and the raw-byte
+      // equality refused the `{}` spelling of a call the runtime itself
+      // publishes as `{}` (r44-fable).
       if (placed(index)) {
-        const current = this.toolStates.get(index)?.arguments ?? '';
-        const meeting = folded && (item.arguments === undefined || item.arguments === current);
+        const current = argumentsOrEmptyObject(this.toolStates.get(index)?.arguments ?? '');
+        const meeting = folded && (item.arguments === undefined || argumentsOrEmptyObject(item.arguments) === current);
         if (!meeting) throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
       // `output[i]` is the item announced at `output_index: i`: an

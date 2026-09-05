@@ -2881,6 +2881,46 @@ test('...and with another value through that door the second listing is refused,
 
 
 
+test('a name-bearing frame joining a fold\'s survivor that owns the call_id does not put its item id where the call_id stood (r43-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    // The holder at 0 owns `call_h` and no name (non-absorbable); `fc_a` is
+    // known by its item id alone (absorbable); the frame naming `alpha` at 0
+    // joins the two. The survivor is the holder — and the client echoes
+    // `call_h`, not the frame's item id.
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_h' } },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"h":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_h', name: 'alpha', arguments: '{"h":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
+  const announced = [...new Set(events.filter((event) => event.type === 'tool_call_delta').map((event) => event.id))];
+  assert.deepEqual(announced, ['call_h']);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_h', 'alpha', '{"h":1}']]);
+});
+
+test('the split identity meeting compares the value as published: the `{}` spelling of a call the runtime publishes as `{}` is one call (r44-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    // The holder at 1 streamed no bytes (published as `{}`); the fold item
+    // spells that same empty call `{}`.
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{}']]);
+});
+
 test('the first call_id is latched like the name: a live frame naming another call_id for the same item is refused (r41-codex)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
