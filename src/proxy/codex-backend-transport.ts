@@ -204,6 +204,13 @@ interface ToolState {
    */
   announcedDone: boolean;
   /**
+   * A completed item has been applied to this call. Carried by the fold's
+   * survivor: tracked by ordinal, the flag stayed on the retired state and
+   * a second listing resolving to the survivor slipped past the
+   * listed-twice gate (r40-fable).
+   */
+  placed: boolean;
+  /**
    * Where this call sits in ANNOUNCEMENT order, set when the client is first
    * told about it. The completed result has to list calls in the order the
    * wire opened their blocks, and the map's own key is first-SEEN order — the
@@ -534,6 +541,7 @@ class CodexBackendStreamState {
         state.named = true;
       }
       if (state.hasCallId && state.named) state.identified = true;
+      if (otherState.placed) state.placed = true;
     }
     const position = this.positions.get(other);
     if (position !== undefined && !this.positions.has(survivor)) this.positions.set(survivor, position);
@@ -907,6 +915,7 @@ class CodexBackendStreamState {
       anonymous: seed.anonymous ?? false,
       argumentsDone: false,
       announcedDone: false,
+      placed: false,
     };
   }
 
@@ -1199,7 +1208,7 @@ class CodexBackendStreamState {
     // discarded by a count the fold had not yet corrected (r33-fable F2), as
     // it was by a count taken once before the loop (r32-fable F1).
     const streamed = new Set(this.toolStates.keys());
-    const placed = new Set<number>();
+    const placed = (ordinal: number): boolean => this.toolStates.get(ordinal)?.placed === true;
     for (const item of items) {
       if (anonymous(item)) continue;
       // An item whose `id` and `call_id` name two DIFFERENT calls the stream
@@ -1237,13 +1246,13 @@ class CodexBackendStreamState {
       // value the call already holds (the r32 fold) — another value through
       // that door replaced the first listing's under a 200 (r39-fable,
       // r39-codex).
-      if (placed.has(index)) {
+      if (placed(index)) {
         const current = this.toolStates.get(index)?.arguments ?? '';
         const meeting = folded && (item.arguments === undefined || item.arguments === current);
         if (!meeting) throw backendContractError('The local runtime named two tool calls as one.', this.request.shape);
       }
-      placed.add(index);
       this.applyFinalItem(item, index);
+      this.toolStates.get(index)!.placed = true;
     }
     // An anonymous item has nothing but its position, and the position is the
     // protocol's own correlation: `output[i]` is the item announced at
@@ -1258,8 +1267,8 @@ class CodexBackendStreamState {
         unplaced.push(item);
         continue;
       }
-      placed.add(holder);
       this.applyFinalItem(item, holder);
+      this.toolStates.get(holder)!.placed = true;
     }
     // The rest align by count, and only when the two views agree on how many
     // calls are left: the streamed calls still standing after the folds
@@ -1281,7 +1290,7 @@ class CodexBackendStreamState {
     // a 200 (r34-codex). With nothing streamed, every item is a call of its
     // own the same way.
     const standing = [...streamed].filter((ordinal) => this.toolStates.has(ordinal));
-    const unmatched = standing.filter((ordinal) => !placed.has(ordinal));
+    const unmatched = standing.filter((ordinal) => !placed(ordinal));
     const only = unplaced.length === 1 && unmatched.length === 1 ? unmatched[0] : undefined;
     for (const item of unplaced) {
       const index = only !== undefined && this.namesAgree(item.name, only) && this.positionAgrees(item.outputIndex, only) ? only : this.nextToolOrdinal;

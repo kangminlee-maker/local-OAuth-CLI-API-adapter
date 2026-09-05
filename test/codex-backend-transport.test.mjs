@@ -2771,3 +2771,38 @@ test('the fold door takes exactly the value the call already holds: a second lis
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
   }, /named two tool calls as one/);
 });
+
+test('the listed-twice gate follows the fold\'s survivor: a first listing placed on a state a later item folds away still counts (r40-fable)', async () => {
+  // The first listing places the item-id-only state `fc_b` (absorbable);
+  // the second folds it into the announced `call_a` and carries another
+  // value. Tracked by ordinal, the gate missed the survivor.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"evil":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', name: 'alpha', arguments: '{"evil":1}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"z":9}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a repeated output_item.added renaming a call before its announcement is refused at the known door (r40-fable coverage)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
