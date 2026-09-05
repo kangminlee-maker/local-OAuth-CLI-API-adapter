@@ -2073,3 +2073,77 @@ test('a call that finishes after the vendor moved past it is released on its own
   ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true);
   assert.ok(early, `finish signal must precede the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
 });
+
+test('a call identified by folding a finished holder into it on a delta frame is announced on that frame (r31-fable F1)', async () => {
+  // A: `call_id` on an index-less frame, never named. A holder at position 2
+  // is named and finished on frames carrying no id. The delta with A's item
+  // id at position 2 folds the holder into A — identified and finished in
+  // one step. Dropping the delta's bytes must not drop the announcement.
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 2, item: { type: 'function_call', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 2, delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 2, arguments: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.delta', output_index: 2, item_id: 'fc_a', delta: '' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a');
+  assert.ok(early, `the call must be announced before the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.index, event.argumentsDone]))}`);
+  assert.ok(!events.some((event) => event.type === 'tool_call_delta' && event.index < 0), 'no wire index below zero');
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+});
+
+test('two identifiers that first meet in the completed output fold into the one call the client knows (r31-fable F2)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' }] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+  const announced = events.filter((event) => event.type === 'tool_call_delta' && event.argumentsDelta === '').map((event) => [event.id, event.index]);
+  assert.deepEqual(announced, [['call_a', 0]], JSON.stringify(events.map((event) => [event.type, event.id, event.index, event.argumentsDone])));
+  assert.ok(!events.some((event) => event.type === 'tool_call_delta' && event.index < 0), 'no wire index below zero');
+});
+
+test('a value-less finish event is the frame a call can learn its position from: released on it once the vendor has moved past (r29-codex, r31-fable F3)', async () => {
+  // Every earlier frame of the call carries no position; the narration at 1
+  // moved the vendor on, but the call had no position to compare. The
+  // value-less `function_call_arguments.done` at 0 is the first frame that
+  // places it — returning before correlating it left the call held.
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true);
+  assert.ok(early, `finish signal must precede the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+});
+
+test('a call identified only by the completed output folding a finished holder into it is announced with a real wire index before its finish signal (r31-fable F1)', async () => {
+  // A: `call_id` only, index-less, never named live. B: an item id, a name and
+  // finished bytes at position 0, no `call_id`. The completed item carries
+  // both ids: A survives, absorbs B, and is identified for the first time —
+  // at the terminal frame, where no branch announces it. The finish signal
+  // must not go out for a call the client was never told about.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_b', arguments: '{"city":"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' }] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+  const tool = events.filter((event) => event.type === 'tool_call_delta').map((event) => [event.id, event.index, event.argumentsDelta ?? null, event.argumentsDone ?? false]);
+  assert.ok(!tool.some(([, index]) => index < 0), `no wire index below zero: ${JSON.stringify(tool)}`);
+  const announced = tool.findIndex(([id, index, delta]) => id === 'call_a' && index === 0 && delta === '');
+  const finished = tool.findIndex(([id, , , done]) => id === 'call_a' && done === true);
+  assert.ok(announced >= 0 && finished > announced, `announced before finished: ${JSON.stringify(tool)}`);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+});

@@ -665,9 +665,11 @@ class CodexBackendStreamState {
       // could not carry this delta (`emitArgumentExtension`), and folding it
       // into the completed result put bytes in the body that the closed block
       // never had (r22-fable F4). The signal promised "what you have is what
-      // the body will report".
-      if (state.argumentsDone) return out;
-      state.arguments += delta;
+      // the body will report". Only the BYTES are dropped: a call this frame
+      // identified — by folding a finished holder into it — is still
+      // announced below, or the finish signal went out for a call the client
+      // had never been told about (r31-fable F1).
+      if (!state.argumentsDone) state.arguments += delta;
       this.toolStates.set(index, state);
       // Arguments that arrive before the call is named are held, because
       // announcing a placeholder identity is worse than waiting for the real
@@ -889,6 +891,11 @@ class CodexBackendStreamState {
         const position = this.positions.get(index);
         if (position === undefined || position >= this.highestPosition) continue;
       }
+      // A call identified and finished in one step — a holder folded into it
+      // at completion — has not been announced: the identity and the bytes go
+      // first, or the finish signal names a wire index the client never saw
+      // (r31-fable F1).
+      if (!state.started) out.push(...this.emitPending(index, state));
       const complete = argumentsOrEmptyObject(state.arguments);
       out.push(...this.emitArgumentExtension(index, state, complete));
       if (state.streamed !== complete) continue;
@@ -1057,8 +1064,18 @@ class CodexBackendStreamState {
         const itemOrdinal = finalItemId === undefined ? undefined : this.toolOrdinals.get(finalItemId);
         const callOrdinal = finalCallId === undefined ? undefined : this.toolOrdinals.get(finalCallId);
         if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
-          functionCallPosition += 1;
-          continue;
+          // ...unless one of the two is a state the client was never told
+          // about: then the item is where the split identity meets, and it
+          // folds into the one the client knows, as a live frame carrying
+          // both would (r31-fable F2). Two announced states stay apart.
+          const itemState = this.toolStates.get(itemOrdinal);
+          const callState = this.toolStates.get(callOrdinal);
+          const foldable = (itemState !== undefined && this.absorbable(itemState)) || (callState !== undefined && this.absorbable(callState));
+          if (!foldable) {
+            functionCallPosition += 1;
+            continue;
+          }
+          this.coalesce([itemOrdinal, callOrdinal]);
         }
         const index = this.finalOutputOrdinal(
           functionCallPosition,

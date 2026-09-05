@@ -1262,3 +1262,29 @@ test('a cancellation that never settles does not hold back a decided outcome: th
     assert.ok(events(streamed.text).some((frame) => frame.type === 'message_stop'), streamed.text);
   });
 });
+
+test('a call identified by folding a finished holder into it is one call on every surface, in the order the client was told (r31-fable F1)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 2, item: { type: 'function_call', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 2, delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 2, arguments: '{"a":1}' },
+    { type: 'response.function_call_arguments.delta', output_index: 2, item_id: 'fc_a', delta: '' },
+    { type: 'response.output_text.delta', output_index: 3, delta: 'after' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'probe', arguments: '{"a":1}' },
+      { type: 'message', id: 'm', content: [{ type: 'output_text', text: 'after' }] },
+    ] } },
+  ];
+  await withProxyEvents(vendor, async (url) => {
+    const chatStream = events((await post(`${url}/v1/chat/completions`, OPENAI, { ...CHAT, tool_choice: 'auto', stream: true })).text);
+    const calls = chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []);
+    assert.deepEqual(calls.filter((call) => call.id).map((call) => [call.index, call.id]), [[0, 'call_a']], JSON.stringify(calls));
+    assert.ok(!calls.some((call) => call.index < 0), JSON.stringify(calls));
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, tool_choice: { type: 'auto' } });
+    assert.equal(messages.status, 200, messages.text);
+    assert.deepEqual(JSON.parse(messages.text).content.map((block) => block.type), ['tool_use', 'text']);
+    const { starts } = messagesBlocks((await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, tool_choice: { type: 'auto' }, stream: true })).text);
+    assert.deepEqual(starts, [[0, 'tool_use'], [1, 'text']]);
+  });
+});
