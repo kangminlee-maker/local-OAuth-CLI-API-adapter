@@ -26,6 +26,17 @@ Two of those rules are check-then-act on a pathname, not atomic:
 3. `removeStaleLock` decides staleness from `stat` and then unlinks by path: a fresh owner
    that replaced the pathname between the two is removed, and the waiter takes a lease over
    a refresh already in flight (codex round 55).
+4. The save's post-fetch re-read counts a file as usable once it parses as JSON, but the
+   branch that returns the file's current generation calls `authFromFile`, which needs
+   `access_token` and an account id. A concurrent writer that leaves a parseable but
+   token-less file — a codex CLI logout, or a torn write showing `{}` — is treated as a
+   moved generation. Round 56 hardened the CALLER (a logout no longer throws away the token
+   just fetched; the caller keeps its refreshed auth, unsaved, and the logout is not written
+   over), but the single-use rotation the fetch consumed is then persisted nowhere: if the
+   writer's completed file carries the same refresh generation, the next refresh reads that
+   stale token, earns a 401, and forces a re-login. Retrying a parseable-but-unusable re-read
+   the way a parse failure is retried, and persisting the rotation onto the writer's completed
+   generation, is the same handle-vs-pathname atomicity problem as 1–3, on the save's read side.
 
 Both need a takeover — a lease older than 60 s — to land inside a microsecond window of an
 owner whose fetch is bounded to 30 s: on the live path that means a process stalled longer
