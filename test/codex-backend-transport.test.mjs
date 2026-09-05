@@ -1001,7 +1001,7 @@ test('an image item followed by response.failed is a failed turn, not a successf
   assert.equal(calls.length, 1);
 });
 
-test('...and streamed: the image event already written is followed by the failure, not by success (r47-codex)', async () => {
+test('...and streamed: the failure, with no image event — the result is delivered at the terminal frame, and a failed turn has none (r47-codex; since round 49 the image waits for the terminal)', async () => {
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
@@ -1013,7 +1013,7 @@ test('...and streamed: the image event already written is followed by the failur
   await assert.rejects(async () => {
     for await (const event of backend.stream(imageRequest())) events.push(event);
   }, /codex backend turn failed: offline upstream failed after image item/);
-  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.deepEqual(events.map((event) => event.type), ['started']);
 });
 
 test('an image stream that ends without a terminal event is a failure, image or no image (r47-codex)', async () => {
@@ -1164,6 +1164,115 @@ test('a failure as the backend\'s first and only frame is still a started stream
   }, /codex backend turn failed: failed as the first frame/);
   // The writer commits on the signal, so the failure is in-band, not an HTTP error.
   assert.deepEqual(events.map((event) => event.type), ['started']);
+});
+
+test('an abort signal already aborted at the call is honoured by the buffered fan-out: no backend turn runs (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push(init.signal?.aborted);
+    if (init.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    return new Response(settledImageTurn());
+  };
+  const controller = new AbortController();
+  controller.abort();
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal));
+  assert.ok(calls.every((aborted) => aborted === true), `no backend turn ran for a caller that had gone: ${JSON.stringify(calls)}`);
+});
+
+test('an abort during the no-image retry backoff ends the wait: the request fails at its deadline, not after the sleep (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push(init.signal?.aborted);
+    if (init.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    // A finished turn without an image: the retryable case, with a 500 ms backoff.
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  // The request's own signal — the HTTP layer's timeout or a client walking
+  // away — aborts at 80 ms, during the 500 ms backoff.
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 80);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const startedAt = Date.now();
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal));
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 400, `the deadline was 80 ms and the backoff 500 ms; failed after ${elapsed} ms`);
+  assert.deepEqual(calls, [false, true], 'the second attempt was entered with the signal aborted and refused at once');
+});
+
+test('the terminal frame enriches the result: usage and the terminal\'s revised_prompt reach the one image event, streamed and buffered alike (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const image = tinyPngBase64();
+  const turn = () => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 }, output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image, revised_prompt: 'terminal rewrite' },
+    ] } },
+  ]);
+  globalThis.fetch = async () => new Response(turn());
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.revisedPrompt, 'terminal rewrite');
+  assert.equal(events[1].usage?.inputTokens, 3);
+  assert.equal(events[1].usage?.outputTokens, 4);
+  globalThis.fetch = async () => new Response(turn());
+  const buffered = await backend.generate(imageRequest());
+  assert.equal(buffered.images[0].revisedPrompt, 'terminal rewrite');
+  assert.equal(buffered.usage?.inputTokens, 3);
+});
+
+test('usage the no-image attempts reported is carried into the result: the request reports what it consumed (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      return new Response(sse([
+        { type: 'response.created', response: { id: 'resp_1', model: 'gpt-5.5' } },
+        { type: 'response.completed', response: { id: 'resp_1', model: 'gpt-5.5', usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 } } },
+      ]));
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_2', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_2', model: 'gpt-5.5', usage: { input_tokens: 5, output_tokens: 6, total_tokens: 11 } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(attempts, 2);
+  assert.equal(result.usage?.inputTokens, 8);
+  assert.equal(result.usage?.outputTokens, 10);
+});
+
+test('a runaway backend is counted, not retained: one result image, the rest counted by digest, diagnostics bounded (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  // 100 distinct one-pixel-ish payloads: the same PNG with a distinct tail.
+  const base = tinyPngBase64();
+  const frames = [{ type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } }];
+  for (let i = 0; i < 100; i += 1) {
+    frames.push({ type: 'response.output_item.done', output_index: i, item: { type: 'image_generation_call', id: `ig_${i}`, status: 'completed', result: i === 0 ? base : `${base}${'A'.repeat(i)}` } });
+  }
+  frames.push({ type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } });
+  globalThis.fetch = async () => new Response(sse(frames));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, base, 'the first image is the result');
+  assert.equal(diagnostics.at(-1).imageResultCount, 100);
+  assert.equal(diagnostics.at(-1).eventCount, 102);
+  assert.equal(diagnostics.at(-1).eventTypes.length, 64, 'the history is bounded');
+  assert.equal(diagnostics.at(-1).eventTimeline.length, 64);
 });
 
 // The backend has a `size` slot and does not always honour it (a 256×256

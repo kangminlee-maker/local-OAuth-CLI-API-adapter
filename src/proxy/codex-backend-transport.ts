@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { honorRequestModel } from '../settings.js';
@@ -45,6 +45,8 @@ const REFRESH_LOCK_TIMEOUT_MS = 10_000;
 const REFRESH_LOCK_STALE_MS = 60_000;
 const TRANSIENT_BACKEND_RETRY_DELAYS_MS = [250, 1_000] as const;
 const IMAGE_NO_RESULT_RETRY_DELAYS_MS = [500, 1_500] as const;
+/** How many entries each image diagnostic history keeps: a runaway backend must not grow the proxy by its event count. */
+const IMAGE_DIAGNOSTIC_HISTORY = 64;
 const NO_IMAGE_RESULT_MESSAGE = 'codex backend image response completed without image_generation_call result';
 
 export interface CodexBackendTransportOptions {
@@ -71,9 +73,12 @@ export interface CodexBackendImageAttemptDiagnostic {
   readonly ok: boolean;
   readonly retrying?: boolean;
   readonly latencyMs: number;
+  /** Every event the turn produced, counted; the histories below keep the first `IMAGE_DIAGNOSTIC_HISTORY` entries each. */
+  readonly eventCount: number;
   readonly eventTypes: readonly string[];
   readonly outputItemTypes: readonly string[];
   readonly completedOutputTypes: readonly string[];
+  /** Distinct images the backend produced — counted, not retained: one is the turn's result. */
   readonly imageResultCount: number;
   readonly imageItemAdded: boolean;
   readonly imageGenerating: boolean;
@@ -1446,7 +1451,15 @@ class CodexBackendImageState {
   responseId?: string;
   model?: string;
   usage?: LocalUsage;
-  readonly images: OpenAiGeneratedImage[] = [];
+  // The turn's result: the first image the backend produced, by bytes,
+  // enriched by a later record of the same bytes (the terminal output
+  // carries the rewrite the item frame did not — r49-codex). Every other
+  // distinct image is counted by digest and not retained: the turn was asked
+  // for one, the cap on `n` skips the rest, and holding them pinned every
+  // runaway payload until the terminal (r49-codex).
+  private result?: OpenAiGeneratedImage;
+  private readonly imageDigests = new Set<string>();
+  eventCount = 0;
   readonly eventTypes: string[] = [];
   readonly outputItemTypes: string[] = [];
   readonly completedOutputTypes: string[] = [];
@@ -1470,8 +1483,9 @@ class CodexBackendImageState {
 
   push(event: CodexBackendEvent): OpenAiImageGenerationStreamEvent[] {
     const out: OpenAiImageGenerationStreamEvent[] = [];
-    if (event.type) this.eventTypes.push(event.type);
-    if (event.type) this.eventTimeline.push({
+    this.eventCount += 1;
+    if (event.type && this.eventTypes.length < IMAGE_DIAGNOSTIC_HISTORY) this.eventTypes.push(event.type);
+    if (event.type && this.eventTimeline.length < IMAGE_DIAGNOSTIC_HISTORY) this.eventTimeline.push({
       type: event.type,
       offsetMs: Date.now() - this.startedAt,
       ...(event.item?.type ? { itemType: event.item.type } : {}),
@@ -1501,49 +1515,58 @@ class CodexBackendImageState {
       if (this.textSample.length < 240) this.textSample += event.delta;
     }
     if (event.item?.type) {
-      this.outputItemTypes.push(event.item.type);
+      if (this.outputItemTypes.length < IMAGE_DIAGNOSTIC_HISTORY) this.outputItemTypes.push(event.item.type);
       if (isImageGenerationItemType(event.item.type)) this.imageItemAdded = true;
     }
     if (event.type === 'response.image_generation_call.generating') this.imageGenerating = true;
     const itemImage = imageGenerationFromResponseItem(event.item);
-    if (itemImage && !this.hasImage(itemImage)) {
-      this.images.push(itemImage);
-      out.push({
-        type: 'completed',
-        created: Math.floor(Date.now() / 1000),
-        image: itemImage,
-        background: this.request.background,
-        outputFormat: this.request.outputFormat,
-        quality: this.request.quality,
-        size: this.request.size,
-      });
-    }
+    if (itemImage) this.record(itemImage);
     // The terminal frame's output is read the same way whether the turn
     // completed or was cut off at its output limit: a cut-off turn is a
     // finished turn with a reason, and whether it produced an image is
     // judged like any other — an image present only in the cut turn's
     // output was discarded and the turn retried as one without (r48-codex).
+    // The result goes out here, once, with what only the terminal knows:
+    // emitted at the item frame, the streamed event carried no usage and
+    // the terminal's rewrite of the prompt was dropped on both paths
+    // (r49-codex).
     if (event.type === 'response.completed' || event.type === 'response.incomplete') {
       const usage = usageFromResponses(event.response?.usage);
       if (usage) this.usage = usage;
-      this.completedOutputTypes.push(...responseOutputTypes(event.response?.output));
-      for (const image of imageGenerationsFromOutput(event.response?.output)) {
-        if (this.hasImage(image)) continue;
-        this.images.push(image);
+      for (const type of responseOutputTypes(event.response?.output)) {
+        if (this.completedOutputTypes.length < IMAGE_DIAGNOSTIC_HISTORY) this.completedOutputTypes.push(type);
+      }
+      for (const image of imageGenerationsFromOutput(event.response?.output)) this.record(image);
+      this.settled = true;
+      if (this.result) {
         out.push({
           type: 'completed',
           created: Math.floor(Date.now() / 1000),
-          image,
+          image: this.result,
           background: this.request.background,
           outputFormat: this.request.outputFormat,
           quality: this.request.quality,
           size: this.request.size,
-          usage,
+          ...(this.usage ? { usage: this.usage } : {}),
         });
       }
-      this.settled = true;
     }
     return out;
+  }
+
+  /** An image the backend produced: the turn's result if it is the first, its enrichment if it is the result again, a count otherwise. */
+  private record(image: OpenAiGeneratedImage): void {
+    const digest = createHash('sha256').update(image.b64Json).digest('hex');
+    const known = this.imageDigests.has(digest);
+    this.imageDigests.add(digest);
+    if (this.result === undefined) {
+      this.result = image;
+      return;
+    }
+    if (known && this.result.revisedPrompt === undefined && image.revisedPrompt !== undefined
+      && createHash('sha256').update(this.result.b64Json).digest('hex') === digest) {
+      this.result = { ...this.result, revisedPrompt: image.revisedPrompt };
+    }
   }
 
   /** Whether the backend ever said how the turn ended. */
@@ -1557,9 +1580,9 @@ class CodexBackendImageState {
     // without an image is the retryable no-result case.
     if (this.failure) throw new Error(this.failure);
     if (!this.settled) throw new Error('codex backend image stream ended without a terminal event');
-    if (this.images.length === 0) throw new NoImageResultError();
+    if (this.result === undefined) throw new NoImageResultError();
     return {
-      images: this.images,
+      images: [this.result],
       ...(this.usage ? { usage: this.usage } : {}),
       latencyMs: Date.now() - this.startedAt,
     };
@@ -1580,10 +1603,11 @@ class CodexBackendImageState {
       ok: options.ok,
       ...(options.retrying !== undefined ? { retrying: options.retrying } : {}),
       latencyMs: Date.now() - this.startedAt,
+      eventCount: this.eventCount,
       eventTypes: [...this.eventTypes],
       outputItemTypes: [...this.outputItemTypes],
       completedOutputTypes: [...this.completedOutputTypes],
-      imageResultCount: this.images.length,
+      imageResultCount: this.imageDigests.size,
       imageItemAdded: this.imageItemAdded,
       imageGenerating: this.imageGenerating,
       textDeltaCount: this.textDeltaCount,
@@ -1593,9 +1617,6 @@ class CodexBackendImageState {
     };
   }
 
-  private hasImage(image: OpenAiGeneratedImage): boolean {
-    return this.images.some((existing) => existing.b64Json === image.b64Json);
-  }
 }
 
 export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenerationClient {
@@ -1744,7 +1765,11 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     // whose result nothing will read. Cancel them with the first failure.
     const fanOut = new AbortController();
     const abortFanOut = (): void => fanOut.abort();
-    signal?.addEventListener('abort', abortFanOut, { once: true });
+    // An abort signal is state as well as an event: one already aborted at
+    // this boundary has no event left to fire, and the fan-out ran the turn
+    // for a caller that had gone (r49-codex).
+    if (signal?.aborted) fanOut.abort();
+    else signal?.addEventListener('abort', abortFanOut, { once: true });
     let results: CodexBackendImageTurnResult[];
     try {
       results = await Promise.all(
@@ -1787,6 +1812,10 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     // commit already made.
     let committed = false;
     for (let index = 0; index < request.n; index += 1) {
+      // Usage the attempts that produced no image reported: the request paid
+      // for them, and the result reports what the request consumed
+      // (r49-codex).
+      let carried: LocalUsage | undefined;
       for (let attempt = 0; attempt <= IMAGE_NO_RESULT_RETRY_DELAYS_MS.length; attempt += 1) {
         const state = new CodexBackendImageState(request, Date.now());
         try {
@@ -1802,10 +1831,12 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
               }
               continue;
             }
+            const usage = mergeUsage(carried, local.usage as LocalUsage | undefined);
             yield {
               ...local,
               image: postprocessFlatGraphicImageIfNeeded(request, await realizeRequestedSize(request, local.image)),
               partialImageIndex: index,
+              ...(usage ? { usage } : {}),
             };
           }
           state.completed();
@@ -1827,7 +1858,8 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
             error: errorMessage(err),
           }));
           if (!retrying) throw err;
-          await sleep(IMAGE_NO_RESULT_RETRY_DELAYS_MS[attempt] ?? 0);
+          carried = mergeUsage(carried, state.usage);
+          await sleep(IMAGE_NO_RESULT_RETRY_DELAYS_MS[attempt] ?? 0, signal);
         }
       }
     }
@@ -1838,6 +1870,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     imageIndex: number,
     signal?: AbortSignal,
   ): Promise<CodexBackendImageTurnResult> {
+    let carried: LocalUsage | undefined;
     for (let attempt = 0; attempt <= IMAGE_NO_RESULT_RETRY_DELAYS_MS.length; attempt += 1) {
       const state = new CodexBackendImageState(request, Date.now());
       try {
@@ -1853,7 +1886,8 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
           attempt,
           ok: true,
         }));
-        return result;
+        const usage = mergeUsage(carried, result.usage);
+        return { ...result, ...(usage ? { usage } : {}) };
       } catch (err) {
         const retrying = shouldRetryNoImageResult(err, attempt, signal);
         this.reportImageAttempt(state.diagnostic({
@@ -1865,7 +1899,8 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
           error: errorMessage(err),
         }));
         if (!retrying) throw err;
-        await sleep(IMAGE_NO_RESULT_RETRY_DELAYS_MS[attempt] ?? 0);
+        carried = mergeUsage(carried, state.usage);
+        await sleep(IMAGE_NO_RESULT_RETRY_DELAYS_MS[attempt] ?? 0, signal);
       }
     }
     throw new NoImageResultError();
@@ -1897,7 +1932,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
           response = await this.postBackendRequest(auth, body, controller.signal);
         } catch (err) {
           if (!shouldRetryTransientBackendFetchError(err, attempt, controller.signal)) throw err;
-          await sleep(TRANSIENT_BACKEND_RETRY_DELAYS_MS[attempt] ?? 0);
+          await sleep(TRANSIENT_BACKEND_RETRY_DELAYS_MS[attempt] ?? 0, controller.signal);
           continue;
         }
         if (response.ok) break;
@@ -1907,7 +1942,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
           response = await this.postBackendRequest(auth, body, controller.signal);
           if (response.ok) break;
         } else if (shouldRetryTransientBackendError(response.status, raw, attempt)) {
-          await sleep(TRANSIENT_BACKEND_RETRY_DELAYS_MS[attempt] ?? 0);
+          await sleep(TRANSIENT_BACKEND_RETRY_DELAYS_MS[attempt] ?? 0, controller.signal);
           continue;
         } else {
           throw codexBackendError(response.status, raw);
@@ -1915,7 +1950,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         if (!response.ok) {
           const retryRaw = await response.text().catch(() => '');
           if (shouldRetryTransientBackendError(response.status, retryRaw, attempt)) {
-            await sleep(TRANSIENT_BACKEND_RETRY_DELAYS_MS[attempt] ?? 0);
+            await sleep(TRANSIENT_BACKEND_RETRY_DELAYS_MS[attempt] ?? 0, controller.signal);
             continue;
           }
           throw codexBackendError(response.status, retryRaw);
@@ -2531,8 +2566,25 @@ function isFileExistsError(err: unknown): boolean {
     && (err as { code?: unknown }).code === 'EEXIST';
 }
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+/**
+ * A delay the abort signal ends early: a retry backoff that slept through
+ * the request's abort entered its next attempt with the signal already
+ * aborted, after the deadline the caller had set (r49-codex). The caller
+ * re-checks the signal on the attempt that follows.
+ */
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', wake);
+      resolve();
+    }, ms);
+    const wake = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal?.addEventListener('abort', wake, { once: true });
+  });
 }
 
 async function responseInputItems(request: NormalizedRequest): Promise<unknown[]> {
