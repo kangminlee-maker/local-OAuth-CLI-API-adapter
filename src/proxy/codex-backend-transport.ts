@@ -608,7 +608,11 @@ class CodexBackendStreamState {
    * coordinate fed into the positional keyspace minted a second ordinal for a
    * call already streamed, r27-codex, and re-adopted holders the doors above
    * had declined, r39-fable/r39-codex, until round 45 removed it); else a new
-   * call claiming that index. An item that names nothing is placed by
+   * call, which records NO position — the array lists each index once, so
+   * nothing resolves to it by position afterwards and `captureFinalOutput`
+   * refuses a later item resolving to it by id as that call listed twice;
+   * a position recorded here would count toward `progress()` on a cut turn
+   * and close a block the vendor left open. An item that names nothing is placed by
    * `captureFinalOutput` itself: by the call holding its position first; then,
    * only when exactly one such item and one standing call no item placed
    * remain and their names do not conflict, as that pair; every other one is
