@@ -212,6 +212,18 @@ interface ToolState {
   announcedAt?: number;
 }
 
+/**
+ * The identifiers a tool event or a completed item carries, each in its own
+ * namespace. Item ids, call ids and output positions are opaque to each
+ * other: kept in one map, a `call_id` spelled `#0` resolved the holder of
+ * position 0, and a spelling shared between one call's item id and another's
+ * `call_id` bound the second call to the first (r35-codex).
+ */
+interface ToolIds {
+  readonly itemId?: string;
+  readonly callId?: string;
+}
+
 /** One `function_call` item of the completed output, as `captureFinalOutput` reads it. */
 interface FinalCallItem {
   readonly outputIndex: number;
@@ -234,7 +246,10 @@ class CodexBackendStreamState {
   // not the backend output position: a preceding reasoning item shifts
   // `output_index` (observed on gpt-5.6-terra), and forwarding the raw index
   // desyncs streamed deltas from the completed result's dense positions.
-  private readonly toolOrdinals = new Map<string, number>();
+  private readonly itemOrdinals = new Map<string, number>();
+  private readonly callOrdinals = new Map<string, number>();
+  /** The ordinal holding each backend output position: its first claimant, or the survivor of a fold. */
+  private readonly holders = new Map<number, number>();
   /**
    * Each call's backend output position, from the first event that carried
    * one. The early finish signal compares positions: only an event for a
@@ -281,7 +296,7 @@ class CodexBackendStreamState {
    * stream's own `output_index` as fallback. Argument deltas arrive once per
    * token, so a known id resolves before anything is allocated.
    */
-  private toolOrdinal(event: CodexBackendEvent, ...ids: ReadonlyArray<string | undefined>): number {
+  private toolOrdinal(event: CodexBackendEvent, ids: ToolIds): number {
     // A request that permits no call — no tools, or `tool_choice: none`; the
     // vendor is sent none — is refused at its first tool event, before
     // anything is correlated or announced: refusing at completion published
@@ -296,10 +311,7 @@ class CodexBackendStreamState {
     // `item_id` bound by a positioned delta are one call, and the frame that
     // carries both is where they meet — taking the first match announced
     // the one invocation twice (r30-codex).
-    const bound = [...new Set(ids.flatMap((id) => {
-      const ordinal = typeof id === 'string' ? this.toolOrdinals.get(id) : undefined;
-      return ordinal === undefined ? [] : [ordinal];
-    }))];
+    const bound = this.boundOrdinals(ids);
     const known = bound.length > 1 ? this.coalesce(bound) : bound[0];
     const position = explicitOutputIndex(event);
     const explicit = position !== undefined;
@@ -340,7 +352,7 @@ class CodexBackendStreamState {
     // really at position 0 was then bound to it and vanished — its identity
     // and arguments refused by a state that had already started (r29-codex).
     // Such an event is a new call, correlated by its ids alone.
-    const identified = ids.some((id) => typeof id === 'string');
+    const identified = ids.itemId !== undefined || ids.callId !== undefined;
     // An event that names neither an item nor a position is uncorrelatable.
     // Read as position 0, it was spliced into whichever call next omitted its
     // index: the stream carried `{"b":2}{"a":1}` under a call whose body said
@@ -349,12 +361,12 @@ class CodexBackendStreamState {
     if (!identified && !explicit) {
       throw backendContractError('The local runtime wrote a tool event that names no call.', this.request.shape);
     }
-    let ordinal = explicit ? this.toolOrdinals.get(`#${position}`) : undefined;
+    let ordinal = explicit ? this.holders.get(position) : undefined;
     if (ordinal === undefined) {
       ordinal = this.nextToolOrdinal;
       this.nextToolOrdinal += 1;
     }
-    if (explicit) this.toolOrdinals.set(`#${position}`, ordinal);
+    if (explicit) this.holders.set(position, ordinal);
     this.bindOrdinal(ordinal, ids);
     this.recordPosition(ordinal, event);
     return ordinal;
@@ -410,9 +422,9 @@ class CodexBackendStreamState {
    * is refused rather than guessed.
    */
   private adoptHolder(known: number, position: number): number {
-    const holder = this.toolOrdinals.get(`#${position}`);
+    const holder = this.holders.get(position);
     if (holder === undefined) {
-      this.toolOrdinals.set(`#${position}`, known);
+      this.holders.set(position, known);
       return known;
     }
     if (holder === known) return known;
@@ -497,35 +509,42 @@ class CodexBackendStreamState {
     // later arrived there was bound to the survivor and vanished (r31-codex
     // F4).
     const accepted = this.positions.get(survivor);
-    for (const [key, ordinal] of this.toolOrdinals) {
+    for (const aliases of [this.itemOrdinals, this.callOrdinals]) {
+      for (const [id, ordinal] of aliases) if (ordinal === other) aliases.set(id, survivor);
+    }
+    for (const [position, ordinal] of this.holders) {
       if (ordinal !== other) continue;
-      if (key.startsWith('#') && Number(key.slice(1)) !== accepted) this.toolOrdinals.delete(key);
-      else this.toolOrdinals.set(key, survivor);
+      if (position === accepted) this.holders.set(position, survivor);
+      else this.holders.delete(position);
     }
     this.toolStates.delete(other);
   }
 
-  private knownOrdinal(ids: ReadonlyArray<string | undefined>): number | undefined {
-    for (const id of ids) {
-      if (typeof id === 'string') {
-        const known = this.toolOrdinals.get(id);
-        if (known !== undefined) return known;
-      }
-    }
-    return undefined;
+  /** The distinct ordinals the ids resolve to, each id in its own namespace. */
+  private boundOrdinals(ids: ToolIds): number[] {
+    const bound = new Set<number>();
+    const byItem = ids.itemId === undefined ? undefined : this.itemOrdinals.get(ids.itemId);
+    const byCall = ids.callId === undefined ? undefined : this.callOrdinals.get(ids.callId);
+    if (byItem !== undefined) bound.add(byItem);
+    if (byCall !== undefined) bound.add(byCall);
+    return [...bound];
   }
 
-  private bindOrdinal(ordinal: number, ids: ReadonlyArray<string | undefined>): void {
-    for (const id of ids) {
-      if (typeof id === 'string') this.toolOrdinals.set(id, ordinal);
-    }
+  private knownOrdinal(ids: ToolIds): number | undefined {
+    return this.boundOrdinals(ids)[0];
+  }
+
+  private bindOrdinal(ordinal: number, ids: ToolIds): void {
+    if (ids.itemId !== undefined) this.itemOrdinals.set(ids.itemId, ordinal);
+    if (ids.callId !== undefined) this.callOrdinals.set(ids.callId, ordinal);
   }
 
   /**
    * The ordinal for an item of the COMPLETED output that names a call — by
-   * id, by the anonymous holder at its `output_index`, or, for an unfamiliar
-   * id, by the anonymous holder at its dense `slot` (the caller's coordinate:
-   * the streamed calls in order). Two coordinate systems meet here: the
+   * id; by the anonymous holder at its `output_index`; by the holder there
+   * the stream knows by its item id alone, when the item names no other item
+   * (r28-codex F7); or, for an unfamiliar id, by the anonymous holder at its
+   * dense `slot` (the caller's coordinate: the streamed calls in order). Two coordinate systems meet here: the
    * completed array's index is the stream's `output_index` (both count every
    * item), while the dense slot counts function calls only. Feeding an array
    * position into the stream's positional keyspace minted a second ordinal for
@@ -533,7 +552,7 @@ class CodexBackendStreamState {
    * `captureFinalOutput` itself — by position first, then one to one with the
    * standing calls no item placed.
    */
-  private finalOutputOrdinal(slot: number | undefined, outputIndex: number, ...ids: ReadonlyArray<string | undefined>): number {
+  private finalOutputOrdinal(slot: number | undefined, outputIndex: number, ids: ToolIds): number {
     const known = this.knownOrdinal(ids);
     if (known !== undefined) {
       // A call known by id whose frames never carried a position is placed
@@ -548,7 +567,7 @@ class CodexBackendStreamState {
     // coordinate: with the events arriving out of order the holder for
     // backend position 1 lived at ordinal 0, and inspecting ordinal 1 instead
     // invented a third call (r27-codex).
-    const holder = this.toolOrdinals.get(`#${outputIndex}`);
+    const holder = this.holders.get(outputIndex);
     const byPosition = this.adoptableOrdinal(holder);
     if (byPosition !== undefined) {
       this.bindOrdinal(byPosition, ids);
@@ -561,9 +580,8 @@ class CodexBackendStreamState {
     // invocation twice, under the item id and under the `call_id` (r28-codex
     // F7). A holder that already has a `call_id` is not adopted: an item
     // naming a different one is the vendor contradicting itself (declared).
-    const [itemId] = ids;
     const holderState = holder === undefined ? undefined : this.toolStates.get(holder);
-    if (holder !== undefined && holderState !== undefined && !holderState.hasCallId && itemId === undefined) {
+    if (holder !== undefined && holderState !== undefined && !holderState.hasCallId && ids.itemId === undefined) {
       this.bindOrdinal(holder, ids);
       return holder;
     }
@@ -652,7 +670,7 @@ class CodexBackendStreamState {
       // r29-codex); whether the added snapshot's string is cumulative or
       // authoritative is unmeasured, so a string is left to the later frames.
       argumentsText(event.item.arguments, this.request.shape);
-      const index = this.toolOrdinal(event, itemId, callId);
+      const index = this.toolOrdinal(event, { itemId, callId });
       out.push(...this.announceFinished('moved'));
       const id = callId ?? itemId ?? `call_${index + 1}`;
       const named = itemId !== undefined || callId !== undefined;
@@ -696,7 +714,7 @@ class CodexBackendStreamState {
       // the Messages stream behind the earlier call (r29-codex).
       const finished = argumentsText(event.arguments, this.request.shape);
       const itemId = identityText(event.item_id, this.request.shape);
-      const index = this.toolOrdinal(event, itemId);
+      const index = this.toolOrdinal(event, { itemId });
       out.push(...this.announceFinished('moved'));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: itemId,
@@ -713,7 +731,7 @@ class CodexBackendStreamState {
       const delta = argumentsText(event.delta, this.request.shape);
       if (delta === undefined) return out;
       const itemId = identityText(event.item_id, this.request.shape);
-      const index = this.toolOrdinal(event, itemId);
+      const index = this.toolOrdinal(event, { itemId });
       out.push(...this.announceFinished('moved'));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
         id: itemId,
@@ -740,7 +758,7 @@ class CodexBackendStreamState {
       const itemId = identityText(event.item.id, this.request.shape);
       const callId = identityText(event.item.call_id, this.request.shape);
       const name = identityText(event.item.name, this.request.shape);
-      const index = this.toolOrdinal(event, itemId, callId);
+      const index = this.toolOrdinal(event, { itemId, callId });
       out.push(...this.announceFinished('moved'));
       const named = itemId !== undefined || callId !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
@@ -1129,8 +1147,8 @@ class CodexBackendStreamState {
       // Position is not proof of identity and neither is half an identity:
       // the streamed state — what the client already acted on — wins, and
       // the item is left alone (declared, matrix §7 row 8).
-      const itemOrdinal = item.itemId === undefined ? undefined : this.toolOrdinals.get(item.itemId);
-      const callOrdinal = item.callId === undefined ? undefined : this.toolOrdinals.get(item.callId);
+      const itemOrdinal = item.itemId === undefined ? undefined : this.itemOrdinals.get(item.itemId);
+      const callOrdinal = item.callId === undefined ? undefined : this.callOrdinals.get(item.callId);
       if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
         // ...unless one of the two is a state the client was never told
         // about: then the item is where the split identity meets, and it
@@ -1145,7 +1163,7 @@ class CodexBackendStreamState {
       // The dense slot — the streamed calls in order — is where an
       // unfamiliar item goes when an anonymous holder sits there.
       const slot = [...this.toolStates.keys()].sort((a, b) => a - b)[item.position];
-      const index = this.finalOutputOrdinal(slot, item.outputIndex, item.itemId, item.callId);
+      const index = this.finalOutputOrdinal(slot, item.outputIndex, item);
       placed.add(index);
       this.applyFinalItem(item, index);
     }
@@ -1157,7 +1175,7 @@ class CodexBackendStreamState {
     // is aligned by count, so the count cannot book that call again.
     const unplaced: FinalCallItem[] = [];
     for (const item of items.filter(anonymous)) {
-      const holder = this.toolOrdinals.get(`#${item.outputIndex}`);
+      const holder = this.holders.get(item.outputIndex);
       if (holder === undefined || !this.toolStates.has(holder)) {
         unplaced.push(item);
         continue;
@@ -1171,32 +1189,50 @@ class CodexBackendStreamState {
     // stream never showed is not one of them — against the items no position
     // placed. Counted whole, an item that ADDS a call the stream never showed
     // outnumbered the standing calls and the item completing the index-less
-    // streamed call was discarded (r34-fable F1). When they agree the
-    // alignment is one to one: the k-th item no position placed is the k-th
-    // standing call no item placed, in order — not the k-th streamed call, a
-    // slot a position may already have taken, which booked one call twice
-    // and stranded the position-less one (r33-fable F1). When they disagree
-    // which call an item completes is not knowable — aligned anyway, an item
-    // would land on whichever call shares its slot and overwrite it, turning
-    // one call into a second copy of another — and each item left is a call
-    // of its own: one the completed output reports without an identity,
-    // refused at `completed()` as a call missing its `call_id`. Discarded
-    // instead, two calls the runtime wrote vanished under a 200 (r34-codex).
-    // With nothing streamed, every item is a call of its own the same way.
+    // streamed call was discarded (r34-fable F1). The count is identity only
+    // when it leaves nothing to choose: ONE item no position placed and ONE
+    // standing call no item placed, agreeing on the name when the item gives
+    // one — not the k-th to the k-th, a slot a position may already have
+    // taken (r33-fable F1), and not two to two in arrival order, which handed
+    // each call the other's arguments when both had streamed `{` and the
+    // completed output listed them the other way round (r35-codex). Every
+    // other item left is a call of its own: one the completed output reports
+    // without an identity, refused at `completed()` as a call missing its
+    // `call_id`. Discarded instead, two calls the runtime wrote vanished under
+    // a 200 (r34-codex). With nothing streamed, every item is a call of its
+    // own the same way.
     const standing = [...streamed].filter((ordinal) => this.toolStates.has(ordinal));
-    const unmatched = standing.filter((ordinal) => !placed.has(ordinal)).sort((a, b) => a - b);
-    const paired = unplaced.length === unmatched.length;
+    const unmatched = standing.filter((ordinal) => !placed.has(ordinal));
+    const only = unplaced.length === 1 && unmatched.length === 1 ? unmatched[0] : undefined;
     for (const item of unplaced) {
-      const index = (paired ? unmatched.shift() : undefined) ?? this.nextToolOrdinal;
+      const index = only !== undefined && this.namesAgree(item, only) ? only : this.nextToolOrdinal;
       if (index >= this.nextToolOrdinal) this.nextToolOrdinal = index + 1;
       this.applyFinalItem(item, index);
     }
   }
 
-  /** Applies one completed item to the state at `index`, creating it for a call the stream never showed. */
+  /** Whether the item's name, when it gives one, is the name the call at `index` already carries. */
+  private namesAgree(item: FinalCallItem, index: number): boolean {
+    const state = this.toolStates.get(index);
+    return item.name === undefined || state === undefined || !state.named || state.name === item.name;
+  }
+
+  /**
+   * Applies one completed item to the call its caller correlated it with —
+   * by id, by the call holding its position, or as the one remaining pair —
+   * creating the state for a call the stream never showed. What it applies
+   * is bounded by what the stream already told the client: an item may fill
+   * in what the stream never delivered and may not replace what it did.
+   */
   private applyFinalItem(item: FinalCallItem, index: number): void {
     const anonymous = item.itemId === undefined && item.callId === undefined;
     const existing = this.toolStates.get(index);
+    // An anonymous item that names a DIFFERENT tool than the call it was
+    // correlated with is not that call's account: the vendor contradicting
+    // itself, kept out like a contradicting value (declared). Applied anyway,
+    // its arguments went out under the streamed call's name whenever they
+    // extended the prefix — always, when the prefix was `{` (r35-codex).
+    if (anonymous && existing !== undefined && !this.namesAgree(item, index)) return;
     const state = existing ?? {
       ...this.newToolState(index, {
         id: item.callId,
@@ -1206,12 +1242,10 @@ class CodexBackendStreamState {
       hasCallId: item.callId !== undefined,
       identified: item.callId !== undefined && item.name !== undefined,
     };
-    // An anonymous item is matched by position alone, and position is not
-    // proof of identity: with two calls listed in an order the stream did
-    // not use, overwriting here gave each streamed call the OTHER call's
-    // name and arguments under its own id, so tool results came back
-    // answering the wrong call. It may fill in what the stream never
-    // delivered; it may not replace what it did.
+    // Correlation is not proof of identity for an anonymous item: with two
+    // calls listed in an order the stream did not use, overwriting here gave
+    // each streamed call the OTHER call's name and arguments under its own
+    // id, so tool results came back answering the wrong call.
     const mayReplace = !anonymous || existing === undefined;
     // An identity the client has already been told is a promise: a client
     // that reported `call_1`/`probe` from the stream cannot be handed

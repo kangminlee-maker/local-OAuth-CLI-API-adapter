@@ -2451,3 +2451,91 @@ test('an anonymous completed item no position places and no remainder pairs is a
     for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
   }, /missing its call_id/);
 });
+
+test('two anonymous completed items against two index-less streamed calls are not paired by arrival order: behind a shared `{` the pairing is a guess, and each is refused as a call without an identity (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+      { type: 'function_call', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('the one remaining pair still needs the names to agree: an anonymous item naming another tool than the one index-less call left is a call without an identity (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('an anonymous item at a held position naming another tool than the call there is that call\'s contradiction: kept out, the streamed bytes stand (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{']]);
+});
+
+test('a call_id spelled like a position key names nothing but itself: `#0` is a second call, not the holder of position 0 (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: '#0', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_b', call_id: '#0', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('#0'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('item ids and call ids are two namespaces: a spelling shared between one call\'s item id and another\'s call_id binds nothing across them (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'shared', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'shared', delta: '{"a":1}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'shared', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'shared', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'shared', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('shared'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
