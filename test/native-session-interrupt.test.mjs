@@ -124,10 +124,13 @@ test('an interrupt during the turn/start round-trip still reaches the child', { 
   await manager.interrupt(session.id);
   await drain;
 
-  assert.equal(
-    (await receivedMethods(methodLog)).filter((method) => method === 'turn/interrupt').length,
-    1,
-    'the turn must be interrupted on the child, whenever the interrupt lands',
+  // The caller is answered at the stop, before the child acknowledges the
+  // start (t1 B-res): the interrupt is written when the acknowledgement
+  // arrives, so it is waited for, not read the instant the caller returns.
+  await waitFor(
+    async () => (await receivedMethods(methodLog)).filter((method) => method === 'turn/interrupt').length === 1,
+    3_000,
+    'the turn to be interrupted on the child, whenever the interrupt lands',
   );
   assert.equal(events.at(-1).event, 'cli.error', 'the caller stops iterating too');
 });
@@ -198,7 +201,7 @@ test('a turn/start the child never names within the budget replaces the child: t
   // The child already spawned keeps its environment; its replacement will not.
   delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
   const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
@@ -262,7 +265,7 @@ test('a credentials directory the replacement cannot remove stops nothing and es
     // Unreadable: the replacement's `rm` of it rejects.
     await chmod(isolationRoot, 0o000);
     process.on('unhandledRejection', onRejection);
-    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
     assert.equal(first.status, 'error');
     assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
     const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
@@ -315,7 +318,7 @@ test('a turn waiting for a child replacement is the session\'s: it occupies the 
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   // The replacement child is slow to come up: the next turn waits for it.
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '800';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
   const outcome = waiting.next().catch((err) => ({ error: err }));
@@ -338,7 +341,7 @@ test('a stop that lands while the turn waits for the replacement ends the wait, 
   delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '250';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
   const outcome = waiting.next().catch((err) => ({ error: err }));
@@ -359,7 +362,7 @@ test('a close that lands while a turn waits for the replacement ends the child b
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   // The replacement's handshake would take two seconds.
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '2000';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 1000 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 3000 }); // caller budget above the RPC budget (1000): the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
   const outcome = waiting.next().catch((err) => ({ error: err }));
@@ -384,7 +387,7 @@ test('a replacement whose handshake fails leaves no child: the waiting turn repo
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   // Slower than the RPC budget: the replacement's `initialize` times out.
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '850';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   // A deadline longer than the failing handshake: what ends this turn is the
   // replacement's failure, not the idle budget.
@@ -411,7 +414,7 @@ test('closeAll reports a teardown that left a credentials copy on disk, after ev
     delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
     [isolationRoot] = (await readdir(privateTmp)).map((name) => join(privateTmp, name));
     await chmod(isolationRoot, 0o000);
-    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
     assert.equal(first.status, 'error');
     const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
     assert.equal(second.status, 'completed');
@@ -454,7 +457,7 @@ test('a turn admitted before the close and read after it hears the close, and re
   assert.equal(closed.status, 'closed');
   const event = await stream.next();
   assert.equal(event.value?.event, 'cli.error', JSON.stringify(event));
-  assert.match(event.value.raw.message, /session is closed/, 'the close is the reason the reader hears');
+  assert.match(event.value.raw.message, /session closed/, 'the close is the reason the reader hears — the one in-band answer on both runtimes (t1 B-res)');
   assert.deepEqual((await stream.next()).done, true, 'and the iteration ends');
   const methods = await receivedMethods(methodLog);
   assert.equal(methods.filter((method) => method === 'turn/start').length, 0, 'no turn reached the child');
@@ -589,7 +592,7 @@ test('the manager\'s deadline restarts on every event: with the runtime\'s own t
   const silentAt = Date.now();
   const partial = await manager.runTurn(session.id, { input: 'PARTIAL' }, { timeoutMs: 300 });
   assert.equal(partial.status, 'error');
-  assert.match(partial.events.at(-1).raw.message, /interrupted/);
+  assert.match(partial.events.at(-1).raw.message, /aborted/, 'the manager\'s deadline answers, on both runtimes (t1 B-res)');
   assert.ok(Date.now() - silentAt < 1000, `silence ended at the budget: ${Date.now() - silentAt} ms`);
 });
 
@@ -1016,6 +1019,137 @@ test('closing a session tells a streaming caller its turn ended, not that it fin
 
   await assert.rejects(pending, /session closed/i);
 });
+
+test('a reservation whose reader cancels before the first read is released: the session answers ready and the next turn runs (t1 B-res, gap 1)', { timeout: 20_000 }, async () => {
+  // Admission is at the call; the reader may never read. An async generator's
+  // `finally` does not run for a `return()` before its first `next()`, so the
+  // slot taken at admission was held for the session's life — every later turn
+  // a 409 (r56-codex, on the round-55 synchronous admission).
+  const { manager, session, state } = await countingManager();
+  const iterator = manager.streamTurn(session.id, { input: 'reserved, never read' })[Symbol.asyncIterator]();
+  assert.equal(manager.get(session.id).status, 'running', 'admitted at the call');
+  assert.deepEqual(await iterator.return(), { done: true, value: undefined });
+  assert.equal(manager.get(session.id).status, 'ready', 'a reader that cancelled holds nothing');
+  const second = await manager.runTurn(session.id, { input: 'second' });
+  assert.equal(second.status, 'completed');
+  assert.equal(state.starts, 1, 'only the second turn reached the runtime');
+});
+
+test('a deadline that fires on a reservation nobody read releases it: the session answers ready, and the stale iterable dispatches nothing (t1 B-res, gap 1)', { timeout: 20_000 }, async () => {
+  const { manager, session, state } = await countingManager();
+  const iterable = manager.streamTurn(session.id, { input: 'reserved, never read' }, { timeoutMs: 50 });
+  await waitFor(() => manager.get(session.id).status === 'ready', 1_000, 'the deadline to release the reservation');
+  const events = [];
+  for await (const event of iterable) events.push(event.event);
+  assert.deepEqual(events, ['cli.error'], 'the stale reader hears the end and nothing else');
+  assert.equal(state.starts, 0, 'nothing was dispatched for the timed-out reservation');
+  const second = await manager.runTurn(session.id, { input: 'second' });
+  assert.equal(second.status, 'completed');
+  assert.equal(state.starts, 1);
+});
+
+test('an interrupt before the first read ends the turn: nothing is dispatched, the reader hears the stop, the session answers ready (t1 B-res, gap 2)', { timeout: 20_000 }, async () => {
+  // Between admission and the first read the runtime has no turn, so its
+  // interrupt found nothing, and the reservation's signal was not fired because
+  // the runtime implements `interrupt`: the endpoint answered `ready` and the
+  // turn it said it stopped ran on the next read (r56-codex).
+  const { manager, session, state } = await countingManager();
+  const iterable = manager.streamTurn(session.id, { input: 'admitted then interrupted' });
+  assert.equal(manager.get(session.id).status, 'running');
+  const snapshot = await manager.interrupt(session.id);
+  assert.equal(snapshot.status, 'ready');
+  const events = [];
+  for await (const event of iterable) events.push(event);
+  assert.equal(events.length, 1, JSON.stringify(events));
+  assert.equal(events[0].event, 'cli.error');
+  assert.match(String(events[0].raw?.message), /aborted/);
+  assert.equal(state.starts, 0, 'the turn the endpoint said it stopped never ran');
+  assert.equal(manager.get(session.id).status, 'ready');
+});
+
+test('a stop while turn/start is in flight ends the caller within the stop, not at the acknowledgement — and still precedes the next turn on the child (t1 B-res, gap 4)', { timeout: 20_000 }, async () => {
+  // The stop failed the turn's queue, but the caller was parked in the
+  // `turn/start` RPC, not on the queue: it heard the stop only when the child
+  // acknowledged the start — a whole RPC budget against a child that never
+  // does (r56-codex). What must not move is the order on the child: the
+  // interrupt is written before the next turn's start.
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '800';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  const stream = manager.streamTurn(session.id, { input: 'slow acknowledgement' })[Symbol.asyncIterator]();
+  const pending = stream.next();
+  await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 2_000, 'turn/start to reach the child');
+  const stoppedAt = Date.now();
+  await manager.interrupt(session.id);
+  const first = await pending;
+  const callerMs = Date.now() - stoppedAt;
+  assert.equal(first.value?.event, 'cli.error', JSON.stringify(first));
+  assert.ok(callerMs < 300, `the caller hears the stop within the stop, not at the child's acknowledgement (${callerMs}ms)`);
+  assert.equal(manager.get(session.id).status, 'running', 'the session stays occupied until the child has been told');
+  assert.throws(() => manager.streamTurn(session.id, { input: 'too soon' }), /already has a running turn/);
+  await waitFor(() => manager.get(session.id).status === 'ready', 3_000, 'the acknowledgement to retire the turn');
+  const second = await manager.runTurn(session.id, { input: 'after the stop' }, { timeoutMs: 500 });
+  assert.equal(second.status, 'error', 'the fake never completes a turn; the deadline ends it');
+  const methods = (await receivedMethods(methodLog)).filter((m) => m === 'turn/start' || m === 'turn/interrupt');
+  assert.deepEqual(methods.slice(0, 3), ['turn/start', 'turn/interrupt', 'turn/start'], `the interrupt precedes the next start: ${methods.join(',')}`);
+});
+
+test('a turn admitted before the close and read after it hears the close on the claude runtime too (t1 B-res, two paths)', { timeout: 20_000 }, async () => {
+  // The codex runtime answered "closed" here (r55-fable); the claude runtime
+  // answered "not running" — a different fact for the same sequence.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: cwd,
+    runtimes: {
+      claude: async (input) => ClaudeNativeCliChatSession.create({ command: fakeClaude, cwd: input.cwd, model: 'claude-opus-4-8', timeoutMs: 2_000 }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'claude' });
+  const stream = manager.streamTurn(session.id, { input: 'admitted first' })[Symbol.asyncIterator]();
+  const closed = await manager.close(session.id);
+  assert.equal(closed.status, 'closed');
+  const event = await stream.next();
+  assert.equal(event.value?.event, 'cli.error', JSON.stringify(event));
+  assert.match(String(event.value.raw?.message), /session closed/, 'the close is the reason — not "not running"');
+  assert.equal((await stream.next()).done, true);
+});
+
+/** A manager over an in-process runtime that only counts what it was asked. */
+async function countingManager() {
+  const state = { starts: 0, interrupts: 0, closes: 0 };
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: {},
+        async *startTurn() {
+          state.starts += 1;
+          yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'ok' };
+        },
+        async interrupt() { state.interrupts += 1; },
+        async close() { state.closes += 1; },
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'codex' });
+  return { manager, session, state };
+}
+
+/** Polls a condition instead of sleeping for it: the bound is on the wait, not on the timing. */
+async function waitFor(check, timeoutMs = 3_000, what = 'condition') {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`);
+    await delay(10);
+  }
+}
 
 async function turnText(session, input) {
   let text = '';

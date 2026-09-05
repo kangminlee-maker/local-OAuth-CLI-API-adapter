@@ -27,12 +27,39 @@ export interface LocalCliChatTurnOptions {
   readonly timeoutMs?: number;
 }
 
-/** What the manager owns for one turn: the caller's deadline and its signal. */
-interface ManagedTurn {
+/**
+ * What the manager owns for one turn, from the moment it is admitted to the
+ * moment its caller's iteration ends — whether or not the generator that
+ * delivers the turn's events was ever entered. It used to be two records
+ * (`running` and a `currentTurn` installed at admission) released only by a
+ * generator's `finally`, which never runs for a reader that cancels before its
+ * first read: the slot stayed taken for the session's life (r56-codex).
+ *
+ * States: `admitted` (slot taken, runtime not asked, nobody has read),
+ * `streaming` (the first read entered the generator), and the two terminal
+ * ones — `stopped` (a stop ended the turn for its caller; one `cli.error`
+ * carrying the reason is owed to a reader) and `released` (ended without a
+ * stop: completed, failed runtime-side, or the reader returned). A terminal
+ * transition runs once, clears the deadline, and detaches from the session
+ * iff the session still holds this reservation.
+ */
+interface TurnReservation {
+  readonly turnId: string;
   readonly abort: AbortController;
-  /** Cancels this turn's idle deadline, wherever the turn ends. */
-  readonly stopDeadline: () => void;
+  readonly idleTimeoutMs: number | undefined;
+  state: 'admitted' | 'streaming' | 'stopped' | 'released';
+  /** The stop's reason — what the reader is owed as its one `cli.error`. */
+  reason: string | null;
+  /** Settles when a stop ends the turn: a read parked in the runtime ends there. */
+  readonly stopped$: Promise<void>;
+  markStopped: () => void;
+  deadline: NodeJS.Timeout | undefined;
 }
+
+/** The manager's answer for every turn it stops itself, on both runtimes. */
+const TURN_ABORTED = 'local CLI chat turn aborted';
+/** The runtimes' own in-band answer when a close ends a running turn, reused for one not yet entered. */
+const SESSION_CLOSED = 'local CLI chat session closed';
 
 interface ManagedSession {
   readonly id: string;
@@ -43,24 +70,23 @@ interface ManagedSession {
   readonly title?: string;
   readonly nativeSession: LocalCliChatRuntimeSession;
   closed: boolean;
-  /**
-   * Whether a turn is running, for a runtime that cannot say. A runtime that
-   * can is asked instead — see `sessionStatus`.
-   */
-  running: boolean;
   lastTurnId?: string;
-  currentTurn?: ManagedTurn;
+  reservation?: TurnReservation;
 }
 
 /**
- * One answer about occupancy, from whoever knows. A runtime that reports it
- * IS the authority: the manager's own bookkeeping used to be a second, parallel
- * lifetime, and the two disagreed — a session answered `ready` while its
- * runtime refused every turn as concurrent, and the reverse.
+ * Occupancy is two single-owner values, projected: the manager's reservation
+ * (admission → the caller's iteration ends) and the runtime's `isBusy`
+ * (dispatch → the child-side retirement). Neither restates the other — the
+ * manager's own bookkeeping used to be a second, parallel lifetime, and the
+ * two disagreed. The disjunction is what lets a stop free the caller before
+ * the child has acknowledged the turn without freeing the SESSION: codex keeps
+ * its turn until the acknowledgement, retiring it immediately before it writes
+ * the interrupt, so admission answers 409 for that whole window (r56-codex).
  */
 function sessionStatus(session: ManagedSession): LocalCliChatSessionStatus {
   if (session.closed) return 'closed';
-  const busy = session.nativeSession.isBusy?.() ?? session.running;
+  const busy = session.reservation !== undefined || session.nativeSession.isBusy?.() === true;
   return busy ? 'running' : 'ready';
 }
 
@@ -94,7 +120,6 @@ export class LocalCliChatSessionManager {
       title: input.title,
       nativeSession,
       closed: false,
-      running: false,
     };
     this.sessions.set(session.id, session);
     return snapshot(session);
@@ -116,11 +141,12 @@ export class LocalCliChatSessionManager {
     // error, not a session kept listed (r54-fable).
     session.closed = true;
     this.sessions.delete(id);
-    try {
-      await session.nativeSession.close();
-    } finally {
-      this.endTurn(session);
-    }
+    // The turn found is stopped before the teardown is awaited: a reader that
+    // arrives after the close hears the close — on both runtimes — and the
+    // runtime is never asked to start it (r56: claude answered "not running",
+    // the wrong fact, for the same sequence codex answered "closed").
+    if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
+    await session.nativeSession.close();
     return snapshot(session);
   }
 
@@ -132,12 +158,9 @@ export class LocalCliChatSessionManager {
     // credentials copy on disk says so to the server's own close, which used
     // to hear a clean shutdown over it (r55-codex).
     const outcomes = await Promise.allSettled(sessions.map(async (session) => {
-      try {
-        await session.nativeSession.close();
-      } finally {
-        this.endTurn(session);
-        session.closed = true;
-      }
+      session.closed = true;
+      if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
+      await session.nativeSession.close();
     }));
     const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
     if (failures.length === 1) throw failures[0].reason;
@@ -155,38 +178,77 @@ export class LocalCliChatSessionManager {
     // the session's own handler for that signal runs the same stop. Asking
     // both ways at once is what told the child twice. A runtime that
     // implements no interrupt is stopped through the signal alone.
-    // The turn's deadline goes with the turn. An abandoned stream's `finally` —
-    // the only other place it was cleared — never runs, so the deadline
-    // outlived the turn it belonged to and later aborted a signal whose turn
-    // was long over, stopping whoever was running by then.
-    const turn = this.endTurn(session);
-    try {
-      if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
-      else turn?.abort.abort();
-    } finally {
-      // Even when the runtime's stop threw. Whether the session is free again
-      // is the runtime's answer, not this bookkeeping — a turn the child has
-      // not named yet keeps it busy until it can be told to stop.
-      session.running = false;
-    }
+    // The reservation is stopped BEFORE the runtime is asked — synchronously,
+    // so nothing can be dispatched in between: a turn admitted but not yet read
+    // had no runtime turn to stop, the endpoint answered `ready`, and the turn
+    // ran on the next read (r56-codex). Stopped, the reservation owes its
+    // reader one `cli.error` and holds the session no longer; whether the
+    // session is free is then the runtime's answer — a turn the child has not
+    // named yet keeps it busy until it can be told to stop. And the stop is
+    // recorded even when the runtime's own stop throws: the rejection is the
+    // caller's, not a session wedged at `running`.
+    const reservation = session.reservation;
+    if (reservation) this.stop(session, reservation, TURN_ABORTED);
+    if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
+    else reservation?.abort.abort();
     return snapshot(session);
   }
 
-  /** Ends the manager's side of the current turn: its deadline and its record. */
-  private endTurn(session: ManagedSession): ManagedTurn | undefined {
-    const turn = session.currentTurn;
-    turn?.stopDeadline();
-    session.currentTurn = undefined;
-    return turn;
+  /** The one place a stop ends a turn for its caller. Runs once; safe on a turn already over. */
+  private stop(session: ManagedSession, reservation: TurnReservation, reason: string): void {
+    if (reservation.state === 'stopped' || reservation.state === 'released') return;
+    reservation.state = 'stopped';
+    reservation.reason = reason;
+    this.end(session, reservation);
+    reservation.markStopped();
+  }
+
+  /** The one place a turn ends without a stop: completed, failed runtime-side, or the reader returned. */
+  private release(session: ManagedSession, reservation: TurnReservation): void {
+    if (reservation.state === 'stopped' || reservation.state === 'released') return;
+    reservation.state = 'released';
+    this.end(session, reservation);
+  }
+
+  /**
+   * The terminal transition's effects: the deadline dies with the turn, and
+   * only the turn that still owns the session releases it — an abandoned
+   * stream finalizes late, after its turn was stopped and the next one
+   * started, and releasing there handed the running turn's slot to whoever
+   * asked next.
+   */
+  private end(session: ManagedSession, reservation: TurnReservation): void {
+    if (reservation.deadline) clearTimeout(reservation.deadline);
+    reservation.deadline = undefined;
+    if (session.reservation === reservation) session.reservation = undefined;
+  }
+
+  /**
+   * The idle deadline bounds SILENCE, not duration: a native turn is an agentic
+   * CLI session that legitimately runs for many minutes while streaming, and a
+   * total cap would cut a turn that is working. Re-armed on every delivered
+   * event, so what it ends is a turn that has stopped producing. Firing, it
+   * is a stop like any other — the caller is answered at once, and the signal
+   * reaches the runtime as it always did — where it used to only fire the
+   * signal, which a reservation nobody had read could not observe (r56-codex).
+   */
+  private armDeadline(session: ManagedSession, reservation: TurnReservation): void {
+    if (reservation.idleTimeoutMs === undefined) return;
+    if (reservation.deadline) clearTimeout(reservation.deadline);
+    reservation.deadline = setTimeout(() => {
+      this.stop(session, reservation, TURN_ABORTED);
+      reservation.abort.abort();
+    }, reservation.idleTimeoutMs);
   }
 
   /**
    * Admits the turn NOW — the 404/409/410 are thrown from this call, before
-   * the caller has committed anything — and returns the turn's events, which
-   * the caller must consume: the reservation made here is released by the
-   * iteration's end (r55-codex: a lazy generator ran its admission only at
-   * the first read, after the HTTP writer had committed 200 SSE headers, so a
-   * known 404 went out as a 200 with a generic error).
+   * the caller has committed anything (r55-codex: a lazy generator ran its
+   * admission only at the first read, after the HTTP writer had committed 200
+   * SSE headers, so a known 404 went out as a 200 with a generic error) — and
+   * returns the turn's events. The reservation made here is released by the
+   * iteration's end, by a reader that returns before it ever read, by the idle
+   * deadline, or by a stop — not only by a generator's `finally`.
    */
   streamTurn(
     sessionId: string,
@@ -203,52 +265,135 @@ export class LocalCliChatSessionManager {
     }
     const turnId = `turn_${randomUUID()}`;
     session.lastTurnId = turnId;
-    session.running = true;
-    const abort = new AbortController();
+    let markStopped = (): void => {};
+    const stopped$ = new Promise<void>((resolve) => { markStopped = resolve; });
     // The caller's deadline reaches the runtime through the turn's own signal —
     // the same mechanism `interrupt` uses. Without it a child that stopped
     // answering held the HTTP request open with no end, and left the session
     // `running`, so every later turn was refused with 409.
-    //
-    // It bounds SILENCE, not duration: a native turn is an agentic CLI session
-    // that legitimately runs for many minutes while streaming, and a total cap
-    // would cut a turn that is working. Every event restarts the clock, so what
-    // the deadline ends is a turn that has stopped producing.
-    const idleTimeoutMs = options.timeoutMs !== undefined && options.timeoutMs > 0
-      ? options.timeoutMs
-      : undefined;
-    let deadline: NodeJS.Timeout | undefined;
-    const stopDeadline = (): void => {
-      if (deadline) clearTimeout(deadline);
-      deadline = undefined;
+    const reservation: TurnReservation = {
+      turnId,
+      abort: new AbortController(),
+      idleTimeoutMs: options.timeoutMs !== undefined && options.timeoutMs > 0 ? options.timeoutMs : undefined,
+      state: 'admitted',
+      reason: null,
+      stopped$,
+      markStopped,
+      deadline: undefined,
     };
-    const turn: ManagedTurn = { abort, stopDeadline };
-    session.currentTurn = turn;
-    const armDeadline = (): void => {
-      if (idleTimeoutMs === undefined) return;
-      stopDeadline();
-      deadline = setTimeout(() => abort.abort(), idleTimeoutMs);
-    };
-    armDeadline();
-    return this.turnEvents(session, turn, turnId, input, abort, armDeadline, stopDeadline);
+    session.reservation = reservation;
+    this.armDeadline(session, reservation);
+    return this.turnEvents(session, reservation, input);
   }
 
-  private async *turnEvents(
+  /**
+   * The turn's events, as an iterator whose `return()` and `next()` are real
+   * code from the moment of admission. An async generator's `finally` does
+   * not run for a `return()` before its first `next()`, and a stop that lands
+   * while a read is parked inside the runtime — codex's `turn/start` RPC —
+   * cannot settle that read by failing a queue nobody is reading yet, so the
+   * caller waited out the child's acknowledgement (r56-codex). Every read
+   * races the runtime against the reservation's stop; a stopped reservation
+   * answers with its reason, once, and the read still pending in the runtime
+   * is absorbed — its settlement runs the generator's own `catch` and
+   * `finally` (a replacement on timeout, the retirement on acknowledgement)
+   * and reaches no caller.
+   */
+  private turnEvents(
     session: ManagedSession,
-    turn: ManagedTurn,
-    turnId: string,
+    reservation: TurnReservation,
     input: LocalCliChatTurnInput,
-    abort: AbortController,
-    armDeadline: () => void,
-    stopDeadline: () => void,
   ): AsyncIterable<LocalCliChatEvent> {
+    const inner = this.runtimeEvents(session, reservation, input);
+    // Read through a call: the state moves under an `await`, past what a
+    // narrowing on the field would admit.
+    const stopped = (): boolean => reservation.state === 'stopped';
+    const done: IteratorResult<LocalCliChatEvent> = { done: true, value: undefined };
+    let finished = false;
+    let owed = true;
+    const stopEvent = (): IteratorResult<LocalCliChatEvent> => {
+      if (!owed) {
+        finished = true;
+        return done;
+      }
+      owed = false;
+      return {
+        done: false,
+        value: {
+          event: 'cli.error',
+          session_id: session.id,
+          turn_id: reservation.turnId,
+          runtime: session.runtime,
+          raw: { message: reservation.reason ?? TURN_ABORTED },
+        },
+      };
+    };
+    const absorb = (pending: Promise<IteratorResult<LocalCliChatEvent>>): void => {
+      // One handler, attached once: the generator's own `catch` turns every
+      // runtime error into an event, so this settles, but nothing may be left
+      // for the process to report. `return()` queues behind the pending read.
+      pending.then(() => inner.return(undefined), () => inner.return(undefined)).catch(() => undefined);
+    };
+    let chain: Promise<unknown> = Promise.resolve();
+    const serialized = <T>(step: () => Promise<T>): Promise<T> => {
+      const result = chain.then(step, step);
+      chain = result.catch(() => undefined);
+      return result;
+    };
+    const iterator: AsyncIterableIterator<LocalCliChatEvent> = {
+      [Symbol.asyncIterator]() {
+        return iterator;
+      },
+      next: () => serialized(async () => {
+        if (finished) return done;
+        if (reservation.state === 'stopped') return stopEvent();
+        if (reservation.state === 'released') {
+          finished = true;
+          return done;
+        }
+        reservation.state = 'streaming';
+        const pending = inner.next();
+        const outcome = await Promise.race([
+          pending.then((result): { result: IteratorResult<LocalCliChatEvent> | null } => ({ result })),
+          reservation.stopped$.then((): { result: IteratorResult<LocalCliChatEvent> | null } => ({ result: null })),
+        ]);
+        if (outcome.result === null || stopped()) {
+          absorb(pending);
+          return stopEvent();
+        }
+        if (outcome.result.done) {
+          finished = true;
+          return done;
+        }
+        this.armDeadline(session, reservation);
+        return outcome.result;
+      }),
+      return: () => serialized(async () => {
+        if (finished) return done;
+        finished = true;
+        if (reservation.state === 'admitted') {
+          // Never entered: nothing to finalize, and the slot goes now.
+          this.release(session, reservation);
+          return done;
+        }
+        if (reservation.state === 'streaming') await inner.return(undefined);
+        return done;
+      }),
+    };
+    return iterator;
+  }
+
+  private async *runtimeEvents(
+    session: ManagedSession,
+    reservation: TurnReservation,
+    input: LocalCliChatTurnInput,
+  ): AsyncGenerator<LocalCliChatEvent, void, undefined> {
     try {
-      for await (const runtimeEvent of session.nativeSession.startTurn(input, abort.signal)) {
-        armDeadline();
+      for await (const runtimeEvent of session.nativeSession.startTurn(input, reservation.abort.signal)) {
         yield {
           event: 'cli.event',
           session_id: session.id,
-          turn_id: turnId,
+          turn_id: reservation.turnId,
           runtime: session.runtime,
           raw: runtimeEvent.raw,
           ...(runtimeEvent.textDelta !== undefined ? { text_delta: runtimeEvent.textDelta } : {}),
@@ -258,7 +403,7 @@ export class LocalCliChatSessionManager {
       yield {
         event: 'cli.completed',
         session_id: session.id,
-        turn_id: turnId,
+        turn_id: reservation.turnId,
         runtime: session.runtime,
         raw: { status: 'completed' },
       };
@@ -266,22 +411,14 @@ export class LocalCliChatSessionManager {
       yield {
         event: 'cli.error',
         session_id: session.id,
-        turn_id: turnId,
+        turn_id: reservation.turnId,
         runtime: session.runtime,
         raw: {
           message: err instanceof Error ? err.message : String(err),
         },
       };
     } finally {
-      stopDeadline();
-      // Only the turn that still owns the session may release it. An
-      // interrupted stream nobody is reading finalizes late — after its turn
-      // was stopped and the next one started — and releasing there handed the
-      // running turn's slot to whoever asked next.
-      if (session.currentTurn === turn) {
-        session.currentTurn = undefined;
-        session.running = false;
-      }
+      this.release(session, reservation);
     }
   }
 

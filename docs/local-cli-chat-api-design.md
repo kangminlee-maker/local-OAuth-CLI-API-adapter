@@ -206,7 +206,15 @@ that lands while a turn waits for the replacement ends the wait, not the replace
 close during a replacement ends the child being started rather than waiting out its
 handshake; a replacement whose handshake fails leaves no child; and a
 streamed turn is admitted before any SSE commits, so a 404, 409 or 410 arrives in the
-native envelope on that path too (round 55). A close stops the turn it finds — one
+native envelope on that path too (round 55). The turn the manager admits is a reservation
+it owns from the call to the end of its caller's iteration — released by that end, by a
+reader that returns before it ever read, by the idle deadline, or by a stop — not only by a
+generator's `finally`, which never runs for a reader that cancels before its first read; a
+stop (interrupt, deadline, close) ends the turn for its caller at once, on both runtimes and
+with one answer (`local CLI chat turn aborted`; `local CLI chat session closed`), while the
+session stays occupied until the runtime has retired the turn — codex keeps its turn until the
+child names it and the interrupt is written, so a turn asked for in that window is refused 409
+rather than started ahead of the interrupt (track 1, B-res). A close stops the turn it finds — one
 still preparing its input ends without writing to the child being archived, and one
 admitted before the close but read after it hears the close (round 55). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
