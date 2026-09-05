@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import { honorRequestModel } from '../settings.js';
@@ -43,6 +43,8 @@ const ACCESS_TOKEN_REFRESH_WINDOW_MS = 5 * 60 * 1000;
 const FALLBACK_REFRESH_INTERVAL_MS = 8 * 24 * 60 * 60 * 1000;
 const REFRESH_LOCK_TIMEOUT_MS = 10_000;
 const REFRESH_LOCK_STALE_MS = 60_000;
+/** A refresh fetch ends before its lease can go stale (r52-codex). */
+const REFRESH_FETCH_BUDGET_MS = REFRESH_LOCK_STALE_MS / 2;
 const TRANSIENT_BACKEND_RETRY_DELAYS_MS = [250, 1_000] as const;
 const IMAGE_NO_RESULT_RETRY_DELAYS_MS = [500, 1_500] as const;
 /** How many entries each image diagnostic history keeps: a runaway backend must not grow the proxy by its event count. */
@@ -1455,17 +1457,23 @@ class CodexBackendImageState {
   // the terminal output's record of the turn's image when the terminal
   // lists one — the backend's final word, carrying the rewrite the item
   // frame did not (r49-codex), a re-encoding, or a corrected rewrite
-  // (r50-codex) — paired with the item frame's by item id (r51-fable: the
-  // record of a different call inherited the item frame call's rewrite).
-  // Every other image is counted and not retained — not even
-  // a digest: the turn was asked for one, the cap on `n` skips the rest,
-  // and holding them pinned every runaway payload until the terminal
-  // (r49-codex); a set of digests still grew by the runaway's count
-  // (r50-fable).
+  // (r50-codex) — paired with the item frame's by item id AND bytes
+  // (r51-fable: the record of a different call inherited the item frame
+  // call's rewrite; r52-codex: so did a re-encoding of the same call).
+  // No payload is retained beyond the result: the turn was asked for one,
+  // the cap on `n` skips the rest, and holding them pinned every runaway
+  // payload until the terminal (r49-codex). What is kept per call is a
+  // digest and the rewrite, in a map bounded like the histories (a set of
+  // digests once grew by the runaway's count, r50-fable).
   private result?: OpenAiGeneratedImage;
-  private resultId?: string;
   private terminalRecorded = false;
-  private otherImages = 0;
+  /**
+   * The calls the backend produced an image for, by item id. A record
+   * without an id, or one past the bound, is counted in `uncorrelated` and
+   * paired with nothing.
+   */
+  private readonly calls = new Map<string, CodexBackendImageCallRecord>();
+  private uncorrelated = 0;
   eventCount = 0;
   readonly eventTypes: string[] = [];
   readonly outputItemTypes: string[] = [];
@@ -1563,36 +1571,43 @@ class CodexBackendImageState {
   }
 
   /**
-   * An image the backend produced. From an item frame: the turn's result if
-   * it is the first, a count otherwise. From the terminal output: the first
-   * record replaces the result — the same call's members over the item
-   * frame's, so a terminal record without a rewrite keeps the item's; the
-   * record of another call, or of one with no id to pair by, stands alone
-   * and the item frame's image is counted (r51-fable) — and the rest are
-   * counted.
+   * An image the backend produced. Every call is counted once, by item id;
+   * the first item frame's image is the result until the terminal output
+   * speaks, and the terminal's first record is then the turn's image AS A
+   * UNIT — a record without a rewrite takes the item frame's only when it
+   * is the same call with the same bytes (r51-fable: another call's record
+   * inherited the item frame call's rewrite; r52-codex: so did a
+   * re-encoding of the same call, and a call counted at its item frame was
+   * counted again at the terminal). Later terminal records are counted.
    */
   private record({ id, image }: CodexBackendImageRecord, terminal: boolean): void {
+    const known = id === undefined ? undefined : this.calls.get(id);
+    this.remember(id, image);
     if (!terminal) {
-      if (this.result === undefined) {
-        this.result = image;
-        this.resultId = id;
-      } else {
-        this.otherImages += 1;
-      }
+      if (this.result === undefined) this.result = image;
       return;
     }
-    if (this.terminalRecorded) {
-      this.otherImages += 1;
-      return;
-    }
+    if (this.terminalRecorded) return;
     this.terminalRecorded = true;
-    if (this.result !== undefined && id !== undefined && id === this.resultId) {
-      this.result = { ...this.result, ...image };
+    const lent = known !== undefined
+      && image.revisedPrompt === undefined
+      && known.digest === imageDigest(image.b64Json)
+      ? known.revisedPrompt
+      : undefined;
+    this.result = lent === undefined ? image : { ...image, revisedPrompt: lent };
+  }
+
+  /** Counts a call once — a known id is nothing new, even with the map at its bound. */
+  private remember(id: string | undefined, image: OpenAiGeneratedImage): void {
+    if (id !== undefined && this.calls.has(id)) return;
+    if (id === undefined || this.calls.size >= IMAGE_DIAGNOSTIC_HISTORY) {
+      this.uncorrelated += 1;
       return;
     }
-    if (this.result !== undefined) this.otherImages += 1;
-    this.result = image;
-    this.resultId = id;
+    this.calls.set(id, {
+      digest: imageDigest(image.b64Json),
+      ...(image.revisedPrompt !== undefined ? { revisedPrompt: image.revisedPrompt } : {}),
+    });
   }
 
   /** Whether the backend ever said how the turn ended. */
@@ -1633,7 +1648,7 @@ class CodexBackendImageState {
       eventTypes: [...this.eventTypes],
       outputItemTypes: [...this.outputItemTypes],
       completedOutputTypes: [...this.completedOutputTypes],
-      imageResultCount: (this.result === undefined ? 0 : 1) + this.otherImages,
+      imageResultCount: this.calls.size + this.uncorrelated,
       imageItemAdded: this.imageItemAdded,
       imageGenerating: this.imageGenerating,
       textDeltaCount: this.textDeltaCount,
@@ -2049,8 +2064,17 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       // refresh after a backend 401 never passed it (round 51: both
       // started a refresh for a caller that had gone).
       if (signal?.aborted) throw abortError();
-      const refreshResponse = await requestChatgptTokenRefresh(current.refreshToken);
-      const updated = mergeRefreshedAuth(parsed, refreshResponse);
+      const refreshResponse = await requestChatgptTokenRefresh(
+        current.refreshToken,
+        Math.min(this.timeoutMs, REFRESH_FETCH_BUDGET_MS),
+      );
+      // Persisted only onto the generation this refresh consumed: a lease
+      // taken over mid-refresh means another refresh may have advanced the
+      // file since, and the older rotation overwrote the newer (r52-codex).
+      const latest = await this.loadAuthFile();
+      const advanced = authFromFile(latest);
+      if (advanced.refreshToken !== current.refreshToken) return advanced;
+      const updated = mergeRefreshedAuth(latest, refreshResponse);
       await saveAuthFile(this.codexHome, updated);
       return authFromFile(updated);
     });
@@ -2205,6 +2229,10 @@ async function withRefreshLock<T>(
 ): Promise<T> {
   const lockPath = join(codexHome, 'auth.json.refresh.lock');
   const startedAt = Date.now();
+  // The lock names its owner: a lease that went stale mid-refresh is taken
+  // over, and the first owner, finishing late, removed the lock it no
+  // longer held — leaving the taker's refresh unguarded (r52-codex).
+  const owner = randomUUID();
   while (true) {
     let handle;
     try {
@@ -2212,12 +2240,13 @@ async function withRefreshLock<T>(
       await handle.writeFile(JSON.stringify({
         pid: process.pid,
         created_at: new Date().toISOString(),
+        owner,
       }));
       try {
         return await fn();
       } finally {
         await handle.close().catch(() => undefined);
-        await unlink(lockPath).catch(() => undefined);
+        await unlinkOwnLock(lockPath, owner);
       }
     } catch (err) {
       await handle?.close().catch(() => undefined);
@@ -2261,6 +2290,17 @@ async function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promis
   });
 }
 
+/** Removes the lock only while it is still this owner's. */
+async function unlinkOwnLock(lockPath: string, owner: string): Promise<void> {
+  try {
+    const current = JSON.parse(await readFile(lockPath, 'utf8')) as { owner?: unknown };
+    if (current?.owner !== owner) return;
+    await unlink(lockPath);
+  } catch {
+    // Gone, or unreadable: not this owner's to remove.
+  }
+}
+
 async function removeStaleLock(lockPath: string): Promise<boolean> {
   try {
     const info = await stat(lockPath);
@@ -2272,18 +2312,27 @@ async function removeStaleLock(lockPath: string): Promise<boolean> {
   }
 }
 
-async function requestChatgptTokenRefresh(refreshToken: string): Promise<CodexRefreshResponse> {
-  const response = await fetch(CODEX_REFRESH_TOKEN_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      client_id: CODEX_CLIENT_ID,
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-    }),
-  });
+async function requestChatgptTokenRefresh(refreshToken: string, budgetMs: number): Promise<CodexRefreshResponse> {
+  let response: Response;
+  try {
+    response = await fetch(CODEX_REFRESH_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        client_id: CODEX_CLIENT_ID,
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+      }),
+      signal: AbortSignal.timeout(budgetMs),
+    });
+  } catch (err) {
+    if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      throw codexRefreshError(`Codex OAuth token refresh timed out after ${budgetMs}ms.`);
+    }
+    throw err;
+  }
   if (response.ok) {
     // A 200 carrying no usable token is a failed refresh, not a silent no-op:
     // merging it kept the expired token AND rewrote `last_refresh`, destroying
@@ -2479,6 +2528,16 @@ function codexBackendImageQuality(quality: string | undefined): 'low' | 'medium'
 interface CodexBackendImageRecord {
   readonly id?: string;
   readonly image: OpenAiGeneratedImage;
+}
+
+/** What the image state keeps of a call: its bytes by digest, and its rewrite — never the payload. */
+interface CodexBackendImageCallRecord {
+  readonly digest: string;
+  readonly revisedPrompt?: string;
+}
+
+function imageDigest(b64Json: string): string {
+  return createHash('sha256').update(b64Json).digest('hex');
 }
 
 function imageGenerationFromResponseItem(

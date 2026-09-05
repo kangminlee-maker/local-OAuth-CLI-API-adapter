@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -1430,6 +1430,75 @@ test('a caller that leaves during an in-flight refresh stops waiting for it, and
   assert.deepEqual(urls, ['https://auth.openai.com/oauth/token']);
 });
 
+test('a lease taken over mid-refresh: the first owner removes only its own lock and persists only onto the generation it consumed (r52-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const lockPath = join(codexHome, 'auth.json.refresh.lock');
+  const authPath = join(codexHome, 'auth.json');
+  const gates = [];
+  let refreshes = 0;
+  globalThis.fetch = async (url, init) => {
+    if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+    assert.equal(JSON.parse(init.body).refresh_token, 'old-refresh-token');
+    refreshes += 1;
+    const order = refreshes;
+    await new Promise((resolve) => { gates[order] = resolve; });
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: order === 1 ? 'a-new' : 'b-from-old' });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  // A starts a refresh; its caller leaves; the refresh stays in flight.
+  const a = new AbortController();
+  const callerA = backend.generate(imageRequest(), a.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  a.abort();
+  await assert.rejects(callerA, /aborted/);
+  assert.equal(refreshes, 1);
+  // The lease goes stale under it.
+  const past = new Date(Date.now() - 61_000);
+  await utimes(lockPath, past, past);
+  // B takes the lease over and starts its own refresh with the same old token; its caller leaves too.
+  const b = new AbortController();
+  const callerB = backend.generate(imageRequest(), b.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  b.abort();
+  await assert.rejects(callerB, /aborted/);
+  assert.equal(refreshes, 2);
+  const takerLock = await readFile(lockPath, 'utf8');
+  // A finishes late: the file is still on the generation it consumed, so it persists — and leaves B's lock alone.
+  gates[1]();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'a-new');
+  assert.equal(await readFile(lockPath, 'utf8'), takerLock, "the taker's lock is still there");
+  // B finishes: the file has advanced past the generation it consumed, so it persists nothing — and removes its own lock.
+  gates[2]();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'a-new', 'the older rotation did not overwrite the newer');
+  assert.equal(existsSync(lockPath), false);
+});
+
+test('a refresh fetch is bounded below its lease: a token endpoint that never answers fails the refresh at the budget and releases the lock (r52-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  let refreshSignal;
+  globalThis.fetch = (url, init) => new Promise((_resolve, reject) => {
+    assert.equal(String(url), 'https://auth.openai.com/oauth/token');
+    refreshSignal = init.signal;
+    init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })), { once: true });
+  });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 200 });
+  // The request's own budget ends the caller's wait; the refresh behind it ends at the same budget, not never.
+  await assert.rejects(() => backend.generate(imageRequest()), /aborted/);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(refreshSignal?.aborted, true, 'the refresh fetch carried a budget and it fired');
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false, 'the lock was released');
+});
+
 test('the terminal output\'s first record of another call stands alone: its bytes without the item frame call\'s rewrite, both paths, the item frame\'s image counted (r51-fable)', async () => {
   const codexHome = await createCodexHome();
   const diagnostics = [];
@@ -1454,6 +1523,78 @@ test('the terminal output\'s first record of another call stands alone: its byte
   assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
   assert.equal(events[1].image.b64Json, terminalBytes);
   assert.equal(events[1].image.revisedPrompt, undefined);
+});
+
+test('a re-encoding of the same call on the terminal stands as the terminal records it: without a rewrite of its own it takes none — the item frame\'s went with other bytes (r52-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const itemBytes = tinyPngBase64();
+  const terminalBytes = `${itemBytes}AA==`;
+  const turn = () => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: itemBytes, revised_prompt: 'item rewrite' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: terminalBytes },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn());
+  const buffered = await backend.generate(imageRequest());
+  assert.equal(buffered.images[0].b64Json, terminalBytes);
+  assert.equal(buffered.images[0].revisedPrompt, undefined);
+  assert.equal(diagnostics.at(-1).imageResultCount, 1);
+  globalThis.fetch = async () => new Response(turn());
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, terminalBytes);
+  assert.equal(events[1].image.revisedPrompt, undefined);
+});
+
+test('a terminal record of a call counted at its item frame is that call: counted once, its own rewrite with its own bytes and none with other bytes (r52-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const one = tinyPngBase64();
+  const two = `${one}AA==`;
+  const turn = (terminalBytes) => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: one, revised_prompt: 'item one' } },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'image_generation_call', id: 'ig_2', status: 'completed', result: two, revised_prompt: 'item two' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_2', status: 'completed', result: terminalBytes },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn(two));
+  const same = await backend.generate(imageRequest());
+  assert.equal(same.images[0].b64Json, two);
+  assert.equal(same.images[0].revisedPrompt, 'item two');
+  assert.equal(diagnostics.at(-1).imageResultCount, 2, 'two calls, not three records');
+  globalThis.fetch = async () => new Response(turn(`${two}BB==`));
+  const reencoded = await backend.generate(imageRequest());
+  assert.equal(reencoded.images[0].b64Json, `${two}BB==`);
+  assert.equal(reencoded.images[0].revisedPrompt, undefined);
+  assert.equal(diagnostics.at(-1).imageResultCount, 2);
+});
+
+test('within the bound a call is one whatever names it, past it the rest are counted without identity: seventy item frames, the terminal naming the third (r52-codex mutant)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const base = tinyPngBase64();
+  const bytesOf = (i) => (i === 0 ? base : `${base}${'A'.repeat(i)}`);
+  const frames = [{ type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } }];
+  for (let i = 0; i < 70; i += 1) {
+    frames.push({ type: 'response.output_item.done', output_index: i, item: { type: 'image_generation_call', id: `ig_${i}`, status: 'completed', result: bytesOf(i), ...(i === 3 ? { revised_prompt: 'third' } : {}) } });
+  }
+  frames.push({ type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+    { type: 'image_generation_call', id: 'ig_3', status: 'completed', result: bytesOf(3) },
+  ] } });
+  globalThis.fetch = async () => new Response(sse(frames));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images[0].b64Json, bytesOf(3), 'the turn\'s image is the one the terminal names');
+  assert.equal(result.images[0].revisedPrompt, 'third', 'its own rewrite, its own bytes');
+  assert.equal(diagnostics.at(-1).imageResultCount, 70, 'seventy calls: the map holds sixty-four, six are counted without identity, and the third is not counted again');
 });
 
 // The backend has a `size` slot and does not always honour it (a 256×256
