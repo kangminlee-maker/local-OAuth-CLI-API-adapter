@@ -1455,12 +1455,15 @@ class CodexBackendImageState {
   // the terminal output's record of the turn's image when the terminal
   // lists one — the backend's final word, carrying the rewrite the item
   // frame did not (r49-codex), a re-encoding, or a corrected rewrite
-  // (r50-codex). Every other image is counted and not retained — not even
+  // (r50-codex) — paired with the item frame's by item id (r51-fable: the
+  // record of a different call inherited the item frame call's rewrite).
+  // Every other image is counted and not retained — not even
   // a digest: the turn was asked for one, the cap on `n` skips the rest,
   // and holding them pinned every runaway payload until the terminal
   // (r49-codex); a set of digests still grew by the runaway's count
   // (r50-fable).
   private result?: OpenAiGeneratedImage;
+  private resultId?: string;
   private terminalRecorded = false;
   private otherImages = 0;
   eventCount = 0;
@@ -1523,8 +1526,8 @@ class CodexBackendImageState {
       if (isImageGenerationItemType(event.item.type)) this.imageItemAdded = true;
     }
     if (event.type === 'response.image_generation_call.generating') this.imageGenerating = true;
-    const itemImage = imageGenerationFromResponseItem(event.item);
-    if (itemImage) this.record(itemImage, false);
+    const itemRecord = imageGenerationFromResponseItem(event.item);
+    if (itemRecord) this.record(itemRecord, false);
     // The terminal frame's output is read the same way whether the turn
     // completed or was cut off at its output limit: a cut-off turn is a
     // finished turn with a reason, and whether it produced an image is
@@ -1541,7 +1544,7 @@ class CodexBackendImageState {
       for (const type of responseOutputTypes(event.response?.output)) {
         if (this.completedOutputTypes.length < IMAGE_DIAGNOSTIC_HISTORY) this.completedOutputTypes.push(type);
       }
-      for (const image of imageGenerationsFromOutput(event.response?.output)) this.record(image, true);
+      for (const record of imageGenerationsFromOutput(event.response?.output)) this.record(record, true);
       this.settled = true;
       if (this.result) {
         out.push({
@@ -1562,13 +1565,20 @@ class CodexBackendImageState {
   /**
    * An image the backend produced. From an item frame: the turn's result if
    * it is the first, a count otherwise. From the terminal output: the first
-   * replaces the result — its members over the item frame's, so a terminal
-   * record without a rewrite keeps the item's — and the rest are counted.
+   * record replaces the result — the same call's members over the item
+   * frame's, so a terminal record without a rewrite keeps the item's; the
+   * record of another call, or of one with no id to pair by, stands alone
+   * and the item frame's image is counted (r51-fable) — and the rest are
+   * counted.
    */
-  private record(image: OpenAiGeneratedImage, terminal: boolean): void {
+  private record({ id, image }: CodexBackendImageRecord, terminal: boolean): void {
     if (!terminal) {
-      if (this.result === undefined) this.result = image;
-      else this.otherImages += 1;
+      if (this.result === undefined) {
+        this.result = image;
+        this.resultId = id;
+      } else {
+        this.otherImages += 1;
+      }
       return;
     }
     if (this.terminalRecorded) {
@@ -1576,7 +1586,13 @@ class CodexBackendImageState {
       return;
     }
     this.terminalRecorded = true;
-    this.result = this.result === undefined ? image : { ...this.result, ...image };
+    if (this.result !== undefined && id !== undefined && id === this.resultId) {
+      this.result = { ...this.result, ...image };
+      return;
+    }
+    if (this.result !== undefined) this.otherImages += 1;
+    this.result = image;
+    this.resultId = id;
   }
 
   /** Whether the backend ever said how the turn ended. */
@@ -2016,6 +2032,11 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     force?: boolean;
     previousAccessToken?: string;
   } = {}, signal?: AbortSignal): Promise<CodexBackendAuth> {
+    // A caller that has gone starts no refresh — from `readAuth` after its
+    // own check, or after a backend 401 (r51-fable: the forced refresh ran
+    // for a caller that left while the 401 body was on the wire). A refresh
+    // already running completes and is persisted; only the wait ends.
+    if (signal?.aborted) throw abortError();
     return await withRefreshLock(this.codexHome, signal, async () => {
       const parsed = await this.loadAuthFile();
       const current = authFromFile(parsed);
@@ -2452,9 +2473,15 @@ function codexBackendImageQuality(quality: string | undefined): 'low' | 'medium'
   return 'high';
 }
 
+/** An image a backend item carries, with the item's id — the identity a terminal record is paired by. */
+interface CodexBackendImageRecord {
+  readonly id?: string;
+  readonly image: OpenAiGeneratedImage;
+}
+
 function imageGenerationFromResponseItem(
   item: CodexBackendEvent['item'] | unknown,
-): OpenAiGeneratedImage | null {
+): CodexBackendImageRecord | null {
   const obj = asRecord(item);
   if (!obj) return null;
   if (!isImageGenerationItemType(obj?.type)) return null;
@@ -2466,10 +2493,13 @@ function imageGenerationFromResponseItem(
       ? obj.revisedPrompt
       : '';
   return {
-    b64Json: result,
-    ...(revisedPrompt.trim()
-      ? { revisedPrompt }
-      : {}),
+    ...(typeof obj.id === 'string' ? { id: obj.id } : {}),
+    image: {
+      b64Json: result,
+      ...(revisedPrompt.trim()
+        ? { revisedPrompt }
+        : {}),
+    },
   };
 }
 
@@ -2492,11 +2522,11 @@ function imageResultBase64(item: Record<string, unknown>): string | null {
   return withoutDataUrl.replace(/\s/g, '');
 }
 
-function imageGenerationsFromOutput(output: readonly unknown[] | undefined): OpenAiGeneratedImage[] {
+function imageGenerationsFromOutput(output: readonly unknown[] | undefined): CodexBackendImageRecord[] {
   if (!Array.isArray(output)) return [];
   return output
     .map(imageGenerationFromResponseItem)
-    .filter((image): image is OpenAiGeneratedImage => Boolean(image));
+    .filter((record): record is CodexBackendImageRecord => Boolean(record));
 }
 
 function postprocessFlatGraphicImages(

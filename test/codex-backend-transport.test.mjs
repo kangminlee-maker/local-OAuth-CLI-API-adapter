@@ -1386,6 +1386,76 @@ test('a caller that leaves while the refresh lock is held stops waiting for it: 
   assert.deepEqual(urls, []);
 });
 
+test('a caller that leaves while the 401 body is on the wire starts no forced refresh: the guard holds on the refresh door, not only the read door (r51-fable)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    refreshToken: 'old-refresh-token',
+  });
+  const controller = new AbortController();
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    // The client disconnects while the 401 body is on the wire.
+    controller.abort();
+    return new Response(JSON.stringify({ error: { message: 'token expired', code: 'token_expired' } }), { status: 401 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(textRequest(), controller.signal), /aborted/);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(urls, ['https://chatgpt.com/backend-api/codex/responses'], 'no refresh started for the caller that had gone');
+});
+
+test('a caller that leaves during an in-flight refresh stops waiting for it, and the refresh completes and is persisted — a refresh token is single-use (r51-fable mutant)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: 'new-refresh-token' });
+  };
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const startedAt = Date.now();
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal), /aborted/);
+  assert.ok(Date.now() - startedAt < 150, `the wait ended with the abort, not with the refresh: ${Date.now() - startedAt} ms`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const persisted = JSON.parse(await readFile(join(codexHome, 'auth.json'), 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'new-refresh-token', 'the refresh the caller left behind completed and was persisted');
+  assert.deepEqual(urls, ['https://auth.openai.com/oauth/token']);
+});
+
+test('the terminal output\'s first record of another call stands alone: its bytes without the item frame call\'s rewrite, both paths, the item frame\'s image counted (r51-fable)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const itemBytes = tinyPngBase64();
+  const terminalBytes = `${itemBytes}AA==`;
+  const turn = () => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: itemBytes, revised_prompt: 'item rewrite' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_2', status: 'completed', result: terminalBytes },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn());
+  const buffered = await backend.generate(imageRequest());
+  assert.equal(buffered.images[0].b64Json, terminalBytes);
+  assert.equal(buffered.images[0].revisedPrompt, undefined);
+  assert.equal(diagnostics.at(-1).imageResultCount, 2);
+  globalThis.fetch = async () => new Response(turn());
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, terminalBytes);
+  assert.equal(events[1].image.revisedPrompt, undefined);
+});
+
 // The backend has a `size` slot and does not always honour it (a 256×256
 // source edited at `1024x1024` came back 1254×1254, measured 2026-08-29). The
 // direct API returns the requested canvas; so does this transport, on the
