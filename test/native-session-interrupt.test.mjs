@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -26,6 +27,8 @@ const originalNoCompletion = process.env.FAKE_CODEX_NO_TURN_COMPLETION;
 const originalMethodLog = process.env.FAKE_CODEX_METHOD_LOG;
 const originalStartDelay = process.env.FAKE_CODEX_TURN_START_DELAY_MS;
 const originalTrailing = process.env.FAKE_CODEX_TRAILING_NOTIFICATION;
+const originalInitDelay = process.env.FAKE_CODEX_INITIALIZE_DELAY_MS;
+const originalArchiveDelay = process.env.FAKE_CODEX_ARCHIVE_DELAY_MS;
 
 before(async () => {
   await chmod(fakeCodex, 0o755);
@@ -44,6 +47,10 @@ afterEach(async () => {
   else process.env.FAKE_CODEX_TURN_START_DELAY_MS = originalStartDelay;
   if (originalTrailing === undefined) delete process.env.FAKE_CODEX_TRAILING_NOTIFICATION;
   else process.env.FAKE_CODEX_TRAILING_NOTIFICATION = originalTrailing;
+  if (originalInitDelay === undefined) delete process.env.FAKE_CODEX_INITIALIZE_DELAY_MS;
+  else process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = originalInitDelay;
+  if (originalArchiveDelay === undefined) delete process.env.FAKE_CODEX_ARCHIVE_DELAY_MS;
+  else process.env.FAKE_CODEX_ARCHIVE_DELAY_MS = originalArchiveDelay;
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -263,6 +270,12 @@ test('a credentials directory the replacement cannot remove stops nothing and es
     assert.match(second.final.text, /OK$/);
     await delay(200);
     assert.deepEqual(rejections, [], 'nothing escaped');
+    // The directory the replacement could not remove is the close's: it tries
+    // again, and what still will not go is its error — after the session is
+    // gone from the manager, with the child killed (r54-codex, r54-fable).
+    await assert.rejects(manager.close(session.id), /credentials copy could not be removed/);
+    assert.throws(() => manager.get(session.id), /Unknown local CLI chat session/);
+    assert.ok(existsSync(isolationRoot), 'the directory is still there to be reported');
   } finally {
     process.off('unhandledRejection', onRejection);
     if (originalTmp === undefined) delete process.env.TMPDIR;
@@ -283,15 +296,53 @@ test('a credentials directory the close cannot remove does not keep the session 
     [isolationRoot] = (await readdir(privateTmp)).map((name) => join(privateTmp, name));
     assert.ok(isolationRoot, 'the child\'s isolation directory');
     await chmod(isolationRoot, 0o000);
-    const closed = await manager.close(session.id);
-    assert.equal(closed.status, 'closed');
-    assert.throws(() => manager.get(session.id), /not found|unknown|no such/i);
+    await assert.rejects(manager.close(session.id), /credentials copy could not be removed/, 'not a success over a copied credential left on disk');
+    assert.throws(() => manager.get(session.id), /Unknown local CLI chat session/, 'and not a session kept listed');
   } finally {
     if (originalTmp === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = originalTmp;
     if (isolationRoot) await chmod(isolationRoot, 0o700).catch(() => undefined);
     tempDirs.push(privateTmp);
   }
+});
+
+test('a turn waiting for a child replacement is the session\'s: it occupies the session, an interrupt ends it, and it never reaches the new child (r54-codex)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(300);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // The replacement child is slow to come up: the next turn waits for it.
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '800';
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  assert.equal(first.status, 'error');
+  const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
+  const outcome = waiting.next().catch((err) => ({ error: err }));
+  await delay(100);
+  assert.equal(manager.get(session.id).status, 'running', 'the waiting turn occupies the session');
+  await manager.interrupt(session.id);
+  const result = await outcome;
+  assert.ok('error' in result || result.value?.event === 'cli.error', 'the interrupted turn ended');
+  await delay(1000);
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'turn/start').length, 1, 'the interrupted turn never reached the new child');
+  assert.equal(manager.get(session.id).status, 'ready');
+});
+
+test('a session being deleted admits no turn: the DELETE\'s archive grace is not a window (r54-codex)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_ARCHIVE_DELAY_MS = '600';
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const closing = manager.close(session.id);
+  await delay(100);
+  await assert.rejects(manager.runTurn(session.id, { input: 'late' }), /Unknown local CLI chat session/, 'gone before the teardown finishes');
+  assert.throws(() => manager.get(session.id), /Unknown local CLI chat session/);
+  const closed = await closing;
+  assert.equal(closed.status, 'closed');
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'turn/start').length, 0, 'no turn reached the child');
+  assert.equal(methods.filter((method) => method === 'thread/archive').length, 1);
 });
 
 test('a stop between the request and its acknowledgement still precedes the next turn', { timeout: 20_000 }, async () => {

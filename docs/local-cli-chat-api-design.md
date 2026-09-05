@@ -195,7 +195,13 @@ turn within the budget is replaced, thread and all — the way the claude runtim
 replaces a child that stopped answering — rather than the session released to a
 next turn ahead of work nobody can interrupt (round 52); a session closed while that
 replacement is in flight gets no new child, and the close tears down whatever the
-replacement left (round 53). A turn requested in that window
+replacement left (round 53). A turn that arrives while the replacement is in flight
+owns the session from its first moment — it occupies it, an interrupt ends it, and it
+never reaches the new child — and a session being closed admits no turn: it is gone
+from the manager before the runtime's teardown is awaited (round 54). A close whose
+teardown leaves a credentials directory it could not remove is an error to its caller,
+after the session is gone and the child killed — not a success, and not a session
+kept listed (round 54). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
 is the runtime's own answer about whether a turn occupies it, not separate
 bookkeeping — the two used to disagree, so a session could report `ready` while

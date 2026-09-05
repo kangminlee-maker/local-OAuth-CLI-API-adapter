@@ -115,6 +115,8 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private restarting: Promise<void> | null = null;
   /** Set by `close()`: a replacement in flight must not start a child the session will never close. */
   private closed = false;
+  /** Isolation directories a replacement could not remove — the close's to remove, or to report. */
+  private isolationDebt: string[] = [];
 
   private constructor(options: Required<CodexNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -156,8 +158,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     input: LocalCliChatTurnInput,
     signal?: AbortSignal,
   ): AsyncIterable<LocalCliChatRuntimeEvent> {
-    if (this.restarting) await this.restarting;
-    if (!this.child) throw new Error('codex native chat session is not running');
+    if (this.closed) throw new Error('codex native chat session is closed');
     if (this.turn) throw new Error('codex native chat session already has a running turn');
     // A caller that has already left gets no turn at all. Failing the queue and
     // then starting one anyway spent a turn on the child that nobody would read
@@ -182,6 +183,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     signal?.addEventListener('abort', onAbort, { once: true });
     let preparedInput: Awaited<ReturnType<typeof prepareCodexInput>> | null = null;
     try {
+      // The turn owns the session from here — through a child replacement in
+      // flight too, so a stop or a close that lands while it waits is honoured
+      // where every other one is: `stopped` is read after the input is
+      // prepared, and a close leaves no child to send to (r54-codex: a turn
+      // waiting for the replacement was nobody's — `interrupt` found no turn,
+      // the session read `ready`, and the turn ran afterwards).
+      if (this.restarting) await this.restarting;
+      if (!this.child) throw new Error('codex native chat session is not running');
       preparedInput = await prepareCodexInput(request, chatPromptText(input));
       turn.cleanup = preparedInput.cleanup;
       if (turn.stopped) throw new Error('local CLI chat turn aborted');
@@ -301,8 +310,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
           const { rm } = await import('node:fs/promises');
           await rm(isolation.rootDir, { recursive: true, force: true });
         } catch {
-          // A directory that will not go stops nothing; the replacement's own
-          // isolation is a fresh one.
+          // A directory that will not go stops nothing here; it is the close's
+          // to remove, or to report (r54-codex: consumed and forgotten, it
+          // outlived a close that reported success).
+          this.isolationDebt.push(isolation.rootDir);
         }
       }
       // A session closed while its child was being replaced gets no new child:
@@ -387,17 +398,27 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.child?.kill('SIGTERM');
     this.child = null;
     this.lineReader = null;
-    if (this.isolation) {
-      const isolation = this.isolation;
-      this.isolation = null;
+    // Every isolation directory this session made goes here — the current one
+    // and any a replacement could not remove. One that still will not go is
+    // the close's error, thrown after everything else is torn down: the
+    // session is closed either way, and the operator hears what remains
+    // (r54-fable: a rejection before the teardown kept the session listed
+    // `ready` over a dead child; r54-codex: a success over a copied credential
+    // left on disk).
+    const directories = [...this.isolationDebt, ...(this.isolation ? [this.isolation.rootDir] : [])];
+    this.isolation = null;
+    const remaining: string[] = [];
+    for (const directory of directories) {
       try {
         const { rm } = await import('node:fs/promises');
-        await rm(isolation.rootDir, { recursive: true, force: true });
+        await rm(directory, { recursive: true, force: true });
       } catch {
-        // A directory that will not go does not keep a closed session listed:
-        // a close that rejected here left the manager's entry, `ready` over a
-        // dead child, for good (r54-fable).
+        remaining.push(directory);
       }
+    }
+    this.isolationDebt = remaining;
+    if (remaining.length > 0) {
+      throw new Error(`codex native chat session closed, but its credentials copy could not be removed: ${remaining.join(', ')}`);
     }
   }
 

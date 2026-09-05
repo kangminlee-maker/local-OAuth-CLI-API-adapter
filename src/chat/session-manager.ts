@@ -106,14 +106,21 @@ export class LocalCliChatSessionManager {
 
   async close(id: string): Promise<LocalCliChatSessionSnapshot> {
     const session = this.requireSession(id);
-    // Closed first, then aborted. A runtime whose stop is a child REPLACEMENT
-    // spawned one on the way out — a whole CLI launch, killed microseconds
-    // later by the close that followed. Closing ends the turn; the abort is
-    // what is left for a runtime that needs the signal.
-    await session.nativeSession.close();
-    this.endTurn(session);
+    // Closed first — gone from the map before the runtime's teardown is
+    // awaited, so no turn is admitted during the archive's grace (r54-codex:
+    // one was, and completed, while the DELETE waited) — then aborted. A
+    // runtime whose stop is a child REPLACEMENT spawned one on the way out — a
+    // whole CLI launch, killed microseconds later by the close that followed.
+    // Closing ends the turn; the abort is what is left for a runtime that
+    // needs the signal. A teardown that fails after that is the caller's
+    // error, not a session kept listed (r54-fable).
     session.closed = true;
     this.sessions.delete(id);
+    try {
+      await session.nativeSession.close();
+    } finally {
+      this.endTurn(session);
+    }
     return snapshot(session);
   }
 

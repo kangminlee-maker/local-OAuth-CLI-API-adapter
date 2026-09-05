@@ -175,6 +175,11 @@ rl.on('line', (line) => {
 
   if (payload.id === undefined) return;
   recordMethod(payload.method);
+  if (payload.method === 'initialize' && Number(process.env.FAKE_CODEX_INITIALIZE_DELAY_MS ?? 0) > 0) {
+    // A child slow to come up: the window a replacement is in flight for.
+    setTimeout(() => result(payload.id, { userAgent: 'fake-codex' }), Number(process.env.FAKE_CODEX_INITIALIZE_DELAY_MS));
+    return;
+  }
   if (payload.method === 'initialize') {
     result(payload.id);
     return;
@@ -251,6 +256,12 @@ rl.on('line', (line) => {
       if (process.env.FAKE_CODEX_NO_TURN_COMPLETION === '1') return;
       setTimeout(() => emitTurn(threadId, turnId, text), 0);
     }, ackDelayMs);
+    return;
+  }
+  if (payload.method === 'thread/archive' && Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS ?? 0) > 0) {
+    // An archive slow to be acknowledged: the close's grace, and the window a
+    // turn used to be admitted in.
+    setTimeout(() => result(payload.id), Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS));
     return;
   }
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {
