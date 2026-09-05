@@ -1597,6 +1597,36 @@ test('within the bound a call is one whatever names it, past it the rest are cou
   assert.equal(diagnostics.at(-1).imageResultCount, 70, 'seventy calls: the map holds sixty-four, six are counted without identity, and the third is not counted again');
 });
 
+test('the terminal listing the turn\'s image call twice is one record or a contradiction: an identical repeat is counted once, different bytes or a different rewrite are refused (r52-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const item = tinyPngBase64();
+  const first = `${item}AA==`;
+  const record = (members) => ({ type: 'image_generation_call', id: 'ig_1', status: 'completed', ...members });
+  const turn = (second) => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: record({ result: item, revised_prompt: 'item one' }) },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      record({ result: first, revised_prompt: 'terminal one' }),
+      second,
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn(record({ result: first, revised_prompt: 'terminal one' })));
+  const repeated = await backend.generate(imageRequest());
+  assert.equal(repeated.images[0].b64Json, first);
+  assert.equal(repeated.images[0].revisedPrompt, 'terminal one');
+  assert.equal(diagnostics.at(-1).imageResultCount, 1, 'one call, listed twice');
+  globalThis.fetch = async () => new Response(turn(record({ result: `${first}BB==`, revised_prompt: 'terminal one' })));
+  await assert.rejects(() => backend.generate(imageRequest()), /twice with different records/);
+  globalThis.fetch = async () => new Response(turn(record({ result: first, revised_prompt: 'terminal two' })));
+  const events = [];
+  await assert.rejects((async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  })(), /twice with different records/);
+  assert.deepEqual(events.map((event) => event.type), ['started'], 'the stream committed and then carried the failure, no image');
+});
+
 // The backend has a `size` slot and does not always honour it (a 256×256
 // source edited at `1024x1024` came back 1254×1254, measured 2026-08-29). The
 // direct API returns the requested canvas; so does this transport, on the

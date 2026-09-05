@@ -1466,7 +1466,8 @@ class CodexBackendImageState {
   // digest and the rewrite, in a map bounded like the histories (a set of
   // digests once grew by the runaway's count, r50-fable).
   private result?: OpenAiGeneratedImage;
-  private terminalRecorded = false;
+  /** The terminal record the result came from — id, bytes by digest, its own rewrite. */
+  private terminal?: CodexBackendImageCallRecord & { readonly id?: string };
   /**
    * The calls the backend produced an image for, by item id. A record
    * without an id, or one past the bound, is counted in `uncorrelated` and
@@ -1554,7 +1555,7 @@ class CodexBackendImageState {
       }
       for (const record of imageGenerationsFromOutput(event.response?.output)) this.record(record, true);
       this.settled = true;
-      if (this.result) {
+      if (this.result && !this.failure) {
         out.push({
           type: 'completed',
           created: Math.floor(Date.now() / 1000),
@@ -1578,7 +1579,10 @@ class CodexBackendImageState {
    * is the same call with the same bytes (r51-fable: another call's record
    * inherited the item frame call's rewrite; r52-codex: so did a
    * re-encoding of the same call, and a call counted at its item frame was
-   * counted again at the terminal). Later terminal records are counted.
+   * counted again at the terminal). Later terminal records are counted — and
+   * a later record OF THE TURN'S CALL must be the same record: one call
+   * listed twice with different bytes or a different rewrite is a
+   * contradiction, refused rather than resolved by first-wins (r52-codex).
    */
   private record({ id, image }: CodexBackendImageRecord, terminal: boolean): void {
     const known = id === undefined ? undefined : this.calls.get(id);
@@ -1587,14 +1591,23 @@ class CodexBackendImageState {
       if (this.result === undefined) this.result = image;
       return;
     }
-    if (this.terminalRecorded) return;
-    this.terminalRecorded = true;
-    const lent = known !== undefined
-      && image.revisedPrompt === undefined
-      && known.digest === imageDigest(image.b64Json)
+    if (this.terminal !== undefined) {
+      if (id !== undefined && id === this.terminal.id
+        && (this.terminal.revisedPrompt !== image.revisedPrompt || this.terminal.digest !== imageDigest(image.b64Json))) {
+        this.failure = "codex backend listed the turn's image call twice with different records";
+      }
+      return;
+    }
+    const digest = imageDigest(image.b64Json);
+    const lent = known !== undefined && image.revisedPrompt === undefined && known.digest === digest
       ? known.revisedPrompt
       : undefined;
     this.result = lent === undefined ? image : { ...image, revisedPrompt: lent };
+    this.terminal = {
+      ...(id !== undefined ? { id } : {}),
+      digest,
+      ...(image.revisedPrompt !== undefined ? { revisedPrompt: image.revisedPrompt } : {}),
+    };
   }
 
   /** Counts a call once — a known id is nothing new, even with the map at its bound. */
