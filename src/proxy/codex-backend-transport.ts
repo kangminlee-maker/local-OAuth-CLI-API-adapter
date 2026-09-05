@@ -422,6 +422,15 @@ class CodexBackendStreamState {
    * is refused rather than guessed.
    */
   private adoptHolder(known: number, position: number): number {
+    // The call claims only its accepted position — from the completed output
+    // as from a live frame. An item at another index naming this call is the
+    // vendor contradicting itself, and adopting the holder there handed the
+    // call that position's anonymous arguments under a 200 (r36-codex); left
+    // apart, the holder is a call without an identity, refused at completion.
+    // A call with no position yet takes this one: its first evidence.
+    const accepted = this.positions.get(known);
+    if (accepted !== undefined && accepted !== position) return known;
+    if (accepted === undefined) this.positions.set(known, position);
     const holder = this.holders.get(position);
     if (holder === undefined) {
       this.holders.set(position, known);
@@ -549,8 +558,10 @@ class CodexBackendStreamState {
    * item), while the dense slot counts function calls only. Feeding an array
    * position into the stream's positional keyspace minted a second ordinal for
    * a call already streamed. An item that names nothing is placed by
-   * `captureFinalOutput` itself — by position first, then one to one with the
-   * standing calls no item placed.
+   * `captureFinalOutput` itself: by the call holding its position first; then,
+   * only when exactly one such item and one standing call no item placed
+   * remain and their names do not conflict, as that pair; every other one is
+   * a call without an identity, refused at completion.
    */
   private finalOutputOrdinal(slot: number | undefined, outputIndex: number, ids: ToolIds): number {
     const known = this.knownOrdinal(ids);
@@ -1220,9 +1231,13 @@ class CodexBackendStreamState {
   /**
    * Applies one completed item to the call its caller correlated it with —
    * by id, by the call holding its position, or as the one remaining pair —
-   * creating the state for a call the stream never showed. What it applies
-   * is bounded by what the stream already told the client: an item may fill
-   * in what the stream never delivered and may not replace what it did.
+   * creating the state for a call the stream never showed. An identity the
+   * client was told is frozen. Arguments: an anonymous item may only fill in
+   * what the stream never delivered (an absent value, or a value the streamed
+   * bytes are a prefix of); an identified item may replace the pending value
+   * until the vendor's own finish event has fixed it, and a replacement that
+   * disagrees with the streamed bytes is the declared stream/body
+   * contradiction (matrix row 8). Nothing is repaired either way.
    */
   private applyFinalItem(item: FinalCallItem, index: number): void {
     const anonymous = item.itemId === undefined && item.callId === undefined;

@@ -2539,3 +2539,23 @@ test('item ids and call ids are two namespaces: a spelling shared between one ca
   assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
   assert.deepEqual(calls.get('shared'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
 });
+
+test('the completed output cannot move a known call to another position: the anonymous holder there stays a call without an identity, refused (r36-codex)', async () => {
+  // `call_a` accepted position 0 live; the completed output lists it at
+  // index 1, where anonymous deltas had streamed. Adopting that holder handed
+  // `call_a` the position-1 arguments under a 200.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"belongs":"position-1"}' },
+    { type: 'response.function_call_arguments.done', output_index: 1, arguments: '{"belongs":"position-1"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'message', role: 'assistant', content: [] },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"belongs":"position-1"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
