@@ -1205,7 +1205,8 @@ class CodexBackendStreamState {
     // streamed call was discarded (r34-fable F1). The count is identity only
     // when it leaves nothing to choose: ONE item no position placed and ONE
     // standing call no item placed, agreeing on the name when the item gives
-    // one — not the k-th to the k-th, a slot a position may already have
+    // one and on the position when the call has one (`positionAgrees`,
+    // r37-fable) — not the k-th to the k-th, a slot a position may already have
     // taken (r33-fable F1), and not two to two in arrival order, which handed
     // each call the other's arguments when both had streamed `{` and the
     // completed output listed them the other way round (r35-codex). Every

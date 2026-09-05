@@ -784,11 +784,12 @@ test('an anonymous completed call cannot rewrite what the stream already deliver
   // Position is not identity. With two calls listed in an order the stream did
   // not use, overwriting gave each streamed call the other call's name and
   // arguments under its own id, so a client answered the wrong call. The item
-  // at index 1 names `get_time` where the stream put `get_weather` — that
-  // call's contradiction, kept out; the item at index 0 correlates with
-  // nothing (the one call left sits at position 2), and an item correlated
-  // with nothing is a call without an identity: the turn is refused rather
-  // than guessed (round 37).
+  // at index 1 (`get_weather`) is the call holding position 1, name and
+  // value agreeing — applied, a no-op; the item at index 0 (`get_time`)
+  // correlates with nothing: no call holds position 0, and the one call
+  // left, `call_2`, sits at position 2. An item correlated with nothing is
+  // a call without an identity: the turn is refused rather than guessed
+  // (round 37).
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
