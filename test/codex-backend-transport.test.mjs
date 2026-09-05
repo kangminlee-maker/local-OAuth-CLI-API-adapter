@@ -2315,3 +2315,62 @@ test('an anonymous completed item at a position a call holds completes that call
   assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
   assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
 });
+
+test('a completed item at a held position completes that call even when the completed output also adds a call the stream never showed (r33-codex F1)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"b":' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('the count-aligned rest never takes a call a position placed: a positioned call announced first, an index-less one second (r33-codex F2)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('the position of a state that can still fold into another is not progress: an item-id half at a later position does not close the cut call it then folds into (r33-codex F3)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"a":' },
+    { type: 'response.output_item.added', output_index: 9, item: { type: 'function_call', id: 'fc_shadow', name: 'alpha' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_shadow', call_id: 'call_a', name: 'alpha', arguments: '{"a":' } },
+    { type: 'response.incomplete', response: { id: 'r', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [
+      { type: 'function_call', id: 'fc_shadow', call_id: 'call_a', name: 'alpha', arguments: '{"a":' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const finished = events.filter((event) => event.type === 'tool_call_delta' && event.argumentsDone);
+  assert.deepEqual(finished, [], `a cut call is never signalled finished: ${JSON.stringify(finished)}`);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"a":']]);
+  assert.equal(events.at(-1).result.stopReason, 'max_tokens');
+});

@@ -313,13 +313,10 @@ class CodexBackendStreamState {
       // too, and the real call there was bound to this one and vanished
       // (r30-codex).
       this.recordPosition(known, event);
-      // Progress advances from the call's accepted position only: a frame
-      // naming this call at some other position is a mislabel, not a later
-      // item (r31-codex F5).
-      if (explicit && this.positions.get(known) === position) {
-        this.advance(position);
-        return this.adoptHolder(known, position);
-      }
+      // The call claims only its accepted position: a frame naming this
+      // call at some other position is a mislabel, not a later item
+      // (r31-codex F5).
+      if (explicit && this.positions.get(known) === position) return this.adoptHolder(known, position);
       return known;
     }
     // An `output_index` the event actually carries names ONE item: an
@@ -357,13 +354,33 @@ class CodexBackendStreamState {
     if (explicit) this.toolOrdinals.set(`#${position}`, ordinal);
     this.bindOrdinal(ordinal, ids);
     this.recordPosition(ordinal, event);
-    this.advance(position);
     return ordinal;
   }
 
   /** The vendor has produced an item at this position: everything below it is behind it. */
   private advance(position: number | undefined): void {
     if (position !== undefined && position > this.highestPosition) this.highestPosition = position;
+  }
+
+  /**
+   * How far the vendor has got: the highest position of an item that cannot
+   * be an earlier call — narration and the other non-tool items (`advance`),
+   * and the calls the client will be told about, at their accepted
+   * positions. A tool event's position is not progress in itself: a state
+   * that can still fold into another (`absorbable` — no `call_id`, nothing
+   * announced) may BE an earlier call, and counting its position closed the
+   * block of the very call it then folded into, ahead of the cut that
+   * `response.incomplete` reported (r33-codex F3). Derived, not retained:
+   * a fold retires the provisional state and its position with it.
+   */
+  private progress(): number {
+    let progress = this.highestPosition;
+    for (const [ordinal, state] of this.toolStates) {
+      if (this.absorbable(state)) continue;
+      const position = this.positions.get(ordinal);
+      if (position !== undefined && position > progress) progress = position;
+    }
+    return progress;
   }
 
   /** The first explicit output position seen for a call is its position. */
@@ -915,19 +932,21 @@ class CodexBackendStreamState {
    * frame held every later block of the Messages stream behind its open block
    * (r27-fable F3). Positions, not "any other item": a late frame for an
    * EARLIER item closed the block of the very call the cut then hit
-   * (r28-fable F2). The vendor's progress is the retained `highestPosition`,
-   * not the frame at hand: compared against the frame alone, a call that
-   * learned its position — or finished — after the vendor had moved on
-   * waited for the terminal frame (r30-codex). An event carrying no position
-   * proves nothing, and a call whose position is unknown waits.
+   * (r28-fable F2). The vendor's progress is `progress()` — retained
+   * non-tool positions and the accepted positions of the calls that cannot
+   * fold into another — not the frame at hand: compared against the frame
+   * alone, a call that learned its position — or finished — after the vendor
+   * had moved on waited for the terminal frame (r30-codex). An event carrying
+   * no position proves nothing, and a call whose position is unknown waits.
    */
   private announceFinished(scope: 'terminal' | 'moved'): LocalStreamEvent[] {
     const out: LocalStreamEvent[] = [];
+    const progress = this.progress();
     for (const [index, state] of [...this.toolStates.entries()].sort(([a], [b]) => a - b)) {
       if (!state.identified || !state.argumentsDone || state.announcedDone) continue;
       if (scope === 'moved') {
         const position = this.positions.get(index);
-        if (position === undefined || position >= this.highestPosition) continue;
+        if (position === undefined || position >= progress) continue;
       }
       // A call identified and finished in one step — a holder folded into it
       // at completion — has not been announced: the identity and the bytes go
