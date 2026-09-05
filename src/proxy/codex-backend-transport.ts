@@ -1535,6 +1535,11 @@ class CodexBackendImageState {
     return out;
   }
 
+  /** Whether the backend ever said how the turn ended. */
+  isSettled(): boolean {
+    return this.settled;
+  }
+
   completed(): CodexBackendImageTurnResult {
     // A reported failure, or a stream that simply stopped, is not a result —
     // not even with an image already collected; only a turn that finished
@@ -1658,7 +1663,31 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
   ): AsyncIterable<LocalStreamEvent> {
     const startedAt = Date.now();
     const state = new CodexBackendStreamState(request, startedAt);
-    const events = this.responseEvents(request, signal)[Symbol.asyncIterator]();
+    yield* this.pump(this.responseEvents(request, signal), state);
+    // A turn only finished if the backend said so. A reported failure, or a
+    // stream that simply stopped, was previously yielded as a completed result
+    // — the client received a 200 whose content was whatever had arrived.
+    const failure = state.terminalFailure();
+    if (failure) throw new Error(failure);
+    if (!state.isSettled()) throw new Error('codex backend stream ended without a terminal event');
+    yield { type: 'completed', result: state.completed() };
+  }
+
+  async close(): Promise<void> {}
+
+  /**
+   * Reads the backend's events into a turn state until the backend says how
+   * the turn ended, yielding what each event produced. One read discipline
+   * for the text turn and both image loops: the image loops read the body
+   * to its end, so a body that broke or never closed after the terminal
+   * frame overturned a settled image into a failure or held it until the
+   * timeout — and on a fan-out aborted every billed sibling (r48-fable).
+   */
+  private async *pump<TLocal>(
+    source: AsyncIterable<CodexBackendEvent>,
+    state: { push(event: CodexBackendEvent): TLocal[]; isSettled(): boolean },
+  ): AsyncIterable<TLocal> {
+    const events = source[Symbol.asyncIterator]();
     let unwinding = false;
     try {
       for (;;) {
@@ -1691,16 +1720,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         await teardown;
       }
     }
-    // A turn only finished if the backend said so. A reported failure, or a
-    // stream that simply stopped, was previously yielded as a completed result
-    // — the client received a 200 whose content was whatever had arrived.
-    const failure = state.terminalFailure();
-    if (failure) throw new Error(failure);
-    if (!state.isSettled()) throw new Error('codex backend stream ended without a terminal event');
-    yield { type: 'completed', result: state.completed() };
   }
-
-  async close(): Promise<void> {}
 
   private async generateImage(
     request: OpenAiImageGenerationRequest,
@@ -1755,17 +1775,16 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       for (let attempt = 0; attempt <= IMAGE_NO_RESULT_RETRY_DELAYS_MS.length; attempt += 1) {
         const state = new CodexBackendImageState(request, Date.now());
         try {
-          for await (const event of this.responseEventsForBody(
+          const events = this.responseEventsForBody(
             JSON.stringify(await this.imageRequestBody(request, index, attempt)),
             signal,
-          )) {
-            for (const local of state.push(event)) {
-              yield {
-                ...local,
-                image: postprocessFlatGraphicImageIfNeeded(request, await realizeRequestedSize(request, local.image)),
-                partialImageIndex: index,
-              };
-            }
+          );
+          for await (const local of this.pump(events, state)) {
+            yield {
+              ...local,
+              image: postprocessFlatGraphicImageIfNeeded(request, await realizeRequestedSize(request, local.image)),
+              partialImageIndex: index,
+            };
           }
           state.completed();
           this.reportImageAttempt(state.diagnostic({
@@ -1800,12 +1819,11 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     for (let attempt = 0; attempt <= IMAGE_NO_RESULT_RETRY_DELAYS_MS.length; attempt += 1) {
       const state = new CodexBackendImageState(request, Date.now());
       try {
-        for await (const event of this.responseEventsForBody(
+        const events = this.responseEventsForBody(
           JSON.stringify(await this.imageRequestBody(request, imageIndex, attempt)),
           signal,
-        )) {
-          state.push(event);
-        }
+        );
+        for await (const local of this.pump(events, state)) void local;
         const result = state.completed();
         this.reportImageAttempt(state.diagnostic({
           operation: request.operation,

@@ -1039,6 +1039,87 @@ test('a settled image turn is finished, whatever follows: a failure frame after 
   assert.equal(result.images.length, 1);
 });
 
+function brokenAfter(text, error) {
+  // The whole SSE text arrives on the first read; the next read fails — a
+  // transport failure after the terminal frame.
+  let reads = 0;
+  return new ReadableStream({
+    pull(controller) {
+      reads += 1;
+      if (reads === 1) controller.enqueue(new TextEncoder().encode(text));
+      else controller.error(error);
+    },
+  });
+}
+
+function neverClosingAfter(text) {
+  // The whole SSE text arrives on the first read; the next read never
+  // resolves.
+  let reads = 0;
+  return new ReadableStream({
+    pull(controller) {
+      reads += 1;
+      if (reads === 1) controller.enqueue(new TextEncoder().encode(text));
+      return reads === 1 ? undefined : new Promise(() => {});
+    },
+  });
+}
+
+const settledImageTurn = () => sse([
+  { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+  { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+  { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+]);
+
+test('the image turn ends at the terminal frame: a body that breaks after it does not overturn the settled image, buffered (r48-fable)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async () => {
+    calls.push(1);
+    return new Response(brokenAfter(settledImageTurn(), new Error('body broke after the terminal')));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(calls.length, 1);
+});
+
+test('...and streamed: the image event, then completion — no in-band error for a body that broke after the terminal (r48-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(brokenAfter(settledImageTurn(), new Error('body broke after the terminal')));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['completed']);
+});
+
+test('...and a body that never closes after the terminal frame does not hold the settled image until the timeout (r48-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(neverClosingAfter(settledImageTurn()));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 5_000 });
+  const startedAt = Date.now();
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.ok(Date.now() - startedAt < 4_000, 'the answer was in hand at the terminal frame, not at the timeout');
+});
+
+test('a cut-off image turn (response.incomplete) is a finished turn: an image it produced is the result, without a retry (r48-fable mutant)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async () => {
+    calls.push(1);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.incomplete', response: { id: 'resp_image', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(calls.length, 1);
+});
+
 // The backend has a `size` slot and does not always honour it (a 256×256
 // source edited at `1024x1024` came back 1254×1254, measured 2026-08-29). The
 // direct API returns the requested canvas; so does this transport, on the
