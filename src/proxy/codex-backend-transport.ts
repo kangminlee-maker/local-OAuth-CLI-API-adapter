@@ -129,14 +129,15 @@ interface CodexBackendEvent {
   /** Text on a text delta; read as arguments through `argumentsText`. */
   readonly delta?: unknown;
   readonly output_index?: number;
-  readonly item_id?: string;
+  /** Identity members are read through `identityText`. */
+  readonly item_id?: unknown;
   /** `function_call_arguments.done` carries the call's whole arguments here. */
   readonly arguments?: unknown;
   readonly item?: {
-    readonly id?: string;
+    readonly id?: unknown;
     readonly type?: string;
-    readonly name?: string;
-    readonly call_id?: string;
+    readonly name?: unknown;
+    readonly call_id?: unknown;
     readonly arguments?: unknown;
     readonly status?: string;
     readonly revised_prompt?: string;
@@ -256,27 +257,37 @@ class CodexBackendStreamState {
    */
   private toolOrdinal(event: CodexBackendEvent, ...ids: ReadonlyArray<string | undefined>): number {
     const known = this.knownOrdinal(ids);
-    if (known !== undefined) return known;
-    const outputIndex = readOutputIndex(event);
+    const position = explicitOutputIndex(event);
+    const explicit = position !== undefined;
+    if (known !== undefined) {
+      // A call bound by id on a frame that carried no position learns it from
+      // the first later frame that does. Returning before the recording left
+      // such a call positionless, and the early finish signal never fired for
+      // it — the r27 held-blocks defect back for one input family (r29-fable
+      // F1). That frame also claims the position for the call, so the
+      // anonymous deltas that follow at it reach the call.
+      this.recordPosition(known, event);
+      if (explicit && !this.toolOrdinals.has(`#${position}`)) this.toolOrdinals.set(`#${position}`, known);
+      return known;
+    }
     // An `output_index` the event actually carries names ONE item: an
     // unfamiliar identifier arriving at a position a call already holds is
     // that call's other identifier (`call_id` first, `item_id` later, or the
     // reverse), and is bound to it. Splitting it off announced the same
-    // `call_id` twice, `{}` and `{"a":1}` (r24-codex F5/F6). The anti-merge
-    // rule below is for events that OMIT the index and read as 0.
-    const explicit = explicitOutputIndex(event) !== undefined;
-    // An event that names an unfamiliar call is a new call: it must not INHERIT
-    // the ordinal an earlier NAMED call bound to this position, or a stream
-    // whose events omit `output_index` (`readOutputIndex` reports 0 for those)
-    // would merge every call into one. It does still CLAIM the position, so the
-    // anonymous argument deltas that follow — the ones carrying only an
-    // `output_index` — reach the call that most recently occupied it.
+    // `call_id` twice, `{}` and `{"a":1}` (r24-codex F5/F6).
     //
-    // An ANONYMOUS holder is the other way round: argument deltas that arrive
-    // before the call is named have nothing but the position, so they belong to
-    // the call that names it. Splitting them off invented a second call — named
-    // `tool`, carrying a fragment of the real call's arguments — that the model
-    // never made and the client would have executed.
+    // An ANONYMOUS holder is the same rule the other way round: argument
+    // deltas that arrive before the call is named have nothing but the
+    // position, so they belong to the call that names it. Splitting them off
+    // invented a second call — named `tool`, carrying a fragment of the real
+    // call's arguments — that the model never made and the client would have
+    // executed.
+    //
+    // Only an event that carries a position claims one. An identified event
+    // without one used to claim `#0` (its index read as 0), and a later call
+    // really at position 0 was then bound to it and vanished — its identity
+    // and arguments refused by a state that had already started (r29-codex).
+    // Such an event is a new call, correlated by its ids alone.
     const identified = ids.some((id) => typeof id === 'string');
     // An event that names neither an item nor a position is uncorrelatable.
     // Read as position 0, it was spliced into whichever call next omitted its
@@ -286,17 +297,21 @@ class CodexBackendStreamState {
     if (!identified && !explicit) {
       throw backendContractError('The local runtime wrote a tool event that names no call.', this.request.shape);
     }
-    const positionKey = `#${outputIndex}`;
-    const claimed = this.toolOrdinals.get(positionKey);
-    let ordinal = identified && !explicit ? this.adoptableOrdinal(claimed) : claimed;
+    let ordinal = explicit ? this.toolOrdinals.get(`#${position}`) : undefined;
     if (ordinal === undefined) {
       ordinal = this.nextToolOrdinal;
       this.nextToolOrdinal += 1;
     }
-    this.toolOrdinals.set(positionKey, ordinal);
+    if (explicit) this.toolOrdinals.set(`#${position}`, ordinal);
     this.bindOrdinal(ordinal, ids);
-    if (explicit && !this.positions.has(ordinal)) this.positions.set(ordinal, outputIndex);
+    this.recordPosition(ordinal, event);
     return ordinal;
+  }
+
+  /** The first explicit output position seen for a call is its position. */
+  private recordPosition(ordinal: number, event: CodexBackendEvent): void {
+    const position = explicitOutputIndex(event);
+    if (position !== undefined && !this.positions.has(ordinal)) this.positions.set(ordinal, position);
   }
 
   /** The ordinal at a position, when nothing named has claimed it yet. */
@@ -424,11 +439,14 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
-      const index = this.toolOrdinal(event, event.item.id, event.item.call_id);
+      const itemId = identityText(event.item.id, this.request.shape);
+      const callId = identityText(event.item.call_id, this.request.shape);
+      const name = identityText(event.item.name, this.request.shape);
+      const index = this.toolOrdinal(event, itemId, callId);
       out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
-      const id = event.item.call_id ?? event.item.id ?? `call_${index + 1}`;
-      const named = event.item.id !== undefined || event.item.call_id !== undefined;
-      const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name: event.item.name, anonymous: !named });
+      const id = callId ?? itemId ?? `call_${index + 1}`;
+      const named = itemId !== undefined || callId !== undefined;
+      const state = this.toolStates.get(index) ?? this.newToolState(index, { id, name: name, anonymous: !named });
       // Same rule the `.done` branch states: never downgrade an announced
       // `call_id` to an item id. A repeat of the item that omits it would
       // otherwise rename a call the client has already reported under — and
@@ -437,10 +455,10 @@ class CodexBackendStreamState {
       // renamed the body's call behind a stream that had announced
       // `call_1`/`probe`).
       if (!state.started) {
-        if (event.item.call_id !== undefined) state.id = event.item.call_id;
+        if (callId !== undefined) state.id = callId;
         else if (!state.identified) state.id = id;
-        state.name = event.item.name ?? state.name;
-        if (event.item.name !== undefined) state.named = true;
+        state.name = name ?? state.name;
+        if (name !== undefined) state.named = true;
       }
       if (named) state.anonymous = false;
       // `call_id` is the identity the client echoes back with the tool result;
@@ -451,7 +469,7 @@ class CodexBackendStreamState {
       // the buffer, since only an announced call is ever flushed.
       // Identity is a `call_id` AND a name: announcing on the id alone told
       // the client a call named `tool` (r25-codex).
-      if (event.item.call_id !== undefined) state.hasCallId = true;
+      if (callId !== undefined) state.hasCallId = true;
       if (state.hasCallId && state.named) state.identified = true;
       this.toolStates.set(index, state);
       if (state.identified) out.push(...this.emitPending(index, state));
@@ -464,7 +482,7 @@ class CodexBackendStreamState {
       // whole value; it precedes `output_item.done`, which may then arrive
       // without an `arguments` member. Left unread (r23-codex), a delta after
       // it was folded into every stream while the bodies kept the done value.
-      const itemId = typeof event.item_id === 'string' ? event.item_id : undefined;
+      const itemId = identityText(event.item_id, this.request.shape);
       const index = this.toolOrdinal(event, itemId);
       out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
@@ -481,7 +499,7 @@ class CodexBackendStreamState {
     if (event.type === 'response.function_call_arguments.delta') {
       const delta = argumentsText(event.delta, this.request.shape);
       if (delta === undefined) return out;
-      const itemId = typeof event.item_id === 'string' ? event.item_id : undefined;
+      const itemId = identityText(event.item_id, this.request.shape);
       const index = this.toolOrdinal(event, itemId);
       out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
@@ -504,12 +522,15 @@ class CodexBackendStreamState {
       return out;
     }
     if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
-      const index = this.toolOrdinal(event, event.item.id, event.item.call_id);
+      const itemId = identityText(event.item.id, this.request.shape);
+      const callId = identityText(event.item.call_id, this.request.shape);
+      const name = identityText(event.item.name, this.request.shape);
+      const index = this.toolOrdinal(event, itemId, callId);
       out.push(...this.announceFinished({ before: explicitOutputIndex(event) }));
-      const named = event.item.id !== undefined || event.item.call_id !== undefined;
+      const named = itemId !== undefined || callId !== undefined;
       const state = this.toolStates.get(index) ?? this.newToolState(index, {
-        id: event.item.call_id ?? event.item.id,
-        name: event.item.name,
+        id: callId ?? itemId,
+        name: name,
         anonymous: !named,
       });
       // Never downgrade an announced call_id to an item id: the client echoes
@@ -517,12 +538,12 @@ class CodexBackendStreamState {
       // An identity the client has been told is frozen (`started`), as in
       // `captureFinalOutput` (r25-fable).
       if (!state.started) {
-        state.id = event.item.call_id ?? state.id;
-        state.name = event.item.name ?? state.name;
-        if (event.item.name !== undefined) state.named = true;
+        state.id = callId ?? state.id;
+        state.name = name ?? state.name;
+        if (name !== undefined) state.named = true;
       }
       if (named) state.anonymous = false;
-      if (event.item.call_id !== undefined) state.hasCallId = true;
+      if (callId !== undefined) state.hasCallId = true;
       if (state.hasCallId && state.named) state.identified = true;
       // A call already announced as finished keeps the value it was finished
       // on; an item that names a different one afterwards is the vendor
@@ -860,7 +881,10 @@ class CodexBackendStreamState {
       const obj = asRecord(item);
       if (obj?.type === 'function_call') {
         const finalArguments = argumentsText(obj.arguments, this.request.shape);
-        const anonymous = typeof obj.id !== 'string' && typeof obj.call_id !== 'string';
+        const finalItemId = identityText(obj.id, this.request.shape);
+        const finalCallId = identityText(obj.call_id, this.request.shape);
+        const finalName = identityText(obj.name, this.request.shape);
+        const anonymous = finalItemId === undefined && finalCallId === undefined;
         if (anonymous && !alignable) {
           functionCallPosition += 1;
           continue;
@@ -872,8 +896,8 @@ class CodexBackendStreamState {
         // Position is not proof of identity and neither is half an identity:
         // the streamed state — what the client already acted on — wins, and
         // the item is left alone (declared, matrix §7 row 8).
-        const itemOrdinal = typeof obj.id === 'string' ? this.toolOrdinals.get(obj.id) : undefined;
-        const callOrdinal = typeof obj.call_id === 'string' ? this.toolOrdinals.get(obj.call_id) : undefined;
+        const itemOrdinal = finalItemId === undefined ? undefined : this.toolOrdinals.get(finalItemId);
+        const callOrdinal = finalCallId === undefined ? undefined : this.toolOrdinals.get(finalCallId);
         if (itemOrdinal !== undefined && callOrdinal !== undefined && itemOrdinal !== callOrdinal) {
           functionCallPosition += 1;
           continue;
@@ -881,19 +905,19 @@ class CodexBackendStreamState {
         const index = this.finalOutputOrdinal(
           functionCallPosition,
           outputIndex,
-          typeof obj.id === 'string' ? obj.id : undefined,
-          typeof obj.call_id === 'string' ? obj.call_id : undefined,
+          finalItemId,
+          finalCallId,
         );
         functionCallPosition += 1;
         const existing = this.toolStates.get(index);
         const state = existing ?? {
           ...this.newToolState(index, {
-            id: typeof obj.call_id === 'string' ? obj.call_id : undefined,
-            name: typeof obj.name === 'string' ? obj.name : undefined,
+            id: finalCallId,
+            name: finalName,
           }),
           started: true,
-          hasCallId: typeof obj.call_id === 'string',
-          identified: typeof obj.call_id === 'string' && typeof obj.name === 'string',
+          hasCallId: finalCallId !== undefined,
+          identified: finalCallId !== undefined && finalName !== undefined,
         };
         // An anonymous item is matched by position alone, and position is not
         // proof of identity: with two calls listed in an order the stream did
@@ -906,12 +930,12 @@ class CodexBackendStreamState {
         // that reported `call_1`/`probe` from the stream cannot be handed
         // `call_2`/`other` by the body (r23-codex). The completed output may
         // supply identity to a call never announced, not rename one.
-        if (typeof obj.call_id === 'string' && !state.started) {
-          state.id = obj.call_id;
+        if (finalCallId !== undefined && !state.started) {
+          state.id = finalCallId;
           state.hasCallId = true;
         }
-        if (typeof obj.name === 'string' && !state.started && (mayReplace || !state.named)) {
-          state.name = obj.name;
+        if (finalName !== undefined && !state.started && (mayReplace || !state.named)) {
+          state.name = finalName;
           state.named = true;
         }
         if (!anonymous) state.anonymous = false;
@@ -1155,6 +1179,7 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     const startedAt = Date.now();
     const state = new CodexBackendStreamState(request, startedAt);
     const events = this.responseEvents(request, signal)[Symbol.asyncIterator]();
+    let unwinding = false;
     try {
       for (;;) {
         const next = await events.next();
@@ -1165,15 +1190,22 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         // answer into a 500 (r25-codex).
         if (state.isSettled()) break;
       }
+    } catch (err) {
+      unwinding = true;
+      throw err;
     } finally {
       // Ownership of the unread body ends here either way. Once the backend's
       // terminal frame has settled the turn, a rejection from cancelling what
       // was left unread is teardown noise, not the turn's outcome — it turned
-      // a completed answer into a 500 with the usage lost (r27-codex).
+      // a completed answer into a 500 with the usage lost (r27-codex). The
+      // same when an error is already unwinding: a refusal thrown from the
+      // pump (`push`) holds the outcome, and a rejection thrown from here
+      // replaced it — a declared 502 became a 500 carrying the body's
+      // teardown message (r29-fable F2).
       try {
         await events.return?.(undefined);
       } catch (err) {
-        if (!state.isSettled()) throw err;
+        if (!state.isSettled() && !unwinding) throw err;
       }
     }
     // A turn only finished if the backend said so. A reported failure, or a
@@ -2342,10 +2374,6 @@ function usageFromResponses(value: unknown): LocalUsage | undefined {
   };
 }
 
-function readOutputIndex(event: CodexBackendEvent): number {
-  return explicitOutputIndex(event) ?? 0;
-}
-
 /** The output position an event actually carries, or nothing. */
 function explicitOutputIndex(event: CodexBackendEvent): number | undefined {
   return typeof event.output_index === 'number' && Number.isFinite(event.output_index)
@@ -2396,6 +2424,18 @@ function argumentsText(value: unknown, shape: NormalizedRequest['shape']): strin
   if (value === undefined) return undefined;
   if (typeof value === 'string') return value;
   throw backendContractError('The local runtime wrote tool arguments that are not text.', shape);
+}
+
+/**
+ * An identity member — item `id`, `call_id`, `name`, a delta's `item_id` — as
+ * the vendor wrote it: absent, or text. Presence alone passed the identity
+ * gate, so an object-valued `call_id` crossed the `LocalToolCall` boundary and
+ * went out as the id the client must echo, on every surface (r29-codex).
+ */
+function identityText(value: unknown, shape: NormalizedRequest['shape']): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === 'string') return value;
+  throw backendContractError('The local runtime named a tool call with something that is not text.', shape);
 }
 
 /** The message a terminal failure frame carries, whatever shape it arrives in. */

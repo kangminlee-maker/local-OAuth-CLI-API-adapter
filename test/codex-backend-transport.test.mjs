@@ -1943,3 +1943,28 @@ test('a forced call cut off at the output limit keeps its fragment verbatim (r18
   assert.equal(whole.stopReason, undefined);
   assert.equal(whole.toolCalls[0].arguments, '{"city":"Seo');
 });
+
+test('a call whose first frame carried no output_index learns its position from a later one: the finish signal fires when the vendor moves on (r29-fable F1)', async () => {
+  // `toolOrdinal` resolved every later frame through the id binding and
+  // returned before recording the position, so the call stayed positionless
+  // and its finish signal waited for the terminal frame — the Messages block
+  // held every later block behind it again (the r27 defect, one input family).
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const finished = events.findIndex((event) => event.type === 'tool_call_delta' && event.argumentsDone === true);
+  const narration = events.findIndex((event) => event.type === 'text_delta');
+  assert.ok(finished >= 0, 'the call was announced finished');
+  assert.ok(narration >= 0);
+  assert.ok(finished < narration, `finish signal at ${finished} must precede the narration at ${narration}: ${JSON.stringify(events.map((event) => event.type))}`);
+});
