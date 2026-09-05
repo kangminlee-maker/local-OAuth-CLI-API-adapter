@@ -1,4 +1,68 @@
 {
   "note": "Divergences from the vendor that the proxy makes on purpose. Each is data, not an exception in code: it carries the surface it applies to, the exact behavior, and why. A divergence that stops being true fails the same check that a new one does — a stale exemption hides a fixed defect and lets the next regression through. Seed of the manifest described in docs/conformance-suite-design.md §2.",
-  "divergences": []
+  "divergences": [
+    {
+      "id": "chat-function-tools-with-reasoning-effort",
+      "surface": "/v1/chat/completions",
+      "behavior": "The proxy accepts function tools together with a reasoning effort other than 'none' and runs them. The direct API refuses that combination for the gpt-5.6 family with 400 invalid_request_error, param 'reasoning_effort', message \"Function tools with reasoning_effort are not supported for <model> in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.\"",
+      "why": "Measured 2026-08-30: gpt-5.6-terra and gpt-5.6-sol refuse it, gpt-5.5 accepts it, so the refusal is one model family's limitation on OpenAI's own chat endpoint. The Codex backend behind this proxy runs the combination, and the option rules refuse only what cannot be realized — refusing a request the backend executes would be the violation, not the parity.",
+      "measuredAt": "2026-08-30",
+      "evidence": "docs/conformance-matrix.md §5.5.5",
+      "claim": "chat-function-tools-with-reasoning-effort"
+    },
+    {
+      "id": "messages-output-config-task-budget",
+      "surface": "/v1/messages",
+      "behavior": "The proxy accepts `output_config.task_budget` ({type:'tokens', total: >= 20000}) and uses it. The direct API does not know the member and answers 400 `output_config.task_budget: Extra inputs are not permitted` — its `output_config` takes only `format` and `effort`.",
+      "why": "Measured 2026-08-31: the direct API's output_config member set is {format, effort}. `task_budget` is this proxy's own extension over the Claude CLI's task budget, so it is an ADDITION to the surface rather than a difference in shared behaviour. Nothing a direct-API client sends is answered differently; a client that sends it gets the CLI knob it names. Removing it would take a capability away with no parity gain.",
+      "measuredAt": "2026-08-31",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "claim": "messages-output-config-task-budget"
+    },
+    {
+      "id": "messages-whitespace-model-is-a-400",
+      "surface": "/v1/messages",
+      "behavior": "The proxy answers 400 `model: String should have at least 1 character` for a whitespace-only model name. The direct API treats it as a NAME and answers 404 model-not-found.",
+      "why": "Measured 2026-08-31: `model: '   '` returns 404 on the direct API, the same answer it gives any name it does not know. This proxy runs every model name on its configured backend and so has no name it does not know — it cannot mirror that 404 for one input without mirroring it for all of them, which would break its purpose. It keeps a 400 for the one shape that is plainly a slip rather than dispatching a turn for it.",
+      "measuredAt": "2026-08-31",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "claim": "messages-whitespace-model-is-a-400"
+    },
+    {
+      "id": "responses-replayed-item-ids-are-not-looked-up",
+      "surface": "/v1/responses",
+      "behavior": "The proxy accepts a replayed item — `reasoning`, a hosted-tool call or its output — without checking its `id`. The direct API answers 404 `Item with id '<id>' not found.` for an id it does not hold, including alongside a valid user turn, and finds the id when the item really came from its own previous response. This entry is about the ID LOOKUP only. What an accepted item then becomes is a separate behaviour and a separate entry: `responses-replayed-hosted-tool-items-are-transcript-records`.",
+      "why": "Measured 2026-08-31. Feeding `output` back as `input` is the documented way to hold a conversation on a surface that stores none, and this proxy stores none either: it has no id table to look one up in. Mirroring the 404 would mean refusing EVERY replayed item, the legitimate ones included, which would break the round trip the surface exists for.",
+      "measuredAt": "2026-08-31",
+      "evidence": "docs/conformance-matrix.md §5.5.6-A",
+      "claim": "responses-replayed-item-ids-are-not-looked-up"
+    },
+    {
+      "id": "responses-replayed-hosted-tool-items-are-transcript-records",
+      "surface": "/v1/responses",
+      "behavior": "What a replayed item BECOMES, once its id has been accepted, depends on the item. A `reasoning` item replays as NOTHING — it is dropped, and a body whose only item is one runs as an empty conversation (`messages: []` reaches the backend). Every OTHER typed item the surface knows, other than the `function_call`/`function_call_output` pair this proxy replays as its own tool history — the hosted-tool calls and outputs a client feeds back to preserve them, `web_search_call` and the rest — replays as a LABELLED TRANSCRIPT RECORD in the turn's own role: the literal `[replayed item]`, then `type: <the item type>`, then the item's own JSON, and that message reaches the backend intact. A `type` the surface does not know is not replayed at all: it is 400 `invalid_value` at `input[<i>]` listing the types it does know. The direct API replays each of these against its own stored copy of the item.",
+      "why": "Measured 2026-09-01 at this baseline. The previous wording of `responses-replayed-item-ids-are-not-looked-up` said a hosted-tool item is 'replayed as nothing', which conflated two behaviours and is now false for everything but `reasoning`. These runtimes have no hosted-tool slot to replay such an item INTO, so the honest options are to drop it or to hand the model the record of it; dropping it silently loses conversation the client sent, and writing it as a function tool result made the default transport parse it back into an empty `function_call_output` under an invented id, so the record never reached the model at all. The labelled record is the one form that carries the item's own content through, and nothing parses the label back — so text inside a record cannot forge a tool-result boundary. `reasoning` stays dropped for its own reason: its `summary`, `reasoning_text` and `encrypted_content` have no slot in either runtime, and putting them in a turn told the model its own chain of thought in the user's voice.",
+      "measuredAt": "2026-09-01",
+      "evidence": "docs/conformance-matrix.md §5.5.6-A",
+      "claim": "responses-replayed-hosted-tool-items-are-transcript-records"
+    },
+    {
+      "id": "messages-assistant-prefill-is-not-refused",
+      "surface": "/v1/messages",
+      "behavior": "The proxy accepts a conversation whose last message is an `assistant` turn. `claude-sonnet-5` answers 400 `This model does not support assistant message prefill. The conversation must end with a user message.`",
+      "why": "Measured 2026-08-31. The sentence names the MODEL, and assistant prefill is a capability some Claude models have and others do not. This proxy runs whatever its configured backend runs, so refusing prefill because one model refuses it would refuse a turn the backend can perform — the violation, not the parity. Same shape as `chat-function-tools-with-reasoning-effort`.",
+      "measuredAt": "2026-08-31",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "claim": "messages-assistant-prefill-is-not-refused"
+    },
+    {
+      "id": "chat-function-role-is-not-refused",
+      "surface": "/v1/chat/completions",
+      "behavior": "The proxy accepts a `function` role message and runs the turn: `{\"role\":\"function\",\"name\":\"f\",\"content\":\"23C\"}` reaches the backend as a TRANSCRIPT turn — the marker line, the function's name, and its output as text — and NOT as a tool result. The role carries a NAME and no call id, so there is no call for a result to answer; it used to arrive as `{\"type\":\"function_call_output\",\"call_id\":\"tool_call\"}`, an id this proxy invented, answering a call that appears nowhere in the request (measured on the real transport 2026-09-02, fixed the same day; pinned in `test/tool-history-structure.test.mjs`). The direct API refuses the role OUTRIGHT for `gpt-5.6-terra`, whatever the content — 400 `unsupported_value`, param `messages[2].role`, message \"Unsupported value: 'messages[2].role' does not support 'function' with this mode\" — with `content: null` and with `content: '23C'` alike. The proxy's own answer for `content: null` is its ordinary missing-content one, at param `messages.[2].content` with no code and the sentence \"Invalid value for 'content': expected a string, got null.\", so the two sides differ in which fault they report as well as in whether they refuse. `function` remains a value the role enum names on both sides: the proxy's `messages[i].role` enum sentence lists it, and so does the direct API's.",
+      "why": "Measured 2026-09-01. The refusal names the MODE — 'does not support ... with this mode' — which puts it in the same class as `chat-function-tools-with-reasoning-effort` and `messages-assistant-prefill-is-not-refused`: a refusal whose sentence names the model or the mode is a capability of that vendor model, not of this surface. The deprecated `function` role is an ordinary transcript turn, and the backends behind this proxy serve it. Refusing a turn the backends CAN serve because one vendor model will not is itself the violation, and this is the safer direction of the two — a client that never sends the role sees no difference, and one that does gets its turn run instead of a 400. Mirroring the refusal would take a working request away for nothing.",
+      "measuredAt": "2026-09-01",
+      "evidence": "docs/conformance-matrix.md §5.5.5",
+      "claim": "chat-function-role-is-not-refused"
+    }
+  ]
 }

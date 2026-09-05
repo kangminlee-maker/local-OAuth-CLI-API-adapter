@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { BACKEND_IDENTIFIERS } from '../dist/proxy/types.js';
-import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +92,9 @@ async function modelsWithSetting(honorRequestModel, listed, backendModel = 'conf
   const root = await mkdtemp(join(tmpdir(), 'models-endpoint-'));
   trees.push(root);
   await cp(join(repoRoot, 'dist'), join(root, 'dist'), { recursive: true });
+  // `dist` resolves its runtime dependencies (`ajv`) from a `node_modules`
+  // beside it, the way an installed package does.
+  await symlink(join(repoRoot, 'node_modules'), join(root, 'node_modules'));
   const settings = JSON.parse(await readFile(join(repoRoot, 'settings.json'), 'utf8'));
   await writeFile(
     join(root, 'settings.json'),

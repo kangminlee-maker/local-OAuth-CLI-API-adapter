@@ -92,3 +92,59 @@ test('honour-on settles the first event before returning', () => {
     assert.deepEqual(seen, ['first']);
   })();
 });
+
+// `withFirstEventSettled` was a generator until 2026-08-31 and is now an
+// explicit iterator, because `return()` on a generator that was never started
+// skips its body — an abandoned fan-out sibling is exactly that case. The
+// rewrite made `close()` idempotent by hand, and a generator's own `finally`
+// runs once for free, so the property that came free before now needs pinning:
+// a source whose second teardown rejects, or releases an already-released lock
+// or process, turns a legal repeated `return()` into a different answer.
+test('the wrapper closes its source once, however many times it is returned', async () => {
+  let returns = 0;
+  const source = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next() { return { done: false, value: { type: 'text_delta', delta: 'a' } }; },
+        async return() {
+          returns += 1;
+          if (returns > 1) throw new Error('a second teardown must never happen');
+          return { done: true, value: undefined };
+        },
+      };
+    },
+  };
+  const wrapped = await withFirstEventSettled(source);
+  const iterator = wrapped[Symbol.asyncIterator]();
+  assert.deepEqual(await iterator.return(), { done: true, value: undefined });
+  assert.deepEqual(await iterator.return(), { done: true, value: undefined }, 'a repeated return is legal and is a no-op');
+  assert.equal(returns, 1, 'the source is torn down exactly once');
+  // And a fresh iterator off the same wrapper does not tear it down again.
+  await wrapped[Symbol.asyncIterator]().return?.();
+  assert.equal(returns, 1);
+  // Closed means closed: no event is delivered after it.
+  assert.deepEqual(await iterator.next(), { done: true, value: undefined });
+});
+
+test('a source exhausted normally is closed once, not once per next()', async () => {
+  let returns = 0;
+  let delivered = 0;
+  const source = {
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          delivered += 1;
+          return delivered <= 2
+            ? { done: false, value: { type: 'text_delta', delta: String(delivered) } }
+            : { done: true, value: undefined };
+        },
+        async return() { returns += 1; return { done: true, value: undefined }; },
+      };
+    },
+  };
+  const wrapped = await withFirstEventSettled(source);
+  const seen = [];
+  for await (const event of wrapped) seen.push(event.delta);
+  assert.deepEqual(seen, ['1', '2']);
+  assert.equal(returns, 1, 'exhaustion closes the source exactly once');
+});

@@ -10,6 +10,7 @@ import {
   outputSchemaFor,
   parseBackendOutput,
   requestInstructionText,
+  textMayBeRefused,
 } from '../dist/proxy/backend-contract.js';
 
 test('tool decision schema remains enabled before an auto tool call', () => {
@@ -117,20 +118,30 @@ test('a continuation keeps the requested JSON schema when the tools are off', ()
   assert.match(buildPrompt(request), /Valid JSON only/);
 });
 
-test('buildPrompt does not turn generous token caps into style instructions', () => {
-  const generous = buildPrompt(requestWithTools({
-    tools: [],
-    maxTokens: 640,
-    messages: [{ role: 'user', content: 'Write a detailed incident report.', images: [] }],
-  }));
-  assert.doesNotMatch(generous, /Max output tokens|Output token limit/);
+// The prompt is not a place to implement `max_tokens`. It used to be, for
+// values <= 128, which made the cap a request rather than a promise: the
+// option was accepted and echoed while a backend that ignored the sentence
+// returned a full-length answer. Neither runtime has a channel that caps
+// output the way the API does, so the cap is now declared unenforced instead
+// of being asked for. This test fails if the sentence comes back at any value.
+test('buildPrompt never asks the model for a token cap, at any value', () => {
+  for (const maxTokens of [1, 16, 64, 128, 129, 640, 64_000]) {
+    const prompt = buildPrompt(requestWithTools({
+      tools: [],
+      maxTokens,
+      messages: [{ role: 'user', content: 'Write a detailed incident report.', images: [] }],
+    }));
+    assert.doesNotMatch(
+      prompt,
+      /Max output tokens|Output token limit|token limit|max_tokens/i,
+      `maxTokens: ${maxTokens} put a cap instruction in the prompt`,
+    );
+  }
+});
 
-  const narrow = buildPrompt(requestWithTools({
-    tools: [],
-    maxTokens: 64,
-    messages: [{ role: 'user', content: 'Reply briefly.', images: [] }],
-  }));
-  assert.match(narrow, /Output token limit: 64/);
+// The guard above only means something if this string would be caught.
+test('CONTROL: the cap guard catches the sentence it is guarding against', () => {
+  assert.match('Output token limit: 64.', /Max output tokens|Output token limit|token limit|max_tokens/i);
 });
 
 test('buildPrompt can split API instruction messages from conversation input', () => {
@@ -268,6 +279,300 @@ test('narration that comes with a tool call survives the wrapper', () => {
     {
       text: '날씨를 확인하겠습니다.',
       toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"서울"}' }],
+      // The wrapper put its `text` key first, so the narration is one run
+      // before the call — stated, not left to a reader's default.
+      textRuns: [{ text: '날씨를 확인하겠습니다.', afterCalls: 0 }],
     },
   );
+});
+
+// Both ordered surfaces report a turn's parts in production order and read it
+// from `textRuns` — where each run of the narration sits among the calls. Only
+// `CodexBackendTransport` ever set it, so the two backends that go through
+// the incremental reader of the time streamed `[call, text]` while their buffered body
+// said `[text, call]`. The wrapper's own key order is the artifact BOTH paths
+// see, so it is what decides. The wrapper holds one array and one text field,
+// so the turn it describes has at most ONE run: all-before (the call count) or
+// all-after (0). A wrapper with no narration has no run at all — there is
+// nothing to place, and inventing one would put an empty block on a surface
+// that reports none.
+const ORDER_REQUEST = {
+  shape: 'openai-responses', model: 'm', messages: [], stream: false, streamOptions: {},
+  tools: [{ name: 'get_weather', description: 'w', parameters: {} }], toolChoice: { type: 'auto' }, raw: {},
+};
+const CALL = '{"id":"c1","name":"get_weather","arguments":"{}"}';
+const CALLS = (n) => Array.from({ length: n }, (_, i) => `{"id":"c${i + 1}","name":"get_weather","arguments":"{}"}`).join(',');
+
+/** Where each run of the parsed turn's narration sits among its calls. */
+const runPositions = (parsed) => (parsed.textRuns ?? []).map((run) => run.afterCalls);
+
+for (const [label, raw, expected] of [
+  ['text before toolCalls', `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`, [0]],
+  ['toolCalls before text', `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`, [1]],
+  ['toolCalls with no text at all', `{"status":"tool_calls","toolCalls":[${CALL}]}`, []],
+  ['text with no calls', '{"status":"message","text":"just talking"}', []],
+  // Above one call, "the number of calls that came first" and the constant 1
+  // stop being the same number — and every fixture here used to carry exactly
+  // one call, so nothing could tell them apart.
+  ['TWO calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(2)}],"text":"checking"}`, [2]],
+  ['THREE calls before text', `{"status":"tool_calls","toolCalls":[${CALLS(3)}],"text":"checking"}`, [3]],
+  ['THREE calls after text', `{"status":"tool_calls","text":"checking","toolCalls":[${CALLS(3)}]}`, [0]],
+  ['THREE calls and no text at all', `{"status":"tool_calls","toolCalls":[${CALLS(3)}]}`, []],
+]) {
+  test(`the wrapper's key order decides production order: ${label}`, () => {
+    const parsed = parseBackendOutput(ORDER_REQUEST, raw);
+    assert.deepEqual(runPositions(parsed), expected);
+    // One run at most, and it carries the whole narration: the wrapper has one
+    // `text` field, so a parse that split it would be inventing structure.
+    assert.equal((parsed.textRuns ?? []).map((run) => run.text).join(''), parsed.textRuns ? parsed.text : '');
+  });
+}
+
+test('the ordinal is the CALL COUNT, not a fixed one', () => {
+  // The ordinal says how many calls came before the narration, so on a
+  // calls-first wrapper it has to track the array's length. Read as a constant
+  // it puts the text after the FIRST call, which is an order the turn never
+  // had — and no single-call fixture can see the difference.
+  const ordinals = [];
+  for (let count = 1; count <= 4; count += 1) {
+    const parsed = parseBackendOutput(
+      ORDER_REQUEST,
+      `{"status":"tool_calls","toolCalls":[${CALLS(count)}],"text":"checking"}`,
+    );
+    assert.equal(parsed.toolCalls.length, count, 'the wrapper carried the calls it claims');
+    assert.deepEqual(runPositions(parsed), [count], `${count} calls came before the narration`);
+    ordinals.push(runPositions(parsed)[0]);
+  }
+  assert.deepEqual(ordinals, [1, 2, 3, 4]);
+  // CONTROL: a constant would satisfy the count-1 case alone, so the values
+  // must actually differ across the four.
+  assert.equal(new Set(ordinals).size, 4, 'the ordinal moved with the call count');
+});
+
+test('CONTROL: the two key orders report opposite flags', () => {
+  // A flag stuck on one answer would satisfy every consumer twice over. These
+  // are the same parts in the opposite key order, and they must not read alike.
+  const textFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","text":"checking","toolCalls":[${CALL}]}`);
+  const callsFirst = parseBackendOutput(ORDER_REQUEST, `{"status":"tool_calls","toolCalls":[${CALL}],"text":"checking"}`);
+  assert.deepEqual(runPositions(textFirst), [0]);
+  assert.deepEqual(runPositions(callsFirst), [1]);
+});
+
+test('an object that is not wrapper-shaped, and plain prose, are the answer', () => {
+  // Only a wrapper this backend produced may be unwrapped. Reading a
+  // non-wrapper object as a wrapper found no `text` and returned an empty
+  // answer — the whole reply dropped on the floor.
+  const request = {
+    model: 'm', shape: 'openai-chat', messages: [], jsonMode: false,
+    tools: [{ name: 'get_weather', inputSchema: { type: 'object' } }], toolChoice: { type: 'auto' }, raw: {},
+  };
+  assert.equal(parseBackendOutput(request, '{"my":"object"}').text, '{"my":"object"}');
+  assert.equal(parseBackendOutput(request, 'plain prose').text, 'plain prose');
+  assert.deepEqual(parseBackendOutput(request, 'plain prose').toolCalls, []);
+});
+
+// ---------------------------------------------------------------------------
+// Conformance matrix §7 rows 8 and 10: the schema the client supplied is the
+// runtime's output contract, and the response path refuses what breaks it.
+// ---------------------------------------------------------------------------
+
+const WEATHER_SCHEMA = { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] };
+
+function forcedRequest(inputSchema = WEATHER_SCHEMA, strict = true) {
+  return {
+    model: 'm', shape: 'openai-chat', messages: [], jsonMode: false,
+    tools: [{ name: 'get_weather', inputSchema, strict }], toolChoice: { type: 'required' }, raw: {},
+  };
+}
+
+function refused(error, pattern) {
+  return error.statusCode === 502 && pattern.test(error.message);
+}
+
+test('row 8: a forced call whose arguments are not JSON is refused at completion', () => {
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo'), (e) => refused(e, /arguments that are not JSON/));
+  // A stop reason that is not the output limit is no excuse either.
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo', 'end_turn'), (e) => refused(e, /arguments that are not JSON/));
+  // Prose used to be REPAIRED into `{"input":"Seoul please"}` and delivered as
+  // an executable call (r18-codex); it is not JSON, and it is refused as such.
+  assert.throws(() => parseBackendOutput(forcedRequest(), 'Seoul please'), (e) => refused(e, /not JSON/));
+  // JSON that is not an object is not a call's arguments on any direct API,
+  // strict or not.
+  assert.throws(() => parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '"Seoul"'), (e) => refused(e, /not a JSON object/));
+  assert.throws(() => parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '[1]'), (e) => refused(e, /not a JSON object/));
+  // …unless the runtime reports the output limit, when a bare fragment is
+  // delivered as it stands.
+  assert.equal(parseBackendOutput(forcedRequest(), '"Seo', 'max_tokens').toolCalls[0].arguments, '"Seo');
+});
+
+test('r20: both call paths see the same bytes — only JSON whitespace is stripped before the arguments are judged', () => {
+  // A BOM, U+00A0, U+2028 or U+000B before the object is not JSON on the
+  // wrapper path and must not be silently stripped on the forced one.
+  for (const prefix of ['\uFEFF', '\u00A0', '\u2028', '\u000B']) {
+    assert.throws(() => parseBackendOutput(forcedRequest(), `${prefix}{"city":"Seoul"}`), (e) => refused(e, /not JSON/), JSON.stringify(prefix));
+  }
+  // CONTROL: JSON whitespace around the value is accepted and PUBLISHED —
+  // the bytes the runtime wrote, head and tail alike (r20-codex F2).
+  assert.equal(parseBackendOutput(forcedRequest(), ' \t\n\r{"city":"Seoul"}').toolCalls[0].arguments, ' \t\n\r{"city":"Seoul"}');
+  assert.equal(parseBackendOutput(forcedRequest(), '{"city":"Seoul"}\n').toolCalls[0].arguments, '{"city":"Seoul"}\n');
+});
+
+test('r19: the cut-off rule on the wrapper path — a missing call is the cap\'s, a cut wrapper is refused, never leaked', () => {
+  const two = { model: 'm', shape: 'openai-chat', messages: [], jsonMode: false, tools: [{ name: 'a', inputSchema: {} }, { name: 'b', inputSchema: {} }], toolChoice: { type: 'required' }, raw: {} };
+  // `required` answered with no call under the cap: delivered (the direct
+  // APIs deliver whatever the cap left, under `length`).
+  assert.equal(parseBackendOutput(two, '{"status":"message","text":"I was about to","toolCalls":[]}', 'max_tokens').text, 'I was about to');
+  assert.throws(() => parseBackendOutput(two, '{"status":"message","text":"I was about to","toolCalls":[]}'), (e) => refused(e, /without calling a tool/), 'CONTROL: the same wrapper completed is the refusal');
+  // A wrapper cut off mid-way is this proxy's grammar: refused, not published
+  // as the assistant's words (r19-fable F4b).
+  const fragment = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","na';
+  assert.throws(() => parseBackendOutput(two, fragment, 'max_tokens'), (e) => refused(e, /cut off at its output limit inside the tool wrapper/));
+  assert.throws(() => parseBackendOutput({ ...two, toolChoice: { type: 'auto' } }, fragment, 'max_tokens'), (e) => refused(e, /inside the tool wrapper/), 'on auto too');
+  // CONTROL: the same bytes with no cap reported are row 2\'s regime — prose.
+  assert.equal(parseBackendOutput({ ...two, toolChoice: { type: 'auto' } }, fragment).text, fragment);
+});
+
+test('r18: a wrapper call\'s arguments are judged by the same rule, never repaired', () => {
+  const tools = (strict) => [{ name: 'get_weather', inputSchema: WEATHER_SCHEMA, strict }];
+  const request = (strict) => ({ model: 'm', shape: 'openai-chat', messages: [], jsonMode: false, tools: tools(strict), toolChoice: { type: 'auto' }, raw: {} });
+  const wrapper = (args) => `{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":${JSON.stringify(args)}}]}`;
+  assert.throws(() => parseBackendOutput(request(false), wrapper('Seoul')), (e) => refused(e, /not JSON/), 'prose used to become {"input":"Seoul"}');
+  assert.throws(() => parseBackendOutput(request(false), wrapper('"Seoul"')), (e) => refused(e, /not a JSON object/));
+  assert.equal(parseBackendOutput(request(false), wrapper('{"city":1}')).toolCalls[0].arguments, '{"city":1}', 'non-strict: delivered');
+  assert.throws(() => parseBackendOutput(request(true), wrapper('{"city":1}')), (e) => refused(e, /outside the tool's schema/), 'strict: refused');
+  assert.equal(parseBackendOutput(request(true), wrapper('{"city":"Seoul"}')).toolCalls[0].arguments, '{"city":"Seoul"}');
+  // A wrapper `arguments` member that is not a string is a schema violation,
+  // and re-serializing it rounded its numbers (r20-codex): refused.
+  const objectArgs = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":{"id":9007199254740993}}]}';
+  assert.throws(() => parseBackendOutput(request(false), objectArgs), (e) => refused(e, /`arguments` member that is not a string/));
+  assert.throws(() => parseBackendOutput(request(false), objectArgs, 'max_tokens'), (e) => refused(e, /not a string/), 'the cap is no excuse for a member of the wrong type');
+  // CONTROL: the same bytes as a string member are published exactly.
+  const stringArgs = '{"status":"tool_calls","text":"","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{\\"id\\":9007199254740993}"}]}';
+  assert.equal(parseBackendOutput(request(false), stringArgs).toolCalls[0].arguments, '{"id":9007199254740993}');
+});
+
+test('row 8: the fragment is kept only when the output limit cut the call off', () => {
+  // Both readers of this function spell the limit the Messages API's way.
+  const kept = parseBackendOutput(forcedRequest(), '{"city":"Seo', 'max_tokens');
+  assert.deepEqual(kept.toolCalls, [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seo' }]);
+  // CONTROL: the Responses API's word is not one this reading ever receives
+  // (r18-fable F7 — an arm nothing fed), so it is not an excuse.
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":"Seo', 'length'), (e) => refused(e, /not JSON/));
+});
+
+// ---------------------------------------------------------------------------
+// Round 18: what the two reviewers found in the row 8/10 closure.
+// ---------------------------------------------------------------------------
+
+test('r18: a turn cut off at the output limit is delivered whatever it holds (F4, codex C4)', () => {
+  // The direct APIs deliver a limit-cut structured answer as the fragment it
+  // is under `finish_reason: "length"` (measured 2026-09-04, M7), so none of
+  // the completion rules apply to it.
+  const partial = parseBackendOutput(forcedRequest(), '{"city":"Seoul"}', 'max_tokens');
+  assert.equal(partial.toolCalls[0].arguments, '{"city":"Seoul"}', 'a parseable partial under a schema needing more');
+  const strict = forcedRequest({ ...WEATHER_SCHEMA, required: ['city', 'country'] });
+  assert.equal(parseBackendOutput(strict, '{"city":"Seoul"}', 'max_tokens').toolCalls[0].arguments, '{"city":"Seoul"}');
+  assert.equal(parseBackendOutput(forcedRequest(), '{}', 'max_tokens').toolCalls[0].arguments, '{}');
+  assert.equal(parseBackendOutput(schemaRequest(WEATHER_SCHEMA), '{"city":"Seo', 'max_tokens').text, '{"city":"Seo', 'json_schema fragment');
+  const object = { ...schemaRequest(undefined), jsonSchema: undefined };
+  assert.equal(parseBackendOutput(object, '{"a":', 'max_tokens').text, '{"a":', 'json_object fragment');
+  // CONTROL: the same inputs with no stop reason are the refusals rows 8/10 promise.
+  assert.throws(() => parseBackendOutput(strict, '{"city":"Seoul"}'), (e) => refused(e, /outside the tool's schema/));
+  assert.throws(() => parseBackendOutput(schemaRequest(WEATHER_SCHEMA), '{"city":"Seo'), (e) => refused(e, /not JSON/));
+  assert.throws(() => parseBackendOutput(object, '{"a":'), (e) => refused(e, /not a JSON object/));
+});
+
+test('r18: a schema this path cannot judge passes — $async, $id/$ref across requests, inexact numbers (F1, F3, codex C1/C3)', () => {
+  // `$async: true` compiles to a promise-returning validator: a conforming
+  // answer used to be refused (a promise is never `=== true`) and a
+  // non-conforming one ended the process on an unhandled rejection.
+  const async = forcedRequest({ $async: true, type: 'object', required: ['city'] });
+  assert.equal(parseBackendOutput(async, '{"city":"Seoul"}').toolCalls[0].arguments, '{"city":"Seoul"}');
+  assert.equal(parseBackendOutput(async, '{"town":"Seoul"}').toolCalls[0].arguments, '{"town":"Seoul"}');
+  // One request's `$id` must not decide another's verdict.
+  const a = schemaRequest({ $id: 'https://example.com/r18', type: 'object', required: ['zzz'] });
+  assert.throws(() => parseBackendOutput(a, '{"ok":1}'), (e) => refused(e, /outside the request's JSON schema/));
+  const b = schemaRequest({ $ref: 'https://example.com/r18' });
+  assert.equal(parseBackendOutput(b, '{"ok":1}').text, '{"ok":1}', 'an unresolvable $ref judges nothing, even after A registered that id');
+  const c = schemaRequest({ $id: 'https://example.com/r18', type: 'object', properties: { x: { const: 2 } }, required: ['x'] });
+  assert.throws(() => parseBackendOutput(c, '{"x":1}'), (e) => refused(e, /outside the request's JSON schema/), 'a second schema under a taken $id is still judged');
+  // The client is promised the runtime's bytes; a constraint judged on the
+  // rounded double refused `9007199254740993` against `exclusiveMinimum: 9007199254740992`.
+  const big = schemaRequest({ type: 'object', properties: { id: { type: 'integer', exclusiveMinimum: 9007199254740992 } }, required: ['id'] });
+  assert.equal(parseBackendOutput(big, '{"id":9007199254740993}').text, '{"id":9007199254740993}');
+  // CONTROL: an exact number under the same schema is still judged.
+  assert.throws(() => parseBackendOutput(big, '{"id":5}'), (e) => refused(e, /outside the request's JSON schema/));
+});
+
+test('r18: a schema without a JSON format is not enforced, and the normalizers no longer produce that pair (F2)', () => {
+  const stray = { ...schemaRequest(WEATHER_SCHEMA), jsonMode: false };
+  assert.equal(parseBackendOutput(stray, 'hello world prose').text, 'hello world prose');
+  assert.equal(textMayBeRefused(stray), false, 'and the gates agree: nothing to hold');
+});
+
+test('row 8: arguments outside the forced tool\'s schema are refused; conforming ones pass', () => {
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"city":1}'), (e) => refused(e, /outside the tool's schema/));
+  assert.throws(() => parseBackendOutput(forcedRequest(), '{"town":"Seoul"}'), (e) => refused(e, /outside the tool's schema/));
+  assert.equal(parseBackendOutput(forcedRequest(), '{"city":"Seoul"}').toolCalls[0].arguments, '{"city":"Seoul"}');
+  // CONTROL: a schema Ajv cannot compile judges nothing, so the same answer
+  // that the weather schema refuses passes under it — the promise is
+  // unverifiable, not broken.
+  const uncompilable = { type: 'nonsense' };
+  assert.equal(parseBackendOutput(forcedRequest(uncompilable), '{"city":1}').toolCalls[0].arguments, '{"city":1}');
+  // CONTROL: no schema at all (a tool declared without one) is the same.
+  const schemaless = { ...forcedRequest(), tools: [{ name: 'get_weather' }] };
+  assert.equal(parseBackendOutput(schemaless, '{"city":1}').toolCalls[0].arguments, '{"city":1}');
+});
+
+function schemaRequest(jsonSchema, strict = true) {
+  return { model: 'm', shape: 'openai-chat', messages: [], jsonMode: true, jsonSchema, jsonSchemaStrict: strict, tools: [], toolChoice: { type: 'auto' }, raw: {} };
+}
+
+test('r18: the schema is enforced only where the client took the promise (codex, `strict`)', () => {
+  // The direct OpenAI APIs validate tool arguments and a `json_schema` answer
+  // only under `strict: true`; without it the schema is a request to the
+  // model. The Messages API's structured output is always exact.
+  assert.equal(parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '{"city":1}').toolCalls[0].arguments, '{"city":1}', 'non-strict tool: delivered');
+  assert.throws(() => parseBackendOutput(forcedRequest(WEATHER_SCHEMA, false), '{"city":"Seo'), (e) => refused(e, /not JSON/), 'non-strict tool: still JSON');
+  assert.equal(parseBackendOutput(schemaRequest(WEATHER_SCHEMA, false), '{"city":1}').text, '{"city":1}', 'non-strict json_schema: delivered');
+  assert.throws(() => parseBackendOutput(schemaRequest(WEATHER_SCHEMA, false), 'prose'), (e) => refused(e, /not JSON/), 'non-strict json_schema: still JSON');
+  const anthropic = { ...schemaRequest(WEATHER_SCHEMA, undefined), jsonSchemaStrict: undefined, shape: 'anthropic-messages' };
+  assert.throws(() => parseBackendOutput(anthropic, '{"city":1}'), (e) => refused(e, /outside the request's JSON schema/), 'Messages: exact without a flag');
+});
+
+test('row 10: text outside the client\'s json_schema is refused; conforming text passes', () => {
+  const request = schemaRequest(WEATHER_SCHEMA);
+  assert.throws(() => parseBackendOutput(request, 'Seoul is sunny.'), (e) => refused(e, /not JSON for a request that supplied a JSON schema/));
+  assert.throws(() => parseBackendOutput(request, '{"city":1}'), (e) => refused(e, /outside the request's JSON schema/));
+  // The proxy's own grammar as the client's answer (matrix §7 row 10).
+  assert.throws(() => parseBackendOutput(request, '{"status":"done","text":"Seoul","toolCalls":[]}'), (e) => refused(e, /outside the request's JSON schema/));
+  assert.equal(parseBackendOutput(request, '{"city":"Seoul"}').text, '{"city":"Seoul"}');
+  // A schema rooted at an array keeps its root: the object rule is
+  // `json_object`'s alone, and an array answer under this schema conforms.
+  const list = schemaRequest({ type: 'array', items: { type: 'integer' } });
+  assert.equal(parseBackendOutput(list, '[1,2,3]').text, '[1,2,3]');
+  assert.throws(() => parseBackendOutput(list, '{"0":1}'), (e) => refused(e, /outside the request's JSON schema/));
+  // CONTROL: an uncompilable client schema passes everything that is JSON.
+  assert.equal(parseBackendOutput(schemaRequest({ type: 'nonsense' }), '{"city":1}').text, '{"city":1}');
+  assert.throws(() => parseBackendOutput(schemaRequest({ type: 'nonsense' }), 'prose'), (e) => refused(e, /not JSON/));
+});
+
+test('CONTROL: json_object keeps the object rule and nothing more', () => {
+  const request = { ...schemaRequest(undefined), jsonSchema: undefined };
+  assert.throws(() => parseBackendOutput(request, '[1,2,3]'), (e) => refused(e, /not a JSON object/));
+  assert.equal(parseBackendOutput(request, '{"anything":true}').text, '{"anything":true}');
+});
+
+test('r19: `strict` is read from each surface\'s own location only (codex)', async () => {
+  const { normalizeOpenAiChatRequest, normalizeOpenAiResponsesRequest } = await import('../dist/proxy/normalizers.js');
+  const chat = normalizeOpenAiChatRequest({ model: 'm', messages: [{ role: 'user', content: 'x' }], tools: [
+    { type: 'function', function: { name: 'a', parameters: {}, strict: true } },
+    { type: 'function', function: { name: 'b', parameters: {} }, strict: true },
+  ] });
+  assert.deepEqual(chat.tools.map((t) => t.strict), [true, false], "Chat: function.strict counts, a top-level strict does not");
+  const responses = normalizeOpenAiResponsesRequest({ model: 'm', input: 'x', tools: [
+    { type: 'function', name: 'a', parameters: {}, strict: true },
+    { type: 'function', name: 'b', parameters: {} },
+  ] });
+  assert.deepEqual(responses.tools.map((t) => t.strict), [true, false], 'Responses: the top-level strict counts');
 });

@@ -95,9 +95,9 @@ live smoke 비용을 미리 제한하는 장치는 없다. report는 실제로 �
 5. L1 help, L2 generated schema, L3 official docs는 discovery authority다. 기본 runtime path로 승격하려면 L4 runtime probe가 필요하다.
 5-1. **L4는 "파서가 받았다"까지만 증명한다. "무언가를 바꿨다"는 증명하지 않는다.** 항목의 서술이
    *효과*를 주장하면 — 제어, 격리, 비활성화, 대체, 억제 — L4로는 부족하고 **L5(와이어 캡처 + 짝 대조)**가
-   필요하다. 실측 반례가 있다: `--ignore-user-config`는 help에 있고 parse probe가 받아들이지만
-   AGENTS.md 22,262자가 그대로 와이어에 도달했고, `-c default_tools_enabled=false`는 받아들여지지만
-   내장 도구 9개가 바이트 동일하게 남았다. 두 경우 모두 이 문서의 모든 권위가 "통과"라고 말한다.
+   필요하다. 실측 반례가 있다: `-c default_tools_enabled=false`는 받아들여지지만 내장 도구 9개가
+   바이트 동일하게 남고, `model_verbosity`를 `turn/start` 파라미터로 보내면 오류 없이 접수되지만
+   wire에는 나타나지 않는다. 두 경우 모두 수용 단계의 권위는 "통과"라고 말한다.
 5-2. **예외: Codex app-server 파라미터는 L2로 충분하다.** `validateDocumentedRequestContracts`가 문서화된
    파라미터 표를 생성 스키마와 대조하므로, `TurnStartParams`에 없는 파라미터는 `documentedButAbsent`로
    stale이 된다. 실제로 그 경로가 `model_verbosity`를 잡았다. CLI 플래그와 환경변수에는 이 대조가 없다.
@@ -108,7 +108,37 @@ live smoke 비용을 미리 제한하는 장치는 없다. report는 실제로 �
    ⑤ 두 본문을 diff하고 **관찰된 본문 건수를 아티팩트에 함께 기록한다**. 매 턴이 400으로 죽으므로 비용은 없다.
 5-4. **설정이 무엇을 한다는 주장은 켠 실행과 끈 실행이 실제로 달랐을 때만 관찰된 것이다.** 둘이 같으면
    그 항목은 효과 없음으로 기록하거나 미상으로 남긴다. 받아들여졌다는 사실을 효과로 승격하지 않는다.
+5-4-1. **짝 대조에서 필드를 신호로 읽기 전에 같은 arm을 반복해 그 필드가 고정인지 본다.** 2026-09-04
+   Claude 캡처에서 `tools` 배열 길이는 동일 arm 3회 반복에 117·166·164로 흔들렸다. 한 번씩만 재고
+   비교했다면 flag가 tool을 줄였다고 읽었을 것이다. 반복에서 고정된 필드만 판정에 쓴다.
+5-5. **runtime 버전이 바뀌면 이전 버전의 L5는 새 버전의 권위가 아니다.** 같은 sink 자가 검사와 짝 대조를
+   새 버전에서 다시 실행하거나, 해당 효과를 「미결 효과 주장」으로 내린다. 대조군에서 기대 신호 자체가
+   나타나지 않으면 양쪽이 같아도 "효과 없음"이 아니라 **inconclusive**다.
 6. Codex app-server method는 generated schema 기준으로 삭제/rename 여부를 먼저 확인한다.
+6-1. method는 각 request/notification union arm의 `properties.method.enum` discriminator에서만 수집한다.
+   `openai/form`처럼 slash를 포함한 nested mode/값 enum은 method가 아니며, 이 반례를 negative control로 유지한다.
+5-3-1. **sink 격리로 말할 수 있는 것은 "추론 요청 없음·과금 없음"까지다.** `ANTHROPIC_BASE_URL`을
+   돌려도 CLI는 자기 용무로 provider에 접속한다(2026-09-04 Claude 2.1.260: CONNECT 로그에
+   `api.anthropic.com` 9건). "외부 요청이 전혀 없다"고 쓰지 않는다.
+5-3-2. **서로 다른 두 실행의 본문은 바이트 동일해질 수 없다.** 실행마다 새로 생기는 필드가 있다
+   (Claude는 `metadata.user_id.session_id`). 짝 대조 판정은 **반복에서 흔들린 필드를 뺀 정규화
+   본문의 해시**로 하고, "바이트 동일"이라는 표현은 쓰지 않는다.
+5-3-3. **잡음 필드는 무시하기 전에 원인을 찾고, 가능하면 억제한다.** Claude의 `tools` 흔들림은 MCP
+   tool 발견 경합이고 `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`로 고정된다. 억제하면
+   그 필드를 판정에 다시 쓸 수 있어 대조가 훨씬 날카로워진다.
+5-3-4. **효과의 원인을 값이 아니라 "설정했다는 사실"로 오귀속하지 않도록, 같은 knob의 비-트리거
+   값 arm을 넣는다.** `MAX_THINKING_TOKENS=0`이 `context_management`를 없애는 것을 확인할 때
+   `=2048` arm이 대조군 그룹에 남아야 "환경변수 설정"이 아니라 "reasoning off"가 원인임이 갈린다.
+6-2. **surface가 있느냐를 묻는 프로브는 native binary(`Scan target`)로 돌린다.** 동작 권위를 wrapper로
+   두는 규칙은 wrapper가 통과층일 때의 것이고, PATH를 선점한 shim이 인자를 삼키면 살아 있는 hidden
+   subcommand가 root help로 떨어져 `absent`로 읽힌다. 2026-09-04에 cmux shim이 `attach`·`logs`·
+   `stop`·`kill` 넷을 그렇게 만들었고, 그대로 믿었으면 맞는 문서 네 줄을 지웠을 것이다. alias 명령은
+   native에서도 원래 이름의 usage를 내므로 이름 일치 판정만으로는 위양성이 남는다.
+6-2-1. **미등록 flag 프로브에 `--help`를 붙이지 않는다.** `--help`가 unknown-option 검증을
+   건너뛰어 없는 flag도 usage를 출력한다(값 검증은 건너뛰지 않는다). 음성 대조군이 `--help`와 함께
+   돌면 판별력이 0이 된다.
+6-3. **프로브가 멈출 수 있는 명령은 자동 프로브에서 제외한다.** `claude remote-control --help`는
+   2.1.260에서 반환하지 않는다. `--help`를 붙였으니 안전하다는 가정은 버전이 바뀌면 깨진다.
 7. Claude flag는 local help와 official docs-only 후보를 분리한다.
 8. service-neutral runtime 설계를 유지한다. 특정 서비스 도메인 용어를 기본 catalog 용어로 넣지 않는다.
 9. 위험한 실행은 원본 catalog에 성공한 기능처럼 기록하지 않는다. schema/help smoke와 live execution을 분리한다.
@@ -157,6 +187,8 @@ LLM에게 catalog 갱신을 맡길 때는 아래 입력을 함께 제공한다.
 - **[운영자]** 원본 catalog가 현재 runtime/version/source-level 사실만 담고 있다. 버전을 본문 산문에도
   적었다면 표와 함께 고친다 — 게이트는 `| Codex CLI |` / `| Claude Code |` 행만 읽으므로 산문에 남은
   옛 버전은 보이지 않는다.
+- **[운영자]** L5 관찰의 runtime 버전이 현재 표의 버전과 일치한다. 재측정하지 않은 효과는 L5로 유지하지
+  않고 「미결 효과 주장」에 있으며, 대조군의 기대 신호가 실제로 나타났는지도 함께 확인했다.
 - **[운영자]** 삭제/변경 이력은 artifact report에만 남아 있다.
 - **[기계, 단 범위 주의]** `pnpm pack:adapter`가 통과한다. 이것은 카탈로그가 tarball에 **존재하는지**만
   확인하며 내용은 검사하지 않는다. 내용이 틀린 카탈로그도 통과한다.

@@ -42,20 +42,32 @@ for (const [path, base, provider] of SURFACES) {
     if (provider === 'anthropic') {
       assert.equal(payload.type, 'error');
       assert.equal(payload.error.type, 'invalid_request_error');
+    } else if (path === '/v1/chat/completions') {
+      // Chat answers an absent model with neither `param` nor `code`
+      // (measured 2026-08-30); Responses names the parameter.
+      assert.equal(payload.error.type, 'invalid_request_error');
+      assert.equal(payload.error.param, null);
+      assert.equal(payload.error.message, 'you must provide a model parameter');
     } else {
       assert.equal(payload.error.type, 'invalid_request_error');
       assert.equal(payload.error.param, 'model');
     }
   });
 
-  test(`${path}: an empty model is a 400`, async () => {
+  // A blank model is refused everywhere; the SHAPE of the refusal is the
+  // surface's own. Chat and Anthropic read it as an absent model (400);
+  // Responses reads it as a model that does not exist and answers 404 with no
+  // `param`, exactly as it answers an unknown name (measured 2026-09-03).
+  const blankModelStatus = path === '/v1/responses' ? 404 : 400;
+
+  test(`${path}: an empty model is refused`, async () => {
     const { status } = await post(path, { ...base, model: '' });
-    assert.equal(status, 400);
+    assert.equal(status, blankModelStatus);
   });
 
-  test(`${path}: a whitespace-only model is a 400`, async () => {
+  test(`${path}: a whitespace-only model is refused`, async () => {
     const { status } = await post(path, { ...base, model: '   ' });
-    assert.equal(status, 400);
+    assert.equal(status, blankModelStatus);
   });
 
   test(`${path}: a non-string model is a 400`, async () => {

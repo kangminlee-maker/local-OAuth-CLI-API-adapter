@@ -1251,7 +1251,7 @@ test('OpenAI responses stream forwards live function argument deltas', async () 
       model: 'fake-local-model',
       stream: true,
       input: 'Use weather tool',
-      tools: [openAiWeatherTool()],
+      tools: [responsesWeatherTool()],
       tool_choice: 'required',
     });
     const text = await res.text();
@@ -1411,6 +1411,18 @@ function openAiWeatherTool() {
       description: 'Get current weather by city.',
       parameters: weatherSchema(),
     },
+  };
+}
+
+// The same tool in the Responses shape: flat, not nested under `function`.
+// Sending the Chat shape here is 400 `tools[0].name` on the direct API
+// (measured 2026-08-31) and now on this proxy too.
+function responsesWeatherTool() {
+  return {
+    type: 'function',
+    name: 'get_weather',
+    description: 'Get current weather by city.',
+    parameters: weatherSchema(),
   };
 }
 
@@ -1582,9 +1594,42 @@ test('auth-key gate: open proxy without a key allows unauthenticated requests', 
   }
 });
 
+test('/v1/responses: the opening stream events echo the request the completed event does', async () => {
+  // The opening frames are built from the same request as the completed one, so
+  // every echoed field has to agree across the three. Built from a request
+  // stripped of its `raw`, `response.created` reported the default tier while
+  // `response.completed` reported the resolved one — and the stream-shape tests
+  // only ever looked at event NAMES, so nothing failed. (Found by mutation.)
+  const res = await postJson('/v1/responses', {
+    model: 'fake-local-model', input: 'hi', stream: true, service_tier: 'priority', store: false,
+  });
+  assert.equal(res.status, 200);
+  const wire = await res.text();
+  const byEvent = new Map();
+  for (const frame of wire.split('\n\n')) {
+    const event = /^event: (.+)$/m.exec(frame);
+    const data = /^data: (.+)$/m.exec(frame);
+    if (event && data) byEvent.set(event[1].trim(), JSON.parse(data[1]));
+  }
+  const completed = byEvent.get('response.completed');
+  assert.ok(completed, `expected a response.completed frame: ${[...byEvent.keys()].join(',')}`);
+  assert.equal(completed.response.service_tier, 'priority');
+  assert.equal(completed.response.store, false);
+  for (const name of ['response.created', 'response.in_progress']) {
+    const opening = byEvent.get(name);
+    assert.ok(opening, `expected a ${name} frame: ${[...byEvent.keys()].join(',')}`);
+    assert.equal(opening.response.service_tier, completed.response.service_tier, `${name} must echo service_tier`);
+    assert.equal(opening.response.store, completed.response.store, `${name} must echo store`);
+  }
+});
+
 test('/v1/responses echoes sampling at the direct defaults, not the caller\'s value', async () => {
-  // The echo used to repeat `request.temperature` — a value no backend applied
-  // — and `top_p: 0.98` where the provider echoes `1`.
+  // The echo used to repeat `request.temperature` — a value no backend
+  // applied. The defaults themselves are measured, not assumed: a Responses
+  // request that sends no `top_p` (the only possibility, since this surface
+  // refuses the parameter) is echoed `top_p: 0.98`, not `1`. This file
+  // asserted `1` on the strength of a comment; the capture of 2026-08-30 says
+  // otherwise.
   const res = await postJson('/v1/responses', {
     model: 'fake-local-model',
     input: 'Say OK',
@@ -1593,7 +1638,7 @@ test('/v1/responses echoes sampling at the direct defaults, not the caller\'s va
   const body = await res.json();
   assert.equal(res.status, 200);
   assert.equal(body.temperature, 1);
-  assert.equal(body.top_p, 1);
+  assert.equal(body.top_p, 0.98);
 });
 
 test('/v1/chat/completions rejects a non-default temperature in the direct envelope', async () => {

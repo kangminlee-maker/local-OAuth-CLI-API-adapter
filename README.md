@@ -29,7 +29,7 @@ pnpm pack:adapter
 The command writes and verifies a standalone package:
 
 ```text
-artifacts/local-oauth-cli-api-adapter-0.2.1.tgz
+artifacts/local-oauth-cli-api-adapter-0.4.0.tgz
 ```
 
 Install that tarball from any other repository:
@@ -165,6 +165,34 @@ direct APIs. Which model executes is controlled by
 live image model names (`gpt-image-2` and its siblings; `dall-e-*` and the
 former `image-2` are refused as the direct API refuses them), and the Codex
 model that actually runs image turns is `codexProxy.imageModel`.
+
+## Tool Turns and Streaming
+
+A turn with `tools` on the `claude` and `app-server` runtimes is answered
+through a private JSON wrapper the runtime is asked to produce, and the proxy
+reads that wrapper once, whole. The stream releases nothing for such a turn —
+not even the surface's opening frames — until the runtime has finished and the
+completed answer has been read; what the client then receives is that one
+reading, and a refused turn is an HTTP 502 on the stream as on the buffered
+body. Plain text turns and the `codex-backend` transport stream live.
+
+The schema the client supplied is enforced when the turn completes, where the
+client took that promise: under `strict: true` on a tool or a `json_schema`
+format, or on any Messages structured output, arguments or an answer outside
+the schema are refused with 502 rather than published as a near miss; what is
+not JSON at all is refused regardless. Without `strict` the direct OpenAI APIs
+are best-effort themselves, and so is the proxy. The one exception is a turn
+the runtime reports as cut off by its output limit, which is delivered as the
+fragment it is with the terminal fields saying so — `finish_reason: "length"`,
+`status: "incomplete"`, `stop_reason: "max_tokens"` — the way the direct APIs
+answer (conformance matrix §7, rows 8 and 10).
+
+Measured cost: none on `claude`, whose wrapper already arrived whole in
+`structured_output`; about 0.3 s later call announcement per turn on
+`app-server`. Why the turn waits: an incremental reader used to release bytes
+before the wrapper was complete, and on malformed output it disagreed with the
+completed reading — a streaming client could execute a call the buffered body
+denied (conformance matrix §7).
 
 ## Important Differences From Full Provider APIs
 
@@ -351,6 +379,12 @@ prints the guide before exiting.
 For independence, avoid `file:../path-to-adapter-source` installs. Use the
 verified tarball, a release asset containing that tarball, or a registry package
 built from the same artifact flow.
+
+The package declares two runtime dependencies, allowlisted by name in the
+packaging script: `sharp` (prebuilt libvips, no network) realizes Images API
+options on the bytes, and `ajv` (pure JavaScript, no network) validates a
+forced tool's arguments and a `json_schema` answer against the schema the
+client supplied. Neither reaches a provider.
 
 The proxy also strips direct provider credential/routing environment variables
 from spawned local CLI backends, including OpenAI/Anthropic API keys and base

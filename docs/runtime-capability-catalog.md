@@ -10,10 +10,10 @@ local OAuth CLI를 특정 서비스의 LLM chat UI runtime으로 붙일 때, Cod
 
 | Runtime | Local version | Command on PATH | Scan target | Primary hot path |
 | --- | --- | --- | --- | --- |
-| Codex CLI | `codex-cli 0.149.1` | `/opt/homebrew/bin/codex` | 동일 | `codex app-server --listen stdio://` |
-| Claude Code | `2.1.251` | `/Users/kangmin/.superset/bin/claude` (wrapper) | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
+| Codex CLI | `codex-cli 0.153.0` | `/opt/homebrew/bin/codex` | 동일 | `codex app-server --listen stdio://` |
+| Claude Code | `2.1.260` | cmux CLI shim (세션마다 경로가 바뀌는 `$TMPDIR/cmux-cli-shims/<uuid>/claude`) | `/Users/kangmin/.local/bin/claude` | `claude -p --input-format stream-json --output-format stream-json` |
 
-PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있다. wrapper가 실제로 실행되는 명령이므로 version·help·schema·parse probe 같은 동작 권위는 wrapper 기준으로 수집한다. 다만 wrapper script에는 바이너리 문자열이 없으므로 string scan만 native 바이너리를 대상으로 하며, 그 후보는 wrapper와 `--version`이 일치할 때만 채택한다. 일치하는 후보가 없으면 scan은 대상 없음으로 보고한다. report의 `Command on PATH`와 `Scan target` 열이 이 둘을 구분한다.
+PATH 주의: 가리는 층이 둘이다. `~/.superset/bin/`의 wrapper script가 두 CLI를 가리고, 그보다 앞서 **cmux가 `$TMPDIR/cmux-cli-shims/<uuid>/`에 shim을 깔아 `claude`를 선점한다**(2026-09-04 확인: 깨끗한 환경의 `command -v claude`가 superset wrapper가 아니라 이 shim을 가리켰다). shim 경로는 세션마다 달라지므로 고정 경로로 적을 수 없다. wrapper가 실제로 실행되는 명령이므로 version·help·schema·parse probe 같은 동작 권위는 wrapper 기준으로 수집한다. 다만 wrapper script에는 바이너리 문자열이 없으므로 string scan만 native 바이너리를 대상으로 하며, 그 후보는 wrapper와 `--version`이 일치할 때만 채택한다. 일치하는 후보가 없으면 scan은 대상 없음으로 보고한다. report의 `Command on PATH`와 `Scan target` 열이 이 둘을 구분한다.
 
 ## 신뢰 레벨
 
@@ -30,13 +30,13 @@ PATH 주의: `~/.superset/bin/`의 wrapper script가 두 CLI를 가릴 수 있�
 
 L0과 L4의 관계에 주의한다. binary에 문자열이 남아 있다는 사실은 그 token이 compile되어 있다는 뜻일 뿐, parser가 그 flag를 받는다는 뜻이 아니다. 실제로 현재 Claude Code binary에는 CLI가 `unknown option`으로 거부하는 flag의 문자열도 남아 있다. flag 수용 여부의 권위는 항상 parse probe(L4)다.
 
-**L4와 L5의 관계에는 더 주의한다.** 항목의 서술이 효과를 주장하면 — 제어, 격리, 비활성화, 대체, 억제 — L4는 근거가 되지 못한다. 이 버전에서 확인된 반례가 셋이다. `--ignore-user-config`는 help에 있고 parse probe가 받아들이지만 사용자 `AGENTS.md`가 그대로 wire에 도달했고, `-c default_tools_enabled=false`는 받아들여지지만 내장 tool 9개가 바이트 동일하게 남았으며, `model_verbosity`를 `turn/start` 파라미터로 보내면 오류 없이 접수되지만 wire에는 나타나지 않는다. 세 경우 모두 수용 단계의 모든 권위가 "통과"라고 답한다.
+**L4와 L5의 관계에는 더 주의한다.** 항목의 서술이 효과를 주장하면 — 제어, 격리, 비활성화, 대체, 억제 — L4는 근거가 되지 못한다. 이 버전에서 확인된 반례가 둘이다. `-c default_tools_enabled=false`는 받아들여지지만 내장 tool 9개가 바이트 동일하게 남았으며, `model_verbosity`를 `turn/start` 파라미터로 보내면 오류 없이 접수되지만 wire에는 나타나지 않는다. 두 경우 모두 수용 단계의 모든 권위가 "통과"라고 답한다.
 
 절대 없음을 주장할 때는 도구가 있는 것을 실제로 찾아낸다는 것을 먼저 보인다(negative control). 검증하지 않은 도구가 찾지 못했다는 사실은 발견이 아니다.
 
 예외 하나. Codex app-server 요청 파라미터는 L2로 충분하다. 생성 schema와 문서화된 파라미터 표를 수집기가 직접 대조하므로 미선언 파라미터가 stale로 드러난다. CLI flag와 환경변수에는 이 대조가 없다.
 
-이 문서에서 L5로 표시된 관찰의 출처는 모두 동일하다. **2026-08-28, `codex-cli 0.149.1` / Claude Code `2.1.251`**, 요청 본문을 기록하고 400을 반환하는 로컬 HTTP sink로 수집했다. sink는 CLI 실행 전에 `curl`로 자가 검사해 "본문 0건"이 계측 실패와 구분되도록 했다.
+Codex L5 관찰은 **2026-09-04, `codex-cli 0.153.0`**, Claude L5 관찰은 **2026-08-28, Claude Code `2.1.251`** 기준이다. Claude는 그 사이 `2.1.260`으로 올라갔으므로, 갱신 방식 5-5에 따라 **이 문서의 Claude L5 효과 주장은 설치된 런타임의 권위가 아니다** — 재측정 전까지 미결로 읽는다. 둘 다 요청 본문을 기록하고 400을 반환하는 로컬 HTTP sink로 수집했으며, CLI 실행 전에 sink를 자가 검사해 "본문 0건"이 계측 실패와 구분되도록 했다.
 
 ## 갱신 방식
 
@@ -145,7 +145,8 @@ Useful official references:
 
 - Claude Code CLI reference: https://code.claude.com/docs/en/cli-usage
 - Claude Code MCP/Agent SDK docs: https://code.claude.com/docs/en/agent-sdk/mcp
-- OpenAI Codex model capability reference: https://developers.openai.com/api/docs/models/gpt-5.2-codex
+- OpenAI Codex app-server reference: https://learn.chatgpt.com/docs/app-server
+- OpenAI GPT-5.6 Sol model reference: https://developers.openai.com/api/docs/models/gpt-5.6-sol
 
 ## Codex capability list
 
@@ -183,7 +184,7 @@ hot path에서 쓰는 항목:
 | `codex exec --json` | L1 | one-shot fallback, smoke |
 | `codex exec --output-schema <file>` | L1/L5 | strict final output fallback. `text.format`이 `strict: true`로 wire에 실리는 것을 확인했다 |
 | `codex exec --ephemeral` / `codex exec --ignore-rules` | L1/L4 수용 | 등록되어 있고 parser가 받는다. 세션 파일과 execpolicy에 대한 **효과는 wire로 확인하지 않았다** — 미결 항목 참조 |
-| `codex exec --ignore-user-config` | L1/L4 수용 + L5 반증 | 등록되어 있고 받아들여지지만 instruction을 격리하지 **않는다**. 이 flag를 켠 채 캡처한 본문에도 사용자 `AGENTS.md`가 user 메시지로 도달했고, `CODEX_HOME`을 빈 디렉터리로 돌렸을 때만 사라졌다. 억제 대상은 `config.toml`뿐이다 |
+| `codex exec --ignore-user-config` | L1/L4 수용 + L5 config 효과 | 등록되어 있고 받아들인다. 0.153.0 대조에서 `config.toml`의 `model_verbosity="high"`는 flag를 켜면 기본 `low`로 돌아가 config 억제는 확인했다. 그러나 통제한 두 exec arm 모두 `CODEX_HOME/AGENTS.md` marker를 싣지 않아 instruction 효과는 미결이며, 이 flag를 instruction 격리 수단으로 쓰지 않는다 |
 | `codex debug prompt-input` / `debug models` / `features list` | L1 | 진단·발견 |
 
 CLI option 값 도메인:
@@ -238,34 +239,34 @@ Risk: hidden 항목은 `--help` diff 없이 rename/삭제될 수 있다. Codex �
 
 ### App-server protocol surface
 
-생성 schema 기준 현재 method 수는 238개이며, `--experimental` 생성물은 401개 파일이다.
+생성 schema 기준 현재 method 수는 248개이며, `--experimental` 생성물은 416개 파일이다.
 
 | Category | Count | 비고 |
 | --- | ---: | --- |
-| ClientRequest | 150 | client → server 요청 |
+| ClientRequest | 155 | client → server 요청 |
 | ClientNotification | 1 | `initialized` |
-| ServerRequest | 12 | server → client 요청 (승인, tool call, form 등) |
-| ServerNotification | 75 | server → client 알림 |
+| ServerRequest | 11 | server → client 요청 (승인, tool call, form 등) |
+| ServerNotification | 81 | server → client 알림 |
 
-전체 목록은 `artifacts/runtime-capability-catalog/latest.json`의 `codex.schema.methodEnums`에 있다. 주요 그룹:
+전체 목록은 `pnpm catalog:runtime`이 로컬 gitignored 경로 `artifacts/runtime-capability-catalog/latest.json`의 `codex.schema.methodEnums`에 생성한다. 이 report artifact는 package에 포함되지 않는다. 주요 그룹:
 
 | Group | Methods |
 | --- | --- |
 | Handshake/diagnostics | `initialize`, `server/diagnostics` |
-| Session/thread | `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unarchive`, `thread/delete`, `thread/unsubscribe`, `thread/read`, `thread/list`, `thread/search`, `thread/searchOccurrences`, `thread/loaded/list` |
+| Session/thread | `thread/start`, `thread/resume`, `thread/fork`, `thread/archive`, `thread/unarchive`, `thread/delete`, `thread/unsubscribe`, `thread/read`, `thread/list`, `thread/search`, `thread/searchOccurrences`, `thread/loaded/list`, `thread/shellCommand`, `thread/timeline/list` |
 | Thread section | `threadSection/create`, `threadSection/list`, `threadSection/update`, `threadSection/delete`, `thread/section/move` |
 | Turn control | `turn/start`, `turn/interrupt`, `turn/steer`, `thread/turns/list`, `thread/items/list`, `thread/rollback`, `thread/revert` |
 | Turn queue | `thread/queue/add`, `thread/queue/start`, `thread/queue/list`, `thread/queue/update`, `thread/queue/reorder`, `thread/queue/delete` |
 | Context and settings | `thread/settings/update`, `thread/metadata/update`, `thread/name/set`, `thread/memoryMode/set`, `thread/compact/start`, `thread/inject_items`, `thread/goal/set`, `thread/goal/get`, `thread/goal/clear` |
 | Filesystem | `fs/readFile`, `fs/writeFile`, `fs/readDirectory`, `fs/createDirectory`, `fs/copy`, `fs/remove`, `fs/getMetadata`, `fs/watch`, `fs/unwatch` |
 | Process/terminal | `process/spawn`, `process/writeStdin`, `process/resizePty`, `process/kill`, `command/exec`, `command/exec/write`, `command/exec/resize`, `command/exec/terminate`, `thread/backgroundTerminals/list`, `thread/backgroundTerminals/terminate`, `thread/backgroundTerminals/clean` |
-| Tools/MCP | `mcpServer/tool/call`, `mcpServer/resource/read`, `mcpServer/oauth/login`, `mcpServerStatus/list`, `skills/list`, `skills/config/write`, `skills/extraRoots/set`, `config/mcpServer/reload`, `hooks/list` |
-| Plugin/app/marketplace | `plugin/list`, `plugin/read`, `plugin/search`, `plugin/install`, `plugin/uninstall`, `app/list`, `app/read`, `app/installed`, `marketplace/add`, `marketplace/remove`, `marketplace/upgrade` |
+| Tools/MCP | `mcpServer/tool/call`, `mcpServer/resource/read`, `mcpServer/oauth/login`, `mcpServer/elicitation/request` ("openai/form"은 이 요청의 mode 값), `mcpServer/event/stream/start`, `mcpServer/event/stream/stop`, `mcpServerStatus/list`, `skills/list`, `skills/config/write`, `skills/extraRoots/set`, `config/mcpServer/reload`, `hooks/list` |
+| Plugin/app/marketplace | `plugin/list`, `plugin/read`, `plugin/search`, `plugin/install`, `plugin/uninstall`, `plugin/installed`, `plugin/reconcile`, `plugin/skill/read`, `plugin/share/list`, `app/list`, `app/read`, `app/installed`, `marketplace/add`, `marketplace/remove`, `marketplace/upgrade` |
 | Project | `project/create`, `project/list`, `project/read`, `project/update`, `project/delete`, `project/import`, `project/move` |
 | Memory/review/search | `memory/reset`, `review/start`, `fuzzyFileSearch`, `fuzzyFileSearch/sessionStart`, `fuzzyFileSearch/sessionUpdate`, `fuzzyFileSearch/sessionStop` |
-| Server requests | `item/tool/call`, `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `applyPatchApproval`, `execCommandApproval`, `mcpServer/elicitation/request`, `attestation/generate`, `account/chatgptAuthTokens/refresh`, `currentTime/read`, `openai/form` |
+| Server requests | `item/tool/call`, `item/tool/requestUserInput`, `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval`, `applyPatchApproval`, `execCommandApproval`, `mcpServer/elicitation/request`, `attestation/generate`, `account/chatgptAuthTokens/refresh`, `currentTime/read` |
 | Models/features | `model/list`, `modelProvider/capabilities/read`, `experimentalFeature/list`, `experimentalFeature/enablement/set`, `collaborationMode/list`, `permissionProfile/list` |
-| Account/config | `account/read`, `account/usage/read`, `account/rateLimits/read`, `account/login/start`, `account/login/cancel`, `account/logout`, `config/read`, `config/value/write`, `config/batchWrite`, `configRequirements/read` |
+| Account/config | `account/read`, `account/usage/read`, `account/rateLimits/read`, `account/rateLimitResetCredit/consume`, `account/workspaceMessages/read`, `account/bedrock/discover`, `account/bedrock/setup`, `account/login/start`, `account/login/cancel`, `account/logout`, `config/read`, `config/value/write`, `config/batchWrite`, `configRequirements/read` |
 | Environments | `environment/add`, `environment/info`, `environment/status` |
 | Realtime | `thread/realtime/start`, `thread/realtime/appendText`, `thread/realtime/appendAudio`, `thread/realtime/appendSpeech`, `thread/realtime/stop`, `thread/realtime/listVoices` |
 
@@ -291,7 +292,7 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 | Request | Required | Optional |
 | --- | --- | --- |
 | `thread/start` | 없음 | `allowProviderModelFallback`, `approvalPolicy`, `approvalsReviewer`, `baseInstructions`, `config`, `cwd`, `developerInstructions`, `dynamicTools`, `environments`, `ephemeral`, `experimentalRawEvents`, `historyMode`, `mockExperimentalField`, `model`, `modelProvider`, `multiAgentMode`, `permissions`, `personality`, `projectId`, `runtimeWorkspaceRoots`, `sandbox`, `selectedCapabilityRoots`, `serviceName`, `serviceTier`, `sessionStartSource`, `threadSource` |
-| `turn/start` | `input`, `threadId` | `additionalContext`, `approvalPolicy`, `approvalsReviewer`, `clientUserMessageId`, `collaborationMode`, `cwd`, `effort`, `environments`, `model`, `multiAgentMode`, `outputSchema`, `permissions`, `personality`, `responsesapiClientMetadata`, `runtimeWorkspaceRoots`, `sandboxPolicy`, `serviceTier`, `summary` |
+| `turn/start` | `input`, `threadId` | `additionalContext`, `approvalPolicy`, `approvalsReviewer`, `clientUserMessageId`, `collaborationMode`, `cwd`, `cyberAccessProgram`, `effort`, `environments`, `model`, `multiAgentMode`, `outputSchema`, `permissions`, `personality`, `responsesapiClientMetadata`, `runtimeWorkspaceRoots`, `sandboxPolicy`, `serviceTier`, `serviceTierForTurn`, `summary`, `toolOutput`, `turnTrigger` |
 
 값 도메인:
 
@@ -308,18 +309,18 @@ adapter가 쓰는 두 요청의 선언된 파라미터는 아래와 같다(L2 sc
 
 ### 환경 격리와 wire 기본값
 
-adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 표의 "미설정 기본값"은 캡처한 요청 본문에서 읽은 값이며, help나 schema는 필드의 존재만 말해 주므로 이 표의 권위가 될 수 없다. 관찰 조건은 위 신뢰 레벨 절에 적은 것과 같다(2026-08-28, `codex-cli 0.149.1`, 로컬 sink).
+adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 표의 "미설정 기본값"은 캡처한 요청 본문에서 읽은 값이며, help나 schema는 필드의 존재만 말해 주므로 이 표의 권위가 될 수 없다. 관찰 조건은 위 신뢰 레벨 절에 적은 것과 같다(2026-09-04, `codex-cli 0.153.0`, 로컬 sink).
 
 권위 열의 표기: **L5**는 설정을 켠 본문과 끈 본문이 실제로 달랐다는 뜻이고, **L5 양방향**은 반대 값을 주었을 때 관찰값이 따라 움직이는 것까지 확인했다는 뜻이다.
 
 | Knob | 미설정 기본값 | 효과 | 권위 |
 | --- | --- | --- | --- |
-| `CODEX_HOME` 리디렉션 | `~/.codex` 로드: `AGENTS.md`, 사용자 MCP 서버, `dangerFullAccess` sandbox | 빈 디렉터리를 가리키면 `instructionSources`가 비고, 내장 `codex_apps` 외 MCP 서버가 사라지며, sandbox가 `readOnly` + network 차단으로 내려간다. **instruction 격리의 실제 수단** | L5 |
+| `CODEX_HOME` 리디렉션 | 선택된 home의 `AGENTS.md`를 로드 | 통제 marker가 있는 home과 빈 home을 대조했을 때 marker가 전자에만 실렸다. **app-server instruction 격리의 실제 수단** | L5 양방향 |
 | `baseInstructions` (`thread/start`) | Codex persona developer 블록 + skills 블록 | persona와 skills 블록을 함께 대체한다. 대조 실행에서는 두 블록이 모두 본문에 있었다. config 등가물 `-c instructions`는 persona만 대체하고 skills 블록은 남기므로, app-server 파라미터 쪽이 더 강하다 | L5 |
 | `developerInstructions` (`thread/start`) | 없음 | base 뒤에 developer 메시지를 하나 더 추가한다 | L5 |
 | `-c model_verbosity` | `text.verbosity: "low"` — 지정하지 않아도 전송된다 | CLI가 요청하지 않은 축약을 상류에 요구한다. `high`를 주면 캡처값도 `high`로 움직인다 | L5 양방향 |
 | `-c model_reasoning_effort` | `reasoning.effort: "low"` — reasoning ON | `=none`이 reasoning off 스위치다 | L5 |
-| 내장 tool | 항상 9개: `functions`(`exec`, `wait`, `request_user_input`) + `collaboration` 6개 | **끄는 수단이 없다.** 아래 네 가지 시도가 모두 tool 목록을 바이트 단위로 동일하게 남겼다 | L5 negative |
+| 내장 tool | `input[0].tools`의 두 namespace 아래 항상 9개: `functions`(`exec`, `wait`, `request_user_input`) + `collaboration` 6개 | **끄는 수단이 없다.** 아래 네 가지 시도가 모두 이 namespace/tool 목록을 바이트 단위로 동일하게 남겼다 | L5 negative |
 | output token cap | 없음 | 상류에서 강제할 방법이 없으므로 proxy가 하류에서 처리해야 한다 | L2 + L5 negative |
 | `tool_choice` / `parallel_tool_calls` / `store` | `"auto"` / `false` / `false` | 호출자가 지정하지 않아도 무조건 실린다 | L5 |
 
@@ -327,7 +328,7 @@ adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전�
 
 내장 tool 제거 시도 네 가지는 `-c default_tools_enabled=false`, `codex --disable multi_agent`, `codex --disable code_mode_host`, 그리고 두 flag의 조합이었다. 네 경우 모두 9개가 그대로 남았다. 이 잔여는 artifact가 아니라 응답 성향의 변화이므로 출력에서 탐지하거나 상쇄할 수 없다. 받아들이고 문서화한다.
 
-`--ignore-user-config`는 이 격리를 대신하지 못한다. 이 flag를 켠 `codex exec` capture에서도 사용자 `AGENTS.md`가 user 메시지로 wire에 도달했다. 억제되는 것은 `config.toml`뿐이다. help에도 있고 parse probe도 통과하므로 수용 단계의 권위만 보면 통과로 읽힌다는 점이 이 항목의 요점이다.
+`--ignore-user-config`는 이 격리를 대신하지 못한다. 0.153.0에서 `config.toml` 억제는 L5로 확인했지만, 통제한 exec 대조군과 flag arm 모두 `CODEX_HOME/AGENTS.md` marker를 싣지 않아 instruction 효과는 관찰하지 못했다. instruction 격리는 app-server hot path에서 양방향 대조가 성립한 `CODEX_HOME` 리디렉션을 사용한다.
 
 ### Codex design implications
 
@@ -346,7 +347,7 @@ adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전�
 
 ### CLI command surface
 
-`--help` 재귀 walk 기준으로 50개 명령과 218개 option이 열거된다. root subcommand는 아래 13개이며, 여기에 뒤의 hidden root command가 더해진다.
+`--help` 재귀 walk 기준으로 50개 명령과 221개 option이 열거된다(2026-09-04, `2.1.260`, `pnpm catalog:runtime`). root subcommand는 아래 13개이며, 여기에 뒤의 hidden root command가 더해진다.
 
 | Root subcommand | 설명 | Adapter 관련성 |
 | --- | --- | --- |
@@ -366,7 +367,7 @@ adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전�
 
 ### CLI flags from local help
 
-root command는 63개 option 항목(장문 flag 66개)을 광고한다. 아래 그룹별 요약의 "Chat runtime use" 열은 help 서술과 의도된 용도이며, 그 자체로는 L1이다. 각 flag가 실제로 무엇을 바꾸는지는 뒤의 wire 기본값 표에서 L5로 표시한 항목만 확인된 것이다.
+root command가 광고하는 장문 flag는 72개다(수집기 `localHelpFlagCount`, 2026-09-04). 이 수는 수집기의 help 파서가 센 값이며, 직접 grep으로 세면 camelCase flag(`--allowedTools` 등)를 놓쳐 더 작게 나온다. 아래 그룹별 요약의 "Chat runtime use" 열은 help 서술과 의도된 용도이며, 그 자체로는 L1이다. 각 flag가 실제로 무엇을 바꾸는지는 뒤의 wire 기본값 표에서 L5로 표시한 항목만 확인된 것이다.
 
 | Group | Flags | Chat runtime use |
 | --- | --- | --- |
@@ -397,19 +398,29 @@ root command는 63개 option 항목(장문 flag 66개)을 광고한다. 아래 �
 | `--max-budget-usd` | 0보다 큰 수 | L4 probe |
 | `--session-id` | 유효한 UUID | L4 probe |
 
+2026-09-04 수집에서 카탈로그에 없던 help flag 6개가 나왔다. root help에 있는 것은 `--permission-prompts`, `--system-prompt-snapshot`, `--version` 셋이고, `--all`·`--cwd`·`--json`은 root가 아니라 하위 명령의 option이다. 여섯 모두 등록 여부만 확인했고 **효과는 관찰하지 않았다**.
+
 `--model`은 고정 enum이 아니므로 위 표에 넣지 않는다. help는 최신 모델 alias(`fable`, `opus`, `sonnet`)와 full name(예: `claude-fable-5`)을 받는다고 안내하며, 미지원 값은 세션 시작 단계에서 거부되어 모델 호출에 도달하지 않는다(L4 probe). 즉 Claude 쪽 모델 유효성 판정은 CLI에 위임할 수 있고, Codex 쪽은 위임할 수 없다.
 
 ### Adapter-critical flags hidden from `--help`
 
 `hideHelp()`로 등록되어 `claude --help`에 나오지 않지만 proxy의 Anthropic parity 경로(`output_config`/`thinking`)가 의존하는 flag다. 권위는 L4 parse probe이며, 잘못된 값을 주면 CLI가 허용값과 함께 거부한다. 아래 표의 "Adapter use"는 **의도한 대응 관계이지 관찰된 효과가 아니다.** 세 flag 모두 값 도메인까지는 확인했고, 그 값이 wire를 어떻게 바꾸는지는 확인하지 않았다.
 
-| Flag | Accepts | Adapter use (의도) | 효과 |
+| Flag | Accepts | Adapter use | 효과 (2026-09-04, `2.1.260`, 로컬 sink) |
 | --- | --- | --- | --- |
-| `--thinking` | `enabled`, `adaptive`, `disabled` | Anthropic `thinking.type` | 미결 |
-| `--thinking-display` | `summarized`, `omitted` | Anthropic `thinking.display` | 미결 |
-| `--task-budget` | 양의 정수 토큰 | Anthropic `output_config.task_budget.total` | 미결 |
+| `--thinking` | `enabled`, `adaptive`, `disabled` | Anthropic `thinking.type` | **L5 양방향.** `disabled`는 `thinking:{"type":"disabled"}`를 싣고 `display` 키 자체가 없다. `enabled`와 `adaptive`는 서로도 대조군과도 `metadata.session_id`와 `tools`를 뺀 **모든 필드가 같다** — 값 도메인은 셋이지만 wire 상태는 둘이다 |
+| `--thinking-display` | `summarized`, `omitted` | Anthropic `thinking.display` | **L5 양방향.** `thinking.display`가 값에 따라 움직인다. 미설정 기본값은 `omitted` |
+| `--task-budget` | 양의 정수 토큰 | Anthropic `output_config.task_budget.total` | **L5.** `output_config.task_budget`이 `{"type":"tokens","total":<값>}`으로 실린다. 대조군에 없는 것은 **`task_budget` 키뿐이고 `output_config` 자체는 `{"effort":…}`로 항상 실린다** — `output_config` 유무로 판정하면 오독한다 |
 
-`--thinking`은 특히 먼저 확인할 값이 있다. reasoning을 실제로 끄는 것으로 관찰된 수단은 `MAX_THINKING_TOKENS=0` 하나였고, 그 캡처에서는 flag로 끄는 경로를 시도하지 않았다. 따라서 `--thinking disabled`가 같은 일을 하는지, 수용만 되고 마는지는 아직 갈리지 않았다. parity 경로를 이 flag에 의존시키기 전에 켠·끈 두 실행을 캡처해 비교한다.
+`--thinking disabled`는 `MAX_THINKING_TOKENS=0`과 **같은 본문을 만든다**: 둘 다 `thinking:{"type":"disabled"}`를 싣고, 둘 다 `context_management`를 **함께 없앤다**. 0.149.1 시점의 "reasoning을 끄는 수단은 환경변수뿐이고 대응하는 flag는 없다"는 서술은 2.1.260에서 더 이상 맞지 않는다 — flag가 있고, 환경변수와 등가다.
+
+**잡음 필드는 둘이고 원인이 밝혀져 있다.** 같은 arm을 반복해도 `tools`와 `metadata`만 흔들린다
+(2026-09-04 독립 재현: 39 arm). `tools`는 MCP tool 발견이 요청과 경합하는 것이고 — 흔들리는 이름
+28개 중 27개가 `mcp__*` — `--strict-mcp-config --mcp-config '{"mcpServers":{}}'`로 **고정할 수
+있다**(12회 실행 내내 25개). `metadata`는 `user_id.session_id`가 실행마다 새로 생기는 것이라
+**서로 다른 두 실행의 본문은 결코 바이트 동일해질 수 없다.** 따라서 짝 대조 판정은 이 둘을 뺀
+정규화 본문으로 하고, "바이트 동일"이라는 표현은 이 실험이 만들 수 있는 결과가 아니다.
+`thinking`·`context_management`·`output_config`는 반복에서 고정이므로 판정에 쓸 수 있다.
 
 Risk: hidden이므로 `--help` diff 없이 rename/삭제될 수 있다. Claude Code 버전을 올릴 때마다 `pnpm catalog:runtime`의 parse probe로 세 flag의 등록을 확인한 뒤 parity 경로를 배포한다.
 
@@ -425,7 +436,16 @@ Hidden subcommands (L4: 각자 자기 usage를 출력하며, 없는 이름은 ma
 | `claude logs <id>` | 백그라운드 세션 최근 출력 | 진단 후보 |
 | `claude stop <id>` (alias `kill`) | 백그라운드 세션 종료 | hot path 없음 |
 
-주의: `claude remote-control`을 인자 없이 실행하면 즉시 claude.ai로 원격 제어 세션을 연다. 조사 목적이면 반드시 `--help`만 붙인다.
+주의: `claude remote-control`을 인자 없이 실행하면 즉시 claude.ai로 원격 제어 세션을 연다.
+**2.1.260에서는 `--help`를 붙여도 안전하지 않다** — `claude remote-control --help`가 5분 동안 반환하지
+않아 프로브를 타임아웃으로 죽여야 했다(2026-09-04). 이 명령은 자동 프로브 대상에서 제외한다.
+
+**위 다섯 명령의 존재는 native binary로만 확인된다.** PATH의 cmux shim으로 같은 프로브를 돌리면
+`attach`·`logs`·`stop`·`kill` 넷 모두 자기 usage 대신 root help(`Usage: claude [options] [command]
+[prompt]`)를 출력해 "없는 명령"으로 읽힌다. 실제로 `pnpm catalog:runtime`이 이 넷을 `absent`로
+보고하는데, 그대로 믿으면 **맞는 문서 네 줄을 지우게 된다**. surface 존재 여부를 묻는 프로브는
+`Scan target` 열의 native binary로 돌린다. (`kill`은 별도의 이유도 있다 — alias여서 native에서도
+`Usage: claude stop <id>`를 출력하므로 이름 일치로 판정하면 위양성이 된다.)
 
 parse probe로 등록이 확인된 그 밖의 hidden flag:
 
@@ -451,7 +471,7 @@ binary string scan은 위 목록보다 많은 option 등록 문자열을 뱉지�
 
 ### 환경 격리와 wire 기본값
 
-adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 관찰 조건은 위 신뢰 레벨 절과 같다(2026-08-28, Claude Code `2.1.251`, 로컬 sink). 기준선이 둘이라는 점에 주의한다. host-default는 설정 파일과 CLAUDE.md가 살아 있는 상태이고 isolated는 `--bare`에 빈 `--setting-sources`를 준 상태인데, 아무 flag도 주지 않은 adapter가 물려받는 쪽은 host-default다.
+adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전송하는 값이다. 관찰 조건은 위 신뢰 레벨 절과 같다. 이 표의 행은 출처가 둘이다: `--thinking` 계열 세 행과 `MAX_THINKING_TOKENS`·`context_management` 행은 **2026-09-04, Claude Code `2.1.260`** 재측정이고, 나머지는 **2026-08-28, `2.1.251`** 관찰이라 규칙 5-5에 따라 설치 런타임의 권위가 아니다. 기준선이 둘이라는 점에 주의한다. host-default는 설정 파일과 CLAUDE.md가 살아 있는 상태이고 isolated는 `--bare`에 빈 `--setting-sources`를 준 상태인데, 아무 flag도 주지 않은 adapter가 물려받는 쪽은 host-default다.
 
 | Knob | 미설정 기본값 | 효과 | 권위 |
 | --- | --- | --- | --- |
@@ -459,12 +479,15 @@ adapter가 아무것도 지정하지 않았을 때 CLI가 상류로 실제 전�
 | `--tools ""` | host-default에서는 내장 tool + host MCP tool 다수, `--bare`에서는 `Bash`·`Edit`·`Read` 3개 | `""`를 주면 `tools`가 빈 배열이 된다. 호출할 tool이 없으면 agentic loop가 한 턴으로 접히므로 사실상 completion 모드 스위치다 | L5 |
 | `--setting-sources ""` | **사용자 설정이 로드된다.** host의 effort 설정이 `output_config.effort`로 실려 나간다 | 빈 값이면 어떤 source도 읽지 않는다. 같은 프롬프트에서 host 설정값과 격리 기본값이 서로 다르게 캡처되어 확인했다. 격리하면 `--output-format stream-json`이 `--verbose`를 추가로 요구하는 결합이 드러난다 | L5 양방향 |
 | `--effort` | isolated 기준 `high`, 그 외에는 host 설정값 | `output_config.effort`로 실린다. `off`나 `none`에 해당하는 수준은 없다 | L5 |
-| `MAX_THINKING_TOKENS` | `thinking`이 `adaptive`로 — **reasoning ON** | `=0`이면 `thinking`이 `disabled`로 바뀐다. 확인된 유일한 reasoning off 스위치이며 대응하는 flag는 없다 | L5 |
-| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `max_tokens: 64000` | 지정한 값이 그대로 `max_tokens`로 실린다. 대응하는 flag가 없어 이 변수만이 수단이다 | L5 양방향 |
+| `MAX_THINKING_TOKENS` | `thinking`이 `{"type":"adaptive","display":"omitted"}`로 — **reasoning ON** | `=0`이면 `thinking`이 `{"type":"disabled"}`로 바뀐다. **`--thinking disabled`가 등가다**(2026-09-04 재측정): 두 arm의 `thinking`과 `context_management`가 모두 같다. 0.149.1 시점의 "대응하는 flag 없음"은 더 이상 맞지 않는다 | L5 양방향 |
+| `CLAUDE_CODE_MAX_OUTPUT_TOKENS` | `max_tokens: 64000` | 지정한 값이 그대로 `max_tokens`로 실린다. 대응하는 flag가 없어 이 변수만이 수단이다. **다만 그 상한에 걸린 턴은 잘리지 않고 오류가 된다** — 2026-09-02 재측정에서 16·32 모두 `is_error: true`, 결과 텍스트가 `API Error: Claude's response exceeded the N output token maximum`으로 바뀌고 **부분 출력은 버려졌다**. 직접 API는 부분 텍스트를 `stop_reason:"max_tokens"`와 함께 돌려주므로, 이 변수는 상한을 **API와 같은 방식으로** 구현하는 수단이 아니다 | L5 양방향 + 2026-09-02 상한 도달 동작 재측정 |
 | `--bare` | 전체 harness(CLAUDE.md, hook, plugin, auto-memory, keychain) 로드 | system 블록·첫 user 메시지·tool 수가 모두 크게 줄어든다. `CLAUDE_CODE_SIMPLE=1`을 설정한다 | L5 |
 | `--strict-mcp-config` | host MCP 서버가 로드된다 | `--mcp-config`로 준 서버만 남긴다 | L5 |
+| `--thinking` | 미설정 시 `{"type":"adaptive","display":"omitted"}` | `disabled`가 reasoning을 끄고 `context_management`도 함께 없앤다. `enabled`와 `adaptive`는 잡음 필드를 뺀 모든 필드가 대조군과 같다 | L5 양방향 |
+| `--thinking-display` | `omitted` | `thinking.display`를 값대로 바꾼다 | L5 양방향 |
+| `--task-budget` | `task_budget` 키 없음(`output_config` 자체는 `{"effort":…}`로 실린다) | `output_config.task_budget`을 `{"type":"tokens","total":<값>}`으로 싣는다 | L5 |
 | `--json-schema` | 없음 | schema를 그대로 담은 `StructuredOutput` tool 하나를 전송한다. **`tool_choice`가 실리지 않으므로 provider 강제가 아니다** — codex의 `strict: true`와 달리 conformance는 proxy가 검증해야 한다 | L5 |
-| `context_management` | thinking 정리 edit이 매 요청 전송된다 | 전송 자체는 확인했다. 호출자가 요청한 적 없는 context edit이다 | 전송은 L5. **억제 수단은 미결** — 없다고 단정하지 않는다 |
+| `context_management` | `clear_thinking_20251015` edit이 매 요청 전송된다 | 호출자가 요청한 적 없는 context edit이다. **억제 수단이 있다**: reasoning을 끄면(`--thinking disabled` 또는 `MAX_THINKING_TOKENS=0`) 이 키가 본문에서 통째로 사라진다. 정리 대상이 thinking이므로 기전과도 맞는다. reasoning을 켠 채 이것만 끄는 수단은 여전히 못 찾았다 | L5 양방향(3회 반복에서 유무 고정) |
 
 `--input-format stream-json`은 NDJSON 입력에서 `assistant` 줄을 실제 assistant 턴으로 wire에 올린다. 다만 의미는 history 적재가 아니라 streaming이다. `user` 줄 하나마다 턴이 하나 발생하고, 연달아 오는 user 메시지는 하나로 합쳐지며, assistant 줄은 첫 user 줄 앞으로 당겨진다. 따라서 N턴을 그대로 흘려보내면 원하는 결과가 나오지 않는다. **이전 assistant 턴을 먼저 모두 보내고 마지막에 user 메시지 하나만 두는 형태**가 턴 하나와 올바른 순서를 보장한다. 이 입력 형식은 `--output-format stream-json`을 함께 요구한다.
 
@@ -487,7 +510,7 @@ Claude Code는 MCP 설정과 `allowedTools`로 서비스 tool 연결을 지원�
 - 사용자 설정 격리는 `--setting-sources`에 빈 값을 주는 것으로 한다. 생략은 `user`와 같아 host의 effort·hook·env가 매 턴 요청에 실린다.
 - 서비스 제공 tool에는 `--mcp-config` + `--strict-mcp-config` + 명시적 `--allowedTools`를 쓴다.
 - `--json-schema`는 구조화 최종 출력에만 쓰고, 기본 chat UI는 text stream + tool/action 이벤트를 우선한다. 이 flag는 schema를 tool로 제시할 뿐 강제하지 않으므로, 반환 JSON의 schema 적합성 검증은 proxy가 코드로 처리한다.
-- 출력 토큰 상한이 필요하면 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`를 쓴다. 대응 flag가 없고, 지정하지 않으면 호출자의 값과 무관하게 CLI 기본값이 실린다.
+- 출력 토큰 상한을 **wire에 싣는** 유일한 수단은 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`다. 대응 flag가 없고, 지정하지 않으면 호출자의 값과 무관하게 CLI 기본값이 실린다. **그러나 adapter의 `max_tokens` parity 경로에는 쓸 수 없다**: 상한에 걸리면 CLI가 잘린 답이 아니라 오류를 돌려주고 부분 출력을 버린다(위 표). adapter는 이 상한을 강제하지 않고 conformance matrix A-2·R-8 행에 미강제로 선언한다.
 - per-request tuning(`--effort`, `--thinking`, `--task-budget`)은 proxy에서 먼저 검증한다. `--effort`는 잘못된 값을 조용히 무시하고 hidden flag는 help에 없으므로, 상류 검증만이 결정적으로 잡아내는 지점이다.
 - hidden parity flag는 버전 고정 계약으로 취급한다. Claude Code 버전을 올릴 때마다 `pnpm catalog:runtime`의 parse probe를 재실행한다.
 - native chat에서는 `ANTHROPIC_API_KEY` 등 직접 provider 변수를 자식 env에서 제거한다.
@@ -518,10 +541,10 @@ Rule: projections are convenience views. The raw event is always retained for au
 | 항목 | 지금까지 확인된 것 | 남은 질문 |
 | --- | --- | --- |
 | Codex `exec --ephemeral`, `exec --ignore-rules` | 등록·수용 | 세션 파일과 execpolicy가 실제로 달라지는지 |
-| Claude `--thinking`, `--thinking-display`, `--task-budget` | 등록·수용 + 값 도메인 | 값이 요청 본문을 바꾸는지. 특히 `--thinking disabled`가 `MAX_THINKING_TOKENS=0`과 같은 일을 하는지 |
+| Codex `exec --ignore-user-config`의 instruction 효과 | 등록·수용, `config.toml` 억제는 L5 | 같은 exec 대조군이 `CODEX_HOME/AGENTS.md` marker를 싣는 조건을 먼저 확립한 뒤 flag arm과 비교해야 한다 |
 | Claude `--safe-mode`, `--restricted`, `--disable-slash-commands`, `--exclude-dynamic-system-prompt-sections` | 등록·수용 + help 서술 | 서술대로 context와 tool이 줄어드는지 |
-| Claude `context_management` 억제 | 매 요청 전송되는 것은 관찰 | 끄는 수단이 있는지. 찾지 못했을 뿐 없다고 확인한 것이 아니다 |
 | Claude `--effort` 미지원 값 | CLI가 경고 후 계속 진행하는 것은 관찰 | 그때 wire에 실리는 effort 값이 무엇인지 |
+| Claude `2.1.251` L5 행 전반 | 2026-08-28 관찰 | 설치본이 `2.1.260`이므로 규칙 5-5에 따라 재측정 전까지 권위가 아니다. `--system-prompt`, `--tools`, `--setting-sources`, `--bare`, `--strict-mcp-config`, `--json-schema`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 행이 해당한다 |
 | Codex `thread/inject_items` | schema 선언(L2) | inject 후 `turn/start`에서 role이 붙은 항목이 본문에 나타나는지 |
 | Codex `personality` | schema enum(L2) | 별도 wire 필드로 나타나지 않는다. 값이 무엇을 바꾸는지 |
 | Codex `app-server --code-mode-host` | help 서술(L1) | 원격 host 접속 동작 |

@@ -106,25 +106,44 @@ export class LocalCliChatSessionManager {
 
   async close(id: string): Promise<LocalCliChatSessionSnapshot> {
     const session = this.requireSession(id);
-    // Closed first, then aborted. A runtime whose stop is a child REPLACEMENT
-    // spawned one on the way out — a whole CLI launch, killed microseconds
-    // later by the close that followed. Closing ends the turn; the abort is
-    // what is left for a runtime that needs the signal.
-    await session.nativeSession.close();
-    this.endTurn(session);
+    // Closed first — gone from the map before the runtime's teardown is
+    // awaited, so no turn is admitted during the archive's grace (r54-codex:
+    // one was, and completed, while the DELETE waited) — then aborted. A
+    // runtime whose stop is a child REPLACEMENT spawned one on the way out — a
+    // whole CLI launch, killed microseconds later by the close that followed.
+    // Closing ends the turn; the abort is what is left for a runtime that
+    // needs the signal. A teardown that fails after that is the caller's
+    // error, not a session kept listed (r54-fable).
     session.closed = true;
     this.sessions.delete(id);
+    try {
+      await session.nativeSession.close();
+    } finally {
+      this.endTurn(session);
+    }
     return snapshot(session);
   }
 
   async closeAll(): Promise<void> {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
-    await Promise.all(sessions.map(async (session) => {
-      await session.nativeSession.close().catch(() => undefined);
-      this.endTurn(session);
-      session.closed = true;
+    // Every session is torn down and its bookkeeping finished before any
+    // teardown's error is raised — and one IS raised: a close that leaves a
+    // credentials copy on disk says so to the server's own close, which used
+    // to hear a clean shutdown over it (r55-codex).
+    const outcomes = await Promise.allSettled(sessions.map(async (session) => {
+      try {
+        await session.nativeSession.close();
+      } finally {
+        this.endTurn(session);
+        session.closed = true;
+      }
     }));
+    const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+    if (failures.length === 1) throw failures[0].reason;
+    if (failures.length > 1) {
+      throw new Error(failures.map((failure) => (failure.reason instanceof Error ? failure.reason.message : String(failure.reason))).join('; '));
+    }
   }
 
   async interrupt(id: string): Promise<LocalCliChatSessionSnapshot> {
@@ -161,7 +180,15 @@ export class LocalCliChatSessionManager {
     return turn;
   }
 
-  async *streamTurn(
+  /**
+   * Admits the turn NOW — the 404/409/410 are thrown from this call, before
+   * the caller has committed anything — and returns the turn's events, which
+   * the caller must consume: the reservation made here is released by the
+   * iteration's end (r55-codex: a lazy generator ran its admission only at
+   * the first read, after the HTTP writer had committed 200 SSE headers, so a
+   * known 404 went out as a 200 with a generic error).
+   */
+  streamTurn(
     sessionId: string,
     input: LocalCliChatTurnInput,
     options: LocalCliChatTurnOptions = {},
@@ -203,6 +230,18 @@ export class LocalCliChatSessionManager {
       deadline = setTimeout(() => abort.abort(), idleTimeoutMs);
     };
     armDeadline();
+    return this.turnEvents(session, turn, turnId, input, abort, armDeadline, stopDeadline);
+  }
+
+  private async *turnEvents(
+    session: ManagedSession,
+    turn: ManagedTurn,
+    turnId: string,
+    input: LocalCliChatTurnInput,
+    abort: AbortController,
+    armDeadline: () => void,
+    stopDeadline: () => void,
+  ): AsyncIterable<LocalCliChatEvent> {
     try {
       for await (const runtimeEvent of session.nativeSession.startTurn(input, abort.signal)) {
         armDeadline();

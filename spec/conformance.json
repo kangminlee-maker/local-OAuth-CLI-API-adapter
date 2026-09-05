@@ -1,0 +1,3445 @@
+{
+  "manifestVersion": 1,
+  "generatedBy": "scripts/build-conformance-manifest.mjs",
+  "source": {
+    "matrix": "docs/conformance-matrix.md",
+    "matrixDigest": "5a565258d6456dac9b92d21eca364ce3e237a05cb16c1ef0ad9bd01c2eeb603d",
+    "divergences": "spec/declared-divergences.json"
+  },
+  "counts": {
+    "claims": 148,
+    "claimsOutsideLegendVocabulary": 98,
+    "claimsWithLiveParityRow": 134,
+    "routes": 11,
+    "surfaces": 6,
+    "surfacesWithoutClaims": [
+      "local-cli-sessions",
+      "openai-models"
+    ]
+  },
+  "routes": [
+    {
+      "route": "POST /v1/chat/completions",
+      "surface": "openai-chat",
+      "protocol": [
+        "json",
+        "sse"
+      ]
+    },
+    {
+      "route": "POST /v1/responses",
+      "surface": "openai-responses",
+      "protocol": [
+        "json",
+        "sse"
+      ]
+    },
+    {
+      "route": "POST /v1/messages",
+      "surface": "anthropic-messages",
+      "protocol": [
+        "json",
+        "sse"
+      ]
+    },
+    {
+      "route": "POST /v1/images/generations",
+      "surface": "openai-images",
+      "protocol": [
+        "json",
+        "multipart",
+        "sse"
+      ]
+    },
+    {
+      "route": "POST /v1/images/edits",
+      "surface": "openai-images",
+      "protocol": [
+        "json",
+        "multipart",
+        "sse"
+      ]
+    },
+    {
+      "route": "GET /v1/models",
+      "surface": "openai-models",
+      "protocol": [
+        "json"
+      ]
+    },
+    {
+      "route": "POST /local/cli/sessions",
+      "surface": "local-cli-sessions",
+      "protocol": [
+        "json"
+      ]
+    },
+    {
+      "route": "GET /local/cli/sessions/{id}",
+      "surface": "local-cli-sessions",
+      "protocol": [
+        "json"
+      ]
+    },
+    {
+      "route": "DELETE /local/cli/sessions/{id}",
+      "surface": "local-cli-sessions",
+      "protocol": [
+        "json"
+      ]
+    },
+    {
+      "route": "POST /local/cli/sessions/{id}/interrupt",
+      "surface": "local-cli-sessions",
+      "protocol": [
+        "json"
+      ]
+    },
+    {
+      "route": "POST /local/cli/sessions/{id}/turns",
+      "surface": "local-cli-sessions",
+      "protocol": [
+        "json",
+        "sse"
+      ]
+    }
+  ],
+  "declaredDivergences": [
+    {
+      "id": "chat-function-tools-with-reasoning-effort",
+      "surface": "/v1/chat/completions",
+      "evidence": "docs/conformance-matrix.md §5.5.5",
+      "measuredAt": "2026-08-30"
+    },
+    {
+      "id": "messages-output-config-task-budget",
+      "surface": "/v1/messages",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "measuredAt": "2026-08-31"
+    },
+    {
+      "id": "messages-whitespace-model-is-a-400",
+      "surface": "/v1/messages",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "measuredAt": "2026-08-31"
+    },
+    {
+      "id": "responses-replayed-item-ids-are-not-looked-up",
+      "surface": "/v1/responses",
+      "evidence": "docs/conformance-matrix.md §5.5.6-A",
+      "measuredAt": "2026-08-31"
+    },
+    {
+      "id": "responses-replayed-hosted-tool-items-are-transcript-records",
+      "surface": "/v1/responses",
+      "evidence": "docs/conformance-matrix.md §5.5.6-A",
+      "measuredAt": "2026-09-01"
+    },
+    {
+      "id": "messages-assistant-prefill-is-not-refused",
+      "surface": "/v1/messages",
+      "evidence": "docs/conformance-matrix.md §5.5.7",
+      "measuredAt": "2026-08-31"
+    },
+    {
+      "id": "chat-function-role-is-not-refused",
+      "surface": "/v1/chat/completions",
+      "evidence": "docs/conformance-matrix.md §5.5.5",
+      "measuredAt": "2026-09-01"
+    }
+  ],
+  "claims": [
+    {
+      "id": "openai-chat:1",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "1",
+      "matrixLine": 86,
+      "field": "`model`",
+      "vendor": {
+        "valueSpace": "string, required",
+        "defaultWhenOmitted": "none — required",
+        "observableEffect": "`choices[].message` content quality; echoed in `model`",
+        "invalidValue": "400 / `invalid_request_error` / `model` / `model_not_found` (404 on some paths)"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; required non-empty string, `normalizers.ts:27` `readRequiredModel`; contract `:28`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (accepted: `openai.chat.text.schema_exact` vs `openai-api`, `bench-provider-parity-direct-20260622.json`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:2",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "2",
+      "matrixLine": 87,
+      "field": "`messages`",
+      "vendor": {
+        "valueSpace": "array, `minItems: 1`, required",
+        "defaultWhenOmitted": "none — required",
+        "observableEffect": "the conversation",
+        "invalidValue": "400 / `invalid_request_error` / `messages` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; empty array 400 `normalizers.ts:303`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (same row)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:3",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "3",
+      "matrixLine": 88,
+      "field": "`messages[].role`",
+      "vendor": {
+        "valueSpace": "`developer`|`system`|`user`|`assistant`|`tool`|`function`(dep.)",
+        "defaultWhenOmitted": "none — required, schema discriminator",
+        "observableEffect": "selects message schema",
+        "invalidValue": "400 / `invalid_request_error` / `messages[i].role` / `missing_required_parameter` when absent"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported, all six; `function`→tool; unknown 400 with param+code `normalizers.ts:330-352`",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:4",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "4",
+      "matrixLine": 89,
+      "field": "`messages[].content`",
+      "vendor": {
+        "valueSpace": "string | content-part array (`text`, `image_url`, `input_audio`, `file`); nullable on assistant-with-tool_calls and on `function`",
+        "defaultWhenOmitted": "none — required except those cases",
+        "observableEffect": "text and image inputs reach the model",
+        "invalidValue": "400 / `invalid_request_error` / `messages[i].content` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported for `text` + `image_url`; `input_audio`/`file` parts: **UNKNOWN handling — not in the contract table (`:34`) and not enumerated in `flattenOpenAiMessage`**; probe P-33",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED for text+image (`openai.chat.image.schema_exact`, `openai.chat.multi_image.schema_exact`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:5",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "5",
+      "matrixLine": 90,
+      "field": "`messages[].name`",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "participant disambiguation inside the prompt",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored** — `readOpenAiMessages` reads only `role`/`content` (`normalizers.ts`). The direct API accepts it too (measured); neither side reports it back",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:6",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "6",
+      "matrixLine": 91,
+      "field": "`messages[].tool_calls`",
+      "vendor": {
+        "valueSpace": "array of `{id, type:\"function\", function:{name, arguments}}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "prior assistant tool turn replayed",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported — flattened into context via `ASSISTANT_TOOL_CALL_MARKER`; contract `:36`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.chat.tool_result.schema_exact`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:7",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "7",
+      "matrixLine": 92,
+      "field": "`messages[].tool_call_id`",
+      "vendor": {
+        "valueSpace": "string, required on `role:\"tool\"`",
+        "defaultWhenOmitted": "none on tool role",
+        "observableEffect": "binds result to call",
+        "invalidValue": "400 / `invalid_request_error` / `messages[i].tool_call_id` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; contract `:37`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (same row)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:8",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "8",
+      "matrixLine": 93,
+      "field": "`messages[].function_call`",
+      "vendor": {
+        "valueSpace": "`{name, arguments}` (deprecated)",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "legacy tool turn",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported as a content-optional assistant turn (`normalizers.ts:354-357` comment)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:9",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "9",
+      "matrixLine": 94,
+      "field": "`messages[].refusal`",
+      "vendor": {
+        "valueSpace": "string, assistant input",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "replays a prior refusal",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored**; the direct API accepts it and reports nothing back (measured)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:10",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "10",
+      "matrixLine": 95,
+      "field": "`messages[].audio`",
+      "vendor": {
+        "valueSpace": "`{id}`, assistant input",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "replays prior audio turn",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key — `audio` is not in the direct Chat schema for this family (measured: `unknown_parameter`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:11",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "11",
+      "matrixLine": 96,
+      "field": "`modalities`",
+      "vendor": {
+        "valueSpace": "array of `text`|`audio`",
+        "defaultWhenOmitted": "`[\"text\"]`",
+        "observableEffect": "adds `message.audio` to the response",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key (measured: `unknown_parameter`), where it used to be accepted and ignored",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:12",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "12",
+      "matrixLine": 97,
+      "field": "`audio`",
+      "vendor": {
+        "valueSpace": "`{voice, format}`; required when `modalities` includes `audio`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "audio bytes in `message.audio.data`",
+        "invalidValue": "400 / `invalid_request_error` / `audio` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key (measured: `unknown_parameter`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:13",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "13",
+      "matrixLine": 98,
+      "field": "`temperature`",
+      "vendor": {
+        "valueSpace": "number 0-2",
+        "defaultWhenOmitted": "`1` (see instrument caveat)",
+        "observableEffect": "sampling spread",
+        "invalidValue": "400 / `invalid_request_error` / `temperature` / `unsupported_value` on reasoning models that fix it at 1"
+      },
+      "claimedLead": "rejected",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**rejected unless `1`** (null = omission): 400 `unsupported_value`, message `Unsupported value: 'temperature' does not support 0.5 with this model. Only the default (1) value is supported.` — the direct envelope, mirrored (`normalizers.ts` `rejectUnsupportedOpenAiSampling`). Nothing behind the surface applies it",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct `gpt-5.6-terra` 2026-08-29: 0.5 → 400 `unsupported_value`, 1 → 200)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:14",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "14",
+      "matrixLine": 99,
+      "field": "`top_p`",
+      "vendor": {
+        "valueSpace": "number 0-1",
+        "defaultWhenOmitted": "`1` (caveat)",
+        "observableEffect": "nucleus cutoff",
+        "invalidValue": "400 / `invalid_request_error` / `top_p` / `unsupported_parameter`"
+      },
+      "claimedLead": "rejected",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**rejected unless `1`** (null = omission): 400 `unsupported_parameter`, `Unsupported parameter: 'top_p' is not supported with this model.`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29: 0.5 → 400 `unsupported_parameter`, 1 → 200)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:15",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "15",
+      "matrixLine": 100,
+      "field": "`n`",
+      "vendor": {
+        "valueSpace": "integer ≥1",
+        "defaultWhenOmitted": "`1` (caveat)",
+        "observableEffect": "`choices` array length",
+        "invalidValue": "400 / `invalid_request_error` / `n` / — (and `n>1` unsupported on some models)"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**validated** (integer, 1..8 — the ceiling measured) **and realized**: n backend turns, one per `choices[]` entry, on the buffered and the streamed path. Usage reports the prompt once and sums the completions, as the direct API does",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5; live `n: 2` through the Codex backend: 2 turns, 2 choices, one usage chunk)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:16",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "16",
+      "matrixLine": 101,
+      "field": "`stop`",
+      "vendor": {
+        "valueSpace": "string | array (≤4) | null",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "truncates output at the sequence; `finish_reason:\"stop\"`",
+        "invalidValue": "400 / `invalid_request_error` / `stop` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused** with the direct envelope for this family: `unsupported_parameter` / `param: stop`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5, P-9)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:17",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "17",
+      "matrixLine": 102,
+      "field": "`max_tokens`",
+      "vendor": {
+        "valueSpace": "integer (deprecated)",
+        "defaultWhenOmitted": "model max",
+        "observableEffect": "caps output; `finish_reason:\"length\"`",
+        "invalidValue": "400 / `invalid_request_error` / `max_tokens` / `unsupported_parameter` on o-series"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused** with the direct message: `Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:18",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "18",
+      "matrixLine": 103,
+      "field": "`max_completion_tokens`",
+      "vendor": {
+        "valueSpace": "integer",
+        "defaultWhenOmitted": "model max",
+        "observableEffect": "as above, counts reasoning tokens",
+        "invalidValue": "400 / `invalid_request_error` / `max_completion_tokens` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (integer >= 1, `integer_below_min_value` below it) and passed to the backend as the max-token hint",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:19",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "19",
+      "matrixLine": 104,
+      "field": "`presence_penalty`",
+      "vendor": {
+        "valueSpace": "number -2..2",
+        "defaultWhenOmitted": "`0` (caveat)",
+        "observableEffect": "topic novelty",
+        "invalidValue": "400 / `invalid_request_error` / `presence_penalty` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`), accepted and not applied at `reasoning_effort: none` — both measured",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:20",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "20",
+      "matrixLine": 105,
+      "field": "`frequency_penalty`",
+      "vendor": {
+        "valueSpace": "number -2..2",
+        "defaultWhenOmitted": "`0` (caveat)",
+        "observableEffect": "repetition",
+        "invalidValue": "400 / `invalid_request_error` / `frequency_penalty` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`), accepted and not applied at `reasoning_effort: none` — both measured",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:21",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "21",
+      "matrixLine": 106,
+      "field": "`logit_bias`",
+      "vendor": {
+        "valueSpace": "map token-id → -100..100",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "token ban/boost",
+        "invalidValue": "400 / `invalid_request_error` / `logit_bias` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused** (`unsupported_parameter`) whatever the value, as the direct API refuses it for this family",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:22",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "22",
+      "matrixLine": 107,
+      "field": "`logprobs`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false` (caveat)",
+        "observableEffect": "populates `choices[].logprobs`",
+        "invalidValue": "400 / `invalid_request_error` / `logprobs` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`); at `reasoning_effort: none` it is accepted and not applied — the response carries no `logprobs`, which the contract states",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:23",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "23",
+      "matrixLine": 108,
+      "field": "`top_logprobs`",
+      "vendor": {
+        "valueSpace": "integer 0-20; requires `logprobs:true`",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "per-token alternatives",
+        "invalidValue": "400 / `invalid_request_error` / `top_logprobs` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated as the direct API validates it: integer, 0..5, and only with `logprobs: true` — three distinct measured envelopes. Not applied",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:24",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "24",
+      "matrixLine": 109,
+      "field": "`seed`",
+      "vendor": {
+        "valueSpace": "integer (Beta)",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "best-effort determinism; `system_fingerprint`",
+        "invalidValue": "400 / `invalid_request_error` / `seed` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (integer) and accepted without effect; `system_fingerprint` stays `null`, as it is on the direct API for this family (measured)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:25",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "25",
+      "matrixLine": 110,
+      "field": "`stream`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "SSE chunks vs JSON body",
+        "invalidValue": "400 / `invalid_request_error` / `stream` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; `input.stream === true` strictly (`normalizers.ts:34`) — note a string `\"true\"` is treated as false, no error",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.chat.stream.schema_exact`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:26",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "26",
+      "matrixLine": 111,
+      "field": "`stream_options.include_usage`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "extra final chunk with `choices: []` + `usage`; other chunks carry `usage: null`",
+        "invalidValue": "400 / `invalid_request_error` / `stream_options` / — (400 if set without `stream:true`)"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported (`http-server.ts:2227-2234`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.chat.stream_usage.schema_exact` vs `openai-api`; asserts final-usage shape **and** the `[DONE]` terminator, `benchmark:610-611`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:27",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "27",
+      "matrixLine": 112,
+      "field": "`stream_options.include_obfuscation`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`true` (obfuscation fields present by default)",
+        "observableEffect": "adds `obfuscation` string to delta events",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; defaults true unless explicitly false (contract `:41`); emits `obfuscation` (`http-server.ts:2233`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:28",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "28",
+      "matrixLine": 113,
+      "field": "`response_format`",
+      "vendor": {
+        "valueSpace": "`{type:\"text\"|\"json_object\"|\"json_schema\"}`",
+        "defaultWhenOmitted": "`{\"type\":\"text\"}`",
+        "observableEffect": "forces JSON / schema-valid output",
+        "invalidValue": "400 / `invalid_request_error` / `response_format` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported for `json_object` + `json_schema` (`normalizers.ts:35-38`); `strict` and schema `name` parsed. Both go through a **runtime schema**, not a prompt sentence: `json_schema` carries the client's schema and `json_object` carries `{\"type\":\"object\"}` — the direct API forces a top-level object here (asked for `[1,2,3]` it answered `{\"0\":1,\"1\":2,\"2\":3}`, measured 2026-09-02). Output that is not a JSON object is rejected at the response boundary rather than passed through — for `json_object` only, since a client `json_schema` declares its own root (a schema rooted at an array is handed to the runtime and its arrays are accepted back). A `json_schema` answer is validated against the client's schema at the response boundary (`ajv`, draft 2020-12; §7 row 10) under `strict: true` — the promise the direct API itself enforces — and refused outside it; without `strict` the direct API is best-effort too and the answer is delivered. What cannot be judged passes: an uncompilable or `$async` schema, a boolean-root schema (`true`/`false`), a `$ref` outside the schema, a VIOLATION found in a text carrying a number a double does not hold exactly — decided by value, so `2^53` and `1e16` are judged while `0.3` and `1e-999` are not, with zero and more than 4096 significant digits decided without arithmetic so an exponent like `1e-999999999` cannot exhaust BigInt (round 20; round 21: the significant digits, so `0.000…0` and `1000…0e-4096` are the exact values they spell, not padding read as inexactness); a conforming answer is delivered either way (the direct API accepts `$async` and `$id`/`$ref` at request time, measured 2026-09-04; its answer to a boolean-root schema is **unmeasured**). **Sent together with `tools` the format is NOT enforced**: the one structured-output channel is carrying the tool wrapper, so the client's schema does not reach the runtime and the turn's `text` is returned as it stands. The direct API does serve the pair and honour the schema (measured 2026-09-03), so this is a divergence, declared here rather than faked — supporting it needs a second channel or a wrapper that isolates client data, which is a design change and not a bug fix. Numbers in a runtime-enforced answer are published as the bytes the runtime wrote — an id of `9007199254740993` is not rounded to `…992`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.chat.json_schema.schema_exact`, `option-is-a-promise`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:29",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "29",
+      "matrixLine": 114,
+      "field": "`tools`",
+      "vendor": {
+        "valueSpace": "array of `{type:\"function\", function:{name, description, parameters, strict}}`",
+        "defaultWhenOmitted": "`[]` / absent",
+        "observableEffect": "enables `message.tool_calls`, `finish_reason:\"tool_calls\"`",
+        "invalidValue": "400 / `invalid_request_error` / `tools[i].function.name` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported (name/description/parameters preserved); contract `:38`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.chat.tool_call.schema_exact`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:30",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "30",
+      "matrixLine": 115,
+      "field": "`tools[].function.strict`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "strict schema adherence on arguments",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "read",
+      "claimedLeadInLegend": false,
+      "claimedNote": "read on all three surfaces from each surface's own location only — as is every tool member (`name`, `description`, `parameters`, `strict`: Chat under `function`, Responses at the top level, Messages at the top level), since round 21 found the others still cross-read, so a schema in the other surface's place was what `strict` enforced and a nested `function.name` shadowed a Responses tool's declared name. Measured 2026-09-05 (M9): Chat ignores a top-level `parameters`/`description` (200) and reports a top-level `name` alone as `tools[0].function.name` missing; Responses ignores a stray `function` member (200) and reports a name inside it alone as `tools[0].name` missing — the proxy answers the same. **Declared unenforced:** the direct Chat/Responses strict-schema validation family (`invalid_function_parameters`, e.g. `strict: true` with no `function.parameters` → 400 \"'additionalProperties' is required to be supplied and to be false\") is not mirrored; such a tool runs unjudged and handed to the response path: a forced call's arguments outside the tool's schema are refused (502) only under `strict: true`; without it the direct APIs deliver whatever the model wrote and so does the proxy (§7 row 8, round 18). The runtime schema channel is used either way. The direct API's own envelope for a bad `strict` value is unmeasured",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`backend-contract.test` r18 strict)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:31",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "31",
+      "matrixLine": 116,
+      "field": "`tool_choice`",
+      "vendor": {
+        "valueSpace": "`\"none\"`|`\"auto\"`|`\"required\"`|`{type:\"function\", function:{name}}`",
+        "defaultWhenOmitted": "`\"auto\"` when tools present, `\"none\"` when absent",
+        "observableEffect": "forces / suppresses a call",
+        "invalidValue": "400 / `invalid_request_error` / `tool_choice` / —"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored: the three modes and the `{type:'function', function:{name}}` object, with the direct API's `invalid_value` / `invalid_type` / `missing_required_parameter` envelopes for everything else. The silent `auto` fallback is gone. `required` is enforced by the **runtime schema** for any number of tools — the status enum is locked to `tool_calls`, `toolCalls` has `minItems: 1`, and the call's `name` is limited to the declared tools; a turn that comes back without a call is rejected, never repaired. Matches the direct API, which calls a tool against a prompt begging it not to, and calls again on a continuation that already has the answer (measured 2026-09-02)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5, `option-is-a-promise`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:32",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "32",
+      "matrixLine": 117,
+      "field": "`parallel_tool_calls`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`true`",
+        "observableEffect": "allows >1 call per turn",
+        "invalidValue": "400 / `invalid_request_error` / `parallel_tool_calls` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (boolean) and accepted without effect",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:33",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "33",
+      "matrixLine": 118,
+      "field": "`functions`",
+      "vendor": {
+        "valueSpace": "array (deprecated)",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "legacy tool list",
+        "invalidValue": "400 / `invalid_request_error` / `functions` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated as the direct API validates it (`functions[i].name` required) and **not applied** — carrying it into `tools` would run the tools but answer in the modern shape, and a legacy client reads `message.function_call`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED for validation (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:34",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "34",
+      "matrixLine": 119,
+      "field": "`function_call`",
+      "vendor": {
+        "valueSpace": "`\"none\"`|`\"auto\"`|`{name}` (deprecated)",
+        "defaultWhenOmitted": "`\"auto\"` with `functions`",
+        "observableEffect": "legacy forcing",
+        "invalidValue": "400 / `invalid_request_error` / `function_call` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (`function_call.name` required on the object form) and not applied",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED for validation (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:35",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "35",
+      "matrixLine": 120,
+      "field": "`user`",
+      "vendor": {
+        "valueSpace": "string (superseded)",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "cache bucketing / abuse signal",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (string) and accepted without effect on chat",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:36",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "36",
+      "matrixLine": 121,
+      "field": "`safety_identifier`",
+      "vendor": {
+        "valueSpace": "string ≤64",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "abuse detection bucket",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (string) and accepted without effect on chat",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:37",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "37",
+      "matrixLine": 122,
+      "field": "`prompt_cache_key`",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "raises `usage.prompt_tokens_details.cached_tokens`",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (string) and accepted without effect; the proxy caches nothing of its own",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:38",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "38",
+      "matrixLine": 123,
+      "field": "`prompt_cache_retention`",
+      "vendor": {
+        "valueSpace": "`\"in_memory\"`|`\"24h\"` (deprecated)",
+        "defaultWhenOmitted": "**org-dependent: `24h` without ZDR, `in_memory` with ZDR**",
+        "observableEffect": "cache lifetime",
+        "invalidValue": "400 / `invalid_request_error` / `prompt_cache_retention` / —"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored: `in_memory` is refused with the direct sentence (`This model is compatible only with 24h extended prompt caching`), `24h` accepted and not applied",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:39",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "39",
+      "matrixLine": 124,
+      "field": "`prompt_cache_options`",
+      "vendor": {
+        "valueSpace": "`{ttl:\"30m\", mode:\"implicit\"|\"explicit\"}`",
+        "defaultWhenOmitted": "`ttl:\"30m\"`, `mode:\"implicit\"`",
+        "observableEffect": "explicit cache breakpoints",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (object, and its members against the direct API's own key set — an unknown member is `unknown_parameter` naming `prompt_cache_options.<key>`) and not applied",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:40",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "40",
+      "matrixLine": 125,
+      "field": "`service_tier`",
+      "vendor": {
+        "valueSpace": "`auto`|`default`|`fast`|`flex`|`priority` (the direct API's own list, measured — `scale` is not in it)",
+        "defaultWhenOmitted": "`\"auto\"` (resolves to project setting, usually `default`)",
+        "observableEffect": "echoed as the tier actually used; latency/pricing",
+        "invalidValue": "400 / `invalid_request_error` / `service_tier` / —"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**echoed as requested** (`flex` in, `flex` out), with `auto` and an omitted value resolving to `default` — the hard-coded `default` is gone",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:41",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "41",
+      "matrixLine": 126,
+      "field": "`store`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "retention for distillation/evals",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (boolean) and accepted without effect on chat",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:42",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "42",
+      "matrixLine": 127,
+      "field": "`metadata`",
+      "vendor": {
+        "valueSpace": "map, ≤16 pairs, key ≤64 / value ≤512",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "stored alongside a stored completion",
+        "invalidValue": "400 / `invalid_request_error` / `metadata` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated as the direct API validates it — at most 16 properties, keys <= 64 characters, string values <= 512 — and not applied",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:43",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "43",
+      "matrixLine": 128,
+      "field": "`reasoning_effort`",
+      "vendor": {
+        "valueSpace": "`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`",
+        "defaultWhenOmitted": "model-dependent (**UNKNOWN per-model**)",
+        "observableEffect": "`usage.completion_tokens_details.reasoning_tokens`, latency",
+        "invalidValue": "400 / `invalid_request_error` / `reasoning_effort` / —"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored for this family: `none`/`low`/`medium`/`high`/`xhigh` accepted, everything else (including `minimal` and `max`) refused with the direct `unsupported_value` and its supported list",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:44",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "44",
+      "matrixLine": 129,
+      "field": "`reasoning.effort` (on chat)",
+      "vendor": {
+        "valueSpace": "same enum",
+        "defaultWhenOmitted": "n/a — **not a Chat Completions field**",
+        "observableEffect": "—",
+        "invalidValue": "provider: 400 unknown parameter (expected)"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused as an unknown key**, as the direct API refuses it. The proxy extension is gone: a body the direct API rejects no longer succeeds here",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:45",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "45",
+      "matrixLine": 130,
+      "field": "`verbosity`",
+      "vendor": {
+        "valueSpace": "`low`|`medium`|`high`",
+        "defaultWhenOmitted": "`medium` (**UNKNOWN — spec states no default**)",
+        "observableEffect": "output length",
+        "invalidValue": "400 / `invalid_request_error` / `verbosity` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; an out-of-enum value is the direct `invalid_value` with its supported list",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:46",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "46",
+      "matrixLine": 131,
+      "field": "`text.verbosity` (on chat)",
+      "vendor": {
+        "valueSpace": "same enum",
+        "defaultWhenOmitted": "n/a — **not a Chat Completions field**",
+        "observableEffect": "—",
+        "invalidValue": "provider: 400 unknown parameter (expected)"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused as an unknown key**, as the direct API refuses it (the extension is gone, same as row 44)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:47",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "47",
+      "matrixLine": 132,
+      "field": "`prediction`",
+      "vendor": {
+        "valueSpace": "`{type:\"content\", content}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "speculative decoding; `usage.completion_tokens_details.accepted/rejected_prediction_tokens`",
+        "invalidValue": "400 / `invalid_request_error` / `prediction` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused** (`unsupported_parameter`), as the direct API refuses it for this family",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:48",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "48",
+      "matrixLine": 133,
+      "field": "`web_search_options`",
+      "vendor": {
+        "valueSpace": "`{user_location, search_context_size}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "adds web-search tool call + citations to `annotations`",
+        "invalidValue": "400 / `invalid_request_error` / `web_search_options` / —"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key (measured: `unknown_parameter`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:49",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "49",
+      "matrixLine": 134,
+      "field": "`moderation`",
+      "vendor": {
+        "valueSpace": "`{model, policy:{input:{mode}, output}}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "moderated output / refusals",
+        "invalidValue": "400 / `invalid_request_error` / `moderation` / —"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated as the direct API validates it (`moderation.model` required) and not applied — the local runtimes moderate nothing, so the response carries no `moderation` object",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-chat:50",
+      "surface": "openai-chat",
+      "routes": [
+        "POST /v1/chat/completions"
+      ],
+      "matrixRow": "50",
+      "matrixLine": 135,
+      "field": "*(behavioral)* unknown top-level field, e.g. `{\"foo\":1}`",
+      "vendor": {
+        "valueSpace": "—",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "—",
+        "invalidValue": "400 / `invalid_request_error` / `<key>` / `unknown_parameter` — measured 2026-08-30 on every key outside the schema"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused** with `unknown_parameter` on Chat, against the direct API's own key set, reported after the required parameters and before every other field",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5)",
+      "liveParityRow": false
+    },
+    {
+      "id": "openai-responses:R-1",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-1",
+      "matrixLine": 145,
+      "field": "`model`",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "**spec marks it NOT required** (unlike chat) — behavior when omitted is UNKNOWN",
+        "observableEffect": "selects model; echoed",
+        "invalidValue": "400 or 404 / `invalid_request_error` / `model` / `model_not_found`"
+      },
+      "claimedLead": "divergent",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**divergent**: proxy makes it required and 400s on absence (contract `:107`), citing \"as on the direct APIs\" — the documented Responses schema does not list `model` as required",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-2",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-2",
+      "matrixLine": 146,
+      "field": "`input` (string form)",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "absent (may be omitted with `prompt`/`previous_response_id`)",
+        "observableEffect": "becomes a `user` turn",
+        "invalidValue": "400 / `invalid_request_error` / `input` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported (`normalizers.ts:50`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.responses.text`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-3",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-3",
+      "matrixLine": 147,
+      "field": "`input` (array form)",
+      "vendor": {
+        "valueSpace": "array of typed items",
+        "defaultWhenOmitted": "as above",
+        "observableEffect": "full conversation replay",
+        "invalidValue": "400 / `invalid_request_error` / `input[i]` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; primitives 400 (contract `:109`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.responses.tool_call`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-4",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-4",
+      "matrixLine": 148,
+      "field": "`input[].role`",
+      "vendor": {
+        "valueSpace": "`system`|`developer`|`user`|`assistant`",
+        "defaultWhenOmitted": "required on message items only",
+        "observableEffect": "message semantics",
+        "invalidValue": "400 / `invalid_request_error` / `input[i].role` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; missing/unknown 400 (contract `:110`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-5",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-5",
+      "matrixLine": 149,
+      "field": "`input[].content`",
+      "vendor": {
+        "valueSpace": "string | object | parts (`input_text`, `input_image`, `input_file`)",
+        "defaultWhenOmitted": "required on message items",
+        "observableEffect": "text + image inputs",
+        "invalidValue": "400 / `invalid_request_error` / `input[i].content` / —"
+      },
+      "claimedLead": "input_text",
+      "claimedLeadInLegend": false,
+      "claimedNote": "`input_text` + `input_image` supported; `input_file` handling UNKNOWN (probe P-33)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED for text+image (`openai.responses.image.schema_exact`, `…multi_image…`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-6",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-6",
+      "matrixLine": 150,
+      "field": "`input[].type`",
+      "vendor": {
+        "valueSpace": "`message`, `function_call`, `function_call_output`, `reasoning`, `item_reference`, … (open union)",
+        "defaultWhenOmitted": "absent = message item",
+        "observableEffect": "item semantics",
+        "invalidValue": "400 for a *known-invalid* type; unknown strings: UNKNOWN"
+      },
+      "claimedLead": "deliberately",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**deliberately lenient**: non-string type 400, unknown string types accepted (contract `:110`) — documented, defensible, unverified against the provider",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-7",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-7",
+      "matrixLine": 151,
+      "field": "`instructions`",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "system-level steering; echoed in `instructions`",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; prepended as a `system` message (`normalizers.ts:48-51`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-8",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-8",
+      "matrixLine": 152,
+      "field": "`max_output_tokens`",
+      "vendor": {
+        "valueSpace": "integer",
+        "defaultWhenOmitted": "`null` (model max)",
+        "observableEffect": "caps output; `status:\"incomplete\"` + `incomplete_details.reason:\"max_output_tokens\"`",
+        "invalidValue": "400 / `invalid_request_error` / `max_output_tokens` / —"
+      },
+      "claimedLead": "parsed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "parsed but the cap itself is **not enforced**; echoed in the body. No runtime channel exists for the cap (row A-2). But when the backend reports the limit — the `codex-backend` transport on `response.incomplete`, Claude Code on `stop_reason: \"max_tokens\"` — the response is `status: \"incomplete\"`, `incomplete_details: {reason: \"max_output_tokens\"}`, `completed_at: null`, a `function_call` item with `status: \"incomplete\"`, and the stream ends in `response.incomplete`, as the direct API answers (measured 2026-09-04, `review-artifacts/stage2/report.md` M6)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`output-limit-projection.test`, `codex-backend-transport.test`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-9",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-9",
+      "matrixLine": 153,
+      "field": "`max_tool_calls`",
+      "vendor": {
+        "valueSpace": "integer",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "caps built-in tool calls",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored**; echoed as hard `null` (`http-server.ts:2007`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-10",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-10",
+      "matrixLine": 154,
+      "field": "`temperature`",
+      "vendor": {
+        "valueSpace": "number 0-2",
+        "defaultWhenOmitted": "`1` (caveat; confirmed by the doc's SSE transcript showing `\"temperature\":1.0`)",
+        "observableEffect": "sampling",
+        "invalidValue": "400 / `invalid_request_error` / `temperature` / —"
+      },
+      "claimedLead": "rejected",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**rejected unless `1`** (null = omission): 400 `param: temperature`, `code: null`, `Unsupported parameter: 'temperature' is not supported with this model.`; echoed as the constant `1`",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct `gpt-5.6-terra` 2026-08-29: 0.5 → 400 code null, 1 → 200)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-11",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-11",
+      "matrixLine": 155,
+      "field": "`top_p`",
+      "vendor": {
+        "valueSpace": "number 0-1",
+        "defaultWhenOmitted": "`1` (doc SSE transcript shows `\"top_p\":1.0`)",
+        "observableEffect": "nucleus",
+        "invalidValue": "400 / `invalid_request_error` / `top_p` / —"
+      },
+      "claimedLead": "rejected",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**rejected whenever present**, `1` included: 400 `param: top_p`, `code: null`, `Unsupported parameter: 'top_p' is not supported with this model.`; echoed as the constant `1` (was `0.98`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29: 0.5 → 400, **1 → 400 too** — the Responses surface refuses the parameter, not the value)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-12",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-12",
+      "matrixLine": 156,
+      "field": "`top_logprobs`",
+      "vendor": {
+        "valueSpace": "integer 0-20",
+        "defaultWhenOmitted": "`null` (doc)",
+        "observableEffect": "logprobs on output text",
+        "invalidValue": "400 / `invalid_request_error` / `top_logprobs` / —"
+      },
+      "claimedLead": "ignored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "ignored; echoed as **`0`** (`http-server.ts:2024`) where the provider echoes `null`",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-13",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-13",
+      "matrixLine": 157,
+      "field": "`stream`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "named SSE events",
+        "invalidValue": "400 / `invalid_request_error` / `stream` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`openai.responses.stream`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-14",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-14",
+      "matrixLine": 158,
+      "field": "`stream_options.include_obfuscation`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`true`",
+        "observableEffect": "`obfuscation` on delta events",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "parsed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "parsed via the shared reader (`normalizers.ts:64`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-15",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-15",
+      "matrixLine": 159,
+      "field": "`stream_options.include_usage`",
+      "vendor": {
+        "valueSpace": "—",
+        "defaultWhenOmitted": "**not a documented Responses field** (the Responses `stream_options` object documents only `include_obfuscation`)",
+        "observableEffect": "—",
+        "invalidValue": "provider: UNKNOWN — likely 400 unknown parameter"
+      },
+      "claimedLead": "proxy",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**proxy extension**: parsed and honored (contract `:117`). Responses `usage` is on `response.completed` regardless",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-16",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-16",
+      "matrixLine": 160,
+      "field": "`text.format`",
+      "vendor": {
+        "valueSpace": "`{type:\"text\"|\"json_object\"|\"json_schema\", name, schema, strict}`",
+        "defaultWhenOmitted": "`{\"type\":\"text\"}`",
+        "observableEffect": "structured output",
+        "invalidValue": "400 / `invalid_request_error` / `text.format` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported (`normalizers.ts:65-68`), through the same runtime schema as chat row 28 — `json_object` carries `{\"type\":\"object\"}` and non-object output is rejected; a client `json_schema` keeps its own root, is validated against that schema at the response boundary under `strict: true` (chat row 28, §7 row 10) and is published with its numbers verbatim. **Not enforced together with `tools`**, same as chat row 28",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`option-is-a-promise`, `wrapper-root-and-lexeme`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-17",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-17",
+      "matrixLine": 161,
+      "field": "`text.verbosity`",
+      "vendor": {
+        "valueSpace": "`low`|`medium`|`high`",
+        "defaultWhenOmitted": "`medium` (**UNKNOWN**)",
+        "observableEffect": "output length",
+        "invalidValue": "400 / `invalid_request_error` / `text.verbosity` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-18",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-18",
+      "matrixLine": 162,
+      "field": "`tools`",
+      "vendor": {
+        "valueSpace": "array; `function` tools plus **built-ins** (`web_search`, `file_search`, `code_interpreter`, `image_generation`, `computer_use`, `mcp`)",
+        "defaultWhenOmitted": "`[]`",
+        "observableEffect": "tool calls in `output`",
+        "invalidValue": "400 / `invalid_request_error` / `tools[i]` / —"
+      },
+      "claimedLead": "function",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**function tools only**; built-in and MCP tool entries are UNKNOWN — probably dropped silently by `readOpenAiTools`, so a `web_search` request runs as a plain turn (P-35)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED for function tools (`openai.responses.tool_call`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-19",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-19",
+      "matrixLine": 163,
+      "field": "`tool_choice`",
+      "vendor": {
+        "valueSpace": "`\"none\"`|`\"auto\"`|`\"required\"`|`{type:\"function\", name}`|`{type:\"<builtin>\"}`",
+        "defaultWhenOmitted": "`\"auto\"`",
+        "observableEffect": "forcing",
+        "invalidValue": "400 / `invalid_request_error` / `tool_choice` / —"
+      },
+      "claimedLead": "mapped",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mapped; unknown values fall back to `auto` (same divergence as chat row 31); echoed via `responseToolChoice`. `required` is schema-enforced as in chat row 31",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`option-is-a-promise`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-20",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-20",
+      "matrixLine": 164,
+      "field": "`parallel_tool_calls`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`true`",
+        "observableEffect": ">1 call per turn",
+        "invalidValue": "400 / `invalid_request_error` / `parallel_tool_calls` / —"
+      },
+      "claimedLead": "divergent",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**divergent**: ignored **and** echoed as a hard `true` (`http-server.ts:2011`) even when the client sent `false`",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-21",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-21",
+      "matrixLine": 165,
+      "field": "`reasoning.effort`",
+      "vendor": {
+        "valueSpace": "`none`…`max`",
+        "defaultWhenOmitted": "model-dependent; doc SSE transcript shows `\"effort\":null` echoed for a non-reasoning model",
+        "observableEffect": "reasoning tokens, latency",
+        "invalidValue": "400 / `invalid_request_error` / `reasoning.effort` / —"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported minus `max` (same enum divergence as chat row 43)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-22",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-22",
+      "matrixLine": 166,
+      "field": "`reasoning.summary`",
+      "vendor": {
+        "valueSpace": "`auto`|`concise`|`detailed`",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "adds `summary` parts to the `reasoning` output item",
+        "invalidValue": "400 / `invalid_request_error` / `reasoning.summary` / —"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored** — the proxy never emits reasoning summaries; a client that asked for `detailed` gets an empty/absent summary with no error",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-23",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-23",
+      "matrixLine": 167,
+      "field": "`reasoning.context`",
+      "vendor": {
+        "valueSpace": "`auto`|`current_turn`|`all_turns`",
+        "defaultWhenOmitted": "UNKNOWN (contract's own sample body shows `\"context\":\"current_turn\"`)",
+        "observableEffect": "which reasoning items replay",
+        "invalidValue": "400 / `invalid_request_error` / `reasoning.context` / —"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "echoed via `responseReasoning`; not acted on",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-24",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-24",
+      "matrixLine": 168,
+      "field": "`reasoning.generate_summary`",
+      "vendor": {
+        "valueSpace": "deprecated alias of `summary`",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "as R-22",
+        "invalidValue": "as R-22"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "silently ignored",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-25",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-25",
+      "matrixLine": 169,
+      "field": "`include`",
+      "vendor": {
+        "valueSpace": "array: `reasoning.encrypted_content`, `message.output_text.logprobs`, `web_search_call.action.sources`, `file_search_call.results`, `code_interpreter_call.outputs`, `computer_call_output.output.image_url`, `message.input_image.image_url`",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "adds the named payloads to `output`",
+        "invalidValue": "400 / `invalid_request_error` / `include` / —"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored** — notably `reasoning.encrypted_content`, which stateless multi-turn clients depend on",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-26",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-26",
+      "matrixLine": 170,
+      "field": "`store`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`true` on Responses (doc transcript echoes `\"store\":true`)",
+        "observableEffect": "retrievable via `GET /v1/responses/{id}`",
+        "invalidValue": "400 / `invalid_request_error` / `store` / —"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "echoed (`raw.store === false ? false : true`, `http-server.ts:2019`) but **nothing is stored** — the proxy has no `GET /v1/responses/{id}`, so an echoed `store:true` is a false promise",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-27",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-27",
+      "matrixLine": 171,
+      "field": "`background`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "returns immediately with `status:\"queued\"`; poll to completion",
+        "invalidValue": "400 / `invalid_request_error` / `background` / —"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored**; echoed as hard `false` (`http-server.ts:1999`) — a `background:true` client blocks instead of getting a queued id",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-28",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-28",
+      "matrixLine": 172,
+      "field": "`previous_response_id`",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "server-side conversation continuation",
+        "invalidValue": "400 / `invalid_request_error` / `previous_response_id` / `not_found` when unknown"
+      },
+      "claimedLead": "divergent",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**divergent**: echoed verbatim (`http-server.ts:2013`) but **never resolved** — a client relying on server-side state loses all prior turns, silently, with a `200`",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-29",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-29",
+      "matrixLine": 173,
+      "field": "`conversation`",
+      "vendor": {
+        "valueSpace": "string (conversation id); mutually exclusive with `previous_response_id`",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "conversation-scoped state",
+        "invalidValue": "400 / `invalid_request_error` / `conversation` / —"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored**; not even echoed",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-30",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-30",
+      "matrixLine": 174,
+      "field": "`truncation`",
+      "vendor": {
+        "valueSpace": "`auto`|`disabled`",
+        "defaultWhenOmitted": "`\"disabled\"` (doc states default explicitly)",
+        "observableEffect": "over-context: drop-from-start vs 400",
+        "invalidValue": "400 / `invalid_request_error` / `truncation` / —"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "echoed, not acted on (`http-server.ts:2026`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-31",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-31",
+      "matrixLine": 175,
+      "field": "`metadata`",
+      "vendor": {
+        "valueSpace": "≤16 pairs",
+        "defaultWhenOmitted": "`{}` (doc transcript echoes `{}`)",
+        "observableEffect": "echoed",
+        "invalidValue": "400 / `invalid_request_error` / `metadata` / —"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "echoed via `asRecordPayload` (`http-server.ts:2033`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-32",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-32",
+      "matrixLine": 176,
+      "field": "`user`",
+      "vendor": {
+        "valueSpace": "string (superseded)",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "cache bucketing",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "echoed (`http-server.ts:2032`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-33",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-33",
+      "matrixLine": 177,
+      "field": "`safety_identifier`",
+      "vendor": {
+        "valueSpace": "string ≤64",
+        "defaultWhenOmitted": "UNKNOWN (not in doc transcripts)",
+        "observableEffect": "abuse bucketing",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "echoed (`http-server.ts:2017`)",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-34",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-34",
+      "matrixLine": 178,
+      "field": "`prompt_cache_key`",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "UNKNOWN",
+        "observableEffect": "`usage.input_tokens_details.cached_tokens`",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "echoed",
+      "claimedLeadInLegend": false,
+      "claimedNote": "echoed (`http-server.ts:2014`)",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-35",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-35",
+      "matrixLine": 179,
+      "field": "`prompt_cache_retention`",
+      "vendor": {
+        "valueSpace": "`in_memory`|`24h`",
+        "defaultWhenOmitted": "**org-dependent** (ZDR); whether it is echoed at all when omitted is UNKNOWN",
+        "observableEffect": "cache lifetime",
+        "invalidValue": "400 / `invalid_request_error` / … / —"
+      },
+      "claimedLead": "divergent",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**divergent**: hard-coded `'24h'` in every response (`http-server.ts:2015`) regardless of request or org",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-36",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-36",
+      "matrixLine": 180,
+      "field": "`prompt_cache_options`",
+      "vendor": {
+        "valueSpace": "`{ttl, mode}`",
+        "defaultWhenOmitted": "`ttl:\"30m\"`, `mode:\"implicit\"`",
+        "observableEffect": "explicit breakpoints",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "silently ignored",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-37",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-37",
+      "matrixLine": 181,
+      "field": "`service_tier`",
+      "vendor": {
+        "valueSpace": "`auto`|`default`|`flex`|`scale`|`priority`",
+        "defaultWhenOmitted": "`\"auto\"`",
+        "observableEffect": "echoed as tier used",
+        "invalidValue": "400 / `invalid_request_error` / `service_tier` / —"
+      },
+      "claimedLead": "ignored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "ignored; hard `\"default\"` (`http-server.ts:2018`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-38",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-38",
+      "matrixLine": 182,
+      "field": "`prompt`",
+      "vendor": {
+        "valueSpace": "`{id, version, variables}`",
+        "defaultWhenOmitted": "`null`",
+        "observableEffect": "server-side prompt template expansion",
+        "invalidValue": "400 / `invalid_request_error` / `prompt.id` / `not_found`"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "**silently ignored** — a template-only request (no `input`) would run with an empty conversation",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-39",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-39",
+      "matrixLine": 183,
+      "field": "`context_management`",
+      "vendor": {
+        "valueSpace": "array of `{type:\"compaction\", compact_threshold}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "auto-compaction of long contexts",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "silently ignored",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-40",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-40",
+      "matrixLine": 184,
+      "field": "`moderation`",
+      "vendor": {
+        "valueSpace": "`{model, policy}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "moderated output",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "silently ignored; `moderation` echoed as hard `null` (`http-server.ts:2009`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-responses:R-41",
+      "surface": "openai-responses",
+      "routes": [
+        "POST /v1/responses"
+      ],
+      "matrixRow": "R-41",
+      "matrixLine": 185,
+      "field": "*(behavioral)* unknown top-level field",
+      "vendor": {
+        "valueSpace": "—",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "—",
+        "invalidValue": "expected 400 `unknown_parameter` — unconfirmed"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "silently ignored",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": false
+    },
+    {
+      "id": "openai-images:I-1",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-1",
+      "matrixLine": 195,
+      "field": "`model`",
+      "applicability": "G E V",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "**none — required** (2026-08-29: absent → 400 `missing_required_parameter`; null/number → 400 `invalid_type`)",
+        "observableEffect": "picks the generator; changes which other fields are legal",
+        "invalidValue": "400 / `image_generation_user_error` / `model` / `invalid_value` `The model 'X' does not exist.` — for `dall-e-2`, `dall-e-3`, `image-2`, `''`, anything not in the live list"
+      },
+      "claimedLead": "required",
+      "claimedLeadInLegend": false,
+      "claimedNote": "required; live list `gpt-image-1`, `gpt-image-1-mini`, `gpt-image-1.5`, `gpt-image-2`, `gpt-image-2-2026-04-21`, `chatgpt-image-latest` (`OPENAI_IMAGE_MODELS`, `http-server.ts`); every name runs on the local backend; the former `image-2` is refused like any other unknown name",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29, §5.5.2)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-2",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-2",
+      "matrixLine": 196,
+      "field": "`prompt`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "string; ≤32000 chars",
+        "defaultWhenOmitted": "required",
+        "observableEffect": "the image",
+        "invalidValue": "absent → `missing_required_parameter`; null/number → `invalid_type`; `''` → `empty_string`; whitespace-only **accepted** (all measured 2026-08-30)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored (`imagePrompt`); cap enforced as 32000 UTF-16 code units",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-3",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-3",
+      "matrixLine": 197,
+      "field": "`images` (JSON) / `image`, `image[]` (multipart)",
+      "applicability": "— E —",
+      "vendor": {
+        "valueSpace": "JSON: array of objects; multipart: file parts",
+        "defaultWhenOmitted": "required on E",
+        "observableEffect": "the source image",
+        "invalidValue": "JSON `image`/`image[]` → 400 `invalid_value` \"Unknown parameter: 'image'. For application/json on /v1/images/edits, use 'images' (array).\"; non-array `images` → 400 `invalid_type`; string member → 400 `invalid_type` param `images[0]`; absent → 400 `missing_required_parameter` (all measured 2026-08-29)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored: JSON takes `images` only with those envelopes, multipart takes `image`/`image[]` (`imageInputsForOperation`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29, §5.5.2)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-4",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-4",
+      "matrixLine": 198,
+      "field": "`mask`",
+      "applicability": "— E —",
+      "vendor": {
+        "valueSpace": "binary PNG, <4MB, same dims as `image`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "edit region",
+        "invalidValue": "400 / `invalid_request_error` / `mask` / —"
+      },
+      "claimedLead": "sent",
+      "claimedLeadInLegend": false,
+      "claimedNote": "sent as the tool's `input_image_mask` (`codexBackendImageGenerationTool`); the slot accepts a data URL and an https URL, and 500s on `{}` (never sent empty)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (tool-slot probe 2026-08-29: `slot_input_image_mask`, `slot_mask_https_url`, `slot_mask_empty_object`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-5",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-5",
+      "matrixLine": 199,
+      "field": "`n`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "integer 1-10",
+        "defaultWhenOmitted": "`1` (null = omission)",
+        "observableEffect": "`data` array length",
+        "invalidValue": "below/above → `integer_below_min_value` / `integer_above_max_value` naming bound and value; decimal/string/boolean → `invalid_type` naming the type (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored (`imageInteger`); multipart digit strings still parse",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-6",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-6",
+      "matrixLine": 200,
+      "field": "`size`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "`auto` or `WIDTHxHEIGHT`, both divisible by 16",
+        "defaultWhenOmitted": "`auto`",
+        "observableEffect": "output dimensions",
+        "invalidValue": "`image_generation_user_error` / `size` / `invalid_value`: `Expected WIDTHxHEIGHT, for example '1824x1024'.` for `bogus`/`0x0`; `Width and height must both be divisible by 16.` for `9x9` (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored (`optionalImageSize`); on the default transport a canvas returned at another size is brought to the requested one (§5.5.1 `slot_size_edit_256`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-7",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-7",
+      "matrixLine": 201,
+      "field": "`quality`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "`low`|`medium`|`high`|`auto` (**no `standard`/`hd`** on any live model)",
+        "defaultWhenOmitted": "`auto`",
+        "observableEffect": "fidelity, cost, latency; echoed",
+        "invalidValue": "string outside the set → `invalid_value` `Supported values are: 'low', 'medium', 'high', and 'auto'.`; non-string → `invalid_type` `expected one of … or 'auto', but got an integer instead` (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored (`imageEnum`); the dall-e aliases are refused",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-8",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations"
+      ],
+      "matrixRow": "I-8",
+      "matrixLine": 202,
+      "field": "`style`",
+      "applicability": "G — —",
+      "vendor": {
+        "valueSpace": "`vivid`|`natural` (dall-e-3 only, and dall-e-3 is gone)",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "aesthetic",
+        "invalidValue": "400 / `invalid_request_error` / `style` / `unknown_parameter` (measured on gpt-image-2)"
+      },
+      "claimedLead": "rejected",
+      "claimedLeadInLegend": false,
+      "claimedNote": "rejected whenever present, the same envelope (`rejectUnknownOpenAiImageParameters`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29, §5.5.2)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-9",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-9",
+      "matrixLine": 203,
+      "field": "`background`",
+      "applicability": "G E V",
+      "vendor": {
+        "valueSpace": "`transparent`|`opaque`|`auto` (GPT-image only)",
+        "defaultWhenOmitted": "`auto`",
+        "observableEffect": "alpha channel; echoed",
+        "invalidValue": "400 / `invalid_request_error` / `background` / —"
+      },
+      "claimedLead": "sent",
+      "claimedLeadInLegend": false,
+      "claimedNote": "sent on the tool; `transparent` with `jpeg` rejected locally (`validateOpenAiImageRequest`); `transparent` itself is refused by the backend image model (`gpt-image-2-codex`, `image_generation_user_error` / `invalid_value`) and that refusal is forwarded, streamed or not — **a capability gap**: the direct Responses image tool on `gpt-5.6-terra` accepts `transparent` and generates (measured 2026-08-30, 200); `opaque`/`auto` accepted",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`…background_transparent_unsupported…`; tool-slot probe 2026-08-29: `slot_background`, `slot_background_opaque`, `slot_background_auto`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-10",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-10",
+      "matrixLine": 204,
+      "field": "`output_format`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "`png`|`webp`|`jpeg`",
+        "defaultWhenOmitted": "`png`",
+        "observableEffect": "encoding; echoed",
+        "invalidValue": "`invalid_value` listing the three in that order (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-11",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-11",
+      "matrixLine": 205,
+      "field": "`output_compression`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "integer 0-100",
+        "defaultWhenOmitted": "`100` (null = omission)",
+        "observableEffect": "file size",
+        "invalidValue": "range/type envelopes as `n` (measured: 101, -1, 1.5, \"50\")"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored; PNG + `<100` additionally `invalid_png_output_compression` (proxy rule, direct validation passed `50` with no format)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-12",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-12",
+      "matrixLine": 206,
+      "field": "`moderation`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "`auto`|`low`",
+        "defaultWhenOmitted": "`auto`",
+        "observableEffect": "filter strictness",
+        "invalidValue": "`invalid_value` `Supported values are: 'auto' and 'low'.` (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored; sent on the tool",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3 + tool-slot probe)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-13",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-13",
+      "matrixLine": 207,
+      "field": "`input_fidelity`",
+      "applicability": "— E —",
+      "vendor": {
+        "valueSpace": "`high`|`low` (gpt-image-1/1.5, **not** `-mini`)",
+        "defaultWhenOmitted": "`low`",
+        "observableEffect": "face/style preservation",
+        "invalidValue": "on a generation: 400 `unknown_parameter` (measured on gpt-image-2); on `gpt-image-1-mini`: 400 `unknown_parameter` (measured)"
+      },
+      "claimedLead": "generation",
+      "claimedLeadInLegend": false,
+      "claimedNote": "generation → `unknown_parameter`; edit → sent on the tool, and the backend image model (`gpt-image-2-codex`) refuses it with `invalid_input_fidelity_model`, forwarded",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29 + tool-slot probe)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-14",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-14",
+      "matrixLine": 208,
+      "field": "`response_format`",
+      "applicability": "G E V",
+      "vendor": {
+        "valueSpace": "—",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "—",
+        "invalidValue": "400 / `invalid_request_error` / `response_format` / `unknown_parameter` on every live model, **null included** (measured on gpt-image-2, chatgpt-image-latest, gpt-image-2-2026-04-21)"
+      },
+      "claimedLead": "rejected",
+      "claimedLeadInLegend": false,
+      "claimedNote": "rejected whenever present; the `url` format and the `GET /v1/images/generated/{id}` store are removed (2026-08-29)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29, §5.5.2)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-15",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-15",
+      "matrixLine": 209,
+      "field": "`stream`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "boolean (null = omission)",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "SSE completed image events",
+        "invalidValue": "non-boolean → `invalid_type` `expected a boolean, but got a string instead` (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored in JSON; multipart `true`/`false` strings parse",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-16",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-16",
+      "matrixLine": 210,
+      "field": "`partial_images`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "integer 0-3 (null = omission)",
+        "defaultWhenOmitted": "`0`",
+        "observableEffect": "partial events",
+        "invalidValue": "range/type envelopes as `n` (measured: 4, -1)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored for the envelope; 1-3 then refused as `unsupported_value` (proxy limitation)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": true
+    },
+    {
+      "id": "openai-images:I-17",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-17",
+      "matrixLine": 211,
+      "field": "`user`",
+      "applicability": "G E V",
+      "vendor": {
+        "valueSpace": "string",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "abuse signal",
+        "invalidValue": "UNKNOWN"
+      },
+      "claimedLead": "accepted",
+      "claimedLeadInLegend": false,
+      "claimedNote": "accepted (contract `:254`)",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": false
+    },
+    {
+      "id": "openai-images:I-18",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-18",
+      "matrixLine": 212,
+      "field": "`x_proxy_image_route`",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "object: `visual_class`, `geometry_mode`, `output_format`, `output_compression`",
+        "defaultWhenOmitted": "n/a",
+        "observableEffect": "route-specific generation constraints",
+        "invalidValue": "**direct: 400 `unknown_parameter`** (measured 2026-08-30)"
+      },
+      "claimedLead": "proxy-only",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**proxy-only extension, kept by decision** — the one key accepted here that the direct API refuses",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": false
+    },
+    {
+      "id": "openai-images:I-19",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-19",
+      "matrixLine": 213,
+      "field": "*(behavioral)* body encoding",
+      "applicability": "G E —",
+      "vendor": {
+        "valueSpace": "JSON or multipart on both (the direct API takes JSON `images` on edits, measured)",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "—",
+        "invalidValue": "400 on wrong encoding"
+      },
+      "claimedLead": "json",
+      "claimedLeadInLegend": false,
+      "claimedNote": "JSON and multipart on both operations; variations gone",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (direct 2026-08-29)",
+      "liveParityRow": false
+    },
+    {
+      "id": "openai-images:I-20",
+      "surface": "openai-images",
+      "routes": [
+        "POST /v1/images/generations",
+        "POST /v1/images/edits"
+      ],
+      "matrixRow": "I-20",
+      "matrixLine": 214,
+      "field": "*(behavioral)* unknown top-level field",
+      "applicability": "G E",
+      "vendor": {
+        "valueSpace": "—",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "—",
+        "invalidValue": "400 `unknown_parameter` naming the key; on a generation `mask`, `images`, `input_fidelity` count as unknown (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored, JSON and multipart, `x_proxy_image_route` excepted",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.3)",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-1",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-1",
+      "matrixLine": 224,
+      "field": "`model`",
+      "vendor": {
+        "valueSpace": "string, required",
+        "defaultWhenOmitted": "none",
+        "observableEffect": "the model; echoed in `model`",
+        "invalidValue": "400 / `invalid_request_error` (Anthropic envelope has **no `param`/`code`**)"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; required non-empty string; 404 `not_found_error` when honouring is on (contract `:301`, `:405` ff.)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak (`anthropic.messages.text` vs `anthropic-api`; **the archive shows this case both passing and failing across runs**)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-2",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-2",
+      "matrixLine": 225,
+      "field": "`max_tokens`",
+      "vendor": {
+        "valueSpace": "integer, **required**",
+        "defaultWhenOmitted": "none",
+        "observableEffect": "caps output; `stop_reason:\"max_tokens\"`",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "accepted",
+      "claimedLeadInLegend": false,
+      "claimedNote": "accepted and required, but **the cap is NOT enforced**: a turn longer than `max_tokens` is returned whole with `stop_reason:\"end_turn\"` and a `usage.output_tokens` above the cap, where the direct API truncates and reports `stop_reason:\"max_tokens\"`. Neither runtime has a channel for it — codex has no upstream cap, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` makes the CLI **error** and discard the partial text instead of truncating (measured 2026-09-02 at 16 and 32). Trimming in the response path would leave `usage.output_tokens` reporting tokens that were generated and billed, so the cap is declared unenforced rather than faked. **`0` accepted** on the claim that the direct API accepts it (contract `:316`) — an unverified claim about the provider When the runtime does report the limit, `stop_reason: \"max_tokens\"` is reported even with a `tool_use` block present — the direct API keeps the block and its complete members (measured 2026-09-04, M6); the proxy's buffered writer publishes the complete top-level members of the fragment, each as the bytes the runtime wrote (`completeTopLevelMembers`, §7 row 8), and the stream carries the fragment verbatim in a block left open (`7b-8b`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (measured 2026-09-02, 2026-09-04)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-3",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-3",
+      "matrixLine": 226,
+      "field": "`messages`",
+      "vendor": {
+        "valueSpace": "array, `minItems: 1`, required",
+        "defaultWhenOmitted": "none",
+        "observableEffect": "the conversation",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak (same caveat as A-1)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-4",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-4",
+      "matrixLine": 227,
+      "field": "`messages[].role`",
+      "vendor": {
+        "valueSpace": "`user`|`assistant`, plus `system` in the positions §5.5.7 measures",
+        "defaultWhenOmitted": "none",
+        "observableEffect": "turn attribution",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; `system` carries POSITION rules decided in their own late phase — index 0 is 400 with guidance toward the top-level parameter, and elsewhere a system run must precede an `assistant` message or end the array. Everything else about the item is the ordinary item schema at `messages.<i>` (§5.5.7, which also names the one clause not mirrored). Anything else 400 in the Anthropic envelope",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-5",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-5",
+      "matrixLine": 228,
+      "field": "`messages[].content`",
+      "vendor": {
+        "valueSpace": "string | block array",
+        "defaultWhenOmitted": "none",
+        "observableEffect": "the turn",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-6",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-6",
+      "matrixLine": 229,
+      "field": "`content[].type:\"text\"`",
+      "vendor": {
+        "valueSpace": "`{text, cache_control?, citations?}`",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "text input",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-7",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-7",
+      "matrixLine": 230,
+      "field": "`content[].type:\"image\"`",
+      "vendor": {
+        "valueSpace": "`source`: `{type:\"base64\", media_type, data}` | `{type:\"url\", url}` | `{type:\"file\", file_id}`",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "vision input",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "base64",
+      "claimedLeadInLegend": false,
+      "claimedNote": "base64 + url supported; **`file` rejected pre-execution** (contract `:307`) — the provider accepts it via the Files API, so this is a real capability gap surfaced as a 400",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak for base64/url (`anthropic.messages.image.schema_exact`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-8",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-8",
+      "matrixLine": 231,
+      "field": "`content[].type:\"document\"`",
+      "vendor": {
+        "valueSpace": "PDF / text / custom-content sources",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "document input; PDF page tokens in `usage`",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "unknown",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**UNKNOWN — not in the contract's block table (`:305-310`)**; most likely dropped or 400. Probe P-36",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-9",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-9",
+      "matrixLine": 232,
+      "field": "`content[].type:\"tool_use\"`",
+      "vendor": {
+        "valueSpace": "`{id, name, input}`",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "replays an assistant tool turn",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; flattened into context",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak (`anthropic.messages.tool_use`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-10",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-10",
+      "matrixLine": 233,
+      "field": "`content[].type:\"tool_result\"`",
+      "vendor": {
+        "valueSpace": "`{tool_use_id, content, is_error?}`",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "tool result turn",
+        "invalidValue": "400 / `invalid_request_error` (unmatched `tool_use_id` is a 400 there)"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; `is_error` handling UNKNOWN",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak (`anthropic.messages.tool_result.schema_exact`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-11",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-11",
+      "matrixLine": 234,
+      "field": "`content[].type:\"thinking\"` / `\"redacted_thinking\"`",
+      "vendor": {
+        "valueSpace": "`{thinking, signature}`",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "required to replay a thinking turn; **signature is verified server-side**",
+        "invalidValue": "400 / `invalid_request_error` on a bad signature"
+      },
+      "claimedLead": "unknown",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**UNKNOWN — not in the contract's block table.** A client replaying a thinking turn is unhandled",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-12",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-12",
+      "matrixLine": 235,
+      "field": "`cache_control` (on any block)",
+      "vendor": {
+        "valueSpace": "`{type:\"ephemeral\", ttl?}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "`usage.cache_creation_input_tokens` / `cache_read_input_tokens`",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "accepted",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**accepted and ignored**, documented as such (contract `:405` ff., \"Prompt caching\")",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-13",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-13",
+      "matrixLine": 236,
+      "field": "`system`",
+      "vendor": {
+        "valueSpace": "string | block array",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "system steering",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; flattened (`normalizers.ts:99-100`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-14",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-14",
+      "matrixLine": 237,
+      "field": "`temperature`",
+      "vendor": {
+        "valueSpace": "number **0..1**",
+        "defaultWhenOmitted": "(not applied)",
+        "observableEffect": "sampling",
+        "invalidValue": "400 `invalid_request_error` `temperature: range: 0..1`; non-number or **null** → `temperature: Input should be a valid number` (measured 2026-08-30)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored (`rejectInvalidAnthropicSampling`); a valid value is accepted and inert — the Claude CLI has no sampling control, and nothing echoes it",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-15",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-15",
+      "matrixLine": 238,
+      "field": "`top_p`",
+      "vendor": {
+        "valueSpace": "number 0..1",
+        "defaultWhenOmitted": "(not applied)",
+        "observableEffect": "nucleus",
+        "invalidValue": "`top_p: range: 0..1` / `Input should be a valid number` (measured)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored; accepted and inert",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-16",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-16",
+      "matrixLine": 239,
+      "field": "`top_k`",
+      "vendor": {
+        "valueSpace": "integer (negatives accepted by the direct API)",
+        "defaultWhenOmitted": "(not applied)",
+        "observableEffect": "top-K truncation",
+        "invalidValue": "non-integer → `top_k: Input should be a valid integer` (measured); `-1` accepted"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored; accepted and inert",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-17",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-17",
+      "matrixLine": 240,
+      "field": "`stop_sequences`",
+      "vendor": {
+        "valueSpace": "array of strings",
+        "defaultWhenOmitted": "`[]`",
+        "observableEffect": "stops output; `stop_reason:\"stop_sequence\"` **and `stop_sequence` echoes the matched string**",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "realized",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (P-8, §5.5.5-A)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-18",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-18",
+      "matrixLine": 241,
+      "field": "`stream`",
+      "vendor": {
+        "valueSpace": "boolean",
+        "defaultWhenOmitted": "`false`",
+        "observableEffect": "SSE events",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak (`anthropic.messages.stream`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-19",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-19",
+      "matrixLine": 242,
+      "field": "`tools`",
+      "vendor": {
+        "valueSpace": "array of `{name, description, input_schema}` + server tools (`web_search`, `bash`, `text_editor`, `computer`, …)",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "`tool_use` blocks; `stop_reason:\"tool_use\"`",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "custom",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**custom tools only**; server-tool entries UNKNOWN (probe P-35)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED-weak (`anthropic.messages.tool_use`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-20",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-20",
+      "matrixLine": 243,
+      "field": "`tools[].input_schema`",
+      "vendor": {
+        "valueSpace": "JSON Schema object, required",
+        "defaultWhenOmitted": "none",
+        "observableEffect": "argument shape",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "preserved",
+      "claimedLeadInLegend": false,
+      "claimedNote": "preserved (contract `:311`)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-21",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-21",
+      "matrixLine": 244,
+      "field": "`tool_choice`",
+      "vendor": {
+        "valueSpace": "`{type:\"auto\"|\"any\"|\"tool\"|\"none\", name?, disable_parallel_tool_use?}`",
+        "defaultWhenOmitted": "`{\"type\":\"auto\"}` when tools present",
+        "observableEffect": "forcing",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "none`/`any`/`tool",
+      "claimedLeadInLegend": false,
+      "claimedNote": "`none`/`any`/`tool` mapped (contract `:312`); `any` normalizes to `required` and is schema-enforced as in chat row 31, matching the direct API (`stop_reason:\"tool_use\"` against a prompt begging for no call, measured 2026-09-02); **`disable_parallel_tool_use` handling UNKNOWN**",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (`option-is-a-promise`)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-22",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-22",
+      "matrixLine": 245,
+      "field": "`thinking`",
+      "vendor": {
+        "valueSpace": "`{type:\"adaptive\"|\"enabled\"|\"disabled\", budget_tokens?, display?}`",
+        "defaultWhenOmitted": "UNKNOWN — recent models default to adaptive thinking; the doc example sends `{\"type\":\"adaptive\"}` explicitly",
+        "observableEffect": "`thinking` content blocks; token spend",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated hard (enum, `budget_tokens ≥ 1024` and `< max_tokens`, container non-null) **then `budget_tokens` is deliberately not forwarded** — documented, with the CLI-inertness evidence, at contract `:317`",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-23",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-23",
+      "matrixLine": 246,
+      "field": "`output_config.effort`",
+      "vendor": {
+        "valueSpace": "`low`|`medium`|`high`|`xhigh`|`max`",
+        "defaultWhenOmitted": "UNKNOWN",
+        "observableEffect": "reasoning/effort spend",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; **accepted-and-ignored on models that gate it (Haiku)** — documented (contract `:318`)",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-24",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-24",
+      "matrixLine": 247,
+      "field": "`output_config.format`",
+      "vendor": {
+        "valueSpace": "`{type:\"json_schema\", schema}`",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "structured output",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "supported",
+      "claimedLeadInLegend": true,
+      "claimedNote": "supported; without tools the answer is validated against the schema and refused outside it (chat row 28, §7 row 10). It is no longer REFUSED together with tools — the provider serves that pair (measured 2026-09-03: `{\"verdict\": \"True\", \"score\": 0.95}` with tools present), so refusing a turn the backends can serve was itself a divergence — but it is **not enforced** there either, for the reason given in chat row 28. Accepted, echoed, and declared unenforced rather than silently dropped or falsely refused",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (measured 2026-09-03)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-25",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-25",
+      "matrixLine": 248,
+      "field": "`output_config.task_budget`",
+      "vendor": {
+        "valueSpace": "`{type:\"tokens\", total ≥ 20000}`",
+        "defaultWhenOmitted": "UNKNOWN",
+        "observableEffect": "total task token budget",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated; forwarding UNKNOWN (contract `:320`)",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-26",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-26",
+      "matrixLine": 249,
+      "field": "`output_format` (top level, deprecated)",
+      "vendor": {
+        "valueSpace": "object",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "superseded by `output_config.format`",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key (`output_format: Extra inputs are not permitted`) since 7a8bef6 — not in the measured key set",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4 key set)",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-27",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-27",
+      "matrixLine": 250,
+      "field": "`metadata.user_id`",
+      "vendor": {
+        "valueSpace": "opaque string",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "abuse detection",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated as the direct API validates it — `user_id` only, and a string — then not applied",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-28",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-28",
+      "matrixLine": 251,
+      "field": "`service_tier`",
+      "vendor": {
+        "valueSpace": "`auto`|`standard_only`",
+        "defaultWhenOmitted": "`\"auto\"`",
+        "observableEffect": "**`usage.service_tier` in the response** ( `\"priority\"` / `\"standard\"` )",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (`Input should be 'auto' or 'standard_only'`) and not applied. `usage.service_tier` is **not emitted**, where the direct API always emits it: a local CLI runs in no tier, and the proxy reports the runtime's numbers rather than inventing one",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-29",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-29",
+      "matrixLine": 252,
+      "field": "`speed`",
+      "vendor": {
+        "valueSpace": "`standard`|`fast`",
+        "defaultWhenOmitted": "UNKNOWN (beta)",
+        "observableEffect": "latency mode",
+        "invalidValue": "400 / `invalid_request_error` `speed: Extra inputs are not permitted` (measured without a beta header)"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key, as measured",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4)",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-30",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-30",
+      "matrixLine": 253,
+      "field": "`inference_geo`",
+      "vendor": {
+        "valueSpace": "string (beta)",
+        "defaultWhenOmitted": "UNKNOWN",
+        "observableEffect": "inference region",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "validated",
+      "claimedLeadInLegend": false,
+      "claimedNote": "validated (`must be one of ['global', 'us']`) and not applied; `usage.inference_geo` is not emitted, for the same reason as A-28",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-31",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-31",
+      "matrixLine": 254,
+      "field": "`mcp_servers`",
+      "vendor": {
+        "valueSpace": "array of MCP server defs (beta)",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "`mcp_tool_use` blocks",
+        "invalidValue": "400 `mcp_servers: Extra inputs are not permitted` (measured without a beta header)"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key, as measured",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4)",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-32",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-32",
+      "matrixLine": 255,
+      "field": "`container`",
+      "vendor": {
+        "valueSpace": "string (code-execution container id)",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "container reuse",
+        "invalidValue": "400 / `invalid_request_error`"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**refused for every value** with the direct API's own sentence — it allows `container` only alongside the code execution tool, which this proxy does not serve",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "liveParityRow": true
+    },
+    {
+      "id": "anthropic-messages:A-33",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-33",
+      "matrixLine": 256,
+      "field": "`context_management`",
+      "vendor": {
+        "valueSpace": "object (beta)",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "context editing/compaction",
+        "invalidValue": "400 `context_management: Extra inputs are not permitted` (measured without a beta header)"
+      },
+      "claimedLead": "refused",
+      "claimedLeadInLegend": false,
+      "claimedNote": "refused as an unknown key, as measured",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4)",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-34",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-34",
+      "matrixLine": 257,
+      "field": "`anthropic-version` header",
+      "vendor": {
+        "valueSpace": "e.g. `2023-06-01`; **required**",
+        "defaultWhenOmitted": "none — required",
+        "observableEffect": "request is rejected without it",
+        "invalidValue": "**400 / `invalid_request_error`**"
+      },
+      "claimedLead": "unknown",
+      "claimedLeadInLegend": false,
+      "claimedNote": "**UNKNOWN — the proxy does not appear to require it**; a body missing the header succeeds here and fails there. Probe P-37",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-35",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-35",
+      "matrixLine": 258,
+      "field": "`anthropic-beta` header",
+      "vendor": {
+        "valueSpace": "array/CSV of beta ids",
+        "defaultWhenOmitted": "absent",
+        "observableEffect": "unlocks beta fields",
+        "invalidValue": "400 / `invalid_request_error` on an unknown id"
+      },
+      "claimedLead": "silently ignored",
+      "claimedLeadInLegend": true,
+      "claimedNote": "silently ignored. The direct API refuses an unknown beta id at the header (`Unexpected value(s) … for the anthropic-beta header`); the proxy serves no betas, so it neither honours nor refuses one",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC (measured: direct refuses an unknown id)",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-36",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-36",
+      "matrixLine": 259,
+      "field": "`x-api-key` / `Authorization`",
+      "vendor": {
+        "valueSpace": "credential header",
+        "defaultWhenOmitted": "none — required",
+        "observableEffect": "401 without it",
+        "invalidValue": "401 / `authentication_error`"
+      },
+      "claimedLead": "proxy",
+      "claimedLeadInLegend": false,
+      "claimedNote": "proxy has its own local access gate; **the credential semantics differ by construction** (not applicable)",
+      "evidenceGrade": "DOC",
+      "evidenceNote": "DOC",
+      "liveParityRow": false
+    },
+    {
+      "id": "anthropic-messages:A-37",
+      "surface": "anthropic-messages",
+      "routes": [
+        "POST /v1/messages"
+      ],
+      "matrixRow": "A-37",
+      "matrixLine": 260,
+      "field": "*(behavioral)* unknown top-level field",
+      "vendor": {
+        "valueSpace": "—",
+        "defaultWhenOmitted": "—",
+        "observableEffect": "—",
+        "invalidValue": "400 `invalid_request_error` `bogus_field: Extra inputs are not permitted`; also `messages.0.bogus`; reported after field validation (measured 2026-08-30)"
+      },
+      "claimedLead": "mirrored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "mirrored (`rejectUnknownAnthropicKeys`) against the measured key set of 18 — `user_profile_id`, `mcp_servers`, `context_management`, `betas` are unknown to the direct API without a beta and unknown here",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED (§5.5.4)",
+      "liveParityRow": false
+    }
+  ]
+}

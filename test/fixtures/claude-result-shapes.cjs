@@ -26,6 +26,7 @@
 //   stale_sentence : turn 1 answers but leaves the refusal sentence on stderr;
 //                    turn 2 dies for an unrelated reason.
 //   exit_after_answer : answers, then dies while idle (no waiter).
+//   sized_detail   : a diagnostic of CLAUDE_TEST_DETAIL_CHARS characters.
 //   huge_errors    : an oversized `errors[]` entry.
 //   huge_subtype   : an oversized `subtype`.
 //   huge_both      : both `subtype` and detail oversized.
@@ -173,6 +174,15 @@ function emit() {
     // Both halves oversized: bounding each component separately and composing
     // afterwards would exceed the limit even though neither half did.
     write({ type: 'result', subtype: 'S'.repeat(9000), is_error: true, result: 'D'.repeat(9000) });
+    return;
+  }
+  if (shape === 'sized_detail') {
+    // A diagnostic of a length the TEST chooses, so a bound can be probed from
+    // either side of itself without the fixture hard-coding either number.
+    write({
+      type: 'result', subtype: 'success', is_error: true,
+      result: 'D'.repeat(Number(process.env.CLAUDE_TEST_DETAIL_CHARS || 100)),
+    });
     return;
   }
   if (shape === 'huge_subtype') {

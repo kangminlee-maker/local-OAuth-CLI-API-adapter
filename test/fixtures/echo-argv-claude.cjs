@@ -13,7 +13,10 @@ function emit() {
   write({
     type: 'result',
     subtype: 'success',
-    result: JSON.stringify(args),
+    // An object, not a bare array: these turns are spawned with an object
+    // `--json-schema`, and the real CLI honours it. Echoing an array made the
+    // fixture return a shape the contract it was spawned under forbids.
+    result: JSON.stringify({ argv: args }),
     stop_reason: 'end_turn',
     session_id: 'fake_session',
     usage: { input_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 1 },

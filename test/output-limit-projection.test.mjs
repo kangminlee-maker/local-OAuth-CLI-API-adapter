@@ -1,0 +1,193 @@
+import assert from 'node:assert/strict';
+import { chmod } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterEach, before, test } from 'node:test';
+import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
+
+// A forced call the runtime reports as cut off by its output limit is
+// delivered as the fragment it is, and every terminal field says so — the
+// direct APIs answer `finish_reason: "length"` (Chat), `status: "incomplete"`
+// with `incomplete_details.reason: "max_output_tokens"` and an item
+// `status: "incomplete"` ending in `response.incomplete` (Responses), and
+// `stop_reason: "max_tokens"` with the `tool_use` block present (Messages);
+// measured 2026-09-04, `review-artifacts/stage2/report.md` M6. Round 18
+// (codex C2) found the writers reported a completed call instead.
+
+const here = dirname(fileURLToPath(import.meta.url));
+const streamingClaude = resolve(here, 'fixtures/streaming-claude.cjs');
+const WEATHER = { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] };
+const FRAGMENT = '{"city":"Seoul","country":"Ko';
+
+before(async () => { await chmod(streamingClaude, 0o755); });
+afterEach(() => {
+  delete process.env.WRAPPER_RAW;
+  delete process.env.WRAPPER_STOP_REASON;
+});
+
+const SURFACES = {
+  chat: {
+    path: '/v1/chat/completions',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+    body: { model: 'm', messages: [{ role: 'user', content: 'w' }], tools: [{ type: 'function', function: { name: 'get_weather', parameters: WEATHER } }], tool_choice: { type: 'function', function: { name: 'get_weather' } } },
+  },
+  responses: {
+    path: '/v1/responses',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+    body: { model: 'm', input: 'w', tools: [{ type: 'function', name: 'get_weather', parameters: WEATHER }], tool_choice: { type: 'function', name: 'get_weather' } },
+  },
+  messages: {
+    path: '/v1/messages',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' },
+    body: { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }], tools: [{ name: 'get_weather', input_schema: WEATHER }], tool_choice: { type: 'tool', name: 'get_weather' } },
+  },
+};
+
+async function withProxy(stopReason, run) {
+  process.env.WRAPPER_RAW = FRAGMENT;
+  process.env.WRAPPER_STOP_REASON = stopReason;
+  const backend = new ClaudeCodeBackend({ command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    return await run(server.url);
+  } finally {
+    await server.close();
+    await backend.close();
+  }
+}
+
+async function call(url, surface, stream) {
+  const { path, headers, body } = SURFACES[surface];
+  const res = await fetch(`${url}${path}`, { method: 'POST', headers, body: JSON.stringify({ ...body, ...(stream ? { stream: true } : {}) }) });
+  const text = await res.text();
+  if (!stream) return { status: res.status, json: JSON.parse(text) };
+  const events = text.split('\n').filter((line) => line.startsWith('data: ') && line !== 'data: [DONE]').map((line) => JSON.parse(line.slice(6)));
+  return { status: res.status, events };
+}
+
+test('chat: the fragment under finish_reason "length" on both paths', async () => {
+  await withProxy('max_tokens', async (url) => {
+    const buffered = await call(url, 'chat', false);
+    assert.equal(buffered.status, 200);
+    assert.equal(buffered.json.choices[0].finish_reason, 'length');
+    assert.equal(buffered.json.choices[0].message.tool_calls[0].function.arguments, FRAGMENT);
+    const streamed = await call(url, 'chat', true);
+    assert.equal(streamed.status, 200);
+    const finishes = streamed.events.flatMap((e) => e.choices ?? []).map((c) => c.finish_reason).filter(Boolean);
+    assert.deepEqual(finishes, ['length']);
+    const args = streamed.events.flatMap((e) => e.choices ?? []).flatMap((c) => c.delta?.tool_calls ?? []).map((t) => t.function?.arguments ?? '').join('');
+    assert.equal(args, FRAGMENT);
+  });
+});
+
+test('responses: status incomplete, incomplete_details, an incomplete item, and response.incomplete', async () => {
+  await withProxy('max_tokens', async (url) => {
+    const buffered = await call(url, 'responses', false);
+    assert.equal(buffered.status, 200);
+    assert.equal(buffered.json.status, 'incomplete');
+    assert.deepEqual(buffered.json.incomplete_details, { reason: 'max_output_tokens' });
+    assert.equal(buffered.json.completed_at, null);
+    const item = buffered.json.output.find((o) => o.type === 'function_call');
+    assert.equal(item.status, 'incomplete');
+    assert.equal(item.arguments, FRAGMENT);
+    const streamed = await call(url, 'responses', true);
+    assert.equal(streamed.status, 200);
+    const last = streamed.events.at(-1);
+    assert.equal(last.type, 'response.incomplete');
+    assert.equal(last.response.status, 'incomplete');
+    assert.deepEqual(last.response.incomplete_details, { reason: 'max_output_tokens' });
+    assert.equal(last.response.output.find((o) => o.type === 'function_call').status, 'incomplete');
+    assert.equal(streamed.events.some((e) => e.type === 'response.completed'), false);
+  });
+});
+
+test('messages: stop_reason max_tokens, the complete members in the body, the fragment left open on the stream', async () => {
+  // The direct API's two writers project a cut-off call differently by
+  // design (M6): the body carries the complete top-level members parsed so
+  // far, the stream the verbatim fragment with no `content_block_stop`.
+  await withProxy('max_tokens', async (url) => {
+    const buffered = await call(url, 'messages', false);
+    assert.equal(buffered.status, 200);
+    assert.equal(buffered.json.stop_reason, 'max_tokens');
+    const block = buffered.json.content.find((b) => b.type === 'tool_use');
+    assert.deepEqual(block.input, { city: 'Seoul' });
+    const streamed = await call(url, 'messages', true);
+    assert.equal(streamed.status, 200);
+    const delta = streamed.events.find((e) => e.type === 'message_delta');
+    assert.equal(delta.delta.stop_reason, 'max_tokens');
+    const start = streamed.events.findIndex((e) => e.type === 'content_block_start' && e.content_block.type === 'tool_use');
+    assert.notEqual(start, -1);
+    const json = streamed.events.filter((e) => e.type === 'content_block_delta' && e.delta.type === 'input_json_delta').map((e) => e.delta.partial_json).join('');
+    assert.equal(json, FRAGMENT);
+    assert.equal(streamed.events.some((e) => e.type === 'content_block_stop' && e.index === streamed.events[start].index), false, 'the cut block is not closed');
+    assert.deepEqual(streamed.events.slice(-2).map((e) => e.type), ['message_delta', 'message_stop']);
+  });
+});
+
+test('CONTROL: the same fragment with no limit reported is refused, 502 on both paths', async () => {
+  await withProxy('end_turn', async (url) => {
+    for (const surface of Object.keys(SURFACES)) {
+      const buffered = await call(url, surface, false);
+      assert.equal(buffered.status, 502, surface);
+      const streamed = await call(url, surface, true);
+      assert.equal(streamed.status, 502, `${surface} stream`);
+    }
+  });
+});
+
+test('CONTROL: a whole call under end_turn reports a completed call', async () => {
+  process.env.WRAPPER_RAW = '{"city":"Seoul"}';
+  process.env.WRAPPER_STOP_REASON = 'end_turn';
+  const backend = new ClaudeCodeBackend({ command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    assert.equal((await call(server.url, 'chat', false)).json.choices[0].finish_reason, 'tool_calls');
+    const responses = await call(server.url, 'responses', false);
+    assert.equal(responses.json.status, 'completed');
+    assert.equal(responses.json.incomplete_details, null);
+    assert.equal((await call(server.url, 'messages', false)).json.stop_reason, 'tool_use');
+  } finally {
+    await server.close();
+    await backend.close();
+  }
+});
+
+test('messages stream: only the turn\'s FINAL block stays open — a cut call followed by narration closes (r20 F4)', async () => {
+  // A wrapper turn (two tools, `required`) whose second call's arguments are
+  // the cut fragment and whose narration comes AFTER the calls: the cut block
+  // must close before the text block opens, or the wire nests two blocks and
+  // the narration the body delivers is dropped from the stream.
+  const raw = '{"status":"tool_calls","toolCalls":[{"id":"c1","name":"get_weather","arguments":"{}"},{"id":"c2","name":"get_time","arguments":"{\\"tz\\":\\"As"}],"text":"after the calls"}';
+  process.env.WRAPPER_RAW = raw;
+  process.env.WRAPPER_STOP_REASON = 'max_tokens';
+  const backend = new ClaudeCodeBackend({ command: streamingClaude, cwd: process.cwd(), model: 'sonnet', timeoutMs: 30_000 });
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  try {
+    const body = {
+      model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }],
+      tools: [{ name: 'get_weather', input_schema: WEATHER }, { name: 'get_time', input_schema: { type: 'object', properties: { tz: { type: 'string' } } } }],
+      tool_choice: { type: 'any' },
+    };
+    const res = await fetch(`${server.url}/v1/messages`, { method: 'POST', headers: SURFACES.messages.headers, body: JSON.stringify({ ...body, stream: true }) });
+    assert.equal(res.status, 200);
+    const events = (await res.text()).split('\n').filter((line) => line.startsWith('data: ')).map((line) => JSON.parse(line.slice(6)));
+    // No block opens while another is open, and every opened block closes.
+    let open = null;
+    for (const e of events) {
+      if (e.type === 'content_block_start') { assert.equal(open, null, `block ${e.index} opened inside block ${open}`); open = e.index; }
+      if (e.type === 'content_block_stop') { assert.equal(open, e.index); open = null; }
+    }
+    assert.equal(open, null, 'the final block (narration) is closed');
+    const text = events.filter((e) => e.type === 'content_block_delta' && e.delta.type === 'text_delta').map((e) => e.delta.text).join('');
+    assert.equal(text, 'after the calls', 'the narration after the cut call reaches the stream');
+    assert.equal(events.find((e) => e.type === 'message_delta').delta.stop_reason, 'max_tokens');
+    // And the buffered body agrees on the content.
+    const buffered = await (await fetch(`${server.url}/v1/messages`, { method: 'POST', headers: SURFACES.messages.headers, body: JSON.stringify(body) })).json();
+    assert.deepEqual(buffered.content.map((b) => b.type), ['tool_use', 'tool_use', 'text']);
+    assert.deepEqual(buffered.content[1].input, {}, 'the cut call\'s complete members');
+  } finally {
+    await server.close();
+    await backend.close();
+  }
+});

@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import http from 'node:http';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { MAX_ERROR_MESSAGE_CHARS } from '../dist/proxy/types.js';
 import { unsupportedModelError } from '../dist/proxy/types.js';
+import { ProxyRequestError } from '../dist/proxy/types.js';
 import { LocalCliChatError } from '../dist/chat/types.js';
 
 // What a client actually receives when something goes wrong, per surface. These
@@ -171,7 +173,9 @@ test('/v1/messages: a failure with no provider mapping still uses the Anthropic 
 // A client picks the model, and the runtime echoes it into its refusal. Without a
 // ceiling at the boundary, that is a response as large as the client cares to
 // make it — on every surface and in every envelope.
-const OVERSIZED = 'X'.repeat(900);
+// Sized from the bound rather than beside it: raising the ceiling used to
+// leave these fixtures under it, so the tests stopped testing anything.
+const OVERSIZED = 'X'.repeat(MAX_ERROR_MESSAGE_CHARS * 2);
 
 for (const [path, body, shape] of [
   ['/v1/chat/completions', { ...CHAT, model: OVERSIZED }, 'openai-chat'],
@@ -185,7 +189,7 @@ for (const [path, body, shape] of [
       body,
     );
     const message = JSON.parse(text).error.message;
-    assert.ok(message.length <= 500, `error message must be bounded, got ${message.length}`);
+    assert.ok(message.length <= MAX_ERROR_MESSAGE_CHARS, `error message must be bounded, got ${message.length}`);
     assert.ok(message.endsWith('...[truncated]'), `expected the marker: ${message.slice(-20)}`);
   });
 }
@@ -209,12 +213,12 @@ for (const [label, length] of [['just under', 499], ['exactly at', 500]]) {
 
 test('a message one character over the bound is truncated to the bound', async () => {
   const { text } = await call(
-    backendThat({ fail: () => new Error('M'.repeat(501)) }),
+    backendThat({ fail: () => new Error('M'.repeat(MAX_ERROR_MESSAGE_CHARS + 1)) }),
     '/v1/chat/completions',
     CHAT,
   );
   const message = JSON.parse(text).error.message;
-  assert.equal(message.length, 500);
+  assert.equal(message.length, MAX_ERROR_MESSAGE_CHARS);
   assert.ok(message.endsWith('...[truncated]'));
 });
 
@@ -231,19 +235,19 @@ test('a mid-stream model refusal is bounded in the SSE error frame', async () =>
   assert.ok(frame, `expected an error frame: ${text}`);
   const payload = JSON.parse(frame.replace(/^data: /, '')).error;
   assert.equal(payload.code, 'model_not_found');
-  assert.ok(payload.message.length <= 500, `SSE refusal must be bounded, got ${payload.message.length}`);
+  assert.ok(payload.message.length <= MAX_ERROR_MESSAGE_CHARS, `SSE refusal must be bounded, got ${payload.message.length}`);
 });
 
 test('a mid-stream failure is bounded in the SSE error frame too', async () => {
   const { text } = await call(
-    backendThat({ delta: true, fail: () => new Error('Y'.repeat(900)) }),
+    backendThat({ delta: true, fail: () => new Error('Y'.repeat(MAX_ERROR_MESSAGE_CHARS * 2)) }),
     '/v1/chat/completions',
     { ...CHAT, stream: true },
   );
   const frame = text.split('\n').find((line) => line.includes('"error"'));
   assert.ok(frame, `expected an error frame: ${text}`);
   const message = JSON.parse(frame.replace(/^data: /, '')).error.message;
-  assert.ok(message.length <= 500, `SSE error must be bounded, got ${message.length}`);
+  assert.ok(message.length <= MAX_ERROR_MESSAGE_CHARS, `SSE error must be bounded, got ${message.length}`);
 });
 
 test('/v1/messages: a mid-stream failure ends with an Anthropic error event and no message_stop', async () => {
@@ -321,7 +325,7 @@ function providerError(status, message) {
   }));
 }
 
-const LONG_PROVIDER_MESSAGE = 'M'.repeat(600);
+const LONG_PROVIDER_MESSAGE = 'M'.repeat(MAX_ERROR_MESSAGE_CHARS + 100);
 
 test('a provider error survives mapping even when its message is oversized', async () => {
   const { status, text } = await call(
@@ -334,7 +338,7 @@ test('a provider error survives mapping even when its message is oversized', asy
   assert.equal(body.error.type, 'rate_limit_error');
   assert.equal(body.error.code, 'rate_limit_exceeded');
   assert.ok(body.error.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
-  assert.ok(body.error.message.length <= 500, `bounded, got ${body.error.message.length}`);
+  assert.ok(body.error.message.length <= MAX_ERROR_MESSAGE_CHARS, `bounded, got ${body.error.message.length}`);
 });
 
 test('/v1/messages: a mapped provider error uses the Anthropic envelope', async () => {
@@ -361,12 +365,12 @@ test('a mid-stream provider error keeps its mapping in the SSE frame', async () 
   const payload = JSON.parse(frame.replace(/^data: /, '')).error;
   assert.equal(payload.type, 'rate_limit_error');
   assert.ok(payload.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
-  assert.ok(payload.message.length <= 500);
+  assert.ok(payload.message.length <= MAX_ERROR_MESSAGE_CHARS);
 });
 
 // The generic branch: an unmapped failure whose own message is oversized. The
 // oversized-model tests exercise `ProxyRequestError`, which is a different one.
-const LONG_GENERIC = 'G'.repeat(900);
+const LONG_GENERIC = 'G'.repeat(MAX_ERROR_MESSAGE_CHARS * 2);
 
 for (const [path, body] of [
   ['/v1/chat/completions', CHAT],
@@ -376,7 +380,7 @@ for (const [path, body] of [
   test(`${path}: an oversized unmapped failure is bounded`, async () => {
     const { text } = await call(backendThat({ fail: () => new Error(LONG_GENERIC) }), path, body);
     const message = JSON.parse(text).error.message;
-    assert.ok(message.length <= 500, `expected a bound, got ${message.length}`);
+    assert.ok(message.length <= MAX_ERROR_MESSAGE_CHARS, `expected a bound, got ${message.length}`);
     assert.ok(message.startsWith('GGGG'));
   });
 }
@@ -593,7 +597,7 @@ test('/v1/messages: a mid-stream provider error keeps its mapping and bound', as
   const payload = JSON.parse(frame.slice(6)).error;
   assert.equal(payload.type, 'rate_limit_error', 'the provider type must survive');
   assert.ok(payload.message.startsWith('MMMM'), 'the provider message, not a JSON fragment');
-  assert.ok(payload.message.length <= 500, `bounded, got ${payload.message.length}`);
+  assert.ok(payload.message.length <= MAX_ERROR_MESSAGE_CHARS, `bounded, got ${payload.message.length}`);
 });
 
 test('an empty authKey is a configuration error, not an open proxy', async () => {
@@ -758,7 +762,8 @@ test('/v1/messages: max_tokens is required, as on the direct API', async () => {
   const body = JSON.parse(text);
   assert.equal(body.type, 'error');
   assert.equal(body.error.type, 'invalid_request_error');
-  assert.match(body.error.message, /max_tokens is required/);
+  // The direct API's own sentence, measured 2026-08-31 — not a paraphrase.
+  assert.equal(body.error.message, 'max_tokens: Field required');
 });
 
 for (const [label, value] of [
@@ -794,12 +799,18 @@ for (const [path, body] of [
 ]) {
   test(`${path}: an empty messages array is rejected`, async () => {
     // `minItems: 1` on both direct APIs. An empty conversation was reaching the
-    // runtime as a turn with nothing in it.
+    // runtime as a turn with nothing in it. The OpenAI surface answers with the
+    // direct API's own envelope, measured 2026-08-30.
     const { status, text } = await call(backendThat({}), path, body);
     assert.equal(status, 400);
     const payload = JSON.parse(text);
-    const message = payload.error.message;
-    assert.match(message, /at least one message/);
+    if (path === '/v1/chat/completions') {
+      assert.equal(payload.error.code, 'empty_array');
+      assert.equal(payload.error.param, 'messages');
+      assert.equal(payload.error.message, "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.");
+    } else {
+      assert.match(payload.error.message, /at least one message/);
+    }
   });
 }
 
@@ -852,7 +863,7 @@ test('a message with no role is rejected as missing, not defaulted', async () =>
   assert.equal(body.error.param, 'messages[0].role');
 });
 
-for (const [label, content] of [['null', null], ['a number', 42], ['a bare object', { type: 'text', text: 'x' }]]) {
+for (const [label, content] of [['a number', 42], ['a bare object', { type: 'text', text: 'x' }]]) {
   test(`chat content ${label} is rejected, as on the direct API`, async () => {
     const { status, text } = await call(
       backendThat({}),
@@ -860,18 +871,54 @@ for (const [label, content] of [['null', null], ['a number', 42], ['a bare objec
       { model: 'a-model', messages: [{ role: 'user', content }] },
     );
     assert.equal(status, 400, `content=${JSON.stringify(content)} must be a string or array`);
-    assert.equal(JSON.parse(text).error.param, 'messages[0].content');
+    const payload = JSON.parse(text);
+    assert.equal(payload.error.param, 'messages[0].content');
+    assert.equal(payload.error.code, 'invalid_type');
+    assert.equal(payload.error.message, `Invalid type for 'messages[0].content': expected one of a string or array of objects, but got ${label === 'a number' ? 'an integer' : 'an object'} instead.`);
   });
 }
 
-test('a user message with no content is rejected as missing', async () => {
-  const { status, text } = await call(
-    backendThat({}),
-    '/v1/chat/completions',
-    { model: 'a-model', messages: [{ role: 'user' }] },
-  );
-  assert.equal(status, 400);
-  assert.equal(JSON.parse(text).error.code, 'missing_required_parameter');
+// This block asserted the OPPOSITE until 2026-08-31, on a reading that the
+// instrument itself produced. The note read: "`{"role":"user"}` beside a
+// `temperature: 0.5` tripwire is answered about the temperature, so the message
+// passed validation." The tripwire technique needs the ridden fault to be
+// checked LATER than the field under test — and `content`'s required-ness is
+// checked later than the capability pass, so `temperature` wins over it no
+// matter what the message says. The probe could not have reported anything
+// else, and the conclusion was inverted.
+//
+// Re-measured directly, with no tripwire, on gpt-5.6-terra, gpt-5.5 and
+// gpt-5.6-sol, with `content: "hi"` as the positive control: every one of these
+// is 400.
+for (const [label, message, at] of [
+  ['absent', { role: 'user' }, 1],
+  ['null', { role: 'user', content: null }, 1],
+  ['absent on an assistant turn with no substitute', { role: 'assistant' }, 1],
+  ['absent on a system item', { role: 'system' }, 1],
+]) {
+  test(`a message whose content is ${label} is refused, as on the direct API`, async () => {
+    const { status, text } = await call(
+      backendThat({}),
+      '/v1/chat/completions',
+      { model: 'a-model', messages: [{ role: 'user', content: 'hi' }, message] },
+    );
+    assert.equal(status, 400);
+    const error = JSON.parse(text).error;
+    assert.equal(error.param, `messages.[${at}].content`, 'the dotted-bracket form this fault alone uses');
+    assert.equal(error.code, null, 'and no code at all');
+    assert.equal(error.message, "Invalid value for 'content': expected a string, got null.");
+  });
+}
+
+test('an empty string and an empty array are content, and are accepted', async () => {
+  for (const content of ['', []]) {
+    const { status } = await call(
+      backendThat({}),
+      '/v1/chat/completions',
+      { model: 'a-model', messages: [{ role: 'user', content }] },
+    );
+    assert.equal(status, 200, `content ${JSON.stringify(content)} is present`);
+  }
 });
 
 test('an assistant tool-call turn needs no content, as on the direct API', async () => {
@@ -891,15 +938,6 @@ test('an assistant tool-call turn needs no content, as on the direct API', async
     },
   );
   assert.equal(status, 200);
-});
-
-test('an assistant message with neither content nor tool calls is rejected', async () => {
-  const { status } = await call(
-    backendThat({}),
-    '/v1/chat/completions',
-    { model: 'a-model', messages: [{ role: 'assistant' }] },
-  );
-  assert.equal(status, 400);
 });
 
 test('the deprecated function role is accepted and treated as a tool result', async () => {
@@ -930,7 +968,38 @@ test('/v1/messages: a system role inside messages is rejected, naming the mistak
   assert.equal(status, 400);
   const body = JSON.parse(text);
   assert.equal(body.type, 'error');
-  assert.match(body.error.message, /must be user or assistant/);
+  // Measured: `system` at index 0 is not an unknown role — the direct API
+  // recognizes it and points at the top-level parameter instead. An unknown
+  // role (`developer`) is what gets the "Allowed roles" sentence.
+  assert.equal(
+    body.error.message,
+    "messages.0: use the top-level 'system' parameter for the initial system prompt; the directive-only form (content: [] with output_config) is accepted at any position",
+  );
+});
+
+test('/v1/messages: a system role past the head is accepted, as on the direct API', async () => {
+  // Measured 2026-08-31: a system message at index 1 returns 200. The proxy
+  // used to refuse the role at every position, which made a body the direct
+  // API runs a 400 here.
+  const { status } = await call(
+    backendThat({}),
+    '/v1/messages',
+    { model: 'a-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }, { role: 'system', content: 'be terse' }] },
+  );
+  assert.equal(status, 200);
+});
+
+test('/v1/messages: an unknown role still gets the "Allowed roles" sentence', async () => {
+  const { status, text } = await call(
+    backendThat({}),
+    '/v1/messages',
+    { model: 'a-model', max_tokens: 16, messages: [{ role: 'developer', content: 'x' }, { role: 'user', content: 'hi' }] },
+  );
+  assert.equal(status, 400);
+  assert.equal(
+    JSON.parse(text).error.message,
+    'messages: Unexpected role "developer". Allowed roles are "user" or "assistant"',
+  );
 });
 
 for (const [label, content] of [['null', null], ['a number', 7]]) {
@@ -951,7 +1020,11 @@ test('/v1/responses: a primitive input item is rejected', async () => {
     { model: 'a-model', input: [7] },
   );
   assert.equal(status, 400);
-  assert.match(JSON.parse(text).error.message, /input\[0\] must be an object/);
+  // Measured 2026-08-31: the direct API's own sentence, not the proxy's.
+  const error = JSON.parse(text).error;
+  assert.equal(error.code, 'invalid_type');
+  assert.equal(error.param, 'input[0]');
+  assert.equal(error.message, "Invalid type for 'input[0]': expected an input item, but got an integer instead.");
 });
 
 test('/v1/responses: a message item with no role is rejected, a typed item needs none', async () => {
@@ -963,7 +1036,12 @@ test('/v1/responses: a message item with no role is rejected, a typed item needs
     { model: 'a-model', input: [{ content: 'hi' }] },
   );
   assert.equal(missing.status, 400);
-  assert.equal(JSON.parse(missing.text).error.param, 'input[0].role');
+  // A missing role is not its own fault on this surface — the item simply
+  // fails the role enum, with the empty string standing in for what was sent.
+  const missingError = JSON.parse(missing.text).error;
+  assert.equal(missingError.param, 'input[0]');
+  assert.equal(missingError.code, 'invalid_value');
+  assert.equal(missingError.message, "Invalid value: ''. Supported values are: 'assistant', 'system', 'developer', and 'user'.");
 
   const typed = await call(
     backendThat({}),
@@ -1220,37 +1298,54 @@ test('a non-ASCII key sent as its UTF-8 bytes authenticates', async () => {
   }
 });
 
-test('/v1/responses: a non-string non-array input is rejected, omission is not', async () => {
+test('/v1/responses: input is required, and carrying nothing is not carrying it', async () => {
+  // This test used to end with `assert.equal(omitted.status, 200, 'omission
+  // keeps its existing behaviour')` — it pinned a divergence as the contract.
+  // Measured 2026-08-31: the direct API requires `input`, and its absence
+  // outranks an unknown key, a bad field and the state phase alike.
   for (const input of [7, null, true, {}]) {
     const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input });
     assert.equal(status, 400, `input=${JSON.stringify(input)} is not a string or array`);
     assert.equal(JSON.parse(text).error.param, 'input');
   }
   const omitted = await call(backendThat({}), '/v1/responses', { model: 'a-model' });
-  assert.equal(omitted.status, 200, 'omission keeps its existing behaviour');
+  assert.equal(omitted.status, 400, 'omission is a missing required parameter');
+  assert.equal(JSON.parse(omitted.text).error.code, 'missing_required_parameter');
+  assert.equal(JSON.parse(omitted.text).error.param, 'input');
+  // Present but empty is a different sentence, and names no param at all.
+  for (const input of [[], '']) {
+    const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input });
+    const error = JSON.parse(text).error;
+    assert.equal(status, 400, `input=${JSON.stringify(input)} carries no turn`);
+    assert.equal(error.param, null);
+    assert.equal(error.code, 'missing_required_parameter');
+    assert.equal(error.message, 'One of "input" or "previous_response_id" or \'prompt\' or \'conversation\' must be provided.');
+  }
 });
 
-test('/v1/responses: a non-string item type is rejected, an unknown string type is not', async () => {
-  // `type: null` took the typed-item exemption and skipped role validation.
-  // Unknown STRING types stay accepted deliberately: the direct item union
-  // grows with the API, and pinning it here would 400 tomorrow's valid items.
-  const bad = await call(backendThat({}), '/v1/responses', {
-    model: 'a-model', input: [{ type: null, content: 'hi' }],
-  });
-  assert.equal(bad.status, 400);
-  assert.equal(JSON.parse(bad.text).error.param, 'input[0].type');
-
-  const unknown = await call(backendThat({}), '/v1/responses', {
-    model: 'a-model', input: [{ type: 'not_yet_invented', content: 'hi' }],
-  });
-  assert.equal(unknown.status, 200);
+test('/v1/responses: an item type outside the union is rejected, whatever its JSON type', async () => {
+  // This file used to accept any unknown STRING type, reasoning that the union
+  // grows with the API. The direct API does not: it answers `invalid_value`
+  // naming its 33 members (measured 2026-08-31), and a non-string renders as
+  // the empty string. When the union grows, `pnpm e2e:text:parity` is what
+  // says so — the forward-compatibility worry has an instrument, not a guess.
+  for (const [label, type] of [['null', null], ['an integer', 7], ['an unknown string', 'not_yet_invented']]) {
+    const { status, text } = await call(backendThat({}), '/v1/responses', {
+      model: 'a-model', input: [{ type, content: 'hi' }],
+    });
+    assert.equal(status, 400, `${label} is not an item type`);
+    const error = JSON.parse(text).error;
+    assert.equal(error.param, 'input[0]');
+    assert.equal(error.code, 'invalid_value');
+    assert.match(error.message, /Supported values are: 'additional_tools'.+'web_search_call'\.$/);
+  }
 });
 
 // --- round 39 coverage: promises the inventory showed nothing pins ---
 
 test('an assistant with the singular deprecated function_call needs no content either', async () => {
-  // The exemption names tool_calls AND function_call; only tool_calls was
-  // pinned, so the function_call half could be deleted unnoticed.
+  // The exemption names every substitute in the assistant schema, not only
+  // tool_calls; each half could be deleted unnoticed.
   const { status } = await call(
     backendThat({}),
     '/v1/chat/completions',
@@ -1266,21 +1361,24 @@ test('an assistant with the singular deprecated function_call needs no content e
   assert.equal(status, 200);
 });
 
-test('chat accepts nested reasoning.effort as the alternate spelling', async () => {
-  // The contract names both `reasoning_effort` and `reasoning.effort` on chat;
-  // only the top-level spelling was tested there.
-  let seen;
+test('chat refuses the Responses-shaped spellings, as the direct API does', async () => {
+  // `reasoning` and `text` used to be accepted here as alternate sources for
+  // `reasoning_effort`/`verbosity` — a body the direct Chat API answers with
+  // `unknown_parameter` (measured 2026-08-30) succeeded against the proxy.
   const backend = {
     name: 'test', model: 'configured-model',
-    async generate(request) { seen = request.reasoningEffort; return ok(); },
-    async *stream() {},
+    async generate() { throw new Error('the request must not reach the backend'); },
+    async *stream() { throw new Error('the request must not reach the backend'); },
     async close() {},
   };
-  const { status } = await call(backend, '/v1/chat/completions', {
-    ...CHAT, reasoning: { effort: 'high' },
-  });
-  assert.equal(status, 200);
-  assert.equal(seen, 'high', 'the nested spelling must reach the backend');
+  for (const [key, value] of [['reasoning', { effort: 'high' }], ['text', { verbosity: 'low' }]]) {
+    const { status, text } = await call(backend, '/v1/chat/completions', { ...CHAT, [key]: value });
+    assert.equal(status, 400, key);
+    const payload = JSON.parse(text);
+    assert.equal(payload.error.code, 'unknown_parameter', key);
+    assert.equal(payload.error.param, key);
+    assert.equal(payload.error.message, `Unknown parameter: '${key}'.`);
+  }
 });
 
 test('/v1/responses: a non-streaming tool call is reported as a function_call output item', async () => {
@@ -1456,7 +1554,9 @@ test('/v1/responses: an unknown role on a message item is rejected there too', a
   for (const item of [{ role: 'tool', content: 'hi' }, { type: 'message', role: 'tool', content: 'hi' }]) {
     const { status, text } = await call(backendThat({}), '/v1/responses', { model: 'a-model', input: [item] });
     assert.equal(status, 400, `role tool is not in the Responses message set: ${JSON.stringify(item)}`);
-    assert.equal(JSON.parse(text).error.param, 'input[0].role');
+    const error = JSON.parse(text).error;
+    assert.equal(error.param, 'input[0]');
+    assert.equal(error.message, "Invalid value: 'tool'. Supported values are: 'assistant', 'system', 'developer', and 'user'.");
   }
 });
 
@@ -2053,7 +2153,7 @@ test('an oversized native error message is bounded like every other surface', as
   const started = await startLocalApiProxy({
     backend: backendThat({}), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
     chatSessionManager: {
-      async create() { throw new LocalCliChatError('N'.repeat(900), 502, 'runtime_failed'); },
+      async create() { throw new LocalCliChatError('N'.repeat(MAX_ERROR_MESSAGE_CHARS * 2), 502, 'runtime_failed'); },
       async closeAll() {},
     },
   });
@@ -2064,8 +2164,416 @@ test('an oversized native error message is bounded like every other surface', as
     assert.equal(res.status, 502);
     const body = await res.json();
     assert.equal(body.error.type, 'local_cli_chat_error');
-    assert.ok(body.error.message.length <= 500, `bounded, got ${body.error.message.length}`);
+    assert.ok(body.error.message.length <= MAX_ERROR_MESSAGE_CHARS, `bounded, got ${body.error.message.length}`);
     assert.ok(body.error.message.endsWith('...[truncated]'), body.error.message.slice(-20));
+  } finally {
+    await started.close();
+  }
+});
+
+// `param` is the other half of the client-visible envelope, and it is caller
+// text: an unknown key's own name, `metadata.<key>`, an item path. Bounding
+// only `message` left it as large as the client cared to make the request —
+// measured before this, a 10,000,000-character unknown key answered 400 with
+// `message.len 1024` beside `param.len 10,000,000`.
+for (const [path, body, where] of [
+  ['/v1/chat/completions', { ...CHAT, [OVERSIZED]: 1 }, 'buffered'],
+  ['/v1/responses', { model: 'm', input: 'hi', [OVERSIZED]: 1 }, 'buffered'],
+  // The Anthropic envelope carries no `param` at all, so the caller's key can
+  // only reach a client there through `message`, which is already bounded.
+]) {
+  test(`${path}: an oversized parameter name does not become an oversized param (${where})`, async () => {
+    const { text } = await call(backendThat({}), path, body);
+    const error = JSON.parse(text).error;
+    assert.ok(error.param, `expected a param naming the key: ${text.slice(0, 200)}`);
+    assert.ok(
+      error.param.length <= MAX_ERROR_MESSAGE_CHARS,
+      `param must ride the same ceiling as message, got ${error.param.length}`,
+    );
+    assert.ok(error.param.endsWith('...[truncated]'), `expected the marker: ${error.param.slice(-20)}`);
+    assert.ok(error.message.length <= MAX_ERROR_MESSAGE_CHARS);
+  });
+}
+
+test('a param that already fits is delivered untouched', async () => {
+  // The other side of the bound, which an unconditional truncation would break:
+  // every real param is short, so this is the case that must never change.
+  const { text } = await call(backendThat({}), '/v1/responses', { model: 'm', input: 'hi', zzz_unknown: 1 });
+  const error = JSON.parse(text).error;
+  assert.equal(error.param, 'zzz_unknown');
+});
+
+// Every other bound test in this file derives its fixtures from
+// MAX_ERROR_MESSAGE_CHARS, which is right — a fixture written beside the
+// constant stops testing anything when the constant moves. But it leaves the
+// VALUE tested against itself: changing the export to 1025 kept all 392
+// relevant tests green while clients started receiving 1025 characters. The
+// documented number needs one assertion that does not import it.
+test('the documented ceiling is 1024 characters, written out', () => {
+  // docs/conformance-matrix.md and docs/api-interface-contract.md both state
+  // 1024. Raising it is a decision about what clients receive, not a refactor,
+  // so it fails here first and the docs move with it.
+  assert.equal(MAX_ERROR_MESSAGE_CHARS, 1024);
+});
+
+test('a diagnostic is cut at 1024 characters on the wire, counted independently', async () => {
+  const { text } = await call(
+    backendThat({ fail: () => new Error('M'.repeat(5000)) }),
+    '/v1/chat/completions',
+    CHAT,
+  );
+  // Counted from the response, against the literal — not against the constant
+  // the producer used.
+  assert.equal(JSON.parse(text).error.message.length, 1024);
+});
+
+// `type` and `code` are DISCRIMINATORS a client switches on, and they arrive
+// from an upstream body — a backend-controlled channel into every envelope.
+// Measured before this: a backend error carrying a 4096-character `type` and
+// `code` put both at full length into the Responses and Anthropic envelopes,
+// beside a `message` the ceiling had already bounded.
+const PROVIDER_FLOOD = () => new Error(JSON.stringify({
+  status: 429,
+  error: { message: 'bounded message', type: 'T'.repeat(4096), param: 'p', code: 'C'.repeat(4096) },
+}));
+
+for (const [path, body, headers] of [
+  ['/v1/chat/completions', CHAT, {}],
+  ['/v1/responses', { model: 'a-model', input: 'hi' }, {}],
+  ['/v1/messages', MESSAGES, {}],
+]) {
+  test(`${path}: an upstream's oversized type and code do not reach the client`, async () => {
+    const { text } = await call(backendThat({ fail: PROVIDER_FLOOD }), path, body, headers);
+    const error = JSON.parse(text).error;
+    assert.ok(
+      String(error.type ?? '').length <= MAX_ERROR_MESSAGE_CHARS,
+      `type must be bounded, got ${String(error.type ?? '').length}`,
+    );
+    assert.ok(
+      String(error.code ?? '').length <= MAX_ERROR_MESSAGE_CHARS,
+      `code must be bounded, got ${String(error.code ?? '').length}`,
+    );
+    // A discriminator past the ceiling is not a shortened discriminator — it is
+    // no discriminator, so it falls back to what a missing one gets.
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code ?? null, null);
+    // And the ones that DO fit still arrive whole.
+    assert.equal(error.message, 'bounded message');
+  });
+}
+
+test('an upstream type and code that fit are passed through untouched', async () => {
+  const fits = () => new Error(JSON.stringify({
+    status: 429,
+    error: { message: 'slow down', type: 'rate_limit_error', param: null, code: 'rate_limit_exceeded' },
+  }));
+  const { text } = await call(backendThat({ fail: fits }), '/v1/responses', { model: 'a-model', input: 'hi' });
+  const error = JSON.parse(text).error;
+  assert.equal(error.type, 'rate_limit_error');
+  assert.equal(error.code, 'rate_limit_exceeded');
+});
+
+// The `param` bound has two writers — the JSON one and the SSE one — and only
+// the buffered half was pinned. A stream that has already committed its 200
+// carries its error in-band, which is the half a client with a long-running
+// request actually receives.
+test('an oversized param is bounded in the SSE error frame too', async () => {
+  const { text } = await call(
+    backendThat({ delta: true, fail: PROVIDER_FLOOD }),
+    '/v1/chat/completions',
+    { ...CHAT, stream: true },
+  );
+  const frame = text.split('\n').find((line) => line.includes('"error"'));
+  assert.ok(frame, `expected an error frame: ${text.slice(0, 200)}`);
+  const error = JSON.parse(frame.replace(/^data: /, '')).error;
+  assert.ok(String(error.type ?? '').length <= MAX_ERROR_MESSAGE_CHARS, `type ${String(error.type ?? '').length}`);
+  assert.ok(String(error.code ?? '').length <= MAX_ERROR_MESSAGE_CHARS, `code ${String(error.code ?? '').length}`);
+  assert.equal(error.type, 'invalid_request_error');
+});
+
+// A stream that has committed its 200 carries its failure IN-BAND. Reading the
+// frames through here is what stops a plain JSON 400 — the answer to a request
+// rejected BEFORE any header is written — from being mistaken for a frame: the
+// status, the content type, and the fact that the stream ran at all are
+// asserted before anything is parsed out of it. The test this replaces did the
+// opposite, falling back to `?? body` and parsing a JSON 400 as its frame.
+async function committedStreamFrames(backend, path, body) {
+  const started = await startLocalApiProxy({
+    backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, `a committed stream answers 200: ${text.slice(0, 200)}`);
+    const contentType = res.headers.get('content-type') ?? '';
+    assert.ok(
+      contentType.startsWith('text/event-stream'),
+      `expected a stream, got ${contentType}: ${text.slice(0, 200)}`,
+    );
+    const frames = text.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6).trim())
+      .filter((data) => data && data !== '[DONE]')
+      .map((data) => JSON.parse(data));
+    assert.ok(frames.length >= 2, `expected the stream to have run: ${text.slice(0, 200)}`);
+    return frames;
+  } finally {
+    await started.close();
+  }
+}
+
+function inBandError(frames) {
+  const error = frames.map((frame) => frame.error).find(Boolean);
+  assert.ok(error, `expected an in-band error frame: ${JSON.stringify(frames).slice(0, 300)}`);
+  return error;
+}
+
+test('an oversized unknown key on a stream:true request never reaches the SSE writer', async () => {
+  // What the test that used to stand here CLAIMED to exercise: a caller-supplied
+  // key reaching the stream writer's own envelope. It cannot. Normalization
+  // rejects the key before a single header is written, so the answer is an
+  // ordinary JSON 400 — which the old test's `?? body` fallback then parsed and
+  // called a frame, leaving the SSE `param` bound unguarded. The reachable
+  // behaviour is pinned here, in the envelope it actually lands in.
+  const started = await startLocalApiProxy({
+    backend: backendThat({ delta: true }), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/chat/completions`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'a-model', stream: true, messages: [{ role: 'user', content: 'hi' }], [OVERSIZED]: 1 }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 400, `rejected before the stream commits: ${text.slice(0, 200)}`);
+    assert.ok(
+      (res.headers.get('content-type') ?? '').startsWith('application/json'),
+      'the rejection is a JSON body, not an event stream',
+    );
+    assert.ok(!text.startsWith('data: '), 'a JSON body is not a frame');
+    const error = JSON.parse(text).error;
+    assert.equal(error.param.length, MAX_ERROR_MESSAGE_CHARS);
+    assert.ok(error.param.endsWith('...[truncated]'));
+  } finally {
+    await started.close();
+  }
+});
+
+test('an oversized param from a mid-stream failure is bounded in the real SSE frame', async () => {
+  // The half no test reached: a `ProxyRequestError` raised AFTER the 200 is
+  // committed, whose `param` is the transport's own. Removing `boundedErrorParam`
+  // from that writer left every test in this file green.
+  const param = 'P'.repeat(MAX_ERROR_MESSAGE_CHARS * 2);
+  assert.ok(param.length > MAX_ERROR_MESSAGE_CHARS, 'the fixture must exceed the ceiling');
+  const frames = await committedStreamFrames(
+    backendThat({
+      delta: true,
+      fail: () => new ProxyRequestError('mid-stream', 400, 'openai', 'invalid_request_error', param, 'some_code'),
+    }),
+    '/v1/chat/completions',
+    { ...CHAT, stream: true },
+  );
+  assert.ok(
+    JSON.stringify(frames).includes('partial'),
+    'the stream must have emitted its delta before it failed',
+  );
+  const error = inBandError(frames);
+  assert.equal(error.param.length, MAX_ERROR_MESSAGE_CHARS, `param must ride the ceiling in every writer, got ${error.param.length}`);
+  assert.ok(error.param.endsWith('...[truncated]'));
+  // The discriminators that FIT still arrive whole.
+  assert.equal(error.type, 'invalid_request_error');
+  assert.equal(error.code, 'some_code');
+});
+
+// ── The transport's own error object, not a body this proxy parsed ──────────
+// `codexBackendError` copies the upstream body's `type` and `code` onto a
+// `ProxyRequestError` verbatim, and every writer read those two fields off the
+// error directly — a branch `PROVIDER_FLOOD` above never enters, because that
+// one arrives as a generic Error the proxy parses. Measured at HEAD through the
+// REAL transport, with fetch answering an upstream 400 whose `type` and `code`
+// were 4096 characters each: all six client-visible surfaces published both at
+// full length beside a status the mapping had got right.
+const TRANSPORT_TYPE = 'T'.repeat(MAX_ERROR_MESSAGE_CHARS * 4);
+const TRANSPORT_CODE = 'C'.repeat(MAX_ERROR_MESSAGE_CHARS * 4);
+const TRANSPORT_FLOOD = () => new ProxyRequestError(
+  'upstream said no', 400, 'openai', TRANSPORT_TYPE, 'p', TRANSPORT_CODE,
+);
+
+for (const [path, body, envelope] of [
+  ['/v1/chat/completions', CHAT, 'openai'],
+  ['/v1/responses', { model: 'a-model', input: 'hi' }, 'openai'],
+  ['/v1/messages', MESSAGES, 'anthropic'],
+]) {
+  test(`${path}: a transport error's oversized type and code do not reach the client`, async () => {
+    assert.equal(TRANSPORT_TYPE.length, 4096, 'the fixture must be oversized');
+    assert.equal(TRANSPORT_CODE.length, 4096, 'the fixture must be oversized');
+    const { status, text } = await call(backendThat({ fail: TRANSPORT_FLOOD }), path, body);
+    // The upstream STATUS is the mapping and survives exactly; only the
+    // nonconforming discriminator is sacrificed.
+    assert.equal(status, 400);
+    const parsed = JSON.parse(text);
+    if (envelope === 'anthropic') assert.equal(parsed.type, 'error');
+    const error = parsed.error;
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code ?? null, null);
+    assert.equal(error.message, 'upstream said no');
+  });
+}
+
+for (const [path, body] of [
+  ['/v1/chat/completions', { ...CHAT, stream: true }],
+  ['/v1/responses', { model: 'a-model', input: 'hi', stream: true }],
+  ['/v1/messages', { ...MESSAGES, stream: true }],
+]) {
+  test(`${path}: a transport error's oversized type and code are bounded in the SSE frame`, async () => {
+    assert.equal(TRANSPORT_TYPE.length, 4096, 'the fixture must be oversized');
+    const frames = await committedStreamFrames(
+      backendThat({ delta: true, fail: TRANSPORT_FLOOD }), path, body,
+    );
+    const error = inBandError(frames);
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code ?? null, null);
+  });
+}
+
+// The ceiling is a `>`: exactly MAX survives, MAX+1 does not. Each side needs
+// its own case and each discriminator needs its own fixture — mutating that `>`
+// to `>=` dropped every value AT the ceiling and this file stayed green at
+// 161/161, because nothing here had ever sent one.
+const AT_CEILING = 'A'.repeat(MAX_ERROR_MESSAGE_CHARS);
+const PAST_CEILING = 'B'.repeat(MAX_ERROR_MESSAGE_CHARS + 1);
+
+for (const [route, fail] of [
+  // Both readers of a discriminator, held to the same ceiling.
+  ['a parsed upstream body', (type, code) => () => new Error(JSON.stringify({
+    status: 400, error: { message: 'bounded message', type, param: 'p', code },
+  }))],
+  ['the transport error object', (type, code) => () => new ProxyRequestError(
+    'bounded message', 400, 'openai', type, 'p', code,
+  )],
+]) {
+  test(`a type of exactly ${1024} characters survives (${route})`, async () => {
+    assert.equal(AT_CEILING.length, 1024, 'the fixture is the ceiling itself');
+    const { text } = await call(backendThat({ fail: fail(AT_CEILING, 'short_code') }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.type.length, 1024);
+    assert.equal(error.type, AT_CEILING);
+    assert.equal(error.code, 'short_code', 'the other discriminator is untouched');
+  });
+
+  test(`a type of ${1025} characters is dropped (${route})`, async () => {
+    assert.equal(PAST_CEILING.length, 1025, 'the fixture is one past the ceiling');
+    const { text } = await call(backendThat({ fail: fail(PAST_CEILING, 'short_code') }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.type, 'invalid_request_error');
+    assert.equal(error.code, 'short_code', 'the other discriminator is untouched');
+  });
+
+  test(`a code of exactly ${1024} characters survives (${route})`, async () => {
+    assert.equal(AT_CEILING.length, 1024, 'the fixture is the ceiling itself');
+    const { text } = await call(backendThat({ fail: fail('rate_limit_error', AT_CEILING) }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.code.length, 1024);
+    assert.equal(error.code, AT_CEILING);
+    assert.equal(error.type, 'rate_limit_error', 'the other discriminator is untouched');
+  });
+
+  test(`a code of ${1025} characters is dropped (${route})`, async () => {
+    assert.equal(PAST_CEILING.length, 1025, 'the fixture is one past the ceiling');
+    const { text } = await call(backendThat({ fail: fail('rate_limit_error', PAST_CEILING) }), '/v1/chat/completions', CHAT);
+    const error = JSON.parse(text).error;
+    assert.equal(error.code ?? null, null);
+    assert.equal(error.type, 'rate_limit_error', 'the other discriminator is untouched');
+  });
+}
+
+// ── Images, the fourth writer behind the same exit ──────────────────────────
+// `streamErrorPayload` is documented as the single exit for every OpenAI-shape
+// SSE error frame — chat, responses, images and the native surface — and the
+// loops above cover three of the four. Mutating ONLY the images catch to the
+// unbounded `rawStreamErrorPayload` published a `code` of 4096 characters in a
+// committed image stream and the whole suite stayed green, because no test had
+// ever driven an image stream PAST its commit into a failure.
+
+function failingImageBackend(fail) {
+  const image = { b64Json: 'iVBORw0KGgo=', revisedPrompt: null };
+  return {
+    name: 'test', model: 'configured-model',
+    async generate() { return { created: 0, images: [image] }; },
+    async *stream() {
+      // The commit has to happen on a real event: a stream that fails before
+      // one answers with an HTTP status, which is a different contract.
+      yield { type: 'completed', created: 0, image };
+      throw fail();
+    },
+    async close() {},
+  };
+}
+
+test('/v1/images/generations: a transport error\'s oversized type and code are bounded in the SSE frame', async () => {
+  assert.equal(TRANSPORT_TYPE.length, 4096, 'the fixture must be oversized');
+  assert.equal(TRANSPORT_CODE.length, 4096, 'the fixture must be oversized');
+  const backend = failingImageBackend(TRANSPORT_FLOOD);
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/images/generations`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot', stream: true }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200, `a committed stream answers 200: ${text.slice(0, 200)}`);
+    assert.ok(
+      (res.headers.get('content-type') ?? '').startsWith('text/event-stream'),
+      `expected a stream, got ${res.headers.get('content-type')}`,
+    );
+    // The commit is what puts the failure in-band; without it this would be a
+    // JSON 400 and the frame under test would never be written.
+    assert.ok(text.includes('event: image_generation.completed'), `the stream must have committed: ${text.slice(0, 200)}`);
+    const frames = text.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6).trim())
+      .filter((data) => data && data !== '[DONE]')
+      .map((data) => JSON.parse(data));
+    const error = inBandError(frames);
+    assert.equal(error.type, 'invalid_request_error', `type was ${String(error.type ?? '').length} chars`);
+    assert.equal(error.code ?? null, null, `code was ${String(error.code ?? '').length} chars`);
+    assert.ok(String(error.type ?? '').length <= MAX_ERROR_MESSAGE_CHARS);
+    assert.ok(String(error.code ?? '').length <= MAX_ERROR_MESSAGE_CHARS);
+    assert.equal(error.message, 'upstream said no', 'the diagnostic itself is untouched');
+  } finally {
+    await started.close();
+  }
+});
+
+test('/v1/images/generations: a discriminator that FITS still reaches the SSE frame whole', async () => {
+  // The opposite answer, so the assertion above cannot be satisfied by a writer
+  // that simply drops both fields.
+  const backend = failingImageBackend(
+    () => new ProxyRequestError('upstream said no', 429, 'openai', 'rate_limit_error', 'p', 'slow_down'),
+  );
+  const started = await startLocalApiProxy({
+    backend, imageGenerationClient: backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    const res = await fetch(`${started.url}/v1/images/generations`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a dot', stream: true }),
+    });
+    const text = await res.text();
+    assert.equal(res.status, 200);
+    const frames = text.split('\n')
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6).trim())
+      .filter((data) => data && data !== '[DONE]')
+      .map((data) => JSON.parse(data));
+    const error = inBandError(frames);
+    assert.equal(error.type, 'rate_limit_error');
+    assert.equal(error.code, 'slow_down');
   } finally {
     await started.close();
   }

@@ -6,10 +6,11 @@ import { ProxyRequestError } from './types.js';
 /**
  * Realizes, on the returned bytes, the Images API options that a transport
  * has no slot for. The default `codex-backend` transport sends every option on
- * the `image_generation` tool and never needs this; the diagnostic
- * `app-server` transport starts a Codex turn with the prompt and the attached
- * images only, so `size`, `output_format`, `output_compression`, `background`
- * and `mask` would otherwise be accepted, echoed, and never applied.
+ * the `image_generation` tool and needs only `realizeRequestedSize` (the one
+ * slot the backend has been seen not to honour); the diagnostic `app-server`
+ * transport starts a Codex turn with the prompt and the attached images only,
+ * so `size`, `output_format`, `output_compression`, `background` and `mask`
+ * would otherwise be accepted, echoed, and never applied.
  *
  * What is realized, in order: the `mask` (the generated image replaces the
  * source where the mask is transparent, the source is kept where it is
@@ -78,13 +79,79 @@ export async function realizeImageOptions(
   }
   if (size) pipeline = pipeline.resize(size.width, size.height, { fit: 'cover' });
   if (flatten) pipeline = pipeline.flatten({ background: '#ffffff' });
-  const quality = clampQuality(request.outputCompression);
-  const encoded = format === 'jpeg'
+  const encoded = encodeAs(pipeline, format, clampQuality(request.outputCompression));
+  return { ...image, b64Json: (await encoded.toBuffer()).toString('base64') };
+}
+
+/**
+ * The default `codex-backend` transport sends `size` on the tool slot, and the
+ * backend does not always honour it: an edit of a 256×256 source asked for
+ * `1024x1024` came back 1254×1254 (measured 2026-08-29). The direct API
+ * returns the requested canvas and echoes it, so a returned canvas that
+ * differs is brought to it here — covered, re-encoded in the codec it came
+ * back in (with `output_compression` as the quality, as the tool was told).
+ * A request with no concrete size, a canvas already at it, or bytes the
+ * codec cannot read (there is nothing to realize on those, and the caller is
+ * better served by the backend's bytes than by a failure after a billed turn)
+ * come back untouched.
+ */
+export async function realizeRequestedSize(
+  request: OpenAiImageGenerationRequest,
+  image: OpenAiGeneratedImage,
+): Promise<OpenAiGeneratedImage> {
+  const size = requestedSize(request.size);
+  if (!size) return image;
+  const sharp = await loadSharp();
+  const bytes = Buffer.from(image.b64Json, 'base64');
+  let format: string | undefined;
+  let width: number | undefined;
+  let height: number | undefined;
+  try {
+    ({ format, width, height } = await sharp(bytes).metadata());
+  } catch {
+    return image;
+  }
+  if (width === size.width && height === size.height) return image;
+  const pipeline = sharp(bytes).resize(size.width, size.height, { fit: 'cover' });
+  const encoded = encodeAs(pipeline, format === 'jpeg' || format === 'webp' ? format : 'png', clampQuality(request.outputCompression));
+  try {
+    return { ...image, b64Json: (await encoded.toBuffer()).toString('base64') };
+  } catch {
+    // A header the codec could read over pixels it could not decode.
+    return image;
+  }
+}
+
+/**
+ * Whether `realizeRequestedSize` will need the codec for this request, checked
+ * BEFORE the transport starts a turn: a codec that cannot load (a platform
+ * without a prebuilt binary, a broken install) is the operator's 500 now, not
+ * a failure after a billed generation — the same rule `prepareImageRealization`
+ * applies to the caller's bytes on the app-server transport.
+ */
+export async function prepareRequestedSize(
+  request: OpenAiImageGenerationRequest,
+  load: () => Promise<unknown> = loadSharp,
+): Promise<void> {
+  if (!requestedSize(request.size)) return;
+  try {
+    await load();
+  } catch (err) {
+    throw new ProxyRequestError(
+      `The image codec (sharp) could not be loaded, and a request with a concrete size needs it to hold the canvas it asked for: ${err instanceof Error ? err.message : String(err)}`,
+      500,
+      'openai',
+      'server_error',
+    );
+  }
+}
+
+function encodeAs(pipeline: Sharp, format: 'png' | 'jpeg' | 'webp', quality: number): Sharp {
+  return format === 'jpeg'
     ? pipeline.jpeg({ quality })
     : format === 'webp'
       ? pipeline.webp({ quality })
       : pipeline.png();
-  return { ...image, b64Json: (await encoded.toBuffer()).toString('base64') };
 }
 
 // The generated image is laid over the source through the mask: where the

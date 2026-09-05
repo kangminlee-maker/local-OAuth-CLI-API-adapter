@@ -771,6 +771,80 @@ for (const [label, events, expected] of SEQUENTIAL_BLOCK_CASES) {
   });
 }
 
+// The same turn, read BOTH ways, driven by the real transport.
+//
+// `narrateCallNarrateEvents` is a genuine upstream [text, call, text] turn, and
+// the cases above assert only the STREAM. The stream was never the half that
+// was wrong: the transport recorded one position for "the text", so the
+// buffered body merged the two runs and reported ['text','tool_use'] against
+// the wire's ['text','tool_use','text'] — a disagreement no streamed-only
+// assertion can see. Nothing here is a stub: the transport derives the runs and
+// both writers project them.
+test('a text/call/text turn from the real transport reads the same both ways', async () => {
+  await withProxy(narrateCallNarrateEvents(), async (url) => {
+    const messagesBody = (extra) => JSON.stringify({
+      model: 'gpt-5.5', max_tokens: 128, messages: [{ role: 'user', content: 'w' }],
+      tools: [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }], ...extra,
+    });
+    const headers = { 'content-type': 'application/json', 'x-api-key': 'local', 'anthropic-version': '2023-06-01' };
+    const buffered = await (await realFetch(`${url}/v1/messages`, { method: 'POST', headers, body: messagesBody({}) })).json();
+    const streamed = sseEvents(await (await realFetch(`${url}/v1/messages`, {
+      method: 'POST', headers, body: messagesBody({ stream: true }),
+    })).text());
+
+    const streamedBlocks = streamed.filter((e) => e.type === 'content_block_start').map((e) => e.content_block?.type);
+    const bufferedBlocks = buffered.content?.map((block) => block.type);
+    assert.deepEqual(streamedBlocks, ['text', 'tool_use', 'text'], 'the wire announces the turn the backend produced');
+    assert.deepEqual(bufferedBlocks, streamedBlocks, 'and the buffered body reports the same blocks');
+
+    const texts = new Map();
+    const order = [];
+    for (const event of streamed) {
+      if (event.type === 'content_block_start' && event.content_block?.type === 'text') { order.push(event.index); texts.set(event.index, ''); }
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') texts.set(event.index, `${texts.get(event.index) ?? ''}${event.delta.text}`);
+    }
+    assert.deepEqual(order.map((index) => texts.get(index)), ['Let me check. ', 'One moment.'], 'each run on its own block');
+    assert.deepEqual(
+      buffered.content?.filter((block) => block.type === 'text').map((block) => block.text),
+      ['Let me check. ', 'One moment.'],
+      'and the body carries the same two runs, not one merged block',
+    );
+  });
+});
+
+test('the same turn merges into ONE message item on /v1/responses, both ways', async () => {
+  // The other surface's own shape, held to the same standard: `output` reports
+  // a turn's text as one `message` item — its stream opens exactly one — so
+  // both of ITS readings merge the runs, at the same place. No vendor shape is
+  // being copied on either surface: measured 2026-09-02, the direct Anthropic
+  // API ends such a turn at the tool call and never emits text after it. What
+  // is pinned here is that the two readings agree and that the whole narration
+  // still reaches the client exactly once.
+  await withProxy(narrateCallNarrateEvents(), async (url) => {
+    const body = (extra) => JSON.stringify({
+      model: 'gpt-5.5', input: 'w',
+      tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }], ...extra,
+    });
+    const headers = { 'content-type': 'application/json' };
+    const buffered = await (await realFetch(`${url}/v1/responses`, { method: 'POST', headers, body: body({}) })).json();
+    const streamed = sseEvents(await (await realFetch(`${url}/v1/responses`, {
+      method: 'POST', headers, body: body({ stream: true }),
+    })).text());
+    const added = streamed.filter((e) => e.type === 'response.output_item.added').map((e) => e.item?.type);
+    assert.deepEqual(buffered.output?.map((item) => item.type), added, 'one turn, two readings of /v1/responses');
+    assert.deepEqual(
+      buffered.output?.filter((item) => item.type === 'message').flatMap((item) => item.content ?? []).map((part) => part.text),
+      ['Let me check. One moment.'],
+      'one message item, carrying the whole turn once',
+    );
+    assert.equal(
+      streamed.filter((e) => e.type === 'response.output_text.delta').map((e) => e.delta).join(''),
+      'Let me check. One moment.',
+      'and the deltas carry it once too',
+    );
+  });
+});
+
 /**
  * The backend closes the item but names no arguments there, and only the
  * completed output carries the finished value — the partial the stream sent is
@@ -1095,6 +1169,388 @@ for (const [label, messages] of TOOL_HISTORY_SHAPES) {
       await server.close();
       await backend.close();
       globalThis.fetch = realFetch;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// A tool-calling turn's narration, on a backend that streams none of it.
+//
+// Measured against the installed claude CLI (2.1.251, 2026-08-31) on the native
+// `--json-schema` channel every tool-calling turn now takes: the content_block
+// deltas carry the model's PROSE, and the wrapper object arrives only in the
+// final `result` message as `structured_output`. The extractor reading those
+// deltas as JSON finds neither a `text` property nor a tool call, so the turn
+// streams NOTHING and the whole answer is first known at `completed`.
+//
+//   STREAMED TEXT     : "서울의 날씨를 확인해드리겠습니다."
+//   RESULT.structured : {"status":"tool_calls","text":"서울의 날씨를 …",
+//                        "toolCalls":[{"id":"call_1", …}]}
+//
+// So `result.text` is non-empty while nothing was streamed — the case the
+// `missingTextTail` reconciliation exists for. Assert it on all three surfaces
+// at once: the stream and the buffered body describe ONE turn.
+
+function narratedToolCallBackend() {
+  const result = {
+    id: 'x',
+    model: 'configured-model',
+    text: '서울의 날씨를 확인해드리겠습니다.',
+    toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+    usage: { inputTokens: 20, outputTokens: 8, source: 'provider' },
+    latencyMs: 1,
+  };
+  return {
+    name: 'test',
+    model: 'configured-model',
+    async generate() { return result; },
+    async *stream() { yield { type: 'completed', result }; },
+    async close() {},
+  };
+}
+
+async function narratedToolSurfaces() {
+  const backend = narratedToolCallBackend();
+  const server = await startLocalApiProxy({ backend, host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+  const post = (path, body, headers = {}) => realFetch(`${server.url}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer local', ...headers },
+    body: JSON.stringify(body),
+  });
+  const chatTools = [{ type: 'function', function: { name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true } }];
+  const responsesTools = [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }];
+  const messagesTools = [{ name: 'get_weather', description: 'w', input_schema: WEATHER_PARAMETERS }];
+  const anthropicHeaders = { 'x-api-key': 'local', 'anthropic-version': '2023-06-01' };
+  try {
+    const chatBuffered = await (await post('/v1/chat/completions', { model: 'm', messages: [{ role: 'user', content: 'w' }], tools: chatTools })).json();
+    const chatStream = sseEvents(await (await post('/v1/chat/completions', { model: 'm', stream: true, messages: [{ role: 'user', content: 'w' }], tools: chatTools })).text());
+    const responsesBuffered = await (await post('/v1/responses', { model: 'm', input: 'w', tools: responsesTools })).json();
+    const responsesStream = sseEvents(await (await post('/v1/responses', { model: 'm', stream: true, input: 'w', tools: responsesTools })).text());
+    const messagesBuffered = await (await post('/v1/messages', { model: 'm', max_tokens: 64, messages: [{ role: 'user', content: 'w' }], tools: messagesTools }, anthropicHeaders)).json();
+    const messagesWire = await (await post('/v1/messages', { model: 'm', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'w' }], tools: messagesTools }, anthropicHeaders)).text();
+    const messagesStream = [...messagesWire.matchAll(/^event: (\S+)\ndata: (.+)$/gm)].map(([, type, data]) => ({ type, data: JSON.parse(data) }));
+    return {
+      chat: {
+        buffered: chatBuffered.choices?.[0]?.message?.content ?? '',
+        streamed: chatStream.map((chunk) => chunk.choices?.[0]?.delta?.content ?? '').join(''),
+        finishReason: chatStream.map((chunk) => chunk.choices?.[0]?.finish_reason).filter(Boolean),
+        streamedCalls: chatStream.flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? [])
+          .map((call) => call.function?.arguments).filter((value) => typeof value === 'string').join(''),
+      },
+      responses: {
+        buffered: responsesBuffered.output ?? [],
+        streamed: responsesStream.find((event) => event.type === 'response.completed')?.response?.output ?? [],
+        deltas: responsesStream.filter((event) => event.type === 'response.output_text.delta').map((event) => event.delta).join(''),
+      },
+      messages: {
+        buffered: messagesBuffered.content ?? [],
+        streamedBlocks: messagesStream.filter((event) => event.type === 'content_block_start').map((event) => event.data.content_block),
+        deltas: messagesStream.filter((event) => event.type === 'content_block_delta' && event.data.delta.type === 'text_delta')
+          .map((event) => event.data.delta.text).join(''),
+      },
+    };
+  } finally {
+    await server.close();
+  }
+}
+
+const NARRATION = '서울의 날씨를 확인해드리겠습니다.';
+
+test('chat streams the narration a tool-calling turn carried', async () => {
+  const surfaces = await narratedToolSurfaces();
+  assert.equal(surfaces.chat.buffered, NARRATION, 'the buffered body is the reference');
+  assert.equal(surfaces.chat.streamed, NARRATION, 'the stream must carry the same content the body reports');
+  assert.deepEqual(surfaces.chat.finishReason, ['tool_calls'], 'and it is still a tool-call turn');
+  assert.equal(surfaces.chat.streamedCalls, '{"city":"Seoul"}', 'the call still reaches the client once');
+});
+
+test('responses streams the message item a tool-calling turn carried', async () => {
+  const surfaces = await narratedToolSurfaces();
+  assert.deepEqual(
+    surfaces.responses.buffered.map((item) => item.type),
+    ['message', 'function_call'],
+    'the buffered body is the reference',
+  );
+  assert.deepEqual(
+    surfaces.responses.streamed.map((item) => item.type),
+    ['message', 'function_call'],
+    'the completed output must name the same items, at the same positions',
+  );
+  assert.equal(surfaces.responses.deltas, NARRATION, 'and the deltas must carry the text the item reports');
+  const message = surfaces.responses.streamed.find((item) => item.type === 'message');
+  assert.equal(message?.content?.[0]?.text, NARRATION);
+});
+
+test('messages streams the text block a tool-calling turn carried', async () => {
+  const surfaces = await narratedToolSurfaces();
+  assert.deepEqual(surfaces.messages.buffered.map((block) => block.type), ['text', 'tool_use']);
+  assert.deepEqual(surfaces.messages.streamedBlocks.map((block) => block.type), ['text', 'tool_use']);
+  assert.equal(surfaces.messages.deltas, NARRATION);
+});
+
+// The tail recovery has six relations between what streamed and what the turn
+// finally reported, and the three tests above cover only one of them (nothing
+// streamed). A one-line mutant changing the strict-prefix branch from
+// `final.slice(streamed.length)` to `final` produced "helhello" on both OpenAI
+// surfaces and no test noticed. Table-driven, both surfaces, asserting the
+// aggregated deltas ONCE and the Responses message text against those deltas.
+const TAIL_RELATIONS = [
+  ['nothing streamed', [], 'hello', 'hello'],
+  ['a strict prefix streamed', ['hel'], 'hello', 'hello'],
+  ['everything streamed', ['hello'], 'hello', 'hello'],
+  ['streamed in pieces', ['he', 'l'], 'hello', 'hello'],
+  // Bytes already delivered cannot be retracted, so a final text that
+  // contradicts or falls short of them leaves the client with what it received.
+  ['a divergent final text', ['hello'], 'hullo', 'hello'],
+  // Divergent AND longer, which is the case the prefix guard exists for:
+  // without it the tail is spliced onto a prefix the model never wrote, and
+  // the client assembles "Hxllo" — three characters of one string and two of
+  // another.
+  ['a divergent, longer final text', ['Hxl'], 'Hello', 'Hxl'],
+  ['a shorter final text', ['hello'], 'hel', 'hello'],
+  ['an empty final text', ['hello'], '', 'hello'],
+  ['nothing at all', [], '', ''],
+];
+
+function tailBackend(deltas, text) {
+  const result = {
+    id: 'x', model: 'configured-model', text,
+    toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+    usage: { inputTokens: 20, outputTokens: 8, source: 'provider' }, latencyMs: 1,
+  };
+  return {
+    name: 'test', model: 'configured-model',
+    async generate() { return result; },
+    async *stream() {
+      for (const delta of deltas) yield { type: 'text_delta', delta };
+      yield { type: 'completed', result };
+    },
+    async close() {},
+  };
+}
+
+for (const [label, deltas, text, expected] of TAIL_RELATIONS) {
+  test(`chat streams the turn's text exactly once with ${label}`, async () => {
+    const server = await startLocalApiProxy({ backend: tailBackend(deltas, text), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+    try {
+      const res = await realFetch(`${server.url}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+        body: JSON.stringify({
+          model: 'm', stream: true, messages: [{ role: 'user', content: 'w' }],
+          tools: [{ type: 'function', function: { name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true } }],
+        }),
+      });
+      const chunks = sseEvents(await res.text());
+      const streamed = chunks.map((chunk) => chunk.choices?.[0]?.delta?.content ?? '').join('');
+      assert.equal(streamed, expected, 'the client assembles exactly the turn once');
+      assert.deepEqual(chunks.map((chunk) => chunk.choices?.[0]?.finish_reason).filter(Boolean), ['tool_calls']);
+    } finally {
+      await server.close();
+    }
+  });
+
+  test(`responses streams the turn's text exactly once with ${label}`, async () => {
+    const server = await startLocalApiProxy({ backend: tailBackend(deltas, text), host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000 });
+    try {
+      const res = await realFetch(`${server.url}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+        body: JSON.stringify({
+          model: 'm', stream: true, input: 'w',
+          tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+        }),
+      });
+      const events = sseEvents(await res.text());
+      const streamed = events.filter((event) => event.type === 'response.output_text.delta').map((event) => event.delta).join('');
+      assert.equal(streamed, expected, 'the client assembles exactly the turn once');
+      const output = events.find((event) => event.type === 'response.completed')?.response?.output ?? [];
+      const message = output.find((item) => item.type === 'message');
+      // The completed summary has to agree with the deltas it sent, whichever
+      // relation held: no message item at all when there was no text.
+      assert.equal(message?.content?.[0]?.text ?? '', streamed, 'the message item is what the deltas said');
+      assert.ok(output.some((item) => item.type === 'function_call'), 'and the call is still there');
+    } finally {
+      await server.close();
+    }
+  });
+}
+
+// The turn's text had two sources of truth: the streamed deltas went out as the
+// model wrote them, and `completed()` handed the buffered path a TRIMMED copy.
+// A narration ending in a space arrived as two different strings, and a
+// whitespace-only one gave the stream a whole `message` item the buffered body
+// did not have — one turn, two shapes. The vendor returns what the model
+// emitted, so the trim is gone; these pin that it stays gone.
+for (const [label, narration] of [
+  ['whitespace only', '\n'],
+  ['a trailing space', 'Let me check the weather. '],
+  ['a leading newline', '\nLet me check the weather.'],
+]) {
+  test(`a narration that is ${label} reads the same streamed and buffered`, async () => {
+    const events = [
+      { type: 'response.output_text.delta', delta: narration },
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+      { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+      { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1' },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+      { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+    ];
+    await withProxy(events, async (url) => {
+      const tools = [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }];
+      const post = (body) => realFetch(`${url}/v1/responses`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+        body: JSON.stringify({ model: 'gpt-5.5', input: 'w', tools, ...body }),
+      });
+      const buffered = await (await post({})).json();
+      const events2 = sseEvents(await (await post({ stream: true })).text());
+      const streamed = events2.find((event) => event.type === 'response.completed')?.response?.output ?? [];
+      assert.deepEqual(
+        streamed.map((item) => item.type),
+        (buffered.output ?? []).map((item) => item.type),
+        'the same turn has the same items on both paths',
+      );
+      const textOf = (output) => output.find((item) => item.type === 'message')?.content?.[0]?.text;
+      assert.equal(textOf(streamed), textOf(buffered.output ?? []), 'and the same text, byte for byte');
+      assert.equal(textOf(streamed), narration, 'which is what the model emitted');
+    });
+  });
+}
+
+// Output positions are allocated when an item is ANNOUNCED, so once both are
+// announced the only thing left to decide is the order of the terminal frames —
+// and that has to be the announced order. Ordering them by production instead
+// closed item 2 before item 1, putting the `arguments.done` frame that promises
+// a call is final after a whole other item had already closed.
+test('items complete in the order the stream announced them', async () => {
+  const events = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'reasoning', id: 'rs_1' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', delta: 'checking' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ];
+  await withProxy(events, async (url) => {
+    const res = await realFetch(`${url}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'gpt-5.5', stream: true, input: 'w',
+        tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+      }),
+    });
+    const events2 = sseEvents(await res.text());
+    const added = events2.filter((event) => event.type === 'response.output_item.added').map((event) => event.output_index);
+    const done = events2.filter((event) => event.type === 'response.output_item.done').map((event) => event.output_index);
+    assert.deepEqual(added, [0, 1, 2], 'announced in position order');
+    assert.deepEqual(done, added, 'and completed in the same order');
+    // The frame that promises a call is final may not arrive after a later
+    // item has already closed.
+    const argumentsDone = events2.findIndex((event) => event.type === 'response.function_call_arguments.done');
+    const messageDone = events2.findIndex((event) => event.type === 'response.output_item.done' && event.output_index === 2);
+    assert.ok(argumentsDone < messageDone, 'the call is finalized before a later item closes');
+  });
+});
+
+// The completion-only turn: the backend announces NOTHING while it runs — no
+// text delta, no tool item — and the entire answer first exists at `completed`.
+// Both output positions are then allocated inside that terminal branch, so
+// nothing has been "announced" to order them by and PRODUCTION order is the
+// only thing left, read from `textRuns` exactly as the buffered body reads it.
+// The narration tests above use this shape with the text first only; with a
+// call ahead of it the branch was unprotected, and a mutant pinning it to
+// message-first left every ordering suite green.
+function completionOnlyBackend(afterCalls) {
+  const result = {
+    id: 'x',
+    model: 'configured-model',
+    text: 'Checking the weather.',
+    toolCalls: [{ id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' }],
+    usage: { inputTokens: 20, outputTokens: 8, source: 'provider' },
+    latencyMs: 1,
+    textRuns: [{ text: 'Checking the weather.', afterCalls }],
+  };
+  return {
+    name: 'test',
+    model: 'configured-model',
+    async generate() { return result; },
+    async *stream() { yield { type: 'completed', result }; },
+    async close() {},
+  };
+}
+
+const COMPLETION_ONLY_ORDERS = [
+  ['the turn narrated before it called', 0, ['message', 'function_call']],
+  ['the turn called before it narrated', 1, ['function_call', 'message']],
+];
+
+for (const [label, afterCalls, expected] of COMPLETION_ONLY_ORDERS) {
+  test(`a responses stream that announced nothing orders its items by production when ${label}`, async () => {
+    const server = await startLocalApiProxy({
+      backend: completionOnlyBackend(afterCalls),
+      host: '127.0.0.1',
+      port: 0,
+      requestTimeoutMs: 30_000,
+    });
+    const post = (body) => realFetch(`${server.url}/v1/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer local' },
+      body: JSON.stringify({
+        model: 'm',
+        input: 'w',
+        tools: [{ type: 'function', name: 'get_weather', description: 'w', parameters: WEATHER_PARAMETERS, strict: true }],
+        ...body,
+      }),
+    });
+    try {
+      const buffered = await (await post({})).json();
+      const events = sseEvents(await (await post({ stream: true })).text());
+
+      // Nothing reached the client before `completed`, so these added frames are
+      // the terminal branch's own — their order IS the decision under test.
+      const added = events.filter((event) => event.type === 'response.output_item.added');
+      assert.deepEqual(added.map((event) => event.item.type), expected, 'items are announced in production order');
+      assert.deepEqual(added.map((event) => event.output_index), [0, 1], 'taking the output positions in that order');
+
+      const done = events.filter((event) => event.type === 'response.output_item.done');
+      assert.deepEqual(done.map((event) => event.item.type), expected, 'the terminal frames follow the announced order');
+      assert.deepEqual(done.map((event) => event.output_index), [0, 1], 'and close positions monotonically');
+
+      const completed = events.find((event) => event.type === 'response.completed')?.response?.output ?? [];
+      assert.deepEqual(completed.map((item) => item.type), expected, 'the completed output says the same thing the stream did');
+      assert.deepEqual(
+        (buffered.output ?? []).map((item) => item.type),
+        expected,
+        'which is the order the buffered body reports for this same turn',
+      );
+
+      // The frame that promises a call is final may not arrive after a later
+      // item has already closed.
+      const argumentsDone = events.findIndex((event) => event.type === 'response.function_call_arguments.done');
+      const callDone = events.findIndex((event) => event.type === 'response.output_item.done' && event.item.type === 'function_call');
+      assert.ok(argumentsDone >= 0, 'the call was finalized');
+      assert.ok(argumentsDone < callDone, 'the call is finalized before its own item closes');
+
+      // Reordering may not cost the turn its content.
+      assert.equal(
+        events.filter((event) => event.type === 'response.output_text.delta').map((event) => event.delta).join(''),
+        'Checking the weather.',
+        'the narration still reaches the client exactly once',
+      );
+      assert.equal(
+        completed.find((item) => item.type === 'message')?.content?.[0]?.text,
+        'Checking the weather.',
+        'and the message item reports it',
+      );
+      assert.equal(
+        completed.find((item) => item.type === 'function_call')?.arguments,
+        '{"city":"Seoul"}',
+        'and the call still carries its arguments',
+      );
+    } finally {
+      await server.close();
     }
   });
 }

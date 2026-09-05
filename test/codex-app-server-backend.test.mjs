@@ -123,34 +123,30 @@ test('CodexAppServerBackend streams buffered text deltas', async () => {
   }
 });
 
-test('CodexAppServerBackend records app-server tool stream timing checkpoints', async () => {
+// The app-server half of the removed `.trim()`. `test/tool-stream-surface-parity`
+// pins the codex TRANSPORT half; this backend resolves its completed turn in
+// `resolveTurnWaiter`, and re-adding the trim there is invisible to every other
+// assertion in this file because every fixture narration is whitespace-free.
+// The vendor returns what the model emitted, so a turn's text must reach the
+// client as the backend wrote it — leading and trailing whitespace included.
+test('CodexAppServerBackend returns a completed turn untrimmed', async () => {
   process.env.CODEX_HOME = await createCodexHome();
-  const timings = [];
   const backend = new CodexAppServerBackend({
     command: fakeCodex,
     cwd: process.cwd(),
     timeoutMs: 30_000,
-    onTiming: (timing) => timings.push(timing),
   });
 
   try {
-    const events = [];
-    for await (const event of backend.stream(toolStreamRequest())) {
-      events.push(event);
-    }
-
-    const toolDeltas = events.filter((event) => event.type === 'tool_call_delta');
-    assert.equal(toolDeltas.length, 3);
-    assert.equal(toolDeltas[0].name, 'get_weather');
-    assert.equal(toolDeltas[1].argumentsDelta, '{"city"');
-    assert.equal(toolDeltas[2].argumentsDelta, ':"Seoul"}');
-    assert.equal(events.at(-1).type, 'completed');
-    assert.equal(events.at(-1).result.toolCalls[0].arguments, '{"city":"Seoul"}');
-    assert.equal(timings.length, 1);
-    assert.equal(Number.isFinite(timings[0].firstTextDeltaMs), true);
-    assert.equal(Number.isFinite(timings[0].firstToolCallDeltaMs), true);
-    assert.equal(Number.isFinite(timings[0].firstToolArgumentDeltaMs), true);
-    assert.equal(timings[0].firstTextDeltaMs <= timings[0].firstToolArgumentDeltaMs, true);
+    const result = await backend.generate({
+      ...textRequest(),
+      messages: [{ role: 'user', content: 'PADDED_NARRATION' }],
+    });
+    assert.equal(result.text, '\n  MEDIUM_OK  ');
+    // The control: the trim is invisible unless the padding is, so assert the
+    // padding is what makes this row different from the ordinary narration.
+    assert.notEqual(result.text, 'MEDIUM_OK');
+    assert.equal(result.text.trim(), 'MEDIUM_OK');
   } finally {
     await backend.close();
   }
@@ -666,26 +662,6 @@ function earlyDeltaRequest() {
   return {
     ...textRequest(),
     messages: [{ role: 'user', content: 'EARLY_DELTA' }],
-  };
-}
-
-function toolStreamRequest() {
-  return {
-    ...textRequest(),
-    shape: 'openai-responses',
-    messages: [{ role: 'user', content: 'TOOL_STREAM_DIAGNOSTIC' }],
-    stream: true,
-    tools: [{
-      name: 'get_weather',
-      description: 'Get weather.',
-      inputSchema: {
-        type: 'object',
-        properties: { city: { type: 'string' } },
-        required: ['city'],
-      },
-      raw: {},
-    }],
-    toolChoice: { type: 'required' },
   };
 }
 

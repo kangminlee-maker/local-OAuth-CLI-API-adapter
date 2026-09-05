@@ -166,17 +166,21 @@ test('an empty catalogue rejects every model', async () => {
 test('a probe directory that cannot be created is unknown, not a request failure', async () => {
   // The default transport supplies no cwd, so the lookup creates its own private
   // directory. An unwritable temp volume must not turn into a server error.
+  // The home is pinned, not ambient: under a read-only ambient `CODEX_HOME`
+  // the recovery half could not write its invocation receipt and the test
+  // measured the sandbox instead of the probe directory (r44-codex).
+  const codexHome = await newHome();
   const originalTmp = process.env.TMPDIR;
   process.env.TMPDIR = join(originalTmp ?? '/tmp', 'definitely-not-a-directory-xyz');
   try {
     resetCodexModelCatalogCache();
-    assert.equal(await codexModels({ command: okCommand }), null);
+    assert.equal(await codexModels({ command: okCommand, codexHome }), null);
     // And it must not latch: once the volume works again, lookups resume.
     // Restoring an absent TMPDIR means deleting it, not assigning undefined.
     if (originalTmp === undefined) delete process.env.TMPDIR;
     else process.env.TMPDIR = originalTmp;
     resetCodexModelCatalogCache();
-    const models = await codexModels({ command: okCommand });
+    const models = await codexModels({ command: okCommand, codexHome });
     assert.ok(Array.isArray(models), 'expected the lookup to recover');
   } finally {
     if (originalTmp === undefined) delete process.env.TMPDIR;

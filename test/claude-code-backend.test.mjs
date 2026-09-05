@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { before, test } from 'node:test';
 import { ClaudeCodeBackend } from '../dist/proxy/claude-code-backend.js';
+import { MAX_ERROR_MESSAGE_CHARS } from '../dist/proxy/types.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fakeClaude = resolve(here, 'fixtures/fake-claude.cjs');
@@ -89,7 +90,11 @@ test('ClaudeCodeBackend parses structured tool decisions from persistent schema 
   }
 });
 
-test('ClaudeCodeBackend uses persistent JSON mode without losing exact JSON output', async () => {
+test('ClaudeCodeBackend sends an OpenAI json_schema through the native channel', async () => {
+  // This used to run on the persistent child, whose argv is fixed at spawn, so
+  // `--json-schema` never went with it: the only thing asking for the shape was
+  // a sentence in the prompt. The schema is a promise, so the turn takes the
+  // path that can carry it.
   const backend = new ClaudeCodeBackend({
     command: fakeClaude,
     cwd: process.cwd(),
@@ -100,30 +105,6 @@ test('ClaudeCodeBackend uses persistent JSON mode without losing exact JSON outp
 
     assert.equal(result.text, '{"adapter":"local-oauth-cli","ok":true}');
     assert.deepEqual(result.toolCalls, []);
-  } finally {
-    await backend.close();
-  }
-});
-
-test('ClaudeCodeBackend extracts live tool argument deltas from structured output', async () => {
-  const backend = new ClaudeCodeBackend({
-    command: fakeClaude,
-    cwd: process.cwd(),
-    timeoutMs: 30_000,
-  });
-  try {
-    const events = [];
-    for await (const event of backend.stream(toolRequest())) {
-      events.push(event);
-    }
-
-    const deltas = events
-      .filter((event) => event.type === 'tool_call_delta')
-      .map((event) => event.argumentsDelta ?? '')
-      .join('');
-    assert.equal(deltas, '{"city":"Seoul"}');
-    const completed = events.find((event) => event.type === 'completed');
-    assert.equal(completed.result.toolCalls[0].arguments, '{"city":"Seoul"}');
   } finally {
     await backend.close();
   }
@@ -268,6 +249,47 @@ function toolRequest() {
   };
 }
 
+test('every schema-bearing turn is spawned with --json-schema, on every surface', async () => {
+  // Measured against the real runtime 2026-08-31: with the caller's schema on
+  // the native channel, 0 of 12 hard turns violated it; with the schema left in
+  // the prompt — which is what the OpenAI shapes used to get, because only the
+  // Anthropic shape forced the flag-carrying path — 6 of 12 came back as valid
+  // JSON with keys the model invented (`comparison`, `summary`, `content`)
+  // instead of the caller's. A schema is a promise; the prompt is a request.
+  const base = {
+    model: 'claude-code-cli',
+    messages: [{ role: 'user', content: 'hi' }],
+    stream: false,
+    streamOptions: { includeUsage: false, includeObfuscation: false },
+    jsonMode: false,
+    tools: [],
+    toolChoice: { type: 'auto' },
+    raw: {},
+  };
+  const schema = PROBE_SCHEMA;
+  const weather = { name: 'get_weather', description: 'w', inputSchema: PROBE_SCHEMA };
+
+  for (const [label, request] of [
+    ['an OpenAI response_format schema', { ...base, shape: 'openai-chat', jsonMode: true, jsonSchema: schema }],
+    ['a Responses text.format schema', { ...base, shape: 'openai-responses', jsonMode: true, jsonSchema: schema }],
+    ['an Anthropic output_config schema', { ...base, shape: 'anthropic-messages', jsonMode: true, jsonSchema: schema }],
+    ['a forced tool', { ...base, shape: 'openai-chat', tools: [weather], toolChoice: { type: 'tool', name: 'get_weather' } }],
+  ]) {
+    const argv = await spawnedArgv(request, 'claude-code-cli');
+    const at = argv.indexOf('--json-schema');
+    assert.notEqual(at, -1, `${label} must carry the native channel: ${argv.join(' ')}`);
+    assert.ok(argv[at + 1]?.startsWith('{'), `${label} must carry a schema, got ${argv[at + 1]}`);
+    // The flag is spawn-time only (claude 2.1.251 has no per-turn form in
+    // stream-json input), so the turn cannot be reusing the persistent child.
+    assert.ok(argv.includes('--no-session-persistence'), `${label} must run one-shot`);
+  }
+
+  // And a turn with no schema still reuses the persistent child — the cost is
+  // paid where the promise exists, not everywhere.
+  const plain = await spawnedArgv({ ...base, shape: 'openai-chat' }, 'claude-code-cli');
+  assert.equal(plain.indexOf('--json-schema'), -1, `a schemaless turn must not carry the flag: ${plain.join(' ')}`);
+});
+
 async function spawnedArgv(request, model, options = {}) {
   const backend = new ClaudeCodeBackend({
     command: echoArgvClaude,
@@ -281,7 +303,7 @@ async function spawnedArgv(request, model, options = {}) {
     // Non-tool turns echo argv in result.text; forced-tool turns route the echoed
     // CLI output into the tool call's arguments.
     const raw = result.text || result.toolCalls?.[0]?.arguments || '';
-    return JSON.parse(raw);
+    return JSON.parse(raw).argv;
   } finally {
     await backend.close();
   }
@@ -295,7 +317,11 @@ function modelArgsIn(argv) {
 
 const PREFIX = 'claude model rejection (reported as 404): ';
 
-const PROBE_SCHEMA = { type: 'object', additionalProperties: false, properties: {}, required: [] };
+// The argv-echo double answers `{"argv": [...]}` whatever schema it was spawned
+// with, and the response path holds a schema-bearing answer to its schema
+// (conformance matrix §7 rows 8 and 10) — so the schema these argv probes send
+// is the one the echo satisfies. They measure the argv, not conformance.
+const PROBE_SCHEMA = { type: 'object', properties: { argv: { type: 'array', items: { type: 'string' } } }, required: ['argv'] };
 
 function anthropicTuningRequest(overrides) {
   return {
@@ -1117,7 +1143,7 @@ test('an oversized runtime diagnostic is bounded before it reaches the client', 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 500, `client message must be bounded to 500, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `client message must ride the shared ceiling, got ${err.message.length}`);
         assert.match(err.message, /error_during_execution/);
         return true;
       },
@@ -1176,7 +1202,7 @@ test('an oversized subtype cannot bypass the client-message bound', async () => 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 500, `bound must cover the whole message, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `bound must cover the whole message, got ${err.message.length}`);
         return true;
       },
     );
@@ -1297,7 +1323,7 @@ test('the bound applies to the composed message, not to each half', async () => 
         { honorRequestModel: true, command: resultShapes },
       ),
       (err) => {
-        assert.ok(err.message.length <= 500, `composed message must be bounded, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `composed message must be bounded, got ${err.message.length}`);
         return true;
       },
     );
@@ -1416,7 +1442,7 @@ test('honorRequestModel off: a refusal message is bounded even though nothing ma
       ),
       (err) => {
         assert.equal(err.statusCode, undefined, 'honour-off keeps this a server-side failure');
-        assert.ok(err.message.length <= 500, `refusal message must be bounded, got ${err.message.length}`);
+        assert.ok(err.message.length <= MAX_ERROR_MESSAGE_CHARS, `refusal message must be bounded, got ${err.message.length}`);
         return true;
       },
     );
@@ -1830,7 +1856,7 @@ test('gates effort out for every Haiku spelling on a one-shot turn', async () =>
 });
 
 test('forwards output_config.format schema to claude --json-schema', async () => {
-  const schema = { type: 'object', additionalProperties: false, properties: {}, required: [] };
+  const schema = PROBE_SCHEMA;
   const argv = await spawnedArgv(anthropicTuningRequest({ jsonMode: true, jsonSchema: schema }));
   const i = argv.indexOf('--json-schema');
   assert.ok(i !== -1, `expected --json-schema in argv: ${argv.join(' ')}`);
@@ -1864,7 +1890,11 @@ test('forwards thinking on capable models and gates adaptive on Haiku', async ()
 
 test('forced tool + per-request effort: one-shot argv forwards both --json-schema and --effort', async () => {
   const argv = await spawnedArgv(
-    { ...toolRequest(), shape: 'anthropic-messages', effort: 'low', streamOptions: { includeUsage: false, includeObfuscation: false } },
+    {
+      ...toolRequest(),
+      tools: [{ ...toolRequest().tools[0], inputSchema: PROBE_SCHEMA }],
+      shape: 'anthropic-messages', effort: 'low', streamOptions: { includeUsage: false, includeObfuscation: false },
+    },
     'claude-opus-4-8',
   );
   assert.ok(argv.includes('--effort'), `expected --effort: ${argv.join(' ')}`);
@@ -1918,3 +1948,95 @@ test('honorRequestModel off: the one-shot argv is unchanged', async () => {
   );
   assert.ok(argv.some((arg) => arg.includes('Say OK')), `argv: ${argv.join(' ')}`);
 });
+
+// The ceiling is one constant, and this is the half that proves it: a
+// diagnostic BETWEEN the operator log's 500 and the client ceiling must arrive
+// whole. A second, tighter bound inside this backend clipped these at 500 while
+// the HTTP layer's own comment claimed both were the same — so raising
+// MAX_ERROR_MESSAGE_CHARS silently did nothing for claude-runtime messages.
+test('a runtime diagnostic under the client ceiling is not clipped by the operator log bound', async () => {
+  const length = MAX_ERROR_MESSAGE_CHARS - 100;
+  assert.ok(length > 500, 'this case only exists while the two bounds differ');
+  const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+  const previousChars = process.env.CLAUDE_TEST_DETAIL_CHARS;
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  try {
+    process.stderr.write = () => true;
+    process.env.CLAUDE_TEST_RESULT_SHAPE = 'sized_detail';
+    process.env.CLAUDE_TEST_DETAIL_CHARS = String(length);
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.equal(err.message.length, length, 'a diagnostic that fits the ceiling must arrive whole');
+        assert.ok(!err.message.includes('...[truncated]'), `it must not be truncated: ${err.message.slice(-30)}`);
+        return true;
+      },
+    );
+    // And the other side: over the ceiling, it is bounded AT the ceiling — not
+    // at some smaller number of a producer's own choosing.
+    process.env.CLAUDE_TEST_DETAIL_CHARS = String(MAX_ERROR_MESSAGE_CHARS + 500);
+    await assert.rejects(
+      () => runAgainstRejectingClaude(
+        openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+        'claude-opus-4-8',
+        { honorRequestModel: true, command: resultShapes },
+      ),
+      (err) => {
+        assert.equal(err.message.length, MAX_ERROR_MESSAGE_CHARS);
+        assert.ok(err.message.endsWith('...[truncated]'), `expected the marker: ${err.message.slice(-30)}`);
+        return true;
+      },
+    );
+  } finally {
+    process.stderr.write = originalWrite;
+    if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+    else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+    if (previousChars === undefined) delete process.env.CLAUDE_TEST_DETAIL_CHARS;
+    else process.env.CLAUDE_TEST_DETAIL_CHARS = previousChars;
+  }
+});
+
+// F7 unified the NUMBER and left the RULE: `boundedText` reserved the marker
+// unconditionally, so a diagnostic in the 14-character window just under the
+// ceiling lost its tail and gained a marker it did not need — while the HTTP
+// serializer, whose own comment names that bug as fixed, would have passed the
+// same string through whole. The window is where the two rules differ, so it is
+// where the test has to be.
+for (const [label, length] of [
+  ['well under the ceiling', MAX_ERROR_MESSAGE_CHARS - 200],
+  ['inside the marker window', MAX_ERROR_MESSAGE_CHARS - 9],
+  ['exactly at the ceiling', MAX_ERROR_MESSAGE_CHARS],
+]) {
+  test(`a runtime diagnostic ${label} arrives whole`, async () => {
+    const previousShape = process.env.CLAUDE_TEST_RESULT_SHAPE;
+    const previousChars = process.env.CLAUDE_TEST_DETAIL_CHARS;
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    try {
+      process.stderr.write = () => true;
+      process.env.CLAUDE_TEST_RESULT_SHAPE = 'sized_detail';
+      process.env.CLAUDE_TEST_DETAIL_CHARS = String(length);
+      await assert.rejects(
+        () => runAgainstRejectingClaude(
+          openAiRefusalRequest({ model: 'claude-opus-4-8', effort: 'low' }),
+          'claude-opus-4-8',
+          { honorRequestModel: true, command: resultShapes },
+        ),
+        (err) => {
+          assert.equal(err.message.length, length, 'a diagnostic that fits must not be shortened');
+          assert.ok(!err.message.includes('...[truncated]'), 'nor marked');
+          return true;
+        },
+      );
+    } finally {
+      process.stderr.write = originalWrite;
+      if (previousShape === undefined) delete process.env.CLAUDE_TEST_RESULT_SHAPE;
+      else process.env.CLAUDE_TEST_RESULT_SHAPE = previousShape;
+      if (previousChars === undefined) delete process.env.CLAUDE_TEST_DETAIL_CHARS;
+      else process.env.CLAUDE_TEST_DETAIL_CHARS = previousChars;
+    }
+  });
+}

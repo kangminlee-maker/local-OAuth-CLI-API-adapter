@@ -20,20 +20,172 @@ export interface NormalizedThinking {
   // The contract's `thinking` row documents the divergence.
 }
 
+/** One result of a tool turn the normalizer flattened. */
+export interface NormalizedToolResult {
+  readonly callId: string;
+  /**
+   * The result's own text as ONE STRING — a rendering of `parts`, not the
+   * place its content lives. `function_call_output` carries a string and the
+   * flattened prompt is a string, so the rendering stays.
+   */
+  readonly output: string;
+  /**
+   * The blocks THIS result carried, in the order it carried them.
+   *
+   * A SEQUENCE, not two buckets. It used to be `output` plus an `images` list,
+   * which cannot say where inside the result a picture sat: a result whose own
+   * content was `[text, image, text]` was reduced to one joined string and a
+   * pile of pictures, so the second sentence arrived ahead of the picture it
+   * followed. The same shape defect the message had one level up, arriving one
+   * level down — grouping loses order; a sequence is the order.
+   *
+   * Only `text` and `image` parts occur: a result's content is blocks of those
+   * two kinds, and a call or a result never nests inside one.
+   *
+   * The picture objects are the very ones `NormalizedMessage.images` holds, so
+   * a consumer that walks either one is looking at one picture, not a copy —
+   * which is what lets the image labeller say WHICH call a picture answers. The
+   * message-level list cannot: a turn answering two parallel calls has two
+   * results in it, and reading the FIRST result's call id for all of them
+   * labelled both of a turn's pictures with the first call.
+   */
+  readonly parts: readonly NormalizedPart[];
+}
+
+/**
+ * The pictures one result returned, in the order it carried them.
+ *
+ * Derived from the sequence rather than stored beside it: a stored list and a
+ * sequence holding the same pictures are two views that can disagree, and the
+ * consumers here — the image labeller, the transport's "which pictures did the
+ * sequence already place" check — must see exactly what the projection places.
+ */
+export function toolResultImages(result: NormalizedToolResult): readonly NormalizedImage[] {
+  return (result.parts ?? []).flatMap((part) => (part.kind === 'image' ? [part.image] : []));
+}
+
+/**
+ * One part of a message, in the position the client put it.
+ *
+ * A `text` part is a run of prose the message carried outside its other blocks;
+ * adjacent runs are joined, so no two text parts are ever neighbours.
+ *
+ * A message is only a TOOL turn when a call or a result is in it — text and
+ * pictures alone are an ordinary message, and `tool` stays unset there. The
+ * parts are recorded either way: order between a caption and the picture it
+ * captions is the client's, whether or not a tool ran.
+ */
+export type NormalizedPart =
+  /** `LocalToolCall` is already this shape — one name for one thing. */
+  | { readonly kind: 'call'; readonly call: LocalToolCall }
+  | { readonly kind: 'result'; readonly result: NormalizedToolResult }
+  /**
+   * A picture the turn carried as a block of its OWN — not inside any result,
+   * so `NormalizedToolResult.images` cannot hold it and nothing captions it.
+   *
+   * It is here because a part is what gives a block a POSITION. While the turn
+   * recorded nothing for it, every such image was appended after the whole
+   * sequence: a client sending `[result c1, image, text, result c2]` had its
+   * picture arrive behind c2's output, in an order it never wrote. The image
+   * object is the very one `NormalizedMessage.images` holds, so a consumer that
+   * walks either one is looking at one picture, not a copy.
+   */
+  | { readonly kind: 'image'; readonly image: NormalizedImage }
+  | { readonly kind: 'text'; readonly text: string };
+
+/**
+ * A tool turn as STRUCTURE, recorded where the normalizer already knew it.
+ *
+ * `content` still renders the same turn as text, because the claude runtime
+ * puts `content` in its prompt verbatim and has no items to build. Backends
+ * that DO have items build them from here.
+ *
+ * A SEQUENCE, not groups. It used to be `{calls, results, narration}` — three
+ * buckets and one string — which cannot say where the prose sat: the projection
+ * had to guess (before the calls, after the results), so a client sending
+ * `[call, text, call]` had its text hoisted to the front and `[call, text]` was
+ * reordered outright. The same shape defect the turn's own text/tool order had
+ * one level up, where a boolean could not express `[call, text, call]` either
+ * and became a count. Grouping loses order; a sequence is the order.
+ */
+export interface NormalizedToolTurn {
+  readonly parts: readonly NormalizedPart[];
+}
+
 export interface NormalizedMessage {
   readonly role: 'system' | 'developer' | 'user' | 'assistant' | 'tool';
+  /**
+   * The message as ONE STRING — a rendering of `parts`, not the place its
+   * content lives. Every runtime that has no items of its own puts this in a
+   * prompt verbatim, so it stays; what it cannot say is where a picture sat.
+   */
   readonly content: string;
+  /**
+   * Every picture of the message, in the order it carried them — the same
+   * objects `parts` places, so a consumer that walks either one is looking at
+   * one picture, not a copy. Backends that can only hoist pictures ahead of a
+   * prompt read this; backends with an ordered input read `parts`.
+   */
   readonly images: readonly NormalizedImage[];
   /**
-   * Set only when the normalizer itself flattened a tool turn into this text.
-   * Downstream readers turn tool history back into their transport's native
-   * items, and they used to decide by looking for the marker in the text — which
-   * a caller can write. A user message beginning `[tool result]` became a
-   * `function_call_output` with an empty body: the text was dropped and a tool
-   * result the caller never sent was invented. Provenance is a field, not a
-   * prefix.
+   * The message's content as the SEQUENCE the client sent, when the normalizer
+   * read one.
+   *
+   * `content` is "all the text, joined" and `images` is "the pictures,
+   * collected", and between the two of them the order a client wrote is gone:
+   * `[picture, "what is this"]` reached the model as the question ahead of the
+   * picture, and `["THIS_IS_A", <red>, "THIS_IS_B", <blue>]` reached it as one
+   * merged caption with both pictures behind it — nothing saying which caption
+   * belonged to which picture, so the model could only match them by position.
+   * That is the position-matching the tool-result labels exist to end, arriving
+   * one level up.
+   *
+   * The same sequence a tool turn already records — one concept, not two: when
+   * `tool` is set it holds THIS ARRAY, so the two views cannot disagree.
+   *
+   * Absent on a message built by hand rather than read from a client body.
+   * `messageParts` derives the legacy order for those, so a consumer never has
+   * two code paths.
    */
-  readonly toolHistory?: boolean;
+  readonly parts?: readonly NormalizedPart[];
+  /**
+   * Set only when the normalizer itself flattened a tool turn into this text,
+   * and carrying that turn's own parts in the order the client sent them.
+   *
+   * PRESENCE is the provenance signal, and it means the same thing under the
+   * sequence as it did under the groups: a turn with at least one call or one
+   * result in it. Prose alone never sets the field, so an ordinary message is
+   * never mistaken for tool history.
+   *
+   * It began as a boolean saying "this proxy wrote the grammar", because
+   * downstream readers used to decide by looking for the marker in the text —
+   * which a caller can write, so a user message beginning `[tool result]` became
+   * a `function_call_output` with an empty body. But a flag bounds who wrote the
+   * text, not WHERE the grammar is: a GENUINE tool result whose OUTPUT carried
+   * those lines — a fetched page, a file, a command's stdout, none of it authored
+   * by the client — was re-parsed into a second result under a call id nobody
+   * sent, and the real output was truncated at the marker. Provenance is not a
+   * prefix, and structure is not text: this field carries the parse instead of
+   * inviting one.
+   */
+  readonly tool?: NormalizedToolTurn;
+}
+
+/**
+ * The message's parts, for every consumer that projects a message.
+ *
+ * A message the normalizer read carries its own sequence. A message built by
+ * hand — an instructions turn this proxy synthesizes, a request assembled in a
+ * test — carries none, and gets the order those messages have always had:
+ * the text, then the pictures. One function, so the fallback is written once
+ * and the two shapes never grow separate projections.
+ */
+export function messageParts(message: NormalizedMessage): readonly NormalizedPart[] {
+  if (message.parts) return message.parts;
+  const derived: NormalizedPart[] = [];
+  if (message.content) derived.push({ kind: 'text', text: message.content });
+  for (const image of message.images ?? []) derived.push({ kind: 'image', image });
+  return derived;
 }
 
 export type NormalizedImageDetail = 'low' | 'high' | 'auto' | 'original';
@@ -54,6 +206,13 @@ export interface NormalizedTool {
   readonly name: string;
   readonly description?: string;
   readonly inputSchema?: unknown;
+  /**
+   * Whether the client asked for strict schema adherence on this tool's
+   * arguments (`strict: true` on all three surfaces). Without it the schema
+   * is a request to the model, not a promise the direct APIs enforce, and the
+   * response path delivers what the runtime produced.
+   */
+  readonly strict?: boolean;
   readonly raw: unknown;
 }
 
@@ -91,6 +250,19 @@ export interface NormalizedRequest {
   readonly jsonSchemaStrict?: boolean;
   readonly tools: readonly NormalizedTool[];
   readonly toolChoice: NormalizedToolChoice;
+  /**
+   * Chat `n`: how many completions the caller asked for, when they asked for
+   * more than one. The runtimes have no such slot, so it is realized as that
+   * many backend turns — one per `choices[]` entry, which is what the direct
+   * API's n independent samples are.
+   */
+  readonly choices?: number;
+  /**
+   * Anthropic `stop_sequences`. No runtime carries them, so they are realized
+   * on the response path (`stop-sequences.ts`): the text is cut before the
+   * first one and the turn reports `stop_sequence`.
+   */
+  readonly stopSequences?: readonly string[];
   readonly raw: unknown;
 }
 
@@ -117,20 +289,47 @@ export interface LocalReasoningItem {
   readonly id?: string;
 }
 
+/**
+ * One contiguous run of a turn's text, at the point among the turn's tool
+ * calls where the backend produced it.
+ */
+export interface LocalTextRun {
+  readonly text: string;
+  /** How many of the turn's `toolCalls` were produced before this run. */
+  readonly afterCalls: number;
+}
+
 export interface LocalCompletionResult {
   readonly id: string;
   readonly model: string;
   readonly text: string;
   readonly toolCalls: readonly LocalToolCall[];
   /**
-   * True when the turn's first tool call came before any text. `text` is one
-   * flattened string, so this is the only ordering a non-streaming client
-   * cannot reconstruct — and the Responses `output` array and the Anthropic
-   * `content` array are ordered surfaces, so without it the body contradicts
-   * the stream that carried the same turn. Absent means text came first, which
-   * is what a backend that cannot interleave the two always produces.
+   * The turn's text as the SEQUENCE it was produced in: one entry per run,
+   * each carrying how many of `toolCalls` came before it. `text` is the same
+   * bytes flattened, which is all an unordered surface needs; the Responses
+   * `output` array and the Anthropic `content` array are ordered, so without
+   * this they contradict the stream that carried the same turn.
+   *
+   * A SEQUENCE rather than the count this used to be, which was itself a
+   * widening of a boolean. The boolean could say only "all calls before the
+   * text" or "all calls after it", so [call, text, call] streamed one way and
+   * buffered another. The count said how many calls preceded THE text — one
+   * position, so [text, call, text] streamed as three blocks and buffered as
+   * two. Both times the representation could hold exactly the case that had
+   * just failed. A turn's layout is an interleaving, so the field is one.
+   *
+   * Runs are in production order, `afterCalls` never decreases, and
+   * concatenating them gives `text` — a reader that rebuilds the runs from
+   * `text` therefore never invents bytes.
+   *
+   * Absent means one run before every call. That is a DEFAULT for a backend
+   * with no order to report, not a licence to omit one: a backend whose stream
+   * announced a call before its text, and whose result then says nothing here,
+   * has its buffered body read [text, call] against a streamed [call, text].
+   * Every backend that reports text alongside calls reports the runs with it.
    */
-  readonly toolCallsBeforeText?: boolean;
+  readonly textRuns?: readonly LocalTextRun[];
   /**
    * The reasoning item the backend reported for this turn, when it reported
    * one. Its presence is the fact — a turn that did not reason has no such
@@ -206,7 +405,7 @@ export interface OpenAiImageGenerationResult {
   readonly raw?: unknown;
 }
 
-export interface OpenAiImageGenerationStreamEvent {
+export interface OpenAiImageGenerationImageEvent {
   readonly type: 'partial_image' | 'completed';
   readonly created: number;
   readonly image: OpenAiGeneratedImage;
@@ -217,6 +416,17 @@ export interface OpenAiImageGenerationStreamEvent {
   readonly size?: string;
   readonly usage?: unknown;
 }
+
+/**
+ * The backend has produced its first event for the turn: the stream is
+ * committed from here on, and a failure after it is in-band. Carries no
+ * payload and is never written to the client.
+ */
+export interface OpenAiImageGenerationStartedEvent {
+  readonly type: 'started';
+}
+
+export type OpenAiImageGenerationStreamEvent = OpenAiImageGenerationImageEvent | OpenAiImageGenerationStartedEvent;
 
 export interface OpenAiImageGenerationClient {
   generate(
@@ -322,6 +532,20 @@ export const BACKEND_IDENTIFIERS: readonly string[] = [
   'codex-backend',
   'claude-code-cli',
 ];
+
+// The ceiling on every client-visible diagnostic. It lives beside the error
+// type rather than inside one surface, because its producers are on both sides
+// of the HTTP boundary: a model name a client chose, a backend runtime's own
+// words, an upstream's prose. One constant rather than one per producer —
+// bounding at each source has already been missed once, and a second, tighter
+// bound in a backend made raising this one silently do nothing there.
+//
+// The ceiling bounds GROWTH; it is not a target. It has to clear the longest
+// sentence the surfaces this proxy mirrors actually emit, or it turns a
+// faithful message into a divergence — which is what 500 did to the Responses
+// item-type union (713 characters, measured 2026-08-31, and the parity row
+// `responses input item type unknown` is what catches a regression here).
+export const MAX_ERROR_MESSAGE_CHARS = 1024;
 
 export class ProxyRequestError extends Error {
   constructor(

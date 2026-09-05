@@ -15,7 +15,10 @@ type JsonObject = Record<string, unknown>;
 interface Turn {
   readonly queue: AsyncQueue<LocalCliChatRuntimeEvent>;
   /**
-   * The turn's own deadline. It is retired with the turn: an abandoned
+   * The turn's own deadline — a SILENCE budget, restarted by every JSON line
+   * the child writes, like the session manager's: armed once at the turn's start
+   * it cut a turn that was streaming past the budget while the manager's
+   * deadline, and the contract, let it run (round 51). It is retired with the turn: an abandoned
    * generator never reaches its `finally`, so a turn stopped any other way
    * left its timer armed to fire on whatever turn was running by then.
    */
@@ -85,7 +88,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     if (this.turn) throw new Error('claude native chat session already has a running turn');
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
     const timer = setTimeout(() => {
-      queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms`));
+      queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms of silence`));
       this.retire();
       // The child is still working on the abandoned prompt, and every line it
       // writes goes to whatever turn is active when it arrives — including the
@@ -273,6 +276,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     const message = parseJsonObject(line);
     if (!message || !this.turn) return;
     const event = eventFromClaudeMessage(message);
+    this.turn.timer.refresh();
     this.turn.queue.push(event);
     if (message.type === 'result') {
       if (message.subtype === 'success') this.turn.queue.close();

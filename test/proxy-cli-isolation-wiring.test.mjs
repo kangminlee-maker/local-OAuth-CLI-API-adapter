@@ -81,7 +81,7 @@ async function childArgvThroughProxy(extraArgs) {
     });
     const body = await res.json();
     const text = body.content?.find((block) => block.type === 'text')?.text ?? '';
-    return JSON.parse(text);
+    return JSON.parse(text).argv;
   } finally {
     child.kill('SIGTERM');
   }
@@ -132,7 +132,7 @@ async function chatSessionArgvThroughProxy(extraArgs) {
       .map((event) => event?.raw?.result)
       .find((result) => typeof result === 'string');
     assert.ok(echoed, `no echoed argv in turn body: ${JSON.stringify(body).slice(0, 300)}`);
-    return JSON.parse(echoed);
+    return JSON.parse(echoed).argv;
   } finally {
     child.kill('SIGTERM');
   }

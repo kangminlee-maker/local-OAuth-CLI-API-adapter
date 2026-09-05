@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, before, test } from 'node:test';
+import sharp from 'sharp';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { CodexBackendTransport } from '../dist/proxy/codex-backend-transport.js';
 import { resetCodexModelCatalogCache } from '../dist/proxy/codex-model-catalog.js';
 
@@ -543,7 +547,7 @@ test('calls with ids stay separate when the stream omits output_index', async ()
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
 
   assert.deepEqual(
     events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
@@ -595,7 +599,7 @@ test('a finished call with no arguments streams the value its result reports', a
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['now']))) events.push(event);
 
   const streamed = events
     .filter((event) => event.type === 'tool_call_delta')
@@ -678,9 +682,10 @@ test('a completed call the stream never announced is added, not swapped in', asy
       response: {
         id: 'resp_unseen_call',
         model: 'gpt-5.5',
+        // `call_1` at its accepted position 0; the unseen call after it.
         output: [
-          { type: 'function_call', id: 'fc_9', call_id: 'call_9', name: 'get_time', arguments: '{"tz":"KST"}' },
           { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+          { type: 'function_call', id: 'fc_9', call_id: 'call_9', name: 'get_time', arguments: '{"tz":"KST"}' },
         ],
       },
     },
@@ -688,7 +693,7 @@ test('a completed call the stream never announced is added, not swapped in', asy
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
   const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
 
   assert.deepEqual(
     events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
@@ -772,14 +777,20 @@ test('a tool call carrying no arguments reports an empty object', async () => {
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
 
-  const result = await backend.generate(toolRequest());
+  const result = await backend.generate(withDeclared(toolRequest(), ['get_time']));
   assert.deepEqual(result.toolCalls.map((call) => [call.name, call.arguments]), [['get_time', '{}']]);
 });
 
 test('an anonymous completed call cannot rewrite what the stream already delivered', async () => {
   // Position is not identity. With two calls listed in an order the stream did
   // not use, overwriting gave each streamed call the other call's name and
-  // arguments under its own id, so a client answered the wrong call.
+  // arguments under its own id, so a client answered the wrong call. The item
+  // at index 1 (`get_weather`) is the call holding position 1, name and
+  // value agreeing — applied, a no-op; the item at index 0 (`get_time`)
+  // correlates with nothing: no call holds position 0, and the one call
+  // left, `call_2`, sits at position 2. An item correlated with nothing is
+  // a call without an identity: the turn is refused rather than guessed
+  // (round 37).
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
@@ -799,14 +810,9 @@ test('an anonymous completed call cannot rewrite what the stream already deliver
     },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-
-  const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
-
-  assert.deepEqual(
-    events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]),
-    [['call_1', 'get_weather', '{"city":"Seoul"}'], ['call_2', 'get_time', '{"tz":"KST"}']],
-  );
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) void event;
+  }, /missing its call_id/);
 });
 
 test('a call is announced with the id the client must echo, not a placeholder', async () => {
@@ -842,11 +848,13 @@ test('a call is announced with the id the client must echo, not a placeholder', 
   );
 });
 
-test('an id-less completed call never overwrites a different streamed call', async () => {
+test('an id-less completed call never overwrites a different streamed call: naming another tool at a held position, it is refused (round 26 kept it out; round 41)', async () => {
   // When the completed output holds fewer function calls than the stream did,
   // positional alignment would land an anonymous item on whichever streamed
   // call shares its position — replacing that call's name and arguments with
   // another call's payload. A client would then run the wrong tool, twice.
+  // The item at index 0 names `delete_file` where the stream put
+  // `get_weather`: two calls named as one, refused.
   const codexHome = await createCodexHome();
   globalThis.fetch = async () => new Response(sse([
     { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
@@ -863,18 +871,9 @@ test('an id-less completed call never overwrites a different streamed call', asy
     },
   ]), { status: 200 });
   const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
-
-  const events = [];
-  for await (const event of backend.stream(toolRequest())) events.push(event);
-
-  const toolCalls = events.at(-1).result.toolCalls;
-  assert.deepEqual(
-    toolCalls.map((call) => [call.id, call.name, call.arguments]),
-    [
-      ['call_1', 'get_weather', '{"city":"Seoul"}'],
-      ['call_2', 'delete_file', '{"path":"/tmp/x"}'],
-    ],
-  );
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['delete_file']))) void event;
+  }, /named two tool calls as one/);
 });
 
 test('Images requests ignore honorRequestModel: the configured image model runs', async () => {
@@ -983,6 +982,1042 @@ test('CodexBackendTransport maps Images API requests to backend image_generation
   assert.equal(result.outputFormat, 'jpeg');
   assert.equal(result.usage.inputTokens, 31);
   assert.equal(result.usage.source, 'provider');
+});
+
+test('an image item followed by response.failed is a failed turn, not a successful image: buffered (r47-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'offline upstream failed after image item' } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest()), /codex backend turn failed: offline upstream failed after image item/);
+  // A failed turn is the backend's answer, not the retryable "no image" turn.
+  assert.equal(calls.length, 1);
+});
+
+test('...and streamed: the failure, with no image event — the result is delivered at the terminal frame, and a failed turn has none (r47-codex; since round 49 the image waits for the terminal)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'offline upstream failed after image item' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  }, /codex backend turn failed: offline upstream failed after image item/);
+  assert.deepEqual(events.map((event) => event.type), ['started']);
+});
+
+test('an image stream that ends without a terminal event is a failure, image or no image (r47-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest()), /image stream ended without a terminal event/);
+});
+
+test('a settled image turn is finished, whatever follows: a failure frame after response.completed changes nothing (r47-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'noise after the terminal' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+});
+
+function brokenAfter(text, error) {
+  // The whole SSE text arrives on the first read; the next read fails — a
+  // transport failure after the terminal frame.
+  let reads = 0;
+  return new ReadableStream({
+    pull(controller) {
+      reads += 1;
+      if (reads === 1) controller.enqueue(new TextEncoder().encode(text));
+      else controller.error(error);
+    },
+  });
+}
+
+function neverClosingAfter(text) {
+  // The whole SSE text arrives on the first read; the next read never
+  // resolves.
+  let reads = 0;
+  return new ReadableStream({
+    pull(controller) {
+      reads += 1;
+      if (reads === 1) controller.enqueue(new TextEncoder().encode(text));
+      return reads === 1 ? undefined : new Promise(() => {});
+    },
+  });
+}
+
+const settledImageTurn = () => sse([
+  { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+  { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+  { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+]);
+
+test('the image turn ends at the terminal frame: a body that breaks after it does not overturn the settled image, buffered (r48-fable)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async () => {
+    calls.push(1);
+    return new Response(brokenAfter(settledImageTurn(), new Error('body broke after the terminal')));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(calls.length, 1);
+});
+
+test('...and streamed: the image event, then completion — no in-band error for a body that broke after the terminal (r48-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(brokenAfter(settledImageTurn(), new Error('body broke after the terminal')));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+});
+
+test('...and a body that never closes after the terminal frame does not hold the settled image until the timeout (r48-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(neverClosingAfter(settledImageTurn()));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 5_000 });
+  const startedAt = Date.now();
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.ok(Date.now() - startedAt < 4_000, 'the answer was in hand at the terminal frame, not at the timeout');
+});
+
+test('a cut-off image turn (response.incomplete) is a finished turn: an image it produced is the result, without a retry (r48-fable mutant)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async () => {
+    calls.push(1);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.incomplete', response: { id: 'resp_image', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(calls.length, 1);
+});
+
+test('an image present only in the cut turn\'s output is the result: response.incomplete is read like response.completed, without a retry (r48-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async () => {
+    calls.push(1);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.incomplete', response: { id: 'resp_image', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [
+        { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() },
+      ] } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(calls.length, 1);
+});
+
+test('the backend\'s first event is surfaced as a payload-less started signal, so a failure before any image is in-band on the stream, not an HTTP error (r48-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'failed before any image' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  }, /codex backend turn failed: failed before any image/);
+  assert.deepEqual(events.map((event) => event.type), ['started']);
+});
+
+test('a failure as the backend\'s first and only frame is still a started stream: the started signal precedes the latched failure (r49-fable mutant)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.failed', response: { id: 'resp_image', model: 'gpt-5.5', status: 'failed', error: { message: 'failed as the first frame' } } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  }, /codex backend turn failed: failed as the first frame/);
+  // The writer commits on the signal, so the failure is in-band, not an HTTP error.
+  assert.deepEqual(events.map((event) => event.type), ['started']);
+});
+
+test('an abort signal already aborted at the call is honoured by the buffered fan-out: no backend turn runs (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push(init.signal?.aborted);
+    if (init.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    return new Response(settledImageTurn());
+  };
+  const controller = new AbortController();
+  controller.abort();
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal));
+  assert.ok(calls.every((aborted) => aborted === true), `no backend turn ran for a caller that had gone: ${JSON.stringify(calls)}`);
+});
+
+test('an abort during the no-image retry backoff ends the wait: the request fails at its deadline, not after the sleep (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push(init.signal?.aborted);
+    if (init.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    // A finished turn without an image: the retryable case, with a 500 ms backoff.
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  // The request's own signal — the HTTP layer's timeout or a client walking
+  // away — aborts at 80 ms, during the 500 ms backoff.
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 80);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const startedAt = Date.now();
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal));
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 400, `the deadline was 80 ms and the backoff 500 ms; failed after ${elapsed} ms`);
+  assert.deepEqual(calls, [false], 'the second attempt was refused before any credential work or fetch (round 50)');
+});
+
+test('the terminal frame enriches the result: usage and the terminal\'s revised_prompt reach the one image event, streamed and buffered alike (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const image = tinyPngBase64();
+  const turn = () => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 }, output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image, revised_prompt: 'terminal rewrite' },
+    ] } },
+  ]);
+  globalThis.fetch = async () => new Response(turn());
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.revisedPrompt, 'terminal rewrite');
+  assert.equal(events[1].usage?.inputTokens, 3);
+  assert.equal(events[1].usage?.outputTokens, 4);
+  globalThis.fetch = async () => new Response(turn());
+  const buffered = await backend.generate(imageRequest());
+  assert.equal(buffered.images[0].revisedPrompt, 'terminal rewrite');
+  assert.equal(buffered.usage?.inputTokens, 3);
+});
+
+test('usage the no-image attempts reported is carried into the result: the request reports what it consumed (r49-codex)', async () => {
+  const codexHome = await createCodexHome();
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      return new Response(sse([
+        { type: 'response.created', response: { id: 'resp_1', model: 'gpt-5.5' } },
+        { type: 'response.completed', response: { id: 'resp_1', model: 'gpt-5.5', usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 } } },
+      ]));
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_2', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_2', model: 'gpt-5.5', usage: { input_tokens: 5, output_tokens: 6, total_tokens: 11 } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(attempts, 2);
+  assert.equal(result.usage?.inputTokens, 8);
+  assert.equal(result.usage?.outputTokens, 10);
+});
+
+test('a runaway backend is refused past the bound, not retained: no image, diagnostics bounded (r49-codex, r50-fable, r53-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  // 100 distinct one-pixel-ish payloads: the same PNG with a distinct tail.
+  const base = tinyPngBase64();
+  const frames = [{ type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } }];
+  for (let i = 0; i < 100; i += 1) {
+    frames.push({ type: 'response.output_item.done', output_index: i, item: { type: 'image_generation_call', id: `ig_${i}`, status: 'completed', result: i === 0 ? base : `${base}${'A'.repeat(i)}` } });
+  }
+  frames.push({ type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } });
+  globalThis.fetch = async () => new Response(sse(frames));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  const events = [];
+  await assert.rejects((async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  })(), /more than 64 image calls/);
+  assert.deepEqual(events.map((event) => event.type), ['started'], 'the stream committed, then carried the failure — no image');
+  assert.equal(diagnostics.at(-1).imageResultCount, 64, 'the calls the state could pair by');
+  assert.equal(diagnostics.at(-1).eventCount, 102);
+  assert.equal(diagnostics.at(-1).eventTypes.length, 64, 'the history is bounded');
+  assert.equal(diagnostics.at(-1).eventTimeline.length, 64);
+});
+
+test('usage the no-image attempts reported is carried on the streamed lane too: the one image event reports what the request consumed (r50-fable mutant)', async () => {
+  const codexHome = await createCodexHome();
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts += 1;
+    if (attempts === 1) {
+      return new Response(sse([
+        { type: 'response.created', response: { id: 'resp_1', model: 'gpt-5.5' } },
+        { type: 'response.completed', response: { id: 'resp_1', model: 'gpt-5.5', usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 } } },
+      ]));
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_2', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_2', model: 'gpt-5.5', usage: { input_tokens: 5, output_tokens: 6, total_tokens: 11 } } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.equal(attempts, 2);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].usage?.inputTokens, 8);
+  assert.equal(events[1].usage?.outputTokens, 10);
+});
+
+test('the terminal output\'s record of the image replaces the item frame\'s: a re-encoding with a rewrite is the result, with the rewrite, counted once (r50-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const itemBytes = tinyPngBase64();
+  const terminalBytes = `${itemBytes}AA==`;
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: itemBytes } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: terminalBytes, revised_prompt: 'terminal rewrite for the re-encoded image' },
+    ] } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.equal(result.images[0].b64Json, terminalBytes);
+  assert.equal(result.images[0].revisedPrompt, 'terminal rewrite for the re-encoded image');
+  assert.equal(diagnostics.at(-1).imageResultCount, 1);
+});
+
+test('...and a corrected rewrite on the terminal replaces the item frame\'s; a terminal record without one keeps it (r50-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const image = tinyPngBase64();
+  const turn = (terminalPrompt) => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image, revised_prompt: 'item rewrite' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: image, ...(terminalPrompt ? { revised_prompt: terminalPrompt } : {}) },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  globalThis.fetch = async () => new Response(turn('terminal rewrite'));
+  assert.equal((await backend.generate(imageRequest())).images[0].revisedPrompt, 'terminal rewrite');
+  globalThis.fetch = async () => new Response(turn(undefined));
+  assert.equal((await backend.generate(imageRequest())).images[0].revisedPrompt, 'item rewrite');
+});
+
+test('a caller already gone does no credential work: an aborted signal at the call refreshes no token and starts no turn (r50-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const urls = [];
+  globalThis.fetch = async (url, init) => {
+    urls.push(String(url));
+    if (init?.signal?.aborted) throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: 'new' });
+  };
+  const controller = new AbortController();
+  controller.abort();
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal), /aborted/);
+  // The caller's wait ends at once either way; the credential work must not
+  // go on behind it.
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.deepEqual(urls, [], 'neither the refresh nor the backend was called');
+});
+
+test('a caller that leaves while the refresh lock is held stops waiting for it: rejected at the abort, not at the lock timeout (r50-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  // Another process holds the lock, freshly.
+  await writeFile(join(codexHome, 'auth.json.refresh.lock'), JSON.stringify({ pid: 1, created_at: new Date().toISOString() }));
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    throw new Error('must not be reached');
+  };
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 20);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const startedAt = Date.now();
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal), /aborted/);
+  assert.ok(Date.now() - startedAt < 500, `the wait ended with the abort, not the lock timeout: ${Date.now() - startedAt} ms`);
+  // The lock wait behind the caller stopped too: with the lock released, a
+  // wait still spinning would take it and refresh for a caller that had gone.
+  await rm(join(codexHome, 'auth.json.refresh.lock'));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(urls, []);
+});
+
+test('a caller that leaves while the 401 body is on the wire starts no forced refresh: the guard holds on the refresh door, not only the read door (r51-fable)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }),
+    refreshToken: 'old-refresh-token',
+  });
+  const controller = new AbortController();
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    // The client disconnects while the 401 body is on the wire.
+    controller.abort();
+    return new Response(JSON.stringify({ error: { message: 'token expired', code: 'token_expired' } }), { status: 401 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(() => backend.generate(textRequest(), controller.signal), /aborted/);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.deepEqual(urls, ['https://chatgpt.com/backend-api/codex/responses'], 'no refresh started for the caller that had gone');
+});
+
+test('a caller that leaves during an in-flight refresh stops waiting for it, and the refresh completes and is persisted — a refresh token is single-use (r51-fable mutant)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const urls = [];
+  globalThis.fetch = async (url) => {
+    urls.push(String(url));
+    if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: 'new-refresh-token' });
+  };
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 50);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const startedAt = Date.now();
+  await assert.rejects(() => backend.generate(imageRequest(), controller.signal), /aborted/);
+  assert.ok(Date.now() - startedAt < 150, `the wait ended with the abort, not with the refresh: ${Date.now() - startedAt} ms`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const persisted = JSON.parse(await readFile(join(codexHome, 'auth.json'), 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'new-refresh-token', 'the refresh the caller left behind completed and was persisted');
+  assert.deepEqual(urls, ['https://auth.openai.com/oauth/token']);
+});
+
+test('a lease taken over mid-refresh: the first owner removes only its own lock and persists nothing — the holder\'s refresh is the one on disk (r52-codex, r53-fable)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const lockPath = join(codexHome, 'auth.json.refresh.lock');
+  const authPath = join(codexHome, 'auth.json');
+  const gates = [];
+  let refreshes = 0;
+  globalThis.fetch = async (url, init) => {
+    if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+    assert.equal(JSON.parse(init.body).refresh_token, 'old-refresh-token');
+    refreshes += 1;
+    const order = refreshes;
+    await new Promise((resolve) => { gates[order] = resolve; });
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: order === 1 ? 'a-new' : 'b-from-old' });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  // A starts a refresh; its caller leaves; the refresh stays in flight.
+  const a = new AbortController();
+  const callerA = backend.generate(imageRequest(), a.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  a.abort();
+  await assert.rejects(callerA, /aborted/);
+  assert.equal(refreshes, 1);
+  // The lease goes stale under it.
+  const past = new Date(Date.now() - 61_000);
+  await utimes(lockPath, past, past);
+  // B takes the lease over and starts its own refresh with the same old token; its caller leaves too.
+  const b = new AbortController();
+  const callerB = backend.generate(imageRequest(), b.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  b.abort();
+  await assert.rejects(callerB, /aborted/);
+  assert.equal(refreshes, 2);
+  const takerLock = await readFile(lockPath, 'utf8');
+  // A finishes late: its lease is B's now, so it persists nothing — and leaves B's lock alone.
+  gates[1]();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'old-refresh-token', 'a taken-over refresh is not the one on disk');
+  assert.equal(await readFile(lockPath, 'utf8'), takerLock, "the taker's lock is still there");
+  // B finishes holding the lease: its refresh is the one on disk — and it removes its own lock.
+  gates[2]();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'b-from-old', "the holder's rotation");
+  assert.equal(existsSync(lockPath), false);
+});
+
+test('two refreshes of a taken-over lease finishing in the same tick: exactly one persists, the holder\'s (r53-fable)', async () => {
+  for (let run = 0; run < 3; run += 1) {
+    const codexHome = await createCodexHome({
+      accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+      refreshToken: 'old-refresh-token',
+      lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+    });
+    const lockPath = join(codexHome, 'auth.json.refresh.lock');
+    const gates = [];
+    let refreshes = 0;
+    globalThis.fetch = async (url, init) => {
+      if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+      refreshes += 1;
+      const order = refreshes;
+      await new Promise((resolve) => { gates[order] = resolve; });
+      return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: order === 1 ? 'a-new' : 'b-from-old' });
+    };
+    const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+    const a = new AbortController();
+    const callerA = backend.generate(imageRequest(), a.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    a.abort();
+    await assert.rejects(callerA, /aborted/);
+    const past = new Date(Date.now() - 61_000);
+    await utimes(lockPath, past, past);
+    const b = new AbortController();
+    const callerB = backend.generate(imageRequest(), b.signal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    b.abort();
+    await assert.rejects(callerB, /aborted/);
+    assert.equal(refreshes, 2);
+    gates[1]();
+    gates[2]();
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(JSON.parse(await readFile(join(codexHome, 'auth.json'), 'utf8')).tokens.refresh_token, 'b-from-old', `run ${run}: the holder's rotation, not whichever landed last`);
+    assert.equal(existsSync(lockPath), false);
+  }
+});
+
+test('a writer outside the lease — the codex CLI rewriting auth.json during a refresh — is not overwritten: the refresh saves nothing and the CLI\'s generation stays, its own fields with it (r54-fable)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  let release;
+  globalThis.fetch = async (url, init) => {
+    if (String(url) !== 'https://auth.openai.com/oauth/token') throw new Error('must not be reached');
+    assert.equal(JSON.parse(init.body).refresh_token, 'old-refresh-token');
+    await new Promise((resolve) => { release = resolve; });
+    return Response.json({ access_token: jwt({ exp: Math.floor(Date.now() / 1000) + 3600 }), refresh_token: 'proxy-new' });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const controller = new AbortController();
+  const caller = backend.generate(imageRequest(), controller.signal);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  controller.abort();
+  await assert.rejects(caller, /aborted/);
+  assert.ok(release, 'the refresh is in flight');
+  // The operator's own `codex` run rotates the file meanwhile, lease or no lease.
+  const cli = JSON.parse(await readFile(authPath, 'utf8'));
+  cli.tokens.refresh_token = 'cli-new';
+  cli.tokens.access_token = jwt({ exp: Math.floor(Date.now() / 1000) + 7200 });
+  cli.cli_note = 'mine';
+  await writeFile(authPath, JSON.stringify(cli), { mode: 0o600 });
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const persisted = JSON.parse(await readFile(authPath, 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'cli-new', 'the generation the refresh consumed is gone; it saves nothing over the CLI\'s');
+  assert.equal(persisted.cli_note, 'mine', 'and what the CLI wrote stays');
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false);
+});
+
+test('...and the caller of that refresh uses the file\'s current generation, not its own unsaved one: the backend honours the CLI\'s lineage (r54-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const externalAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 7200, lineage: 'external' });
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600, lineage: 'proxy' });
+  let release;
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      await new Promise((resolve) => { release = resolve; });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    if (init.headers.authorization !== `Bearer ${externalAccess}`) {
+      return new Response(JSON.stringify({ error: { message: 'token superseded', code: 'token_expired' } }), { status: 401 });
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const caller = backend.generate(imageRequest());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(release, 'the refresh is in flight');
+  const cli = JSON.parse(await readFile(authPath, 'utf8'));
+  cli.tokens.refresh_token = 'cli-new';
+  cli.tokens.access_token = externalAccess;
+  await writeFile(authPath, JSON.stringify(cli), { mode: 0o600 });
+  release();
+  const result = await caller;
+  assert.equal(result.images.length, 1);
+  assert.deepEqual(bearers, [`Bearer ${externalAccess}`], 'one backend call, on the CLI\'s generation — no 401, no forced refresh of a revoked token');
+  assert.equal(JSON.parse(await readFile(authPath, 'utf8')).tokens.refresh_token, 'cli-new');
+});
+
+test('a logout under the refresh is not a generation to use: the caller keeps the token it fetched, unsaved, and the logout is not written over (r56-fable)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600, lineage: 'proxy' });
+  let release;
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      await new Promise((resolve) => { release = resolve; });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const caller = backend.generate(imageRequest());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.ok(release, 'the refresh is in flight');
+  // The codex CLI logs out: a JSON file with no tokens — another generation
+  // by the refresh-token test, and one `authFromFile` refuses.
+  await writeFile(authPath, JSON.stringify({ note: 'logged out' }), { mode: 0o600 });
+  release();
+  const result = await caller;
+  assert.equal(result.images.length, 1, 'the request the refresh was for completes');
+  assert.deepEqual(bearers, [`Bearer ${proxyAccess}`], 'on the token the refresh fetched — not thrown away with the logout\'s error');
+  assert.deepEqual(JSON.parse(await readFile(authPath, 'utf8')), { note: 'logged out' }, 'and the logout is not written over');
+});
+
+test('a re-read that fails after the token fetch loses nothing: the caller keeps its refreshed auth, unsaved, and the lock is released (r55-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      // Another writer mid-write: the file is not JSON when the refresh lands.
+      await writeFile(authPath, '{', { mode: 0o600 });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.deepEqual(bearers, [`Bearer ${proxyAccess}`], 'the request went on with the rotation it got');
+  assert.equal(await readFile(authPath, 'utf8'), '{', 'nothing was written over a file that could not be read');
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false);
+});
+
+test('a re-read that lost the identity is saved with the identity the refresh consumed, validated before it is written (r55-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+  globalThis.fetch = async (url) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      // The same generation, rewritten without its identity members, plus a member of its own.
+      const file = JSON.parse(await readFile(authPath, 'utf8'));
+      delete file.tokens.account_id;
+      delete file.tokens.id_token;
+      file.writer_note = 'must-survive';
+      await writeFile(authPath, JSON.stringify(file), { mode: 0o600 });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  const persisted = JSON.parse(await readFile(authPath, 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'proxy-new');
+  assert.equal(persisted.tokens.account_id, 'account-1', 'the identity the refresh consumed');
+  assert.equal(persisted.writer_note, 'must-survive', 'and what the writer added');
+});
+
+test('a refresh fetch is bounded below its lease: a token endpoint that never answers fails the refresh at the budget and releases the lock (r52-codex)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  let refreshSignal;
+  globalThis.fetch = (url, init) => new Promise((_resolve, reject) => {
+    assert.equal(String(url), 'https://auth.openai.com/oauth/token');
+    refreshSignal = init.signal;
+    init.signal?.addEventListener('abort', () => reject(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })), { once: true });
+  });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 200 });
+  // The request's own budget ends the caller's wait; the refresh behind it ends at the same budget, not never.
+  await assert.rejects(() => backend.generate(imageRequest()), /aborted/);
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(refreshSignal?.aborted, true, 'the refresh fetch carried a budget and it fired');
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false, 'the lock was released');
+});
+
+test('the terminal output\'s first record of another call stands alone: its bytes without the item frame call\'s rewrite, both paths, the item frame\'s image counted (r51-fable)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const itemBytes = tinyPngBase64();
+  const terminalBytes = `${itemBytes}AA==`;
+  const turn = () => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: itemBytes, revised_prompt: 'item rewrite' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_2', status: 'completed', result: terminalBytes },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn());
+  const buffered = await backend.generate(imageRequest());
+  assert.equal(buffered.images[0].b64Json, terminalBytes);
+  assert.equal(buffered.images[0].revisedPrompt, undefined);
+  assert.equal(diagnostics.at(-1).imageResultCount, 2);
+  globalThis.fetch = async () => new Response(turn());
+  const events = [];
+  for await (const event of backend.stream(imageRequest())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, terminalBytes);
+  assert.equal(events[1].image.revisedPrompt, undefined);
+});
+
+test('a re-encoding of the same call on the terminal stands as the terminal records it: without a rewrite of its own it takes none — the item frame\'s went with other bytes (r52-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const itemBytes = tinyPngBase64();
+  const terminalBytes = redPngBase64();
+  const turn = () => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: itemBytes, revised_prompt: 'item rewrite' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: terminalBytes },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn());
+  const buffered = await backend.generate(unrealized());
+  assert.equal(buffered.images[0].b64Json, terminalBytes);
+  assert.equal(buffered.images[0].revisedPrompt, undefined);
+  assert.equal(diagnostics.at(-1).imageResultCount, 1);
+  globalThis.fetch = async () => new Response(turn());
+  const events = [];
+  for await (const event of backend.stream(unrealized())) events.push(event);
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, terminalBytes);
+  assert.equal(events[1].image.revisedPrompt, undefined);
+});
+
+test('a terminal record of a call counted at its item frame is that call: counted once, its own rewrite with its own bytes and none with other bytes (r52-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const one = tinyPngBase64();
+  const two = redPngBase64();
+  const turn = (terminalBytes) => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: one, revised_prompt: 'item one' } },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'image_generation_call', id: 'ig_2', status: 'completed', result: two, revised_prompt: 'item two' } },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_2', status: 'completed', result: terminalBytes },
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn(two));
+  const same = await backend.generate(unrealized());
+  assert.equal(same.images[0].b64Json, two);
+  assert.equal(same.images[0].revisedPrompt, 'item two');
+  assert.equal(diagnostics.at(-1).imageResultCount, 2, 'two calls, not three records');
+  globalThis.fetch = async () => new Response(turn(greenPngBase64()));
+  const reencoded = await backend.generate(unrealized());
+  assert.equal(reencoded.images[0].b64Json, greenPngBase64());
+  assert.equal(reencoded.images[0].revisedPrompt, undefined);
+  assert.equal(diagnostics.at(-1).imageResultCount, 2);
+});
+
+test('at the bound a call is one whatever names it: sixty-four item frames, the terminal naming the third; a sixty-fifth call is the turn\'s failure (r52-codex mutant, r53-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const base = tinyPngBase64();
+  const frames = (count) => {
+    const out = [{ type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } }];
+    for (let i = 0; i < count; i += 1) {
+      out.push({ type: 'response.output_item.done', output_index: i, item: { type: 'image_generation_call', id: `ig_${i}`, status: 'completed', result: base, ...(i === 3 ? { revised_prompt: 'third' } : {}) } });
+    }
+    out.push({ type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      { type: 'image_generation_call', id: 'ig_3', status: 'completed', result: base },
+    ] } });
+    return out;
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(sse(frames(64)));
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images[0].revisedPrompt, 'third', 'the turn\'s image is the call the terminal names, with its own rewrite');
+  assert.equal(diagnostics.at(-1).imageResultCount, 64, 'sixty-four calls, the third not counted again');
+  globalThis.fetch = async () => new Response(sse(frames(65)));
+  await assert.rejects(() => backend.generate(imageRequest()), /more than 64 image calls/);
+});
+
+test('the terminal listing the turn\'s image call twice is one record or a contradiction: an identical repeat is counted once, different bytes or a different rewrite are refused (r52-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const item = tinyPngBase64();
+  const first = `${item}AA==`;
+  const record = (members) => ({ type: 'image_generation_call', id: 'ig_1', status: 'completed', ...members });
+  const turn = (second) => sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: record({ result: item, revised_prompt: 'item one' }) },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      record({ result: first, revised_prompt: 'terminal one' }),
+      second,
+    ] } },
+  ]);
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  globalThis.fetch = async () => new Response(turn(record({ result: first, revised_prompt: 'terminal one' })));
+  const repeated = await backend.generate(imageRequest());
+  assert.equal(repeated.images[0].b64Json, first);
+  assert.equal(repeated.images[0].revisedPrompt, 'terminal one');
+  assert.equal(diagnostics.at(-1).imageResultCount, 1, 'one call, listed twice');
+  globalThis.fetch = async () => new Response(turn(record({ result: redPngBase64(), revised_prompt: 'terminal one' })));
+  await assert.rejects(() => backend.generate(imageRequest()), /twice with different records/);
+  globalThis.fetch = async () => new Response(turn(record({ result: first, revised_prompt: 'terminal two' })));
+  const events = [];
+  await assert.rejects((async () => {
+    for await (const event of backend.stream(imageRequest())) events.push(event);
+  })(), /twice with different records/);
+  assert.deepEqual(events.map((event) => event.type), ['started'], 'the stream committed and then carried the failure, no image');
+});
+
+test('the same bytes in another spelling are the same image: a terminal record without padding lends and repeats as one call (r53-codex)', async () => {
+  const codexHome = await createCodexHome();
+  const diagnostics = [];
+  const padded = tinyPngBase64();
+  const unpadded = padded.replace(/=+$/, '');
+  assert.notEqual(padded, unpadded);
+  const record = (members) => ({ type: 'image_generation_call', id: 'ig_1', status: 'completed', ...members });
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    { type: 'response.output_item.done', output_index: 0, item: record({ result: padded, revised_prompt: 'item one' }) },
+    { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5', output: [
+      record({ result: unpadded }),
+      record({ result: padded }),
+    ] } },
+  ]));
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, onImageAttempt: (d) => diagnostics.push(d) });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images[0].b64Json, unpadded, 'the terminal\'s own spelling goes out');
+  assert.equal(result.images[0].revisedPrompt, 'item one', 'the same bytes lend the rewrite');
+  assert.equal(diagnostics.at(-1).imageResultCount, 1, 'one call, listed in two spellings');
+});
+
+// The backend has a `size` slot and does not always honour it (a 256×256
+// source edited at `1024x1024` came back 1254×1254, measured 2026-08-29). The
+// direct API returns the requested canvas; so does this transport, on the
+// bytes, on both the buffered and the streamed path.
+function imageSse(b64, { id = 'resp_size', model = 'gpt-5.5' } = {}) {
+  return sse([
+    { type: 'response.created', response: { id, model } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'in_progress' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: b64 } },
+    { type: 'response.completed', response: { id, model, output: [{ type: 'image_generation_call', id: 'ig_1', status: 'completed', result: b64 }] } },
+  ]);
+}
+async function solidPng(width, height, background = { r: 10, g: 20, b: 30, alpha: 1 }) {
+  return (await sharp({ create: { width, height, channels: 4, background } }).png().toBuffer()).toString('base64');
+}
+const dims = async (b64) => {
+  const m = await sharp(Buffer.from(b64, 'base64')).metadata();
+  return `${m.width}x${m.height}`;
+};
+
+test('a returned canvas that is not the requested size is brought to it (buffered)', async () => {
+  const codexHome = await createCodexHome();
+  const calls = [];
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(imageSse(returned), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), size: '32x16' });
+  assert.equal(JSON.parse(calls[0].init.body).tools[0].size, '32x16', 'the slot is still sent; the bytes are corrected, not the request');
+  assert.equal(result.images.length, 1);
+  assert.equal(await dims(result.images[0].b64Json), '32x16');
+  assert.equal(result.size, '32x16');
+});
+
+test('a returned canvas that is not the requested size is brought to it (streamed)', async () => {
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const events = [];
+  for await (const event of backend.stream({ ...imageRequest(), size: '32x16', stream: true })) events.push(event);
+  const completed = events.filter((event) => event.type === 'completed');
+  assert.equal(completed.length, 1);
+  assert.equal(await dims(completed[0].image.b64Json), '32x16');
+});
+
+test('every image of every turn is corrected, in turn order (n > 1)', async () => {
+  // The fan-out runs one backend turn per requested image; a correction that
+  // only reached the first turn's images would leave the rest at whatever
+  // canvas the backend chose, which is the defect this whole path exists for.
+  const codexHome = await createCodexHome();
+  const returned = [await solidPng(8, 8, { r: 255, g: 0, b: 0, alpha: 1 }), await solidPng(16, 4, { r: 0, g: 0, b: 255, alpha: 1 })];
+  // Keyed by the TURN, read out of the prompt, not by the order the two
+  // concurrent turns happen to reach fetch: an arrival-order stub decides the
+  // colour of turn 0 by a coin flip, and this assertion then passed or failed
+  // on the scheduler rather than on the transport.
+  globalThis.fetch = async (_url, init) => {
+    const body = JSON.stringify(JSON.parse(init.body).input);
+    const turn = body.includes('Generate image 1 of 2') ? 0 : 1;
+    assert.match(body, /Generate image [12] of 2/, 'the turn must be identifiable from its own request');
+    return new Response(imageSse(returned[turn]), { status: 200 });
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), n: 2, size: '32x16' });
+  assert.equal(result.images.length, 2);
+  for (const [index, image] of result.images.entries()) {
+    assert.equal(await dims(image.b64Json), '32x16', `image ${index}`);
+  }
+  // Turn order is the response order: the red turn's image is first.
+  const colour = async (b64) => {
+    const { data } = await sharp(Buffer.from(b64, 'base64')).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    return [data[0], data[1], data[2]];
+  };
+  assert.deepEqual(await colour(result.images[0].b64Json), [255, 0, 0]);
+  assert.deepEqual(await colour(result.images[1].b64Json), [0, 0, 255]);
+});
+
+test('the streamed completed frame reports the size its bytes actually have', async () => {
+  // Through the HTTP surface, because the promise is what the CLIENT reads:
+  // the event's `size` and the bytes beside it have to be the same canvas.
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const started = await startLocalApiProxy({
+    backend: { name: 'unused', model: 'x', async generate() { throw new Error('unused'); }, async close() {} },
+    imageGenerationClient: new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' }),
+    host: '127.0.0.1', port: 0, requestTimeoutMs: 30_000,
+  });
+  try {
+    // The proxy's own fetch stub must not intercept the client's request.
+    const res = await originalFetch(`${started.url}/v1/images/generations`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-image-2', prompt: 'a green leaf icon', size: '32x16', stream: true }),
+    });
+    assert.equal(res.status, 200);
+    const wire = await res.text();
+    const frames = [...wire.matchAll(/^event: (\S+)\ndata: (.+)$/gm)].map(([, type, data]) => ({ type, data: JSON.parse(data) }));
+    assert.equal(frames.length, 1, wire);
+    assert.equal(frames[0].type, 'image_generation.completed');
+    assert.equal(frames[0].data.size, '32x16');
+    assert.equal(await dims(frames[0].data.b64_json), '32x16', 'the frame reports the canvas its own bytes carry');
+  } finally {
+    await started.close();
+  }
+});
+
+// A codec that cannot load is answered before the first backend turn — which
+// cannot be shown in-process, because this process has a working sharp. The
+// child runs the same two requests under a resolve hook that makes
+// `import('sharp')` fail, and the control arm (no hook) is what proves the
+// probe's fetch counter can move at all.
+test('a codec that cannot load is a 500 before any backend turn, buffered and streamed', async () => {
+  const execFileAsync = promisify(execFile);
+  const probe = resolve(here, 'fixtures/image-codec-failure-probe.mjs');
+  const run = async (args) => JSON.parse((await execFileAsync(process.execPath, args, { cwd: resolve(here, '..') })).stdout);
+
+  const failed = await run(['--import', './test/fixtures/register-fail-sharp.mjs', probe]);
+  for (const arm of ['buffered', 'streamed']) {
+    assert.equal(failed[arm].name, 'ProxyRequestError', arm);
+    assert.equal(failed[arm].statusCode, 500, arm);
+    assert.equal(failed[arm].type, 'server_error', arm);
+    assert.equal(failed[arm].param, null, arm);
+    assert.match(failed[arm].message, /sharp/, arm);
+  }
+  assert.equal(failed.fetchCallsAfterBuffered, 0, 'the buffered path did not start a turn');
+  assert.equal(failed.fetchCalls, 0, 'neither path started a turn');
+
+  const control = await run([probe]);
+  assert.equal(control.fetchCalls, 2, 'with a loadable codec both paths do reach the backend — the counter is not stuck at 0');
+  assert.notEqual(control.buffered.statusCode, 500);
+});
+
+test('a returned canvas already at the requested size is passed through byte for byte', async () => {
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(32, 16);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), size: '32x16' });
+  assert.equal(result.images[0].b64Json, returned);
+});
+
+test('a request with size auto takes whatever canvas the backend returns', async () => {
+  const codexHome = await createCodexHome();
+  const returned = await solidPng(8, 8);
+  globalThis.fetch = async () => new Response(imageSse(returned), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  const result = await backend.generate({ ...imageRequest(), size: 'auto' });
+  assert.equal(result.images[0].b64Json, returned);
 });
 
 test('CodexBackendTransport includes reference images for backend image edits', async () => {
@@ -1148,10 +2183,10 @@ test('CodexBackendTransport streams completed image_generation results', async (
   const events = [];
   for await (const event of backend.stream({ ...imageRequest(), stream: true })) events.push(event);
 
-  assert.equal(events.length, 1);
-  assert.equal(events[0].type, 'completed');
-  assert.equal(events[0].image.b64Json, image);
-  assert.equal(events[0].partialImageIndex, 0);
+  // The backend's first event is the payload-less started signal; then the image.
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, image);
+  assert.equal(events[1].partialImageIndex, 0);
 });
 
 test('CodexBackendTransport retries streamed backend image completions before emitting an error', async () => {
@@ -1185,10 +2220,10 @@ test('CodexBackendTransport retries streamed backend image completions before em
   for await (const event of backend.stream({ ...imageRequest(), stream: true })) events.push(event);
 
   assert.equal(calls.length, 2);
-  assert.equal(events.length, 1);
-  assert.equal(events[0].type, 'completed');
-  assert.equal(events[0].image.b64Json, image);
-  assert.equal(events[0].image.revisedPrompt, 'A green leaf icon.');
+  // One started signal for the stream, not one per attempt.
+  assert.deepEqual(events.map((event) => event.type), ['started', 'completed']);
+  assert.equal(events[1].image.b64Json, image);
+  assert.equal(events[1].image.revisedPrompt, 'A green leaf icon.');
 });
 
 test('CodexBackendTransport forwards provider-style backend errors', async () => {
@@ -1522,6 +2557,15 @@ function textRequest() {
   };
 }
 
+/**
+ * The native channel refuses a call the request never declared (round 27,
+ * the wrapper reading's rule): a double that calls `get_time` or `now`
+ * declares it, since what these tests measure is elsewhere.
+ */
+function withDeclared(request, names) {
+  return { ...request, tools: [...request.tools, ...names.map((name) => ({ name, description: name, inputSchema: { type: 'object', properties: {}, additionalProperties: false } }))] };
+}
+
 function toolRequest() {
   return {
     ...textRequest(),
@@ -1559,15 +2603,32 @@ function imageRequest() {
   };
 }
 
+/** An image request with no concrete size: the bytes go out as the backend wrote them, unrealized. */
+function unrealized() {
+  return { ...imageRequest(), size: 'auto' };
+}
+
 function tinyPngBase64() {
   return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 }
 
-// The two tool turns below carry `toolHistory: true` because that is what the
-// normalizer sets when it flattens them — this fixture simulates its output, so
-// it has to match it. Dropping the flag makes the transport read these as
-// ordinary prose, which is the correct behaviour for text a CALLER wrote and the
-// wrong behaviour for a turn this proxy flattened itself.
+/** A one-pixel PNG whose BYTES differ from `tinyPngBase64()`'s — a base64 suffix past the padding decodes to the same image. */
+function redPngBase64() {
+  return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==';
+}
+
+function greenPngBase64() {
+  return 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWNgOMHwHwADXAHIv/99XgAAAABJRU5ErkJggg==';
+}
+
+// The two tool turns below carry a `tool` field because that is what the
+// normalizer records when it flattens them — this fixture simulates its output,
+// so it has to match it: a turn is an ORDERED sequence of parts, because three
+// buckets could not say where the turn's prose sat among its calls. `content` is the same turn rendered as text, which is
+// what the claude runtime reads; the codex transport builds its items from the
+// field. Dropping the field makes the transport read these as ordinary prose,
+// which is the correct behaviour for text a CALLER wrote and the wrong behaviour
+// for a turn this proxy flattened itself.
 function chatToolResultRequest() {
   return {
     ...textRequest(),
@@ -1583,7 +2644,9 @@ function chatToolResultRequest() {
           'arguments: {"city":"Seoul"}',
         ].join('\n'),
         images: [],
-        toolHistory: true,
+        tool: {
+          parts: [{ kind: 'call', call: { id: 'call_weather', name: 'get_weather', arguments: '{"city":"Seoul"}' } }],
+        },
       },
       {
         role: 'tool',
@@ -1593,7 +2656,9 @@ function chatToolResultRequest() {
           '{"city":"Seoul","temperature_c":23,"condition":"clear"}',
         ].join('\n'),
         images: [],
-        toolHistory: true,
+        tool: {
+          parts: [{ kind: 'result', result: { callId: 'call_weather', output: '{"city":"Seoul","temperature_c":23,"condition":"clear"}' } }],
+        },
       },
     ],
     tools: [{
@@ -1640,4 +2705,1279 @@ test('text.verbosity is sent only when someone actually asked for it', async () 
 
   await silent.generate({ ...base, jsonMode: true });
   assert.deepEqual(sent.text, { format: { type: 'json_object' } }, 'json mode still carries its format, with no verbosity added');
+});
+
+// `textRuns` is DERIVED here, from the upstream's own event order, and this is
+// the only backend that can produce a turn one position could not describe: a
+// call, then narration, then another call — and narration on BOTH SIDES of a
+// call, which a count could not carry either. A surface test that hands the
+// field to a stub proves the surfaces read it; only this proves anything
+// writes it.
+async function turnFor(events) {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse(events), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000, model: 'gpt-5.5' });
+  return backend.generate({
+    ...textRequest(),
+    tools: [{ name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } }],
+    toolChoice: { type: 'auto' },
+  });
+}
+
+const CREATED = { type: 'response.created', response: { id: 'r', model: 'x', status: 'in_progress' } };
+const DONE = { type: 'response.completed', response: { id: 'r', model: 'x' } };
+const callAdded = (outputIndex, n) => ({
+  type: 'response.output_item.added',
+  output_index: outputIndex,
+  item: { type: 'function_call', id: `fc${n}`, call_id: `c${n}`, name: 'get_weather', arguments: '' },
+});
+const callDone = (outputIndex, n) => ({
+  type: 'response.output_item.done',
+  output_index: outputIndex,
+  item: { type: 'function_call', id: `fc${n}`, call_id: `c${n}`, name: 'get_weather', arguments: '{}' },
+});
+
+/** The runs the transport recorded, as [text, calls before it] pairs. */
+const runsOf = (turn) => (turn.textRuns ?? []).map((run) => [run.text, run.afterCalls]);
+
+test('the transport reports the text position for a call/text/call turn', async () => {
+  const turn = await turnFor([
+    CREATED, callAdded(0, 1), callDone(0, 1),
+    { type: 'response.output_text.delta', delta: 'BETWEEN' },
+    callAdded(2, 2), callDone(2, 2), DONE,
+  ]);
+  assert.equal(turn.toolCalls.length, 2);
+  assert.deepEqual(runsOf(turn), [['BETWEEN', 1]], 'one call came before the narration');
+});
+
+test('the transport reports every call before the text as the full count', async () => {
+  const turn = await turnFor([
+    CREATED, callAdded(0, 1), callDone(0, 1), callAdded(1, 2), callDone(1, 2),
+    { type: 'response.output_text.delta', delta: 'AFTER' }, DONE,
+  ]);
+  assert.deepEqual(runsOf(turn), [['AFTER', 2]]);
+});
+
+test('the transport reports text-first as no calls before it', async () => {
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'FIRST' },
+    callAdded(1, 1), callDone(1, 1), DONE,
+  ]);
+  assert.deepEqual(runsOf(turn), [['FIRST', 0]]);
+});
+
+test('the transport reports narration on BOTH SIDES of a call as two runs', async () => {
+  // The shape a COUNT could not carry: "how many calls precede THE text" names
+  // one position, and this turn's text has two. Read as a count the turn came
+  // back as `[text, tool_use]` buffered against a streamed
+  // `[text, tool_use, text]` — one turn, two orders, measured on this backend.
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'BEFORE ' },
+    callAdded(1, 1), callDone(1, 1),
+    { type: 'response.output_text.delta', delta: 'AFTER' }, DONE,
+  ]);
+  assert.equal(turn.toolCalls.length, 1);
+  assert.deepEqual(runsOf(turn), [['BEFORE ', 0], ['AFTER', 1]]);
+  assert.equal(turn.text, 'BEFORE AFTER', 'and the flat text is still every byte, in order');
+});
+
+test('the transport reports several runs among several calls', async () => {
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'A' },
+    callAdded(1, 1), callDone(1, 1),
+    { type: 'response.output_text.delta', delta: 'B' },
+    callAdded(3, 2), callDone(3, 2),
+    { type: 'response.output_text.delta', delta: 'C' }, DONE,
+  ]);
+  assert.deepEqual(runsOf(turn), [['A', 0], ['B', 1], ['C', 2]]);
+});
+
+test('deltas with no call between them are ONE run, not one per delta', async () => {
+  // They open one block on the wire, so they are one block in the body: a run
+  // per delta would report as many text blocks as the backend chose to chunk.
+  const turn = await turnFor([
+    CREATED, { type: 'response.output_text.delta', delta: 'A' },
+    { type: 'response.output_text.delta', delta: 'B' },
+    callAdded(1, 1), callDone(1, 1),
+    { type: 'response.output_text.delta', delta: 'C' },
+    { type: 'response.output_text.delta', delta: 'D' }, DONE,
+  ]);
+  assert.deepEqual(runsOf(turn), [['AB', 0], ['CD', 1]]);
+});
+
+test('a forced call cut off at the output limit keeps its fragment verbatim (r18-fable F7)', async () => {
+  // The direct Responses API delivers the fragment under `status: incomplete`
+  // (measured 2026-09-04); wrapping it as `{"input": …}` published an object
+  // the model never produced.
+  const events = (terminal) => [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seo' },
+    terminal,
+  ];
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse(events({
+    type: 'response.incomplete',
+    response: { id: 'r', model: 'gpt-5.5', output: [], incomplete_details: { reason: 'max_output_tokens' } },
+  })), { status: 200 });
+  const cut = await new CodexBackendTransport({ codexHome, timeoutMs: 30_000 }).generate({ ...toolRequest(), stream: false });
+  assert.equal(cut.stopReason, 'max_tokens');
+  assert.equal(cut.toolCalls[0].arguments, '{"city":"Seo');
+  // CONTROL: a turn the backend reports as completed keeps its bytes too —
+  // this transport has no completion backstop (matrix §7 row 8 is scoped to
+  // `claude` and `app-server`); the direct API delivers what the model wrote,
+  // and wrapping it as `{"input": …}` published an object the model never
+  // produced while the stream had carried the bytes (round 21).
+  globalThis.fetch = async () => new Response(sse(events({
+    type: 'response.completed',
+    response: { id: 'r', model: 'gpt-5.5', output: [] },
+  })), { status: 200 });
+  const whole = await new CodexBackendTransport({ codexHome, timeoutMs: 30_000 }).generate({ ...toolRequest(), stream: false });
+  assert.equal(whole.stopReason, undefined);
+  assert.equal(whole.toolCalls[0].arguments, '{"city":"Seo');
+});
+
+test('a call whose first frame carried no output_index learns its position from a later one: the finish signal fires when the vendor moves on (r29-fable F1)', async () => {
+  // `toolOrdinal` resolved every later frame through the id binding and
+  // returned before recording the position, so the call stayed positionless
+  // and its finish signal waited for the terminal frame — the Messages block
+  // held every later block behind it again (the r27 defect, one input family).
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_1', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_1', arguments: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+
+  const finished = events.findIndex((event) => event.type === 'tool_call_delta' && event.argumentsDone === true);
+  const narration = events.findIndex((event) => event.type === 'text_delta');
+  assert.ok(finished >= 0, 'the call was announced finished');
+  assert.ok(narration >= 0);
+  assert.ok(finished < narration, `finish signal at ${finished} must precede the narration at ${narration}: ${JSON.stringify(events.map((event) => event.type))}`);
+});
+
+test('a finish event without its arguments member still names its position: the finished call below it is announced on it (r29-codex)', async () => {
+  // alpha finished at 0; beta added at 1; beta's `function_call_arguments.done`
+  // arrives WITHOUT `arguments` (the captured absent-member shape). Returning
+  // before correlating it lost the event's position, so alpha's finish signal
+  // waited for the terminal frame — and on Messages beta's block waited
+  // behind alpha's. The vendor is released only after alpha's signal is seen.
+  const codexHome = await createCodexHome();
+  const encoder = new TextEncoder();
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    async pull(controller) {
+      if (!pull.first) {
+        pull.first = true;
+        controller.enqueue(encoder.encode(sse([
+          { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+          { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+          // beta is added while alpha is still open, so nothing releases alpha
+          // here; alpha then finishes on its own frame (position 0 proves
+          // nothing); beta's value-less finish at position 1 is the first
+          // event that does.
+          { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+          { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+          { type: 'response.function_call_arguments.done', output_index: 1, item_id: 'fc_b' },
+        ])));
+        return;
+      }
+      await released;
+      controller.enqueue(encoder.encode(sse([
+        { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+      ])));
+      controller.close();
+    },
+  }), { status: 200 });
+  const pull = {};
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+
+  const events = [];
+  let alphaFinishedBeforeRelease = false;
+  let timedOut = false;
+  // The fallback release keeps a failing run terminating; a signal that
+  // arrives only after it — at the terminal frame — must not count.
+  const timer = setTimeout(() => { timedOut = true; release(); }, 2_000);
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) {
+    events.push(event);
+    if (event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true) {
+      if (!timedOut) alphaFinishedBeforeRelease = true;
+      release();
+    }
+  }
+  clearTimeout(timer);
+  assert.ok(alphaFinishedBeforeRelease, `alpha's finish signal must arrive before the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.arguments]), [['call_a', '{"city":"Seoul"}'], ['call_b', '{}']]);
+});
+
+// A vendor stream that pauses before its terminal frame: the test releases
+// it once the awaited signal is seen, or on a fallback timer (which then
+// disqualifies any later signal).
+async function releasedAfter(frames, request, awaited) {
+  const encoder = new TextEncoder();
+  let release;
+  const released = new Promise((resolve) => { release = resolve; });
+  let first = true;
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    async pull(controller) {
+      if (first) { first = false; controller.enqueue(encoder.encode(sse(frames))); return; }
+      await released;
+      controller.enqueue(encoder.encode(sse([{ type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } }])));
+      controller.close();
+    },
+  }), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome: await createCodexHome(), timeoutMs: 30_000 });
+  const events = [];
+  let early = false;
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; release(); }, 2_000);
+  for await (const event of backend.stream(request)) {
+    events.push(event);
+    if (awaited(event)) { if (!timedOut) early = true; release(); }
+  }
+  clearTimeout(timer);
+  return { events, early };
+}
+
+test('a call that learns its position after the vendor moved past it is released on that frame, not at the terminal (r30-codex)', async () => {
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true);
+  assert.ok(early, `finish signal must precede the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+});
+
+test('a call that finishes after the vendor moved past it is released on its own finish frame (r30-codex)', async () => {
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true);
+  assert.ok(early, `finish signal must precede the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+});
+
+test('a call identified by folding a finished holder into it on a delta frame is announced on that frame (r31-fable F1)', async () => {
+  // A: `call_id` on an index-less frame, never named. A holder at position 2
+  // is named and finished on frames carrying no id. The delta with A's item
+  // id at position 2 folds the holder into A — identified and finished in
+  // one step. Dropping the delta's bytes must not drop the announcement.
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 2, item: { type: 'function_call', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 2, delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 2, arguments: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.delta', output_index: 2, item_id: 'fc_a', delta: '' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a');
+  assert.ok(early, `the call must be announced before the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.index, event.argumentsDone]))}`);
+  assert.ok(!events.some((event) => event.type === 'tool_call_delta' && event.index < 0), 'no wire index below zero');
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+});
+
+test('two identifiers that first meet in the completed output fold into the one call the client knows (r31-fable F2)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' }] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+  const announced = events.filter((event) => event.type === 'tool_call_delta' && event.argumentsDelta === '').map((event) => [event.id, event.index]);
+  assert.deepEqual(announced, [['call_a', 0]], JSON.stringify(events.map((event) => [event.type, event.id, event.index, event.argumentsDone])));
+  assert.ok(!events.some((event) => event.type === 'tool_call_delta' && event.index < 0), 'no wire index below zero');
+});
+
+test('a value-less finish event is the frame a call can learn its position from: released on it once the vendor has moved past (r29-codex, r31-fable F3)', async () => {
+  // Every earlier frame of the call carries no position; the narration at 1
+  // moved the vendor on, but the call had no position to compare. The
+  // value-less `function_call_arguments.done` at 0 is the first frame that
+  // places it — returning before correlating it left the call held.
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', item_id: 'fc_a', arguments: '{"city":"Seoul"}' },
+    { type: 'response.output_text.delta', output_index: 1, delta: 'after' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && event.argumentsDone === true);
+  assert.ok(early, `finish signal must precede the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDone]))}`);
+});
+
+test('a call identified only by the completed output folding a finished holder into it is announced with a real wire index before its finish signal (r31-fable F1)', async () => {
+  // A: `call_id` only, index-less, never named live. B: an item id, a name and
+  // finished bytes at position 0, no `call_id`. The completed item carries
+  // both ids: A survives, absorbs B, and is identified for the first time —
+  // at the terminal frame, where no branch announces it. The finish signal
+  // must not go out for a call the client was never told about.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"city":"Seoul"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_b', arguments: '{"city":"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [{ type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' }] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(toolRequest())) events.push(event);
+  const tool = events.filter((event) => event.type === 'tool_call_delta').map((event) => [event.id, event.index, event.argumentsDelta ?? null, event.argumentsDone ?? false]);
+  assert.ok(!tool.some(([, index]) => index < 0), `no wire index below zero: ${JSON.stringify(tool)}`);
+  const announced = tool.findIndex(([id, index, delta]) => id === 'call_a' && index === 0 && delta === '');
+  const finished = tool.findIndex(([id, , , done]) => id === 'call_a' && done === true);
+  assert.ok(announced >= 0 && finished > announced, `announced before finished: ${JSON.stringify(tool)}`);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+});
+
+test('the fold\'s survivor is chosen by the one rule wherever two states meet: a holder the client knows absorbs the item-id half that learns its position, live (r31-codex F3)', async () => {
+  // The item-id half's bytes belong to the announced holder the moment the
+  // delta places them at its position — not at the terminal frame, where the
+  // completed item's fold would join the two anyway. The vendor is paused
+  // before the terminal: the bytes must reach the client first.
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'get_weather' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && (event.argumentsDelta ?? '').includes('Seoul'));
+  assert.ok(early, `the bytes must stream under call_a before the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDelta]))}`);
+  assert.deepEqual(events.filter((event) => event.type === 'tool_call_delta' && event.argumentsDelta === '').map((event) => [event.id, event.index]), [['call_a', 0]]);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+});
+
+test('a frame joining a call\'s two halves at two positions is the vendor contradicting its positions: refused (r31-codex F4 folded them and left the other position to its real call; refused since round 45)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_x', call_id: 'call_a', name: 'get_weather' } },
+    // A delta for alpha's item id at position 1 — not alpha's position.
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"tz":"KST"}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time', arguments: '{"tz":"KST"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time', arguments: '{"tz":"KST"}' },
+    ] } },
+  ]), { status: 200 });
+  // The fold across positions moved position 1's bytes under `call_a` at 0.
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) void event;
+  }, /cannot place/);
+});
+
+test('an id-less completed item is placed by its position, not by arrival order: reversed arrival does not swap the two calls\' arguments (r31-codex F6)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+      { type: 'function_call', name: 'get_time', arguments: '{"tz":"KST"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
+});
+
+test('one call_id under two completed items is that call listed twice: the r32 fold refuses (r32-codex; refused since round 45 — the second listing resolves to a call already placed)', async () => {
+  // The first completed item creates `call_a` at index 0; the second lists
+  // `call_a` again at index 1, folding the finished holder in. Rounds 31–44
+  // kept this door open as the split identity meeting (announced once, at a
+  // real wire index — the r32 finding); it was one `call_id` at two indices.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.done', output_index: 1, item_id: 'fc_b', arguments: '{"city":"Seoul"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'get_weather' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(toolRequest())) void event;
+  }, /named two tool calls as one/);
+});
+
+test('an anonymous completed item at a position no call holds completes the one standing call no item has placed, not the call a position already placed (r33-fable F1)', async () => {
+  // `call_a` was announced index-less and never learned a position; `call_b`
+  // holds `#0`. `output[0]` is `call_b` by position, so `output[1]` can only
+  // be `call_a` — the dense arrival-order slot booked `call_b` twice.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"tz":"KST"}' },
+      { type: 'function_call', arguments: '{"city":"Seoul"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
+});
+
+test('an anonymous completed item is placed by the call holding its position before any count, and the count is judged after every fold the completed output performs (r33-fable F2)', async () => {
+  // The anonymous item comes FIRST and the fold (fc_b into call_a) second:
+  // judged per item in array order, the count still read three standing
+  // calls against two items and discarded the item that completes `call_c`.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_c', delta: '{"c' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"c":3}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_c'), ['beta', '{"c":3}'], JSON.stringify([...calls]));
+});
+
+test('a frame carrying both ids of a call at a position other than the call_id\'s accepted one is the vendor contradicting its positions: refused (r32-codex, the third; refused since round 45)', async () => {
+  // `call_a` was added at position 1; the done frame at position 0 says the
+  // item there IS `call_a`. Rounds 32–44 folded the two and left position 0
+  // to the real call arriving there; the fold moved `call_a` to a second
+  // position, and a frame naming a known call elsewhere is refused now.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_b', arguments: '{"b":2}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'probe' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'probe', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['probe', 'other']))) void event;
+  }, /cannot place/);
+});
+
+test('an anonymous completed item at a position a call holds completes that call whatever the two views count; only the count-aligned rest is gated (r33-fable F2)', async () => {
+  // Two calls streamed, one completed item: the counts disagree, and the
+  // item at `output_index: 0` is still the call holding `#0`.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city' },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"tz":"KST"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"city":"Seoul"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['get_weather', '{"city":"Seoul"}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['get_time', '{"tz":"KST"}'], JSON.stringify([...calls]));
+});
+
+test('a completed item at a held position completes that call even when the completed output also adds a call the stream never showed (r33-codex F1)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"b":' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('the count-aligned rest never takes a call a position placed: a positioned call announced first, an index-less one second (r33-codex F2)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('an item-id half at a later position joined to the cut call at 0 is the vendor contradicting its positions: refused (r33-codex F3 folded it without counting its position as progress; refused since round 45)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"a":' },
+    { type: 'response.output_item.added', output_index: 9, item: { type: 'function_call', id: 'fc_shadow', name: 'alpha' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_shadow', call_id: 'call_a', name: 'alpha', arguments: '{"a":' } },
+    { type: 'response.incomplete', response: { id: 'r', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [
+      { type: 'function_call', id: 'fc_shadow', call_id: 'call_a', name: 'alpha', arguments: '{"a":' },
+    ] } },
+  ]), { status: 200 });
+  // Two accepted positions, one call: the fold is refused before progress
+  // or the cut call's block is in question.
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /cannot place/);
+});
+
+test('an anonymous item before the item whose fold settles the count is judged after that fold, whatever the split halves\' positions (r33-codex F4)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_c', delta: '{"c":' },
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'beta', arguments: '{"c":3}' },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_c'), ['beta', '{"c":3}'], JSON.stringify([...calls]));
+});
+
+test('the count-aligned rest never takes the survivor an earlier item folded and placed, even when that call\'s completed value is empty (r33-codex F5)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{' },
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '' },
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+  assert.notDeepEqual(calls.get('call_a')?.[1], '{"b":2}', JSON.stringify([...calls]));
+});
+
+test('the count-aligned rest is judged on what is left: an item that adds a call the stream never showed does not outnumber the one index-less call the anonymous item completes (r34-fable F1)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('call_b'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('an anonymous completed item no position places and no remainder pairs is a call without an identity: refused, not dropped under a 200 (r34-codex)', async () => {
+  // One index-less streamed call, two anonymous completed items: which call
+  // either completes is not knowable, and the runtime wrote two calls.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.function_call_arguments.done', item_id: 'fc_a', arguments: '{"a":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"dropped":1}' },
+      { type: 'function_call', arguments: '{"dropped":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('two anonymous completed items against two index-less streamed calls are not paired by arrival order: behind a shared `{` the pairing is a guess, and each is refused as a call without an identity (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+      { type: 'function_call', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('the one remaining pair still needs the names to agree: an anonymous item naming another tool than the one index-less call left is a call without an identity (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('an anonymous item at a held position naming another tool than the call there is two calls named as one: refused (r35-codex kept it out; r41-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a call_id spelled like a position key names nothing but itself: `#0` is a second call, not the holder of position 0 (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: '#0', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_b', call_id: '#0', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('#0'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('item ids and call ids are two namespaces: a spelling shared between one call\'s item id and another\'s call_id binds nothing across them (r35-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'shared', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'shared', delta: '{"a":1}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'shared', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'shared', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'shared', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  const calls = new Map(events.at(-1).result.toolCalls.map((call) => [call.id, [call.name, call.arguments]]));
+  assert.deepEqual(calls.get('call_a'), ['alpha', '{"a":1}'], JSON.stringify([...calls]));
+  assert.deepEqual(calls.get('shared'), ['beta', '{"b":2}'], JSON.stringify([...calls]));
+});
+
+test('the completed output cannot move a known call to another position: refused as arguments the transport cannot place (r36-codex, r41-codex)', async () => {
+  // `call_a` accepted position 0 live; the completed output lists it at
+  // index 1, where anonymous deltas had streamed. Adopting that holder handed
+  // `call_a` the position-1 arguments under a 200.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"belongs":"position-1"}' },
+    { type: 'response.function_call_arguments.done', output_index: 1, arguments: '{"belongs":"position-1"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'message', role: 'assistant', content: [] },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"belongs":"position-1"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /cannot place/);
+});
+
+test('the one remaining pair keeps the call at its accepted position: the one item at another index is not that call, refused (r37-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'message', role: 'assistant', content: [] },
+      { type: 'function_call', arguments: '{"evil":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('a call known by id does not adopt a holder of another name: the two are two calls, refused (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"belongs":"beta"}' },
+    { type: 'response.function_call_arguments.done', output_index: 0, arguments: '{"belongs":"beta"}' },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('an identified event at a position held by a state of another name is refused before that holder\'s bytes go out under the new name (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"belongs":"beta"}' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"belongs":"beta"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) events.push(event);
+  }, /named two tool calls as one/);
+  assert.equal(events.filter((event) => event.type === 'tool_call_delta').length, 0, 'nothing announced before the refusal');
+});
+
+test('a split identity whose halves carry different names does not fold: two calls named as one, refused (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"b":2}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a call_id the completed output supplies names the call from then on: a second item carrying it is the call listed twice, refused — not a second call under the same id (r37-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'alias_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_alias', call_id: 'alias_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('two nameless anonymous items against two index-less streamed calls are not paired by arrival order either: refused (r39-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_b', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', arguments: '{"b":2}' },
+      { type: 'function_call', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /missing its call_id/);
+});
+
+test('a second listing folding a byteless state in under another value is refused — as every second listing is since round 45 (r39-fable: the fold door then passed only the call\'s own value)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_x', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"evil":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('an item at a held position naming another tool than the anonymous holder there is two calls named as one (r39-fable: the dense slot re-adopted the holder the name door declined; since round 45 the holder at the item\'s index is the one door, and it refuses)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"belongs":"beta"}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_x', call_id: 'call_x', name: 'alpha', arguments: '{"belongs":"beta"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a call once named keeps that name before its announcement too: a later frame naming another tool for the same item is the vendor contradicting itself, refused (r39-fable, r39-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.output_item.done', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"a":1}' } },
+    // The completed output agrees with the FIRST name, so only the live
+    // door can refuse this turn.
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a completed item naming another tool for a known call is refused, not its arguments delivered under the announced name (r39-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"belongs":"beta"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a known call listed at an index other than its accepted position is the vendor contradicting its own positions: refused as arguments the transport cannot place (r39-codex, r41-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'message', role: 'assistant', content: [] },
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
+});
+
+test('a holder at position 1 is not the completed item at index 0: the item is a call of its own and the holder is refused at completion as a call missing its identity (r39-codex: the dense slot adopted position 1\'s bytes for the item at index 0; the slot is gone since round 45)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{"position":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"position":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /missing its call_id/);
+});
+
+test('the fold door takes exactly the value the call already holds: a second listing extending the first is another value, refused (r39-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('the listed-twice gate follows the fold\'s survivor: a first listing placed on a state a later item folds away still counts (r40-fable)', async () => {
+  // The first listing places the item-id-only state `fc_b` (absorbable);
+  // the second folds it into the announced `call_a` and carries another
+  // value. Tracked by ordinal, the gate missed the survivor.
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    // `call_a` announced index-less; the holder `fc_b` at position 1. The
+    // completed array keeps the live positions: a reasoning item at 0, the
+    // holder's own listing at 1, and the fold item after it.
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"evil":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'reasoning', id: 'rs' },
+      { type: 'function_call', id: 'fc_b', name: 'alpha', arguments: '{"evil":1}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"z":9}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a repeated output_item.added renaming a call before its announcement is refused at the known door (r40-fable coverage)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('the name is heard on the fold\'s survivor: an unnamed call adopting a holder of another name past a frame naming a third is refused, live (r42-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"b":2}' },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    // The completed output agrees with the name the survivor would wrongly
+    // take (`beta`), so only the live door can refuse this turn.
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'beta', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('the name is heard on the fold\'s survivor: a completed item naming alpha for an unnamed call at a beta holder\'s position is refused (r42-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"b":2}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', call_id: 'call_a', name: 'alpha', arguments: '{"b":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a second listing folding the holder in is that call listed twice, own value or not: refused (r42-fable kept the own-value meeting open; refused since round 45)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"e":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"e":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+
+
+
+test('a name-bearing frame joining a fold\'s survivor that owns the call_id does not put its item id where the call_id stood (r43-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    // The holder at 0 owns `call_h` and no name (non-absorbable); `fc_a` is
+    // known by its item id alone (absorbable); the frame naming `alpha` at 0
+    // joins the two. The survivor is the holder — and the client echoes
+    // `call_h`, not the frame's item id.
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_h' } },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"h":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_h', name: 'alpha', arguments: '{"h":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
+  const announced = [...new Set(events.filter((event) => event.type === 'tool_call_delta').map((event) => event.id))];
+  assert.deepEqual(announced, ['call_h']);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_h', 'alpha', '{"h":1}']]);
+});
+
+
+test('the call_id latch is heard at the position-resolved door: a frame at an announced call\'s position naming another call_id is refused, not ratified under the latched id (r45-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_h', name: 'alpha' } },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', call_id: 'call_x', name: 'alpha', arguments: '{"x":1}' } },
+    // The completed output agrees with the latched id, so only the live door
+    // hears the contradiction.
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', call_id: 'call_h', name: 'alpha', arguments: '{"x":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('...and before the announcement: a second frame at the position carrying another call_id does not replace the first (r45-fable)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    // `call_h` at 0 without a name: not announced yet. The second frame at 0
+    // says `call_x` — the completed output agrees with IT, so a door that
+    // let it through would deliver `call_x` under a 200.
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_h' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_x', name: 'alpha' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', call_id: 'call_x', name: 'alpha', arguments: '{}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+
+
+test('a live frame naming a known call at another position is the vendor contradicting its positions: refused as arguments the transport cannot place, not delivered (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_a', delta: '{"from":1}' },
+    { type: 'response.function_call_arguments.done', output_index: 1, item_id: 'fc_a', arguments: '{"from":1}' },
+    // The completed output is coherent with the announcement, so only the
+    // live door hears the contradiction.
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"from":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
+});
+
+test('a completed item at a held position carrying another call_id is two calls named as one, not a second call at the one position (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_first', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"first":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_first', name: 'alpha', arguments: '{"first":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', call_id: 'call_late', name: 'alpha', arguments: '{"late":2}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a completed item at a held position carrying only an item id binds to the call holding it, as the live frame does: one call under the latched call_id (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, delta: '{"x":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', name: 'alpha', arguments: '{"x":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'alpha', '{"x":1}']]);
+});
+
+test('a second listing of a created call\'s call_id at another index, folding a byte-bearing holder in with no value, is that call listed twice — it moved the call across the array (r45-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"held":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('a frame joining two states at two accepted positions is the vendor contradicting its positions: refused, not the retired position\'s bytes moved under the survivor (r45-codex, known survives)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"from":1}' },
+    // At the survivor's own position, so the position door hears nothing;
+    // the fold itself must.
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"from":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"from":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
+});
+
+test('...and with the holder surviving: a call_id holder at 1 joined to an item-id state at 0 is refused the same way (r45-codex, holder survives)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', call_id: 'call_h', name: 'alpha' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"from":0}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_a', call_id: 'call_h', name: 'alpha', arguments: '{"from":0}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_h', name: 'alpha', arguments: '{"from":0}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /cannot place/);
+});
+
+test('two calls the client knows at one position are two items at one index: a live frame placing an index-less announced call at a position another announced call holds is refused, not two calls delivered (r46-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /cannot place/);
+});
+
+test('...and from the completed output: the index-less announced call listed at the index another announced call holds is refused the same way (r46-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_b', delta: '{"b":2}' },
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', item_id: 'fc_a', delta: '{"a":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha', 'beta']))) void event;
+  }, /cannot place/);
+});
+
+test('the first call_id is latched like the name: a live frame naming another call_id for the same item is refused (r41-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"same":1}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_b', name: 'alpha', arguments: '{"same":1}' } },
+    // The completed output agrees with the latched id, so only the live door
+    // hears the contradiction (a mutant there must not be caught at the
+    // completed door instead).
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha', arguments: '{"same":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
+});
+
+test('the first call_id is latched like the name: a completed item naming another call_id for the same item is refused, not kept on the announced id (r41-codex)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'alpha' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"same":1}' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_b', name: 'alpha', arguments: '{"same":1}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  await assert.rejects(async () => {
+    for await (const event of backend.stream(withDeclared(toolRequest(), ['alpha']))) void event;
+  }, /named two tool calls as one/);
 });

@@ -6,13 +6,14 @@ import { AsyncQueue } from './async-queue.js';
 import {
   buildPrompt,
   claudeSystemPrompt,
-  forcedSingleToolCall,
   hasToolDecisionSchema,
+  textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
   usageFor,
 } from './backend-contract.js';
 import { claudeMessageContentFor, hasImageInputs } from './multimodal.js';
+import { rawTopLevelValue } from './tool-wrapper.js';
 import { proxyChildProcessEnv } from './process-env.js';
 import type {
   LocalCliBackend,
@@ -21,8 +22,7 @@ import type {
   LocalUsage,
   NormalizedRequest,
 } from './types.js';
-import { unsupportedModelError } from './types.js';
-import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
+import { MAX_ERROR_MESSAGE_CHARS, unsupportedModelError } from './types.js';
 
 interface ClaudeCodeBackendOptions {
   readonly command?: string;
@@ -51,6 +51,8 @@ interface ClaudeWaiter {
    */
   apiErrorKind?: string;
   structuredOutput: unknown;
+  /** The source text of `structured_output`, kept so numbers survive verbatim. */
+  rawStructuredOutput?: string;
   usage: unknown;
   resolve: (value: ClaudeTurnResult) => void;
   reject: (err: Error) => void;
@@ -59,6 +61,7 @@ interface ClaudeWaiter {
 interface ClaudeTurnResult {
   readonly text: string;
   readonly structuredOutput: unknown;
+  readonly rawStructuredOutput?: string;
   readonly usage: unknown;
   readonly stopReason?: string;
   readonly stopDetails?: unknown;
@@ -214,23 +217,15 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     signal?: AbortSignal,
   ): AsyncIterable<LocalStreamEvent> {
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const forcedTool = forcedSingleToolCall(request);
-    const toolExtractor = forcedTool
-      ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
-      : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor()
-      : null;
-    const shouldStreamText = !toolExtractor && this.canStreamTextDeltas(request);
+    // A tool turn has no incremental reader: nothing is released until
+    // `completed` carries the one reading the buffered path also makes. Two
+    // readers of one wrapper disagreed on malformed output, and a released byte
+    // cannot be retracted (conformance matrix §7).
+    const shouldStreamText = this.canStreamTextDeltas(request);
     const run = this.runRequest(
       request,
       signal,
-      toolExtractor
-        ? (delta) => {
-            for (const event of toolExtractor.push(delta)) queue.push(event);
-          }
-        : shouldStreamText
-        ? (delta) => queue.push({ type: 'text_delta', delta })
-        : undefined,
+      shouldStreamText ? (delta) => queue.push({ type: 'text_delta', delta }) : undefined,
     )
       .then((result) => queue.push({ type: 'completed', result }))
       .catch((err: Error) => queue.fail(err))
@@ -307,8 +302,29 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     }
   }
 
+  /**
+   * Whether this turn's text may be streamed as it is produced.
+   *
+   * Only a turn with NO output schema at all. Two separate reasons converge
+   * on that one condition, and spelling it as "what the backstop can refuse"
+   * covered only the first:
+   *
+   * ① A `json_object` turn used to stream its answer live and then have
+   *    `parseBackendOutput` refuse it for not being an object — the whole
+   *    non-JSON sentence delivered, followed by an error frame.
+   * ② When the CLI is given a schema it answers through `structured_output`,
+   *    and `resultFromTurn` publishes those bytes and discards `turn.text`.
+   *    The streamed text is then not the answer at all: a `json_schema` turn
+   *    streamed `Here you go:\n{"ok": 1}` while its body said `{"ok":1}`, and
+   *    `missingTextTail` cannot repair it because the answer does not start
+   *    with what was streamed. An explicit client schema is exempt from ① but
+   *    not from ②.
+   *
+   * `outputSchemaFor` is the value that decides both, and it is the same value
+   * the backend hands the CLI, so the gate cannot drift from the channel.
+   */
   private canStreamTextDeltas(request: NormalizedRequest): boolean {
-    return !hasToolDecisionSchema(request) && !request.jsonSchema;
+    return outputSchemaFor(request) === null;
   }
 
   private canUsePersistentTurn(request: NormalizedRequest): boolean {
@@ -459,16 +475,21 @@ export class ClaudeCodeBackend implements LocalCliBackend {
     turn: ClaudeTurnResult,
     startedAt: number,
   ): LocalCompletionResult {
+    // The CLI's own bytes when there are any. Re-serializing the parsed value
+    // rounds every number through IEEE-754 first, so a client id of
+    // `9007199254740993` reached the client as `…992` — and it was lost here,
+    // before the response path could preserve anything.
     const rawText = turn.structuredOutput === undefined
       ? turn.text
-      : JSON.stringify(turn.structuredOutput);
-    const parsed = parseBackendOutput(request, rawText);
+      : turn.rawStructuredOutput ?? JSON.stringify(turn.structuredOutput);
+    const parsed = parseBackendOutput(request, rawText, turn.stopReason);
     const usage = usageFromClaude(turn.usage) ?? usageFor(request, parsed.text, parsed.toolCalls);
     return {
       id: `local_${randomUUID()}`,
       model: request.model,
       text: parsed.text,
       toolCalls: parsed.toolCalls,
+      ...(parsed.textRuns ? { textRuns: parsed.textRuns } : {}),
       usage,
       latencyMs: Date.now() - startedAt,
       stopReason: turn.stopReason,
@@ -629,7 +650,8 @@ export class ClaudeCodeBackend implements LocalCliBackend {
       } else if (message.subtype === 'success' && message.is_error !== true) {
         waiter.resolve({
           text: typeof message.result === 'string' ? message.result : waiter.text,
-          structuredOutput: message.structured_output ?? waiter.structuredOutput,
+          structuredOutput: ownStructuredOutput(message, waiter.structuredOutput),
+          rawStructuredOutput: rawTopLevelValue(line, 'structured_output') ?? waiter.rawStructuredOutput,
           usage: message.usage ?? waiter.usage,
           stopReason: readClaudeStopReason(message),
           stopDetails: message.stop_details,
@@ -726,16 +748,43 @@ function claudeTuningArgs(request: NormalizedRequest, model?: string): string[] 
   return args;
 }
 
-// Per-request flags must be on the spawned argv, so a request that contributes any
-// of them runs one-shot rather than reusing the persistent process (whose argv is
-// fixed at spawn). The schema case is scoped to the Anthropic shape, where
-// `jsonSchema` comes from `output_config.format` and must reach `claude
-// --json-schema`; OpenAI-shape `response_format` keeps its persistent path. Tuning
-// flags only force one-shot when they actually contribute (gated-out flags do not).
+/**
+ * Per-request flags must be on the spawned argv, so a request that contributes
+ * any of them runs one-shot rather than reusing the persistent process (whose
+ * argv is fixed at spawn).
+ *
+ * The schema case used to be scoped to the Anthropic shape. Everything else
+ * with a schema — an OpenAI `response_format: json_schema`, and every turn
+ * carrying tools, which is most of them — kept the persistent path, where
+ * `--json-schema` is never passed. What constrained those turns was a sentence
+ * in the prompt ("Schema JSON only.") and nothing else, with `parseBackendOutput`
+ * left to salvage whatever came back. That is asking, not requiring, and this
+ * proxy's rule is that an option is a promise: if the runtime has a channel for
+ * it, the request goes through the channel.
+ *
+ * `claude --json-schema` (2.1.251) is a spawn-time flag with no per-turn form in
+ * stream-json input, so honouring it costs those turns the persistent session.
+ * That is the price of the promise, and it is paid where the schema exists —
+ * a turn with no schema still reuses the child.
+ */
 function requiresOneShotClaudeArgs(request: NormalizedRequest, model?: string): boolean {
-  const needsSchema = request.shape === 'anthropic-messages' && request.jsonSchema !== undefined;
-  return needsSchema || claudeTuningArgs(request, model).length > 0;
+  return outputSchemaFor(request) !== null || claudeTuningArgs(request, model).length > 0;
 }
+/**
+ * The result record's OWN `structured_output`, present-or-absent.
+ *
+ * `??` cannot express this. A client schema of `{"type":"null"}` makes `null`
+ * the answer it asked for, and coalescing a present `null` away selected the
+ * empty fallback text instead: the client got `""` for a schema its own
+ * runtime had satisfied.
+ */
+function ownStructuredOutput(
+  message: { structured_output?: unknown },
+  fallback: unknown,
+): unknown {
+  return 'structured_output' in message ? message.structured_output : fallback;
+}
+
 
 function readClaudeStopReason(message: JsonObject): string | undefined {
   return typeof message.stop_reason === 'string' ? message.stop_reason : undefined;
@@ -884,7 +933,8 @@ function runClaudeProcess(
         } else if (message.subtype === 'success' && message.is_error !== true) {
           finish(undefined, {
             text: typeof message.result === 'string' ? message.result : waiter.text,
-            structuredOutput: message.structured_output ?? waiter.structuredOutput,
+            structuredOutput: ownStructuredOutput(message, waiter.structuredOutput),
+            rawStructuredOutput: rawTopLevelValue(line, 'structured_output') ?? waiter.rawStructuredOutput,
             usage: message.usage ?? waiter.usage,
             stopReason: readClaudeStopReason(message),
             stopDetails: message.stop_details,
@@ -1060,13 +1110,19 @@ function claudeProcessFailure(
 }
 
 /**
- * A client-visible diagnostic, bounded but not escaped. HTTP JSON and SSE JSON
+ * A client-visible diagnostic, bounded to the ceiling every client-visible
+ * diagnostic takes, and not escaped. HTTP JSON and SSE JSON
  * already encode control characters safely, so escaping them here would make a
  * legitimate multi-line runtime message arrive as escape notation. Truncation
  * walks code points so a boundary cannot split an astral character.
  */
 function boundedText(message: string): string {
-  const budget = MAX_LOG_LINE_CHARS - TRUNCATION_MARKER.length;
+  // Same NUMBER and same RULE as the serializer. Reserving the marker
+  // unconditionally shortened messages that were never too long — measured, a
+  // 1015-character diagnostic came back as 1024 with a marker it did not need,
+  // where the HTTP layer would have passed all 1015 through untouched.
+  if (message.length <= MAX_ERROR_MESSAGE_CHARS) return message;
+  const budget = MAX_ERROR_MESSAGE_CHARS - TRUNCATION_MARKER.length;
   let out = '';
   for (const ch of message) {
     if (out.length + ch.length > budget) return `${out}${TRUNCATION_MARKER}`;
@@ -1103,8 +1159,11 @@ const CLAUDE_REFUSAL_DIAGNOSTIC = new RegExp(
 // C0, DEL and C1, plus the two Unicode line separators.
 const NON_PRINTING = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
 const TRUNCATION_MARKER = '...[truncated]';
-// Long enough for the CLI's refusal sentence and a model name; short enough that
-// a hostile value cannot flood an operator's log from one request.
+// The OPERATOR's log line only. Long enough for the CLI's refusal sentence and
+// a model name; short enough that a hostile value cannot flood a log from one
+// request. Client-visible diagnostics take `MAX_ERROR_MESSAGE_CHARS` instead —
+// they are the same channel every other error takes, and a second bound here
+// made raising that one silently do nothing for claude-runtime messages.
 const MAX_LOG_LINE_CHARS = 500;
 // A terminating child gets this long to exit before it is killed outright.
 const CHILD_SHUTDOWN_GRACE_MS = 2_000;

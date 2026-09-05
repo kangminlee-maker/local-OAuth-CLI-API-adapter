@@ -9,6 +9,7 @@ import type { AddressInfo } from 'node:net';
 import type {
   LocalCliBackend,
   LocalCompletionResult,
+  LocalTextRun,
   LocalStreamEvent,
   LocalToolCall,
   LocalUsage,
@@ -25,13 +26,17 @@ import type {
 } from './types.js';
 import { honorRequestModel } from '../settings.js';
 import {
-  BACKEND_IDENTIFIERS, ProxyRequestError } from './types.js';
+  BACKEND_IDENTIFIERS, MAX_ERROR_MESSAGE_CHARS, ProxyRequestError } from './types.js';
 import { unsupportedImageFileIds } from './multimodal.js';
-import { hasToolDecisionSchema } from './backend-contract.js';
-import { missingToolCallArgumentDelta } from './tool-call-stream.js';
+import { assertCallArguments, hasToolDecisionSchema } from './backend-contract.js';
+import { StopSequenceGate, truncateAtStopSequence } from './stop-sequences.js';
+import { RawJson, stringifyJson } from './raw-json.js';
+import { completeTopLevelMembers, missingToolCallArgumentDelta } from './tool-wrapper.js';
 import { image2QualityToGpt55ReasoningEffort } from './image2-via-gpt55.js';
 import {
+  jsonTypeName,
   normalizeAnthropicMessagesRequest,
+  resolvedOpenAiServiceTier,
   normalizeOpenAiChatRequest,
   normalizeOpenAiResponsesRequest,
 } from './normalizers.js';
@@ -224,15 +229,28 @@ async function handleRequest(
       errorShape = 'openai-chat';
       const normalized = normalizeOpenAiChatRequest(body);
       rejectDeferredFeatures(normalized);
+      // `n` is realized as n backend turns — the runtimes have no slot for it,
+      // and n independent samples is exactly what n turns are.
+      const choiceCount = normalized.choices ?? 1;
       if (normalized.stream) {
+        // One `close` listener per turn is wired inside `streamEvents`.
+        if (choiceCount > 1) res.setMaxListeners(choiceCount + 10);
+        // The turns of one fan-out share a cancel: the first failure ends them
+        // all, instead of each waiting out its own timeout.
+        const fanOut = new AbortController();
         await writeOpenAiChatStream(
           res,
-          await streamEvents(backend, normalized, requestTimeoutMs, res),
+          await startFanOutStreams(
+            choiceCount,
+            () => streamEvents(backend, normalized, requestTimeoutMs, res, fanOut.signal),
+            () => fanOut.abort(),
+          ),
           await requestReportingExecutedModel(backend, normalized),
+          () => fanOut.abort(),
         );
       } else {
-        const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
-        writeJson(res, 200, openAiChatResponse(result));
+        const results = await runChoicesWithTimeout(backend, normalized, choiceCount, requestTimeoutMs, res);
+        writeJson(res, 200, openAiChatResponse(results, normalized));
       }
       return;
     }
@@ -264,7 +282,7 @@ async function handleRequest(
         );
       } else {
         const result = await runWithTimeout(backend, normalized, requestTimeoutMs, res);
-        writeJson(res, 200, anthropicMessagesResponse(result));
+        writeJson(res, 200, anthropicMessagesResponse(applyStopSequences(result, normalized)));
       }
       return;
     }
@@ -652,15 +670,6 @@ function unknownImageParameter(name: string): ProxyRequestError {
 // The direct API's wording for a wrong JSON type — "got null / an integer / a
 // decimal number / a boolean / an object / an array instead" — each measured
 // on `model` (2026-08-30).
-function jsonTypeName(value: unknown): string {
-  if (value === null) return 'null';
-  if (Array.isArray(value)) return 'an array';
-  if (typeof value === 'number') return Number.isInteger(value) ? 'an integer' : 'a decimal number';
-  if (typeof value === 'boolean') return 'a boolean';
-  if (typeof value === 'object') return 'an object';
-  return `a ${typeof value}`;
-}
-
 function validateOpenAiImageRequest(request: OpenAiImageGenerationRequest): void {
   // Only compression BELOW 100 needs a lossy format — 100 is "no compression",
   // which PNG can express. The guard rejected every defined value, including the
@@ -1183,6 +1192,36 @@ function turnAbort(res: ServerResponse, requestTimeoutMs: number): { signal: Abo
   };
 }
 
+/**
+ * Chat `n`, realized: n independent turns, run together, one per `choices[]`
+ * entry. A turn that fails cancels its siblings — they are already-lost work,
+ * and on a serialized backend they would hold the queue for a caller that has
+ * its error already.
+ */
+async function runChoicesWithTimeout(
+  backend: LocalCliBackend,
+  request: NormalizedRequest,
+  count: number,
+  requestTimeoutMs: number,
+  res: ServerResponse,
+): Promise<LocalCompletionResult[]> {
+  const abort = turnAbort(res, requestTimeoutMs);
+  const fanOut = new AbortController();
+  const onAbort = (): void => fanOut.abort();
+  abort.signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    return await Promise.all(Array.from({ length: count }, () => backend
+      .generate(request, fanOut.signal)
+      .catch((err: unknown) => {
+        fanOut.abort();
+        throw err;
+      })));
+  } finally {
+    abort.signal.removeEventListener('abort', onAbort);
+    abort.release();
+  }
+}
+
 async function runWithTimeout(
   backend: LocalCliBackend,
   request: NormalizedRequest,
@@ -1217,23 +1256,42 @@ export async function withFirstEventSettled(
 ): Promise<AsyncIterable<LocalStreamEvent>> {
   const iterator = events[Symbol.asyncIterator]();
   const first = await iterator.next();
+  let delivered = false;
+  let closed = false;
+  // The wrapper drives the backend iterator by hand, so closing early — a
+  // client disconnect after the first event, or a fan-out sibling abandoned
+  // when another turn failed to start — would otherwise never reach the source
+  // generator's own cleanup, leaving its timeout, CLI process, or backend lock
+  // alive. It is written as an explicit iterator rather than a generator
+  // because `return()` on a generator that was never started skips its body:
+  // an abandoned turn nothing ever read is exactly that case.
+  const close = async (): Promise<IteratorResult<LocalStreamEvent>> => {
+    if (!closed) {
+      closed = true;
+      await iterator.return?.();
+    }
+    return { done: true, value: undefined };
+  };
   return {
-    async *[Symbol.asyncIterator]() {
-      try {
-        if (first.done) return;
-        yield first.value;
-        while (true) {
-          const next = await iterator.next();
-          if (next.done) return;
-          yield next.value;
-        }
-      } finally {
-        // The wrapper drives the backend iterator by hand, so closing early —
-        // a client disconnect after the first event — would otherwise never
-        // reach the source generator's own cleanup, leaving its timeout, CLI
-        // process, or backend lock alive.
-        await iterator.return?.();
-      }
+    [Symbol.asyncIterator]() {
+      return {
+        async next(): Promise<IteratorResult<LocalStreamEvent>> {
+          if (closed) return { done: true, value: undefined };
+          if (!delivered) {
+            delivered = true;
+            if (!first.done) return { done: false, value: first.value };
+            return await close();
+          }
+          try {
+            const next = await iterator.next();
+            return next.done ? await close() : next;
+          } catch (err) {
+            await close();
+            throw err;
+          }
+        },
+        return: close,
+      };
     },
   };
 }
@@ -1256,29 +1314,87 @@ async function requestReportingExecutedModel(
   return { ...request, model: resolved };
 }
 
+/**
+ * A fan-out's turns, with the whole fan-out cancelled if any of them fails to
+ * start.
+ *
+ * With honouring on, `streamEvents` prefetches each turn's first event, so a
+ * turn that fails before that event rejects HERE — before the writer that owns
+ * the shared cancel exists, which is the only place the siblings were being
+ * cancelled from. Measured before this: `n: 3` with the first turn throwing
+ * answered the client in 13ms and left turns 1 and 2 suspended with zero abort
+ * signals fired, generating until their own request timeouts.
+ */
+async function startFanOutStreams(
+  count: number,
+  start: () => Promise<AsyncIterable<LocalStreamEvent>>,
+  cancel: () => void,
+): Promise<AsyncIterable<LocalStreamEvent>[]> {
+  let failure: { readonly reason: unknown } | undefined;
+  // Cancel on the FIRST start to fail, not once every start has settled.
+  // Awaiting all of them first cannot work: the siblings being cancelled are
+  // exactly the ones still pending, so the wait is for the thing the cancel is
+  // supposed to end. Measured before this, with a 300ms request timeout: the
+  // client got its 500 at 326ms and the sibling aborts fired at 319ms — the
+  // whole timeout, and at 30s the client would have waited 30s for an error
+  // known in milliseconds.
+  const started = await Promise.all(Array.from({ length: count }, () => start().then(
+    (events) => ({ events }),
+    (reason: unknown) => {
+      if (!failure) {
+        failure = { reason };
+        cancel();
+      }
+      return { events: undefined };
+    },
+  )));
+  const live = started.map((entry) => entry.events).filter((events) => events !== undefined);
+  if (!failure) return live;
+  // Cancel first, then collect: an iterator suspended inside `next()` queues a
+  // `return()` behind that call, which is the same trap `mergeTaggedStreams`
+  // documents in its own `finally`. The cancel above has already run.
+  await Promise.allSettled(live.map((events) => events[Symbol.asyncIterator]().return?.()));
+  throw failure.reason;
+}
+
 function streamEvents(
   backend: LocalCliBackend,
   request: NormalizedRequest,
   requestTimeoutMs: number,
   res: ServerResponse,
+  fanOut?: AbortSignal,
 ): Promise<AsyncIterable<LocalStreamEvent>> {
-  // The disconnect signal is wired in BOTH modes and lives for the whole
+  // The cancel signal is wired in BOTH modes and lives for the whole
   // iteration. It used to exist only during honor-on prefetch, so a client
   // that left mid-stream kept its backend turn running to the timeout — and on
   // a serialized backend the next client paid for it.
-  const clientGone = new AbortController();
+  //
+  // A fan-out's siblings cancel through the same door: when one choice fails
+  // the others are turns nothing will read, and without this they ran to the
+  // request timeout with the client's error held back behind them.
+  const cancelled = new AbortController();
   const onResponseClose = (): void => {
-    if (!res.writableEnded) clientGone.abort();
+    if (!res.writableEnded) cancelled.abort();
   };
+  const onFanOut = (): void => cancelled.abort();
   res.once('close', onResponseClose);
+  if (fanOut?.aborted) cancelled.abort();
+  else fanOut?.addEventListener('abort', onFanOut, { once: true });
   const release = (): void => {
     res.removeListener('close', onResponseClose);
+    fanOut?.removeEventListener('abort', onFanOut);
   };
   const events = releaseOnFinish(
-    runStreamWithTimeout(backend, request, requestTimeoutMs, clientGone.signal),
+    runStreamWithTimeout(backend, request, requestTimeoutMs, cancelled.signal),
     release,
   );
-  if (!honorRequestModel()) {
+  // A tool turn's first event IS its completed reading (or the refusal that
+  // replaces it), so pulling it before the headers are written is what gives
+  // the stream the same status the buffered path returns — a real 502, not a
+  // 200 with an error frame after zero content. A JSON-format turn is held the
+  // same way: its text is not released until the response path has accepted
+  // it, so its first event is the same reading.
+  if (!honorRequestModel() && !hasToolDecisionSchema(request) && !request.jsonMode) {
     return Promise.resolve(events);
   }
   return withFirstEventSettled(events);
@@ -1722,12 +1838,16 @@ async function writeOpenAiImageStream(
   };
   // The event count is backend-controlled; `n` is the request's. A runaway
   // stream must not emit more images than were asked for — nor pin more.
+  // The excess is skipped, not the rest of the turn: breaking out here
+  // closed the transport's read before it judged the terminal frame, and a
+  // turn that failed after over-producing was published as a successful
+  // stream (r48-codex). The buffered path keeps the first `n` the same way.
   let completedEmitted = 0;
   try {
     for await (const event of events) {
       commit();
-      if (event.type === 'partial_image') continue;
-      if (completedEmitted >= (request.n ?? 1)) break;
+      if (event.type === 'started' || event.type === 'partial_image') continue;
+      if (completedEmitted >= (request.n ?? 1)) continue;
       completedEmitted += 1;
       const type = imageStreamEventType(request.operation, event.type);
       const payload = {
@@ -1770,41 +1890,97 @@ function imageStreamEventType(
     : `${prefix}.completed`;
 }
 
-function openAiChatResponse(result: LocalCompletionResult): unknown {
-  const hasToolCalls = result.toolCalls.length > 0;
+function openAiChatResponse(
+  results: readonly LocalCompletionResult[],
+  request: NormalizedRequest,
+): unknown {
+  const [first] = results;
   return {
-    id: `chatcmpl-${result.id}`,
+    id: `chatcmpl-${first.id}`,
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: result.model,
-    choices: [
-      {
-        index: 0,
-        message: hasToolCalls ? {
-          role: 'assistant',
-          // Narration that accompanied the tool call, as the provider returns
-          // it; `null` only when the turn really said nothing.
-          content: result.text ? result.text : null,
-          tool_calls: result.toolCalls.map(openAiToolCall),
-          refusal: null,
-          annotations: [],
-        } : {
-          role: 'assistant',
-          content: result.text,
-          refusal: null,
-          annotations: [],
-        },
-        // `length` is how the chat surface says "stopped at the cap"; the
-        // Anthropic surface already passes `max_tokens` through as a stop reason.
-        finish_reason: hasToolCalls
-          ? 'tool_calls'
-          : result.stopReason === 'max_tokens' ? 'length' : 'stop',
-      },
-    ],
-    usage: openAiChatUsage(result.usage),
-    service_tier: 'default',
+    model: first.model,
+    choices: results.map((result, index) => openAiChatChoice(result, index)),
+    usage: openAiChatUsage(mergedChatUsage(results)),
+    service_tier: echoedServiceTier(request),
     system_fingerprint: null,
   };
+}
+
+function openAiChatChoice(result: LocalCompletionResult, index: number): unknown {
+  const hasToolCalls = result.toolCalls.length > 0;
+  return {
+    index,
+    message: hasToolCalls ? {
+      role: 'assistant',
+      // Narration that accompanied the tool call, as the provider returns
+      // it; `null` only when the turn really said nothing.
+      content: result.text ? result.text : null,
+      tool_calls: result.toolCalls.map(openAiToolCall),
+      refusal: null,
+      annotations: [],
+    } : {
+      role: 'assistant',
+      content: result.text,
+      refusal: null,
+      annotations: [],
+    },
+    finish_reason: openAiChatFinishReason(result),
+  };
+}
+
+/**
+ * `length` is how the chat surface says "stopped at the cap", and it says so
+ * even when the cut-off turn carries a tool call — the direct API answers a
+ * forced call cut off by `max_completion_tokens` with the fragment under
+ * `finish_reason: "length"`, not `"tool_calls"` (measured 2026-09-04). One
+ * rule for the body and the stream.
+ */
+function openAiChatFinishReason(result: LocalCompletionResult): 'length' | 'tool_calls' | 'stop' {
+  if (result.stopReason === 'max_tokens') return 'length';
+  return result.toolCalls.length > 0 ? 'tool_calls' : 'stop';
+}
+
+/**
+ * One usage for a fan-out, shaped as the direct API shapes it: the PROMPT is
+ * counted once and the completions are summed (measured on `n: 2` —
+ * `prompt_tokens` unchanged, `completion_tokens` doubled). This proxy really
+ * does send the prompt once per turn, so the number under-reports what the
+ * backend consumed; the contract's `n` row says so. Reporting it n times would
+ * hand a client a number no direct response can produce.
+ */
+function mergedChatUsage(results: readonly LocalCompletionResult[]): LocalUsage {
+  const [first, ...rest] = results;
+  if (rest.length === 0) return first.usage;
+  let outputTokens = first.usage.outputTokens;
+  let reasoningOutputTokens = first.usage.reasoningOutputTokens;
+  for (const result of rest) {
+    outputTokens += result.usage.outputTokens;
+    if (result.usage.reasoningOutputTokens !== undefined) {
+      reasoningOutputTokens = (reasoningOutputTokens ?? 0) + result.usage.reasoningOutputTokens;
+    }
+  }
+  return {
+    ...first.usage,
+    outputTokens,
+    ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(first.usage.totalTokens !== undefined
+      ? { totalTokens: first.usage.inputTokens + outputTokens }
+      : {}),
+  };
+}
+
+/**
+ * The tier the response reports. The direct API does not echo the request
+ * verbatim — `fast` comes back as `priority` — so the resolution lives with
+ * the validator that knows the enum, and the value here is only ever one the
+ * validator has already accepted. Hard-coding `default` for every request
+ * reported a tier the caller had not asked for; echoing the request reported
+ * one the direct API never sends.
+ */
+function echoedServiceTier(request: NormalizedRequest): string {
+  const raw = request.raw as Record<string, unknown> | null | undefined;
+  return resolvedOpenAiServiceTier(raw && typeof raw === 'object' ? raw.service_tier : undefined);
 }
 
 function openAiResponsesResponse(
@@ -1817,13 +1993,15 @@ function openAiResponsesResponse(
   const reasoning = result.reasoning
     ? [openAiResponseReasoningItem(result.reasoning.id)]
     : [];
+  const cutOff = responseCutOff(result);
   const output = result.toolCalls.length > 0
     ? [
         ...reasoning,
-        ...orderedByEmission(result, {
-          text: result.text ? [openAiResponseMessageItem(`msg_${randomUUID()}`, result.text)] : [],
-          toolCalls: result.toolCalls.map(openAiResponseToolCall),
-        }),
+        ...orderedByEmission(
+          mergedTextRun(textRunsFor(result, result.toolCalls.length)),
+          result.toolCalls.map((call) => openAiResponseToolCall(call, cutOff ? 'incomplete' : 'completed')),
+          (run) => openAiResponseMessageItem(`msg_${randomUUID()}`, run.text),
+        ),
       ]
     : [
         ...reasoning,
@@ -1833,25 +2011,176 @@ function openAiResponsesResponse(
     id: `resp_${result.id}`,
     model: result.model,
     request,
-    status: 'completed',
+    status: cutOff ? 'incomplete' : 'completed',
     output,
     usage: openAiResponsesUsage(result.usage),
-    completed: true,
+    completed: !cutOff,
+    incompleteDetails: cutOff ? { reason: 'max_output_tokens' } : null,
   });
 }
 
 /**
- * The turn's parts in the order they were produced. A tool call that arrived
- * before any text is streamed as the first block, so the completed body has to
- * report it as the first block too — the two surfaces describe one turn.
+ * The turn's parts in the order they were produced: every text run at the
+ * point among the calls where the backend produced it. A tool call that
+ * arrived before any text is streamed as the first block, so the completed
+ * body has to report it as the first block too — the two surfaces describe one
+ * turn.
+ *
+ * An interleaving, not a split. A turn can narrate, call a tool, and narrate
+ * again, so there is no single place "the text" goes: choosing between two
+ * whole groups could not express [call, text, call], and splitting the calls
+ * around one position could not express [text, call, text].
  */
 function orderedByEmission(
-  result: LocalCompletionResult,
-  parts: { readonly text: readonly unknown[]; readonly toolCalls: readonly unknown[] },
+  runs: readonly LocalTextRun[],
+  toolCalls: readonly unknown[],
+  renderRun: (run: LocalTextRun) => unknown,
 ): unknown[] {
-  return result.toolCallsBeforeText
-    ? [...parts.toolCalls, ...parts.text]
-    : [...parts.text, ...parts.toolCalls];
+  const out: unknown[] = [];
+  let placed = 0;
+  for (const run of runs) {
+    for (; placed < run.afterCalls; placed += 1) out.push(toolCalls[placed]);
+    out.push(renderRun(run));
+  }
+  for (; placed < toolCalls.length; placed += 1) out.push(toolCalls[placed]);
+  return out;
+}
+
+/**
+ * The turn's text runs, positioned by the result and filled from its `text`.
+ *
+ * `text` carries the bytes and `textRuns` carries the positions, so anything
+ * that rewrites the text — `stop_sequences` cuts it, and the streamed gate
+ * reports only what reached the wire — gets runs that match it without having
+ * to know the runs exist. The text is redistributed over the run lengths in
+ * order: a cut therefore shortens the last surviving run and drops the ones
+ * past it, exactly as a turn that stopped there would have produced them.
+ *
+ * Positions are clamped to the calls actually being rendered and forced
+ * non-decreasing. A backend that reports a run past its own call count would
+ * otherwise put text somewhere the stream never did.
+ */
+function textRunsFor(result: LocalCompletionResult, callCount: number): readonly LocalTextRun[] {
+  const runs: LocalTextRun[] = [];
+  let rest = result.text;
+  let floor = 0;
+  // Absent means one run before every call — what a backend that cannot
+  // interleave the two always produces.
+  const declared = result.textRuns ?? [{ text: result.text, afterCalls: 0 }];
+  for (const [index, run] of declared.entries()) {
+    if (!rest) break;
+    const afterCalls = Math.min(Math.max(floor, Math.floor(run.afterCalls) || 0), callCount);
+    floor = afterCalls;
+    // The last declared run takes whatever is left, so text the runs do not
+    // account for still reaches the client rather than being cut here.
+    const take = index === declared.length - 1 ? rest.length : Math.min(run.text.length, rest.length);
+    const text = rest.slice(0, take);
+    rest = rest.slice(take);
+    if (!text) continue;
+    const open = runs[runs.length - 1];
+    // Runs at the same position are one block: nothing came between them.
+    if (open && open.afterCalls === afterCalls) runs[runs.length - 1] = { text: open.text + text, afterCalls };
+    else runs.push({ text, afterCalls });
+  }
+  return runs;
+}
+
+/**
+ * The turn's text as ONE run, at the point the first of them was produced.
+ *
+ * The Responses surface reports a turn's text as a single `message` item — one
+ * item id, one content part — and its STREAM opens exactly one, however many
+ * runs the turn produced. So both readings merge, and they merge the same way:
+ * the buffered body follows the wire here as it does on the other surface.
+ *
+ * There is no vendor shape being mirrored either way. Measured 2026-09-02 on
+ * the direct Anthropic API, a turn told to narrate, call a tool, then narrate
+ * again answers `content: [text, tool_use]` with `stop_reason: tool_use` and
+ * streams the same two blocks: the vendor ENDS the turn at the call and never
+ * emits text after a `tool_use` block. A backend behind this proxy does emit
+ * it, so what governs is not parity but the two rules that survive its
+ * absence — keep what the backend produced, and let the two readings agree.
+ */
+function mergedTextRun(runs: readonly LocalTextRun[]): readonly LocalTextRun[] {
+  if (runs.length === 0) return [];
+  return [{ text: runs.map((run) => run.text).join(''), afterCalls: runs[0].afterCalls }];
+}
+
+/**
+ * The runs the wire has not carried yet, given how much of the turn's text it
+ * already holds. What went out went out where it was produced; this is what is
+ * left to place.
+ */
+function runsPending(runs: readonly LocalTextRun[], delivered: number): readonly LocalTextRun[] {
+  const out: LocalTextRun[] = [];
+  let skip = delivered;
+  for (const run of runs) {
+    if (skip >= run.text.length) { skip -= run.text.length; continue; }
+    out.push({ text: run.text.slice(skip), afterCalls: run.afterCalls });
+    skip = 0;
+  }
+  return out;
+}
+
+/**
+ * `stop_sequences` on a finished turn: the text is cut before the first one and
+ * the turn reports that it stopped there — the direct API's answer, realized in
+ * the response path because no runtime carries the option. A turn that made
+ * tool calls keeps `tool_use` as its reason; only the text is cut.
+ */
+function applyStopSequences(
+  result: LocalCompletionResult,
+  request: NormalizedRequest,
+): LocalCompletionResult {
+  const sequences = request.stopSequences ?? [];
+  if (sequences.length === 0) return result;
+  const { text, sequence } = truncateAtStopSequence(result.text, sequences);
+  if (sequence === null) return result;
+  return {
+    ...result,
+    text,
+    ...(result.toolCalls.length === 0
+      ? { stopReason: 'stop_sequence', stopSequence: sequence, stopDetails: undefined }
+      : {}),
+  };
+}
+
+/**
+ * Reconciles a finished turn with what the stop-sequence gate let through.
+ * Three cases: a sequence matched on the wire (the turn is a `stop_sequence`
+ * stop and nothing more is written), the result's full text contains one the
+ * deltas never carried (the same, computed from the result), or neither (the
+ * held-back tail plus whatever text the deltas missed is written as usual).
+ */
+function applyStreamStopSequence(
+  result: LocalCompletionResult,
+  gate: StopSequenceGate,
+  streamedText: string,
+): { readonly result: LocalCompletionResult; readonly tail: string } {
+  if (!gate.active) return { result, tail: missingTextTail(streamedText, result.text) };
+  const stopped = (sequence: string): { result: LocalCompletionResult; tail: string } => ({
+    result: result.toolCalls.length === 0
+      ? { ...result, text: streamedText, stopReason: 'stop_sequence', stopSequence: sequence, stopDetails: undefined }
+      : { ...result, text: streamedText },
+    tail: '',
+  });
+  if (gate.stopped) return stopped(gate.stopped);
+  // The deltas may have carried nothing at all (a schema or refusal result), so
+  // the result's own text goes through the gate before it is written. What the
+  // gate is still holding stays inside it — `push` prepends it — and the flush
+  // resolves the turn, which is where a deferred match becomes the answer.
+  const remaining = missingTextTail(streamedText + gate.pending, result.text);
+  const emitted = gate.push(remaining) + gate.flush();
+  if (gate.stopped) {
+    return {
+      ...stopped(gate.stopped),
+      tail: emitted,
+      result: result.toolCalls.length === 0
+        ? { ...result, text: streamedText + emitted, stopReason: 'stop_sequence', stopSequence: gate.stopped, stopDetails: undefined }
+        : { ...result, text: streamedText + emitted },
+    };
+  }
+  return { result, tail: emitted };
 }
 
 function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
@@ -1860,16 +2189,32 @@ function anthropicMessagesResponse(result: LocalCompletionResult): unknown {
   const content = stopReason === 'refusal'
     ? (result.text ? [{ type: 'text', text: result.text }] : [])
     : hasToolCalls
-    ? orderedByEmission(result, {
-        text: result.text ? [{ type: 'text', text: result.text }] : [],
-        toolCalls: result.toolCalls.map(anthropicToolUse),
-      })
-    : [
-        {
-          type: 'text',
-          text: result.text,
-        },
-      ];
+    // Every run gets its OWN block, where it was produced. This surface's
+    // stream opens one block per run — a tool call stops the open text block,
+    // so text that resumes after it is a new block — and merging them here
+    // reported [text, tool_use] against a streamed [text, tool_use, text].
+    //
+    // The vendor never has to answer this question: measured 2026-09-02, the
+    // direct API ends the turn at the tool call and emits no text after a
+    // `tool_use` block, on either reading. A backend here does produce that
+    // turn, and the text it produced is the client's — dropping it to look
+    // more like the vendor would discard work the backend really did, which is
+    // its own defect. It is reported where the backend put it. How such a turn
+    // STOPS is a separate question, and this changes nothing about it.
+    ? orderedByEmission(
+        textRunsFor(result, result.toolCalls.length),
+        result.toolCalls.map((call, index) => anthropicToolUse(call, responseCutOff(result), index === cutCallLeftOpen(result))),
+        (run) => ({ type: 'text', text: run.text }),
+      )
+    // Empty text is NO block, the same rule the two branches above already
+    // apply. Measured on the direct API 2026-09-02, a turn stopped at its very
+    // first token by a stop sequence: `content: []` buffered, and no
+    // `content_block_start` streamed. This branch alone emitted a text block
+    // carrying `''`, so one turn read as `[text]` buffered and as nothing
+    // streamed — and the buffered half was the one the vendor does not send.
+    : result.text
+    ? [{ type: 'text', text: result.text }]
+    : [];
   return {
     id: `msg_${result.id}`,
     type: 'message',
@@ -1894,7 +2239,9 @@ const ANTHROPIC_PASSTHROUGH_STOP_REASONS = new Set([
 ]);
 
 function anthropicStopReason(result: LocalCompletionResult, hasToolCalls: boolean): string {
-  if (hasToolCalls) return 'tool_use';
+  // A call cut off by the output limit is reported as `max_tokens` with the
+  // `tool_use` block still present (measured 2026-09-04, direct API).
+  if (hasToolCalls && result.stopReason !== 'max_tokens') return 'tool_use';
   const reported = result.stopReason;
   if (reported && ANTHROPIC_PASSTHROUGH_STOP_REASONS.has(reported)) return reported;
   return 'end_turn';
@@ -1965,11 +2312,24 @@ interface OpenAiResponseObjectOptions {
   readonly id: string;
   readonly model: string;
   readonly request: NormalizedRequest;
-  readonly status: 'in_progress' | 'completed';
+  readonly status: 'in_progress' | 'completed' | 'incomplete';
   readonly output: readonly unknown[];
   readonly usage: unknown;
   readonly completed: boolean;
+  readonly incompleteDetails?: { readonly reason: string } | null;
   readonly includeBilling?: boolean;
+}
+
+/**
+ * A turn the backend reports as cut off by its output limit is an incomplete
+ * response: `status: "incomplete"`, `incomplete_details.reason:
+ * "max_output_tokens"`, `completed_at: null`, and a `function_call` item with
+ * `status: "incomplete"` (measured 2026-09-04, direct API). Only the backends
+ * that report a stop reason can say so — the codex transport on
+ * `response.incomplete`, Claude Code on `stop_reason: "max_tokens"`.
+ */
+function responseCutOff(result: LocalCompletionResult): boolean {
+  return result.stopReason === 'max_tokens';
 }
 
 function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
@@ -1980,37 +2340,48 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     object: 'response',
     created_at: now,
     status: options.status,
-    background: false,
+    background: raw.background === true ? true : false,
     ...(options.includeBilling === false ? {} : { billing: { payer: 'developer' } }),
     completed_at: options.completed ? now : null,
     error: null,
     frequency_penalty: numberOrDefault(raw.frequency_penalty, 0),
-    incomplete_details: null,
+    incomplete_details: options.incompleteDetails ?? null,
     instructions: typeof raw.instructions === 'string' ? raw.instructions : null,
     max_output_tokens: options.request.maxTokens ?? null,
-    max_tool_calls: null,
+    max_tool_calls: numberOrNull(raw.max_tool_calls),
     model: options.model,
     moderation: null,
     output: options.output,
-    parallel_tool_calls: true,
+    parallel_tool_calls: raw.parallel_tool_calls === false ? false : true,
     presence_penalty: numberOrDefault(raw.presence_penalty, 0),
     previous_response_id: typeof raw.previous_response_id === 'string' ? raw.previous_response_id : null,
     prompt_cache_key: typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : null,
+    // Echoed with its defaults filled in, as the direct API echoes it
+    // (measured 2026-08-30: `{ttl:'30m'}` in, `{mode:'implicit', ttl:'30m'}`
+    // out), and absent from the body when the caller sent none.
+    ...(raw.prompt_cache_options && typeof raw.prompt_cache_options === 'object'
+      ? { prompt_cache_options: { mode: 'implicit', ttl: '30m', ...asRecordPayload(raw.prompt_cache_options) } }
+      : {}),
+    // The only value this surface accepts; `in_memory` is refused at the door.
     prompt_cache_retention: '24h',
     reasoning: responseReasoning(raw.reasoning),
     safety_identifier: typeof raw.safety_identifier === 'string' ? raw.safety_identifier : null,
-    service_tier: 'default',
+    service_tier: echoedServiceTier(options.request),
     store: raw.store === false ? false : true,
     // Sampling is echoed at the direct API's defaults, which are the only
     // values a request can still carry here: the normalizer rejects any other
     // `temperature`, and `top_p` altogether, on this surface. The echo used to
     // repeat whatever the caller sent, for a value no backend applied.
     temperature: 1,
+    // Measured, not assumed: with no `top_p` in the request — the only
+    // possibility, since this surface refuses the parameter — the direct API
+    // echoes 0.98, not 1.
+
     text: responseTextConfig(raw.text),
     tool_choice: responseToolChoice(raw.tool_choice),
     tools: Array.isArray(raw.tools) ? raw.tools : [],
     top_logprobs: numberOrDefault(raw.top_logprobs, 0),
-    top_p: 1,
+    top_p: 0.98,
     truncation: typeof raw.truncation === 'string' ? raw.truncation : 'disabled',
     usage: options.usage,
     user: typeof raw.user === 'string' ? raw.user : null,
@@ -2071,6 +2442,10 @@ function responseToolChoice(value: unknown): unknown {
   return 'auto';
 }
 
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 function numberOrDefault(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
@@ -2128,10 +2503,19 @@ function cachedInputTokens(usage: LocalUsage): number {
     ?? (usage.cacheCreationInputTokens ?? 0) + (usage.cacheReadInputTokens ?? 0);
 }
 
+/**
+ * The Chat stream, with `n` realized: one backend turn per choice, merged as
+ * their events arrive and written with each choice's own `index`. Every chunk
+ * carries exactly one choice, which is how the direct API streams a fan-out
+ * (measured 2026-08-30 on `n: 2`: the two choices' role, content and stop
+ * chunks interleave, one choice per chunk). With one choice this is the stream
+ * it has always been.
+ */
 async function writeOpenAiChatStream(
   res: ServerResponse,
-  events: AsyncIterable<LocalStreamEvent>,
+  streams: readonly AsyncIterable<LocalStreamEvent>[],
   request: NormalizedRequest,
+  cancel?: () => void,
 ): Promise<void> {
   writeSseHeaders(res);
   const id = `chatcmpl-${randomUUID()}`;
@@ -2141,85 +2525,27 @@ async function writeOpenAiChatStream(
     object: 'chat.completion.chunk',
     created,
     model: request.model,
-    service_tier: 'default',
+    service_tier: echoedServiceTier(request),
     system_fingerprint: null,
   };
-  let streamedText = '';
-  let assistantStarted = false;
-  const toolState = new OpenAiChatToolStreamState(
-    res,
-    request.streamOptions,
-    () => assistantStarted,
-    () => {
-      assistantStarted = true;
-    },
-  );
+  const choices = streams.map((_, index) => new OpenAiChatChoiceStream(res, request, index));
+  const results: LocalCompletionResult[] = [];
   try {
-    const ensureTextStarted = async (): Promise<void> => {
-      if (assistantStarted) return;
-      assistantStarted = true;
-      await writeSseData(res, openAiChatStreamChunk(
-        base,
-        [{ index: 0, delta: { role: 'assistant', content: '', refusal: null }, finish_reason: null }],
-        request.streamOptions,
-      ));
-    };
-    if (!hasToolDecisionSchema(request)) {
-      await ensureTextStarted();
-    } else {
-      await toolState.prestart(base, predictableOpenAiChatToolStart(request));
+    for (const choice of choices) await choice.start(base);
+    for await (const { index, value: event } of mergeTaggedStreams(streams, cancel)) {
+      const result = await choices[index].push(base, event);
+      if (result) {
+        base = { ...base, model: result.model };
+        results.push(result);
+      }
     }
-    for await (const event of events) {
-      if (event.type === 'text_delta') {
-        if (!event.delta) continue;
-        await ensureTextStarted();
-        streamedText += event.delta;
-        await writeSseData(res, openAiChatStreamChunk(
-          base,
-          [{ index: 0, delta: { content: event.delta }, finish_reason: null }],
-          request.streamOptions,
-        ));
-        continue;
-      }
-      if (event.type === 'tool_call_delta') {
-        await toolState.write(base, event);
-        continue;
-      }
-      // The chat surface has no reasoning item: its shape reports reasoning
-      // only as a token count in `usage`.
-      if (event.type === 'reasoning_item') continue;
-      const result = event.result;
-      base = { ...base, model: result.model };
-      if (result.toolCalls.length > 0) {
-        await toolState.finish(base, result.toolCalls);
-        await writeSseData(res, openAiChatStreamChunk(
-          base,
-          [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
-          request.streamOptions,
-        ));
-      } else {
-        await ensureTextStarted();
-        for (const chunk of chunkText(missingTextTail(streamedText, result.text))) {
-          await writeSseData(res, openAiChatStreamChunk(
-            base,
-            [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-            request.streamOptions,
-          ));
-        }
-        await writeSseData(res, openAiChatStreamChunk(
-          base,
-          [{ index: 0, delta: {}, finish_reason: 'stop' }],
-          request.streamOptions,
-        ));
-      }
-      if (request.streamOptions.includeUsage) {
-        await writeSseData(res, {
-          ...base,
-          choices: [],
-          usage: openAiChatUsage(result.usage),
-          ...(request.streamOptions.includeObfuscation ? { obfuscation: randomObfuscation() } : {}),
-        });
-      }
+    if (request.streamOptions.includeUsage && results.length > 0) {
+      await writeSseData(res, {
+        ...base,
+        choices: [],
+        usage: openAiChatUsage(mergedChatUsage(results)),
+        ...(request.streamOptions.includeObfuscation ? { obfuscation: randomObfuscation() } : {}),
+      });
     }
     res.write('data: [DONE]\n\n');
   } catch (err) {
@@ -2227,6 +2553,140 @@ async function writeOpenAiChatStream(
     res.write('data: [DONE]\n\n');
   } finally {
     res.end();
+  }
+}
+
+/**
+ * Interleaves n event streams, tagging each event with the stream it came
+ * from. One stream's failure propagates — a fan-out that answers a client with
+ * three of its four choices and no error would be worse than the error — and
+ * the `finally` closes the siblings, so a rejected turn does not leave the
+ * others generating for nobody.
+ */
+async function* mergeTaggedStreams<T>(
+  sources: readonly AsyncIterable<T>[],
+  cancel?: () => void,
+): AsyncIterable<{ index: number; value: T }> {
+  const iterators = sources.map((source) => source[Symbol.asyncIterator]());
+  const pending = new Map<number, Promise<{ index: number; result: IteratorResult<T> }>>();
+  const pull = (index: number): void => {
+    pending.set(index, iterators[index].next().then((result) => ({ index, result })));
+  };
+  iterators.forEach((_, index) => pull(index));
+  try {
+    while (pending.size > 0) {
+      const { index, result } = await Promise.race(pending.values());
+      pending.delete(index);
+      if (result.done) continue;
+      pull(index);
+      yield { index, value: result.value };
+    }
+  } finally {
+    // Cancel FIRST, then collect. `iterator.return()` on a generator suspended
+    // inside `next()` is queued behind that call, so awaiting the returns
+    // without cancelling waits for whatever the sibling is waiting for — in
+    // practice the whole request timeout, with the client's error held back
+    // for all of it. Measured: a failed choice took 3003ms to reach the client
+    // on a 3000ms timeout, and the sibling's abort came from its own timer.
+    cancel?.();
+    await Promise.allSettled(iterators.map((iterator) => iterator.return?.()));
+  }
+}
+
+/**
+ * One choice of a Chat stream: its own assistant-start, its own streamed text,
+ * its own tool-call state. With `n > 1` these run side by side, and nothing
+ * about a choice may leak into another — a shared `assistantStarted` would
+ * silently drop the second choice's opening chunk.
+ */
+class OpenAiChatChoiceStream {
+  private assistantStarted = false;
+  private streamedText = '';
+  private readonly toolState: OpenAiChatToolStreamState;
+
+  constructor(
+    private readonly res: ServerResponse,
+    private readonly request: NormalizedRequest,
+    private readonly choiceIndex: number,
+  ) {
+    this.toolState = new OpenAiChatToolStreamState(
+      res,
+      request.streamOptions,
+      choiceIndex,
+      () => this.assistantStarted,
+      () => {
+        this.assistantStarted = true;
+      },
+    );
+  }
+
+  async start(base: Record<string, unknown>): Promise<void> {
+    // A tool turn announces its calls from the completed result only; nothing
+    // predicted from the request goes on the wire ahead of that reading.
+    if (hasToolDecisionSchema(this.request)) return;
+    await this.ensureTextStarted(base);
+  }
+
+  /** Returns this choice's result once its turn has finished. */
+  async push(
+    base: Record<string, unknown>,
+    event: LocalStreamEvent,
+  ): Promise<LocalCompletionResult | null> {
+    if (event.type === 'text_delta') {
+      if (!event.delta) return null;
+      await this.ensureTextStarted(base);
+      this.streamedText += event.delta;
+      await this.write(base, { delta: { content: event.delta }, finish_reason: null });
+      return null;
+    }
+    if (event.type === 'tool_call_delta') {
+      await this.toolState.write(base, event);
+      return null;
+    }
+    // The chat surface has no reasoning item: its shape reports reasoning
+    // only as a token count in `usage`.
+    if (event.type === 'reasoning_item') return null;
+    const result = event.result;
+    // The closing chunks report the model that actually ran.
+    const finalBase = { ...base, model: result.model };
+    if (result.toolCalls.length > 0) {
+      // The narration that came with the call is part of the turn, and the
+      // buffered body reports it — a stream that drops it makes the two
+      // describe different turns. Nothing streams it live: a backend running a
+      // tool extractor emits no `text_delta` at all, so the wrapper's prose is
+      // first known here.
+      const tail = missingTextTail(this.streamedText, result.text);
+      if (tail) {
+        await this.ensureTextStarted(finalBase);
+        for (const chunk of chunkText(tail)) {
+          this.streamedText += chunk;
+          await this.write(finalBase, { delta: { content: chunk }, finish_reason: null });
+        }
+      }
+      await this.toolState.finish(finalBase, result.toolCalls);
+      await this.write(finalBase, { delta: {}, finish_reason: openAiChatFinishReason(result) });
+    } else {
+      await this.ensureTextStarted(finalBase);
+      for (const chunk of chunkText(missingTextTail(this.streamedText, result.text))) {
+        await this.write(finalBase, { delta: { content: chunk }, finish_reason: null });
+      }
+      await this.write(finalBase, { delta: {}, finish_reason: openAiChatFinishReason(result) });
+    }
+    return result;
+  }
+
+  private async ensureTextStarted(base: Record<string, unknown>): Promise<void> {
+    if (this.assistantStarted) return;
+    this.assistantStarted = true;
+    await this.write(base, { delta: { role: 'assistant', content: '', refusal: null }, finish_reason: null });
+  }
+
+  private async write(base: Record<string, unknown>, choice: Record<string, unknown>): Promise<void> {
+    await writeSseData(this.res, openAiChatStreamChunk(
+      base,
+      [{ index: this.choiceIndex, ...choice }],
+      this.request.streamOptions,
+    ));
   }
 }
 
@@ -2250,14 +2710,12 @@ class OpenAiChatToolStreamState {
   constructor(
     private readonly res: ServerResponse,
     private readonly streamOptions: NormalizedRequest['streamOptions'],
+    // The CHOICE this state belongs to. The `index` inside `tool_calls` is the
+    // tool's position; this one is the choice's, and with `n > 1` they differ.
+    private readonly choiceIndex: number,
     private readonly hasAssistantStarted: () => boolean,
     private readonly markAssistantStarted: () => void,
   ) {}
-
-  async prestart(base: Record<string, unknown>, tool: PredictableToolStart | null): Promise<void> {
-    if (!tool) return;
-    await this.ensureStarted(base, tool.index, tool.id, tool.name);
-  }
 
   async write(
     base: Record<string, unknown>,
@@ -2297,7 +2755,7 @@ class OpenAiChatToolStreamState {
       base,
       [
         {
-          index: 0,
+          index: this.choiceIndex,
           delta: {
             ...(includeAssistantStart ? { role: 'assistant', content: null, refusal: null } : {}),
             tool_calls: [
@@ -2332,7 +2790,7 @@ class OpenAiChatToolStreamState {
       base,
       [
         {
-          index: 0,
+          index: this.choiceIndex,
           delta: {
             tool_calls: [
               {
@@ -2476,35 +2934,114 @@ async function writeOpenAiResponsesStream(
       }
 
       const result = event.result;
+      /**
+       * The terminal frames for the message item, and the one place that
+       * decides what they say.
+       *
+       * They say `streamedText` — the bytes this stream actually delivered —
+       * never the result's own copy. A backend whose `completed` result
+       * disagrees with the deltas it already sent (`hello` on the wire,
+       * `hullo` at the end) would otherwise have the tail reconciler find no
+       * common prefix, add nothing, and then be announced as the final text
+       * anyway: four frames retracting bytes the client already has. The
+       * tool branch always read `streamedText` here; the no-tool branch read
+       * `result.text`, so only text-only turns could contradict themselves.
+       */
+      const emitMessageTerminal = async (): Promise<void> => {
+        const messageItem = openAiResponseMessageItem(itemId, streamedText);
+        await writeResponseEvent('response.output_text.done', {
+          type: 'response.output_text.done',
+          item_id: itemId,
+          output_index: messageOutputIndex,
+          content_index: 0,
+          logprobs: [],
+          text: streamedText,
+        });
+        await writeResponseEvent('response.content_part.done', {
+          type: 'response.content_part.done',
+          item_id: itemId,
+          output_index: messageOutputIndex,
+          content_index: 0,
+          part: { type: 'output_text', text: streamedText, annotations: [], logprobs: [] },
+        });
+        finalItems.set(messageOutputIndex, messageItem);
+        await writeResponseEvent('response.output_item.done', {
+          type: 'response.output_item.done',
+          output_index: messageOutputIndex,
+          item: messageItem,
+        });
+      };
       if (result.toolCalls.length > 0) {
-        for (const { outputIndex, item } of await toolState.finish(result.toolCalls)) {
-          finalItems.set(outputIndex, item);
-        }
-        // Narration streamed before the call belongs in the completed output
-        // too, or the stream's own summary contradicts the deltas it sent.
-        if (streamedText) {
-          const messageItem = openAiResponseMessageItem(itemId, streamedText);
-          await writeResponseEvent('response.output_text.done', {
-            type: 'response.output_text.done',
-            item_id: itemId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            logprobs: [],
-            text: streamedText,
-          });
-          await writeResponseEvent('response.content_part.done', {
-            type: 'response.content_part.done',
-            item_id: itemId,
-            output_index: messageOutputIndex,
-            content_index: 0,
-            part: { type: 'output_text', text: streamedText, annotations: [], logprobs: [] },
-          });
-          finalItems.set(messageOutputIndex, messageItem);
-          await writeResponseEvent('response.output_item.done', {
-            type: 'response.output_item.done',
-            output_index: messageOutputIndex,
-            item: messageItem,
-          });
+        toolState.itemStatus = responseCutOff(result) ? 'incomplete' : 'completed';
+        // The turn's calls `[from, to)`, each taking the next free output
+        // position as it is closed.
+        const finishCalls = async (from: number, to: number): Promise<void> => {
+          if (from >= to) return;
+          for (const { outputIndex, item } of await toolState.finish(
+            result.toolCalls.slice(from, to),
+            undefined,
+            from,
+          )) {
+            finalItems.set(outputIndex, item);
+          }
+        };
+        // Narration belongs in the completed output too, or the stream's own
+        // summary contradicts the deltas it sent — and nothing streams it live
+        // when a tool extractor is active, so the tail the result carries is
+        // the only place the prose appears at all.
+        const finishMessage = async (): Promise<void> => {
+          const tail = missingTextTail(streamedText, result.text);
+          if (!streamedText && !tail) return;
+          await ensureTextStarted();
+          for (const chunk of chunkText(tail)) {
+            streamedText += chunk;
+            await writeResponseEvent('response.output_text.delta', {
+              type: 'response.output_text.delta',
+              item_id: itemId,
+              output_index: messageOutputIndex,
+              content_index: 0,
+              delta: chunk,
+              logprobs: [],
+            });
+          }
+          await emitMessageTerminal();
+        };
+        // Two different questions, and conflating them made
+        // `response.output_item.done` non-monotonic.
+        //
+        // For an item ALREADY announced, its position is fixed and the only
+        // thing left to decide is the order of the terminal frames — which has
+        // to be the order the stream announced them in, or a client is told a
+        // later item finished before an earlier one, and the `arguments.done`
+        // frame that promises a call is final arrives after a whole other item
+        // has closed.
+        //
+        // For a turn that announced NOTHING until it completed — every tool
+        // call on the claude native-schema channel — this call is where both
+        // positions are allocated, so production order decides, through the
+        // same `textRuns` the buffered body reads.
+        if (messageOutputIndex !== -1) {
+          // The message already holds a position, so there is nothing left to
+          // decide: one walk closes every item where it actually sits.
+          for (const { outputIndex, item } of await toolState.finish(
+            result.toolCalls,
+            { outputIndex: messageOutputIndex, emit: finishMessage },
+          )) {
+            finalItems.set(outputIndex, item);
+          }
+        } else {
+          // Nothing holds a position yet, so this is where every one of them is
+          // allocated — and the one message item goes where the turn's FIRST
+          // text run did, exactly as `mergedTextRun` places it for the buffered
+          // body. Choosing between two whole groups here — message first, or
+          // every call first — cannot express narration BETWEEN two calls, so a
+          // turn delivered whole at `completed` read [call, text, call]
+          // buffered and [call, call, text] streamed.
+          const [merged] = mergedTextRun(textRunsFor(result, result.toolCalls.length));
+          const at = merged?.afterCalls ?? 0;
+          await finishCalls(0, at);
+          await finishMessage();
+          await finishCalls(at, result.toolCalls.length);
         }
       } else {
         await ensureTextStarted();
@@ -2521,34 +3058,16 @@ async function writeOpenAiResponsesStream(
             });
           }
         }
-        await writeResponseEvent('response.output_text.done', {
-          type: 'response.output_text.done',
-          item_id: itemId,
-          output_index: messageOutputIndex,
-          content_index: 0,
-          logprobs: [],
-          text: result.text,
-        });
-        await writeResponseEvent('response.content_part.done', {
-          type: 'response.content_part.done',
-          item_id: itemId,
-          output_index: messageOutputIndex,
-          content_index: 0,
-          part: { type: 'output_text', text: result.text, annotations: [], logprobs: [] },
-        });
-        const item = openAiResponseMessageItem(itemId, result.text);
-        finalItems.set(messageOutputIndex, item);
-        await writeResponseEvent('response.output_item.done', {
-          type: 'response.output_item.done',
-          output_index: messageOutputIndex,
-          item,
-        });
+        await emitMessageTerminal();
       }
       const finalOutput = [...finalItems.entries()]
         .sort(([left], [right]) => left - right)
         .map(([, item]) => item);
-      await writeResponseEvent('response.completed', {
-        type: 'response.completed',
+      // The terminal event names the outcome: `response.incomplete` for a turn
+      // the backend cut off at its output limit (measured 2026-09-04).
+      const terminal = responseCutOff(result) ? 'response.incomplete' : 'response.completed';
+      await writeResponseEvent(terminal, {
+        type: terminal,
         response: openAiResponsesCompletedResponse(responseId, result, request, finalOutput),
       });
     }
@@ -2582,6 +3101,8 @@ interface OpenAiResponseToolItemState {
 type OpenAiResponseEventWriter = (event: string, payload: Record<string, unknown>) => Promise<void>;
 
 class OpenAiResponsesToolStreamState {
+  /** The status the completed items report — `incomplete` for a turn cut off at its output limit. */
+  itemStatus: 'completed' | 'incomplete' = 'completed';
   private readonly items = new Map<number, OpenAiResponseToolItemState>();
 
   /**
@@ -2605,19 +3126,43 @@ class OpenAiResponsesToolStreamState {
     if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
   }
 
-  /** The finished items with the output position each was announced at. */
+  /**
+   * The finished items with the output position each was announced at.
+   *
+   * `message` is the turn's message item and how to close it, when it already
+   * holds a position. Calls are closed in ascending announced index and the
+   * message goes out at its own — one walk over the whole turn. Closing the
+   * tools as one group and the message as another could not express a turn
+   * that called, narrated, then called again, and told the client that item 2
+   * had finished before item 1.
+   *
+   * `firstIndex` is where `toolCalls` starts in the turn, so a caller holding a
+   * message the stream never announced can walk the calls BELOW its ordinal,
+   * emit it, then walk the rest — every position still allocated in the order
+   * the items go out. The tool index is the turn's, not the slice's, or the
+   * second walk would reopen the first walk's calls.
+   */
   async finish(
     toolCalls: readonly LocalToolCall[],
+    message?: { readonly outputIndex: number; readonly emit: () => Promise<void> },
+    firstIndex = 0,
   ): Promise<ReadonlyArray<{ readonly outputIndex: number; readonly item: unknown }>> {
     const output: Array<{ outputIndex: number; item: unknown }> = [];
-    for (const [index, call] of toolCalls.entries()) {
+    let pendingMessage = message;
+    for (const [offset, call] of toolCalls.entries()) {
+      const index = firstIndex + offset;
       const state = await this.ensureStarted(index, call.id, call.name);
+      if (pendingMessage && pendingMessage.outputIndex < state.outputIndex) {
+        const emit = pendingMessage.emit;
+        pendingMessage = undefined;
+        await emit();
+      }
       const rest = missingToolCallArgumentDelta(state.arguments, call);
       if (rest) await this.writeArgumentsDelta(index, state, rest);
       const item = {
         id: state.itemId,
         type: 'function_call',
-        status: 'completed',
+        status: this.itemStatus,
         call_id: state.callId,
         name: state.name,
         arguments: call.arguments,
@@ -2635,6 +3180,7 @@ class OpenAiResponsesToolStreamState {
         item,
       });
     }
+    if (pendingMessage) await pendingMessage.emit();
     return output;
   }
 
@@ -2683,30 +3229,6 @@ class OpenAiResponsesToolStreamState {
   }
 }
 
-interface PredictableToolStart {
-  readonly index: number;
-  readonly id: string;
-  readonly name: string;
-}
-
-function predictableOpenAiChatToolStart(request: NormalizedRequest): PredictableToolStart | null {
-  if (request.shape !== 'openai-chat') return null;
-  if (request.toolChoice.type === 'tool') {
-    return {
-      index: 0,
-      id: 'call_1',
-      name: request.toolChoice.name,
-    };
-  }
-  if (request.toolChoice.type === 'required' && request.tools.length === 1) {
-    return {
-      index: 0,
-      id: 'call_1',
-      name: request.tools[0]?.name ?? 'tool',
-    };
-  }
-  return null;
-}
 
 function openAiResponsesCompletedResponse(
   responseId: string,
@@ -2714,17 +3236,34 @@ function openAiResponsesCompletedResponse(
   request: NormalizedRequest,
   output: unknown[],
 ): unknown {
+  const cutOff = responseCutOff(result);
   return openAiResponseObject({
     id: responseId,
     model: result.model,
     request,
-    status: 'completed',
+    status: cutOff ? 'incomplete' : 'completed',
     output,
     usage: openAiResponsesUsage(result.usage),
-    completed: true,
+    completed: !cutOff,
+    incompleteDetails: cutOff ? { reason: 'max_output_tokens' } : null,
     includeBilling: false,
   });
 }
+
+/**
+ * One piece of output waiting for the wire, or the slot the stop-sequence gate
+ * is holding. The queue keeps production order, which is the order the buffered
+ * body reports the same turn in.
+ */
+type PendingOutput =
+  | { readonly kind: 'text'; readonly text: string }
+  | { readonly kind: 'tool'; readonly event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }> }
+  // How many of the characters the gate is holding were produced HERE. There
+  // is one such slot per RUN, not one per turn: a turn that narrated, called a
+  // tool, then narrated again while the gate was still holding produced two
+  // runs, and releasing both at the first slot merged them into one block that
+  // the buffered body — which reports the runs — could not agree with.
+  | { kind: 'gate'; chars: number };
 
 async function writeAnthropicMessagesStream(
   res: ServerResponse,
@@ -2735,6 +3274,10 @@ async function writeAnthropicMessagesStream(
   let textStarted = false;
   let textBlockClosed = false;
   let streamedText = '';
+  // Whether the turn reported a `completed` result. It decides which of the two
+  // exits below owes the release: the completed handler already writes the
+  // turn's terminal frames, and nothing may follow them.
+  let completedSeen = false;
   // Content block indices are wire positions: whichever block opens next takes
   // the next one, whether that is the text block or a tool_use block.
   let nextBlockIndex = 0;
@@ -2745,6 +3288,219 @@ async function writeAnthropicMessagesStream(
     return allocated;
   };
   const toolState = new AnthropicToolUseStreamState(res, allocateBlockIndex);
+  // `stop_sequences`, realized on the wire: text is written through the gate,
+  // which holds back a tail that could still become a sequence and drops
+  // everything once one arrives. The runtime keeps generating — nothing can
+  // stop it mid-turn and still report the turn's usage — so the stream simply
+  // stops carrying its output.
+  const stopGate = new StopSequenceGate(request.stopSequences ?? []);
+  // Output the wire cannot take yet, in the order the turn produced it. Two
+  // things hold the wire, and NEITHER may be resolved by writing something
+  // else past it.
+  //
+  // A tool call cannot take a wire position while the gate is still holding
+  // text, because that text was produced FIRST and its block therefore comes
+  // first — unless a stop sequence eats it, in which case it gets no block at
+  // all. Announcing the call now would settle the question by RELEASE timing:
+  // `writeText('')` opens nothing, the call took block 0, and the released text
+  // opened a new block behind it, so one turn read [text, tool_use] buffered and
+  // [tool_use, text] streamed. Reserving the position by opening an empty text
+  // block instead would strand one on every turn the sequence really matched,
+  // where the buffered body reports content:[tool_use]. The gate keeps a SLOT
+  // in this queue instead: what it releases goes exactly there, and a match
+  // leaves nothing behind.
+  //
+  // The mirror image: anything produced while a call's arguments are still
+  // streaming cannot open its block yet. Opening one stops the call's block,
+  // and a stopped block takes no more `input_json_delta` — so the arguments the
+  // completed result reconciles would never reach the wire and a client
+  // accumulating the deltas would finalize `{"city":` as the whole tool input,
+  // while this surface's own buffered body and both OpenAI surfaces carried
+  // `{"city":"Seoul"}`. Narration is not the only thing that arrives there: a
+  // SECOND call still taking arguments opened its block INSIDE the first, a
+  // shape this wire cannot express at all. So both wait here, the open call
+  // settles — completed from the result where there is one, never closed early
+  // to make room — and then the queue moves.
+  const pending: PendingOutput[] = [];
+  // How many tool blocks the drain may still open. The completed handler lowers
+  // it to place each remaining run of text: the calls below the run go out,
+  // then the run, then the next one's calls.
+  let announceLimit = Number.POSITIVE_INFINITY;
+
+  const ensureTextStarted = async (): Promise<void> => {
+    if (textStarted && !textBlockClosed) return;
+    // Text reaches the wire only through the queue, which never releases it
+    // while a call is open — this is the invariant, not the mechanism. A tool
+    // block whose arguments the backend never declared finished is still open,
+    // and a text block inside it nests two blocks on a wire that has no
+    // nesting, which a client assembling by index cannot read.
+    await toolState.closeOpen();
+    // Two content blocks are never open at once on this wire, so a tool call
+    // stops the text block — and text that resumes afterwards is a NEW block.
+    // Continuing to write at the stopped index left an SDK accumulator, which
+    // finalizes a block on `content_block_stop`, dropping the trailing
+    // narration or rejecting the stream outright.
+    textStarted = true;
+    textBlockClosed = false;
+    textBlockIndex = allocateBlockIndex();
+    await writeSseEvent(res, 'content_block_start', {
+      type: 'content_block_start',
+      index: textBlockIndex,
+      content_block: { type: 'text', text: '' },
+    });
+  };
+
+  // A backend that streams text and then also returns tool calls (e.g. the codex
+  // backend transport) would otherwise open tool_use blocks at the index already
+  // held by the open text block. Close the text block and shift tool indices.
+  const closeOpenTextBlock = async (): Promise<void> => {
+    if (!textStarted || textBlockClosed) return;
+    textBlockClosed = true;
+    await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+  };
+
+  /** Puts text on the wire, opening a text block for it if none is open. */
+  const emitText = async (text: string): Promise<void> => {
+    if (!text) return;
+    await ensureTextStarted();
+    for (const chunk of chunkText(text)) {
+      await writeSseEvent(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: textBlockIndex,
+        delta: { type: 'text_delta', text: chunk },
+      });
+    }
+  };
+
+  /**
+   * Writes as much of the queue as the wire can take, head first, and stops at
+   * the first item that still has to wait: everything behind it was produced
+   * later, so nothing may pass it.
+   */
+  const drainPending = async (): Promise<void> => {
+    while (pending.length > 0) {
+      const next = pending[0];
+      // The gate's slot. What it holds was produced HERE, so nothing produced
+      // after it moves until the gate resolves.
+      if (next.kind === 'gate') return;
+      if (next.kind === 'text') {
+        if (toolState.hasOpenBlock) return;
+        pending.shift();
+        await emitText(next.text);
+        continue;
+      }
+      // A delta for the call that is already open extends a block the wire is
+      // holding open for it; anything else needs a block of its own.
+      if (!toolState.isOpen(next.event.index)) {
+        if (toolState.hasOpenBlock) return;
+        if (!toolState.hasStarted(next.event.index) && toolState.announcedCount >= announceLimit) return;
+      }
+      pending.shift();
+      await closeOpenTextBlock();
+      await toolState.write(next.event);
+    }
+  };
+
+  /**
+   * Accepts text for delivery, at the place in the turn it was produced.
+   * `streamedText` counts it either way — queued text is delayed, never
+   * dropped, so counting it is what stops the completed result from writing it
+   * a second time as a missing tail.
+   */
+  const writeText = async (text: string, at = pending.length): Promise<void> => {
+    if (text) {
+      streamedText += text;
+      pending.splice(at, 0, { kind: 'text', text });
+    }
+    await drainPending();
+  };
+
+  /**
+   * Records that the gate has taken `chars` more characters, produced HERE.
+   * They extend the slot at the tail of the queue when nothing has been
+   * produced since — that is the same run — and open a new one when something
+   * has, because what follows a tool call is a different run.
+   */
+  const holdGate = (chars: number): void => {
+    if (chars <= 0) return;
+    const last = pending[pending.length - 1];
+    if (last && last.kind === 'gate') last.chars += chars;
+    else pending.push({ kind: 'gate', chars });
+  };
+
+  /**
+   * The gate let go: what it released goes back to the slots that were holding
+   * it, oldest first, so each run lands where the turn produced it rather than
+   * where the gate happened to resolve. Text with no slot to its name — the
+   * gate is inactive, or this is the turn's own tail — goes at the end, which
+   * is where it was produced.
+   *
+   * Whatever the gate is still holding stays in its slots; anything left over
+   * a sequence ate, and an eaten run leaves nothing behind, not an empty block.
+   */
+  const releaseGate = async (text: string): Promise<void> => {
+    let rest = text;
+    for (let index = 0; index < pending.length && rest; index += 1) {
+      const item = pending[index];
+      if (item.kind !== 'gate') continue;
+      const chunk = rest.slice(0, Math.min(item.chars, rest.length));
+      rest = rest.slice(chunk.length);
+      item.chars -= chunk.length;
+      streamedText += chunk;
+      if (item.chars === 0) pending.splice(index, 1, { kind: 'text', text: chunk });
+      else pending.splice(index, 0, { kind: 'text', text: chunk });
+    }
+    // The slots hold exactly what the gate holds. Trimming from the front is
+    // what a release is, and what a match is: both take the oldest characters.
+    let held = stopGate.pending.length;
+    for (let index = 0; index < pending.length; ) {
+      const item = pending[index];
+      if (item.kind !== 'gate') { index += 1; continue; }
+      item.chars = Math.min(item.chars, held);
+      held -= item.chars;
+      if (item.chars === 0) { pending.splice(index, 1); continue; }
+      index += 1;
+    }
+    if (rest) {
+      streamedText += rest;
+      pending.push({ kind: 'text', text: rest });
+    }
+    await drainPending();
+  };
+
+  /**
+   * Everything the stream already produced, written out. A call still taking
+   * arguments blocks the queue behind it, so it settles first — completed from
+   * `toolCalls` when the turn has a result to complete it from, closed where it
+   * is when it does not — and what waited takes its own block. It repeats
+   * because what waited may be another call that never finished.
+   */
+  const settlePending = async (toolCalls: readonly LocalToolCall[]): Promise<void> => {
+    await drainPending();
+    while (pending.length > 0 && toolState.hasOpenBlock) {
+      const before = pending.length;
+      await toolState.closeOpen(toolCalls);
+      await drainPending();
+      // Nothing moved, so nothing will: what is left is waiting on something
+      // closing an open call cannot resolve — the announce limit, or the
+      // gate's own slot — and only the caller that set it can lift it.
+      if (pending.length === before) return;
+    }
+  };
+
+  /**
+   * The turn is over without a `completed` event — it ended or it failed —
+   * so nothing more can arrive to beat a half-matched sequence: the gate
+   * resolves, and whatever it was holding is the answer. No completed result
+   * is coming either, so a call whose arguments never settled cannot be
+   * completed from one: it closes on what it streamed, and what waited behind
+   * it takes its own block rather than vanishing with it.
+   */
+  const releaseHeldOutput = async (): Promise<void> => {
+    await releaseGate(stopGate.flush());
+    await settlePending([]);
+    await toolState.closeOpen();
+  };
 
   try {
     await writeSseEvent(res, 'message_start', {
@@ -2764,77 +3520,132 @@ async function writeAnthropicMessagesStream(
       },
     });
 
-    const ensureTextStarted = async (): Promise<void> => {
-      if (textStarted && !textBlockClosed) return;
-      // Two content blocks are never open at once on this wire, so a tool call
-      // stops the text block — and text that resumes afterwards is a NEW block.
-      // Continuing to write at the stopped index left an SDK accumulator, which
-      // finalizes a block on `content_block_stop`, dropping the trailing
-      // narration or rejecting the stream outright.
-      textStarted = true;
-      textBlockClosed = false;
-      textBlockIndex = allocateBlockIndex();
-      await writeSseEvent(res, 'content_block_start', {
-        type: 'content_block_start',
-        index: textBlockIndex,
-        content_block: { type: 'text', text: '' },
-      });
-    };
-
-    // A backend that streams text and then also returns tool calls (e.g. the codex
-    // backend transport) would otherwise open tool_use blocks at the index already
-    // held by the open text block. Close the text block and shift tool indices.
-    const closeOpenTextBlock = async (): Promise<void> => {
-      if (!textStarted || textBlockClosed) return;
-      textBlockClosed = true;
-      await writeSseEvent(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
-    };
-
     for await (const event of events) {
       if (event.type === 'text_delta') {
         if (!event.delta) continue;
-        await ensureTextStarted();
-        streamedText += event.delta;
-        await writeSseEvent(res, 'content_block_delta', {
-          type: 'content_block_delta',
-          index: textBlockIndex,
-          delta: { type: 'text_delta', text: event.delta },
-        });
+        // Booked at the tail of the queue FIRST — where the turn produced it —
+        // and only then fed to the gate, so the release below knows which run
+        // each character belongs to. An inactive gate releases it all at once
+        // and the slot is consumed in the same breath.
+        holdGate(event.delta.length);
+        await releaseGate(stopGate.push(event.delta));
         continue;
       }
       if (event.type === 'tool_call_delta') {
-        await closeOpenTextBlock();
-        await toolState.write(event);
+        // A delta for the call whose block is OPEN extends a block already on
+        // the wire, and that block precedes everything waiting — so it never
+        // queues. This is the only way the rest of an interrupted call's
+        // arguments can still reach a client: a stopped block takes none.
+        if (toolState.isOpen(event.index)) {
+          await toolState.write(event);
+          // `argumentsDone` may have just closed the block the queue waited on.
+          await drainPending();
+          continue;
+        }
+        // Anything else needs a block of its own, so it waits its turn.
+        pending.push({ kind: 'tool', event });
+        await drainPending();
         continue;
       }
       // No content block corresponds to it on this wire — a `thinking` block
       // would need the reasoning TEXT, which the backends do not hand over.
       if (event.type === 'reasoning_item') continue;
 
-      const result = event.result;
+      completedSeen = true;
+      // The gated text is what the caller received, so the turn is reported
+      // against it: a match makes this a `stop_sequence` stop, and the tail the
+      // runtime produced after it is never written.
+      const gated = applyStreamStopSequence(event.result, stopGate, streamedText);
+      const result = gated.result;
       const stopReason = anthropicStopReason(result, result.toolCalls.length > 0);
+      toolState.cutOff = responseCutOff(result);
       if (result.toolCalls.length > 0) {
+        // Blocks follow production order, which is what the non-streamed body
+        // reports through `orderedByEmission`: each run of the turn's text sits
+        // where the backend produced it among the calls. The runs ALREADY on
+        // the wire went out there; only a run that belongs behind calls this
+        // stream never announced has to announce them first.
+        //
+        // One position for "the text" is what this replaced, twice over. A
+        // boolean could not put a run BETWEEN two calls, and a count could not
+        // put runs on BOTH SIDES of one: a turn delivered whole at `completed`
+        // read [call, text, call] buffered against [call, call, text] streamed,
+        // and then [text, call, text] streamed against [text, call] buffered.
+        // Everything the wire has not carried yet, placed by `textRuns` — the
+        // same positions the buffered body reads. The gate's slots say where
+        // its text was RELEASED, which is a different question and not this
+        // one: a turn whose narration the gate held from before the first call
+        // until after it would otherwise stream the text first while the body,
+        // reading the runs, put it between the calls.
+        const remaining = runsPending(
+          textRunsFor(result, result.toolCalls.length),
+          streamedText.length,
+        );
+        // The limit goes up BEFORE anything drains, the gate's release
+        // included: a call that belongs behind the next run must not take a
+        // block ahead of it.
+        const firstAt = remaining.length > 0
+          ? Math.max(remaining[0].afterCalls, toolState.announcedCount)
+          : result.toolCalls.length;
+        try {
+          announceLimit = firstAt;
+          // The slots stop blocking: what they were holding is in `remaining`,
+          // and the runs below place it.
+          await releaseGate('');
+          for (const run of remaining) {
+            // Never backwards: a run cannot precede a call the wire has already
+            // announced, whatever the backend reports about it.
+            const at = Math.max(run.afterCalls, toolState.announcedCount);
+            announceLimit = at;
+            await settlePending(result.toolCalls);
+            if (at > toolState.announcedCount) {
+              // The calls BELOW this run go out first, so the run opens its own
+              // block behind them rather than extending the one before them.
+              // From the START of the turn, not from the first unannounced
+              // call: a call still taking arguments holds an open block, and
+              // opening the next one over it nests two blocks on a wire that
+              // has none. `finish` reconciles that one and stops it first, and
+              // skips every call it already closed.
+              await closeOpenTextBlock();
+              toolState.leaveOpen = cutCallLeftOpen(result);
+              await toolState.finish(result.toolCalls.slice(0, at));
+            }
+            // At the head: everything still queued was produced after this run.
+            await writeText(run.text, 0);
+          }
+        } finally {
+          announceLimit = Number.POSITIVE_INFINITY;
+        }
+        await settlePending(result.toolCalls);
         await closeOpenTextBlock();
+        toolState.leaveOpen = cutCallLeftOpen(result);
         await toolState.finish(result.toolCalls);
       } else {
         // Flush any final text not already streamed (covers schema/refusal results
         // where no live text_delta was emitted), then close the block. A truly empty
         // result opens no content block, matching the non-streaming content:[] mapping
         // — so streaming and non-streaming refusals carry the same content.
-        const tail = missingTextTail(streamedText, result.text);
-        if (tail) {
-          await ensureTextStarted();
-          for (const chunk of chunkText(tail)) {
-            streamedText += chunk;
-            await writeSseEvent(res, 'content_block_delta', {
-              type: 'content_block_delta',
-              index: textBlockIndex,
-              delta: { type: 'text_delta', text: chunk },
-            });
-          }
-        }
+        await releaseGate(gated.tail);
+        await settlePending(result.toolCalls);
         await closeOpenTextBlock();
       }
+
+      // Every block the branches above opened has been closed, so anything
+      // still queued can finally take one of its own — after the call it waited
+      // for, which is where it was produced.
+      await settlePending(result.toolCalls);
+      await closeOpenTextBlock();
+      // A call this stream announced that the completed result does not report
+      // is the one block nothing above closes: `settlePending` stops an open
+      // block only to let something waiting through, and nothing is waiting.
+      // The result is the turn's authority on which calls it made, so the wire
+      // cannot complete that call from one — but the block is already on the
+      // wire and belongs to THIS turn, so it is stopped here, on exactly the
+      // arguments the backend streamed. Leaving it to the release after the
+      // loop wrote a `content_block_stop` PAST `message_stop`, which an SDK
+      // that finalizes the message there reads as a frame for a message that
+      // no longer exists.
+      await toolState.closeOpen(result.toolCalls);
 
       await writeSseEvent(res, 'message_delta', {
         type: 'message_delta',
@@ -2853,7 +3664,31 @@ async function writeAnthropicMessagesStream(
         type: 'message_stop',
       });
     }
+    // A stream that ended without a `completed` event never resolved the gate,
+    // so the text it holds and a call waiting behind it would be dropped rather
+    // than merely delayed. A delta that reached this writer reaches the wire.
+    //
+    // Only that exit. A turn that DID complete resolved the gate, drained the
+    // queue and closed its blocks before `message_delta`, so there is nothing
+    // left to release — and releasing unconditionally could only write a frame
+    // after `message_stop`, which is not a sequence this wire may produce.
+    if (!completedSeen) await releaseHeldOutput();
   } catch (err) {
+    // The turn failed, but the work it had already done is still the client's:
+    // the gate resolves, what it releases goes out, the calls that waited
+    // behind it take their positions, and nothing is left open — then the
+    // error. Writing the error frame straight away told a client nothing at
+    // all about text and tool calls the backend really produced.
+    //
+    // Writing that out must not cost the error frame, which is the one thing
+    // this path owes the client.
+    try {
+      await releaseHeldOutput();
+      await closeOpenTextBlock();
+      await toolState.closeOpen();
+    } catch {
+      // The wire is already unusable; the error frame below says so.
+    }
     // Map the provider error the way every other surface does. Hard-coding
     // `api_error` and serializing the raw throw loses the runtime's status and
     // type, and — because the JSON travels inside the message — hands the client
@@ -2864,7 +3699,12 @@ async function writeAnthropicMessagesStream(
   }
 }
 
+/** The single exit for the Anthropic surface's in-band error event. */
 function anthropicStreamErrorPayload(err: unknown): Record<string, unknown> {
+  return boundedErrorEnvelope(rawAnthropicStreamErrorPayload(err));
+}
+
+function rawAnthropicStreamErrorPayload(err: unknown): Record<string, unknown> {
   const provider = err instanceof ProxyRequestError
     ? { type: err.type, message: err.message }
     : providerErrorFromBackendError(err);
@@ -2888,6 +3728,20 @@ interface AnthropicToolUseState {
 }
 
 class AnthropicToolUseStreamState {
+  /**
+   * The index of the one call whose block stays open: the turn's FINAL block,
+   * when the turn was cut off at the output limit inside that call's
+   * arguments — the direct API sends no `content_block_stop` for it (measured
+   * 2026-09-04, M6), only `message_delta` with `stop_reason: "max_tokens"`. A
+   * cut call with anything after it is closed like any other, or the next
+   * block would open nested inside it (r20).
+   */
+  leaveOpen: number | null = null;
+  /**
+   * Whether the turn was cut off at the output limit: then no call's
+   * arguments are judged, as nowhere else on that turn (matrix §7 row 8).
+   */
+  cutOff = false;
   private readonly states = new Map<number, AnthropicToolUseState>();
 
   /**
@@ -2898,12 +3752,64 @@ class AnthropicToolUseStreamState {
    */
   constructor(private readonly res: ServerResponse, private readonly allocateBlockIndex: () => number) {}
 
+  /**
+   * How many calls have already taken a position on the wire. A run of the
+   * turn's text goes after `afterCalls` calls, so this is what says whether the
+   * calls that precede it have been announced yet — the buffered body's own
+   * positions, measured against the stream.
+   */
+  get announcedCount(): number {
+    return this.states.size;
+  }
+
+  /**
+   * Whether a call still holds an open block. A block is stopped when the
+   * backend's finish signal arrives — the native transport sends it once the
+   * vendor moves on to a later item, or at the terminal frame — so an open one
+   * is a call whose value the completed result still has to reconcile, or the
+   * turn's last call awaiting that frame; nothing else may open a block until
+   * it has.
+   */
+  get hasOpenBlock(): boolean {
+    for (const state of this.states.values()) if (!state.closed) return true;
+    return false;
+  }
+
+  /** Whether this call already holds a wire position. */
+  hasStarted(index: number): boolean {
+    return this.states.has(index);
+  }
+
+  /**
+   * Whether THIS call's block is the open one — the only block a delta may
+   * still extend, and the reason a delta for it never has to wait its turn.
+   */
+  isOpen(index: number): boolean {
+    const state = this.states.get(index);
+    return state !== undefined && !state.closed;
+  }
+
   async write(event: Extract<LocalStreamEvent, { type: 'tool_call_delta' }>): Promise<void> {
     const state = await this.ensureStarted(
       event.index,
       event.id ?? `call_${event.index + 1}`,
       event.name ?? 'tool',
     );
+    // A stopped block takes no more frames, so the block's own value is the
+    // answer: it was stopped either on the completed result's arguments, which
+    // is every character the call has, or — where no result reports the call —
+    // on exactly what the backend streamed for it. Anything written for it now
+    // would land PAST its `content_block_stop`, which this wire has no shape
+    // for, so it is refused once here rather than at each caller.
+    //
+    // No shipped backend produces either order that would arrive here. The
+    // codex transport already refuses to forward a delta for a call it declared
+    // finished (`emitArgumentExtension`), and measured upstream streams open one
+    // `function_call` item at a time, so no call's deltas resume after another's
+    // block opened. A `LocalStreamEvent` sequence can express both, and the
+    // queue above states this invariant about itself — this is what holds it to
+    // that, not a shape a client is receiving.
+    if (state.closed) return;
     if (event.argumentsDelta) await this.writeArgumentsDelta(event.index, state, event.argumentsDelta);
     // A backend that says where a call's arguments end closes the block there,
     // so the narration that resumes after it — or the next call — opens while
@@ -2912,21 +3818,71 @@ class AnthropicToolUseStreamState {
     if (event.argumentsDone) await this.stop(state);
   }
 
-  async finish(toolCalls: readonly LocalToolCall[]): Promise<void> {
-    for (const [index, call] of toolCalls.entries()) {
-      const state = await this.ensureStarted(index, call.id, call.name);
-      // A call the backend announced as finished carries the arguments the
-      // completed result reports: the transport only sends that signal once the
-      // stream holds the value in full, and refuses to let the completed output
-      // rewrite it afterwards. So there is nothing left to reconcile and
-      // nothing left to stop — and nothing could be sent into a stopped block
-      // anyway, which is why the signal is withheld whenever that invariant
-      // cannot be met.
+  /**
+   * Closes any block still open, so nothing else can open inside one — with
+   * the turn's completed calls when the caller has them. A block stopped
+   * without them keeps only what was streamed, which is how a client came to
+   * finalize `{"city":` as a whole tool input; the rest of the value goes in
+   * BEFORE the stop, because a stopped block takes no more deltas.
+   */
+  async closeOpen(toolCalls: readonly LocalToolCall[] = []): Promise<void> {
+    for (const [index, state] of this.states) {
       if (state.closed) continue;
-      const rest = missingToolCallArgumentDelta(state.arguments, call);
+      const call = toolCalls[index];
+      const rest = call ? missingToolCallArgumentDelta(state.arguments, call) : '';
       if (rest) await this.writeArgumentsDelta(index, state, rest);
+      // The block `finish` left open on purpose — the turn's final call, cut
+      // off at the output limit — stays open here too.
+      if (index === this.leaveOpen) continue;
+      if (call) this.judge(call);
       await this.stop(state);
     }
+  }
+
+  /**
+   * `firstIndex` is where `toolCalls` starts in the turn, so a caller can close
+   * the calls below the text's ordinal, write the text, and close the rest —
+   * each block still opening in the order it goes out. The tool index is the
+   * turn's, not the slice's, or the second walk would reopen the first's.
+   */
+  async finish(toolCalls: readonly LocalToolCall[], firstIndex = 0): Promise<void> {
+    for (const [offset, call] of toolCalls.entries()) {
+      const index = firstIndex + offset;
+      const state = await this.ensureStarted(index, call.id, call.name);
+      // Two different facts used to reach this line. A call the backend
+      // announced as finished carries the arguments the completed result
+      // reports — the transport only sends that signal once the stream holds
+      // the value in full, and refuses to let the completed output rewrite it
+      // afterwards — so there is nothing to reconcile and nothing to stop.
+      //
+      // A block this writer stopped to make room for something else is NOT
+      // that, and skipping it streamed `{"city":` as a client's whole tool
+      // input. Nothing can be written into a stopped block, so the fix is not
+      // here: whatever needs a block of its own queues until the call settles
+      // rather than stopping it, which leaves this line reachable only for the
+      // first fact.
+      if (!state.closed) {
+        const rest = missingToolCallArgumentDelta(state.arguments, call);
+        if (rest) await this.writeArgumentsDelta(index, state, rest);
+      }
+      // Judged whether or not the block is already stopped — the native
+      // transport stops it on its own "arguments final" signal, before the
+      // completed result (and its stop reason) exists to judge by.
+      this.judge(call);
+      if (state.closed || index === this.leaveOpen) continue;
+      await this.stop(state);
+    }
+  }
+
+  /**
+   * The buffered writer's rule, applied where this stream would otherwise
+   * close a block on arguments that are not a JSON object: the bytes are
+   * already on the wire, so the refusal follows them as an in-band error —
+   * the same turn the buffered body answers 502 (r21, native transport).
+   */
+  private judge(call: LocalToolCall): void {
+    if (this.cutOff) return;
+    assertCallArguments(call.arguments, undefined, 'anthropic-messages', 'called a tool with');
   }
 
   private async stop(state: AnthropicToolUseState): Promise<void> {
@@ -2988,41 +3944,111 @@ function openAiToolCall(call: LocalToolCall): unknown {
   };
 }
 
-function openAiResponseToolCall(call: LocalToolCall): unknown {
+function openAiResponseToolCall(call: LocalToolCall, status: 'completed' | 'incomplete' = 'completed'): unknown {
   return {
     id: `fc_${randomUUID()}`,
     type: 'function_call',
-    status: 'completed',
+    status,
     call_id: call.id,
     name: call.name,
     arguments: call.arguments,
   };
 }
 
-function anthropicToolUse(call: LocalToolCall): unknown {
+/**
+ * A `tool_use` block whose `input` is the bytes the runtime wrote, spliced
+ * into the body by `stringifyJson` — this surface publishes the arguments as
+ * a JSON value, not a string, and a parse-and-stringify round trip rounded
+ * `9007199254740993` to `…992` and `1e999` to `null` while the stream of the
+ * same turn carried the bytes (round 21). A completed turn's arguments are a
+ * JSON object by the time they reach this writer (matrix §7 row 8). A call
+ * the runtime cut off at its output limit is published as the direct API
+ * publishes it: the complete top-level members parsed so far, the cut member
+ * dropped (measured 2026-09-04, `review-artifacts/stage2/report.md` M6).
+ */
+function anthropicToolUse(call: LocalToolCall, cutOff = false, fragment = false): unknown {
+  // The wrapper reading refused such a call before it got here; the native
+  // transport's arguments are the vendor's own and arrive unjudged, so this
+  // surface — whose `input` is a JSON value — applies the same rule (r21).
+  if (!cutOff) assertCallArguments(call.arguments, undefined, 'anthropic-messages', 'called a tool with');
+  // The one call the cut hit — the turn's last call with nothing after it,
+  // the one whose block the stream leaves open (`cutCallLeftOpen`) — is a
+  // fragment: an object prefix keeps its complete members, and whole JSON
+  // that is no object (`[1, 2]`, `12`) is a fragment of no object, `{}`
+  // (r22). Every other call of a cut turn, a last call with narration after
+  // it included, goes out as written where its bytes are JSON — the stream
+  // closed its block on them, and projecting `[1, 2]` to `{}` here split the
+  // two paths (r23) — and as the projection where they are not, since
+  // `input` must be a JSON value and nothing on a cut turn is judged
+  // (declared, matrix §7 row 8).
+  const whole = fragment ? parsesAsJsonObject(call.arguments) : parsesAsJson(call.arguments);
   return {
     type: 'tool_use',
     id: call.id,
     name: call.name,
-    input: parseToolArguments(call.arguments),
+    input: new RawJson(whole ? call.arguments : completeTopLevelMembers(call.arguments)),
   };
 }
 
-function parseToolArguments(value: string): unknown {
+/**
+ * The call whose block the Messages stream leaves open: the last call of a
+ * turn the runtime cut off inside that call's arguments, with no narration
+ * after it — the turn's final block, as in the direct API's own stream (M6).
+ * Otherwise null, and every block closes.
+ */
+function cutCallLeftOpen(result: LocalCompletionResult): number | null {
+  if (!responseCutOff(result) || result.toolCalls.length === 0) return null;
+  const last = result.toolCalls.length - 1;
+  const lastCall = result.toolCalls[last];
+  if (!lastCall || parsesAsJsonObject(lastCall.arguments)) return null;
+  const trailing = textRunsFor(result, result.toolCalls.length).some((run) => run.afterCalls >= result.toolCalls.length && run.text.length > 0);
+  return trailing ? null : last;
+}
+
+function parsesAsJson(value: string): boolean {
   try {
-    return JSON.parse(value);
+    JSON.parse(value);
+    return true;
   } catch {
-    return { input: value };
+    return false;
   }
 }
 
+/** Whether the bytes are a whole JSON object — the only complete `input`. */
+function parsesAsJsonObject(value: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The single exit for every OpenAI-shape SSE error frame — chat, responses,
+ * images and the native surface all write what this returns.
+ */
 function streamErrorPayload(err: unknown): unknown {
+  return boundedErrorEnvelope(rawStreamErrorPayload(err));
+}
+
+function rawStreamErrorPayload(err: unknown): unknown {
+  if (err instanceof LocalCliChatError) {
+    return {
+      error: {
+        message: boundedErrorMessage(err.message),
+        type: 'local_cli_chat_error',
+        param: null,
+        code: err.code,
+      },
+    };
+  }
   if (err instanceof ProxyRequestError) {
     return {
       error: {
         message: boundedErrorMessage(err.message),
         type: err.type,
-        param: err.param,
+        param: boundedErrorParam(err.param),
         code: err.code,
       },
     };
@@ -3033,7 +4059,7 @@ function streamErrorPayload(err: unknown): unknown {
       error: {
         message: boundedErrorMessage(providerError.message),
         type: providerError.type,
-        param: providerError.param,
+        param: boundedErrorParam(providerError.param),
         code: providerError.code,
       },
     };
@@ -3077,7 +4103,7 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
   res.writeHead(statusCode, {
     'content-type': 'application/json; charset=utf-8',
   });
-  res.end(`${JSON.stringify(payload)}\n`);
+  res.end(`${stringifyJson(payload)}\n`);
 }
 
 function writeSseHeaders(res: ServerResponse): void {
@@ -3167,13 +4193,18 @@ function isAddressInfo(value: string | AddressInfo | null): value is AddressInfo
   return Boolean(value) && typeof value === 'object';
 }
 
-// Every client-visible error message passes through here, so this is where the
-// documented ceiling belongs: one place rather than one per producer. A model
-// name a client chose, a runtime diagnostic, an upstream's prose — each reaches a
-// response through some branch below, and bounding at each source has already
-// been missed once.
-const MAX_ERROR_MESSAGE_CHARS = 500;
 const ERROR_TRUNCATION_MARKER = '...[truncated]';
+
+/**
+ * The same ceiling for `param`. It is client-visible and caller-supplied too —
+ * an unknown key's own name and `metadata.<key>` both put the caller's bytes
+ * there, and a provider error's `param` is prose this proxy did not write.
+ * Measured before this: an unknown key of 10,000,000 characters answered 400
+ * with `message.len 1024` beside `param.len 10,000,000`.
+ */
+function boundedErrorParam(param: string | null): string | null {
+  return param === null ? null : boundedErrorMessage(param);
+}
 
 function boundedErrorMessage(message: string): string {
   // A message that already fits is returned untouched. Reserving the marker
@@ -3190,13 +4221,22 @@ function boundedErrorMessage(message: string): string {
   return `${out}${ERROR_TRUNCATION_MARKER}`;
 }
 
+/**
+ * Every client-visible JSON error body leaves through here. `writeJson` is
+ * shared with the success writers, so the envelope bound belongs on the error
+ * side of it rather than inside it.
+ */
+function writeErrorJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+  writeJson(res, statusCode, boundedErrorEnvelope(payload));
+}
+
 function writeError(
   res: ServerResponse,
   err: unknown,
   shape: ErrorResponseShape = 'openai',
 ): void {
   if (err instanceof LocalCliChatError) {
-    writeJson(res, err.statusCode, {
+    writeErrorJson(res, err.statusCode, {
       error: {
         message: boundedErrorMessage(err.message),
         type: 'local_cli_chat_error',
@@ -3221,7 +4261,7 @@ function writeError(
     // and configuration failures included — they happen before its handler,
     // but the caller is still a native-surface caller.
     if (shape === 'local-cli') {
-      writeJson(res, err.statusCode, {
+      writeErrorJson(res, err.statusCode, {
         error: {
           message: boundedErrorMessage(err.message),
           type: 'local_cli_chat_error',
@@ -3238,7 +4278,7 @@ function writeError(
     // `invalid_request_error`, the type these throws carry, is native to both
     // vocabularies.
     if (err.provider === 'anthropic' || shape === 'anthropic') {
-      writeJson(res, err.statusCode, {
+      writeErrorJson(res, err.statusCode, {
         type: 'error',
         error: {
           type: err.type,
@@ -3247,11 +4287,11 @@ function writeError(
       });
       return;
     }
-    writeJson(res, err.statusCode, {
+    writeErrorJson(res, err.statusCode, {
       error: {
         message: boundedErrorMessage(err.message),
         type: err.type,
-        param: err.param,
+        param: boundedErrorParam(err.param),
         code: err.code,
       },
     });
@@ -3263,7 +4303,7 @@ function writeError(
     // caller's surface. A 429 on the native surface is still a 429 — reported
     // as this surface reports errors.
     if (shape === 'local-cli') {
-      writeJson(res, providerError.statusCode, {
+      writeErrorJson(res, providerError.statusCode, {
         error: {
           message: boundedErrorMessage(providerError.message),
           type: 'local_cli_chat_error',
@@ -3274,7 +4314,7 @@ function writeError(
       return;
     }
     if (shape === 'anthropic') {
-      writeJson(res, providerError.statusCode, {
+      writeErrorJson(res, providerError.statusCode, {
         type: 'error',
         error: {
           type: providerError.type,
@@ -3283,11 +4323,11 @@ function writeError(
       });
       return;
     }
-    writeJson(res, providerError.statusCode, {
+    writeErrorJson(res, providerError.statusCode, {
       error: {
         message: boundedErrorMessage(providerError.message),
         type: providerError.type,
-        param: providerErrorParamForShape(providerError.param, shape),
+        param: boundedErrorParam(providerErrorParamForShape(providerError.param, shape)),
         code: providerError.code,
       },
     });
@@ -3298,16 +4338,16 @@ function writeError(
   // the OpenAI body there hands an Anthropic client something it cannot parse.
   const message = boundedErrorMessage(err instanceof Error ? err.message : String(err));
   if (shape === 'local-cli') {
-    writeJson(res, 500, {
+    writeErrorJson(res, 500, {
       error: { message, type: 'local_cli_chat_error', param: null, code: null },
     });
     return;
   }
   if (shape === 'anthropic') {
-    writeJson(res, 500, { type: 'error', error: { type: 'api_error', message } });
+    writeErrorJson(res, 500, { type: 'error', error: { type: 'api_error', message } });
     return;
   }
-  writeJson(res, 500, {
+  writeErrorJson(res, 500, {
     error: {
       message,
       type: 'server_error',
@@ -3332,11 +4372,54 @@ function providerErrorFromBackendError(err: unknown): {
   if (!statusCode || statusCode < 400 || statusCode >= 600 || !message) return null;
   return {
     statusCode,
-    type: typeof error.type === 'string' ? error.type : 'invalid_request_error',
+    type: boundedDiscriminator(error.type) ?? 'invalid_request_error',
     message,
     param: typeof error.param === 'string' ? error.param : null,
-    code: typeof error.code === 'string' ? error.code : null,
+    code: boundedDiscriminator(error.code),
   };
+}
+
+/**
+ * `type` and `code` come from an upstream body, which makes them a
+ * backend-controlled channel into every client-visible envelope — and unlike
+ * `message` and `param`, they are DISCRIMINATORS: a client switches on them.
+ * Truncating one leaves a value that is neither the real one nor a known one,
+ * so anything past the ceiling is dropped to the same default a missing one
+ * gets. Measured before this: a backend error carrying a 4096-character `type`
+ * and `code` put both, at full length, in the Responses envelope and the
+ * Anthropic one.
+ */
+function boundedDiscriminator(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > MAX_ERROR_MESSAGE_CHARS) return null;
+  return value;
+}
+
+/**
+ * The one exit every client-visible error envelope passes through — the JSON
+ * writer and both SSE writers. A discriminator reaches an envelope from two
+ * sources, and only one of them was bounded: `providerErrorFromBackendError`
+ * parses an upstream body and bounds what it reads, but `codexBackendError`
+ * has already copied that same upstream's `type` and `code` onto a
+ * `ProxyRequestError` verbatim, and every writer read those two fields off the
+ * error directly. Measured before this: an upstream 400 carrying a
+ * 4096-character `type` and `code` arrived at full length on all six
+ * client-visible surfaces — Responses, Chat and Anthropic, buffered and
+ * streamed alike. Bounding the ENVELOPE rather than each reader is the point:
+ * a writer added later cannot reopen it. The upstream STATUS is untouched;
+ * only the nonconforming discriminator is sacrificed.
+ */
+function boundedErrorEnvelope<T>(payload: T): T {
+  const envelope = payload as unknown;
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return payload;
+  const error = (envelope as Record<string, unknown>).error;
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return payload;
+  const fields = error as Record<string, unknown>;
+  const bounded: Record<string, unknown> = { ...fields };
+  // Absent stays absent: the Anthropic envelope has no `code`, and inventing
+  // one is a different divergence from leaking an oversized one.
+  if ('type' in fields) bounded.type = boundedDiscriminator(fields.type) ?? 'invalid_request_error';
+  if ('code' in fields) bounded.code = boundedDiscriminator(fields.code);
+  return { ...(envelope as Record<string, unknown>), error: bounded } as T;
 }
 
 function providerErrorParamForShape(

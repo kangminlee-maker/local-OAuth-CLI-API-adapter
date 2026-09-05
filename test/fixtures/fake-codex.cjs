@@ -48,10 +48,16 @@ function result(id, value = {}) {
 }
 
 function emitTurn(threadId, turnId, text = 'OK') {
-  write({
-    method: 'item/agentMessage/delta',
-    params: { threadId, turnId, delta: text },
-  });
+  // One delta carrying the whole text, or — when a test asks — one delta per
+  // character, the granularity a live turn actually arrives at and the one
+  // that decides what an incremental reader releases before the turn ends.
+  const deltas = process.env.FAKE_CODEX_RAW_TEXT_DELTAS === 'chars' ? [...text] : [text];
+  for (const delta of deltas) {
+    write({
+      method: 'item/agentMessage/delta',
+      params: { threadId, turnId, delta },
+    });
+  }
   write({
     method: 'turn/completed',
     params: {
@@ -96,90 +102,6 @@ function emitEarlyTurn(threadId, turnId) {
           cachedInputTokens: 3,
           outputTokens: 2,
           reasoningOutputTokens: 1,
-        },
-      },
-    },
-  });
-  write({
-    method: 'turn/completed',
-    params: {
-      threadId,
-      turn: { id: turnId, status: 'completed' },
-    },
-  });
-}
-
-function emitToolTurn(threadId, turnId) {
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: '{"status":"tool_calls","text":"","toolCalls":[{"arguments":"{\\"city\\"',
-    },
-  });
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: ':\\"Seoul\\"}","id":"call_1","name":"get_weather"}]}',
-    },
-  });
-  write({
-    method: 'thread/tokenUsage/updated',
-    params: {
-      threadId,
-      turnId,
-      tokenUsage: {
-        last: {
-          totalTokens: 15,
-          inputTokens: 9,
-          cachedInputTokens: 2,
-          outputTokens: 4,
-          reasoningOutputTokens: 0,
-        },
-      },
-    },
-  });
-  write({
-    method: 'turn/completed',
-    params: {
-      threadId,
-      turn: { id: turnId, status: 'completed' },
-    },
-  });
-}
-
-function emitToolArgumentsOnlyTurn(threadId, turnId) {
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: '{"city"',
-    },
-  });
-  write({
-    method: 'item/agentMessage/delta',
-    params: {
-      threadId,
-      turnId,
-      delta: ':"Seoul"}',
-    },
-  });
-  write({
-    method: 'thread/tokenUsage/updated',
-    params: {
-      threadId,
-      turnId,
-      tokenUsage: {
-        last: {
-          totalTokens: 11,
-          inputTokens: 7,
-          cachedInputTokens: 2,
-          outputTokens: 4,
-          reasoningOutputTokens: 0,
         },
       },
     },
@@ -253,6 +175,11 @@ rl.on('line', (line) => {
 
   if (payload.id === undefined) return;
   recordMethod(payload.method);
+  if (payload.method === 'initialize' && Number(process.env.FAKE_CODEX_INITIALIZE_DELAY_MS ?? 0) > 0) {
+    // A child slow to come up: the window a replacement is in flight for.
+    setTimeout(() => result(payload.id, { userAgent: 'fake-codex' }), Number(process.env.FAKE_CODEX_INITIALIZE_DELAY_MS));
+    return;
+  }
   if (payload.method === 'initialize') {
     result(payload.id);
     return;
@@ -293,19 +220,24 @@ rl.on('line', (line) => {
       result(payload.id, { turn: { id: turnId } });
       return;
     }
-    if (input.includes('TOOL_STREAM_DIAGNOSTIC')) {
+    if (input.includes('PADDED_NARRATION')) {
+      // A completed turn whose text carries leading and trailing whitespace.
+      // Every other narration here is whitespace-free, so a `.trim()` on the
+      // way out of this backend is invisible to all of them.
       result(payload.id, { turn: { id: turnId } });
-      const schema = payload.params?.outputSchema;
-      const argsOnly = schema?.properties?.city;
-      setTimeout(() => {
-        if (argsOnly) emitToolArgumentsOnlyTurn(threadId, turnId);
-        else emitToolTurn(threadId, turnId);
-      }, 0);
+      setTimeout(() => emitTurn(threadId, turnId, '\n  MEDIUM_OK  '), 0);
       return;
     }
     if (input.includes('DEBUG_PAYLOAD')) {
       result(payload.id, { turn: { id: turnId } });
       setTimeout(() => emitTurn(threadId, turnId, JSON.stringify(debugPayload())), 0);
+      return;
+    }
+    // A turn whose text the test chooses, so a decision wrapper can be driven
+    // through the REAL `CodexAppServerBackend`.
+    if (process.env.FAKE_CODEX_RAW_TEXT) {
+      result(payload.id, { turn: { id: turnId } });
+      setTimeout(() => emitTurn(threadId, turnId, process.env.FAKE_CODEX_RAW_TEXT), 0);
       return;
     }
     const effort = payload.params?.effort;
@@ -324,6 +256,12 @@ rl.on('line', (line) => {
       if (process.env.FAKE_CODEX_NO_TURN_COMPLETION === '1') return;
       setTimeout(() => emitTurn(threadId, turnId, text), 0);
     }, ackDelayMs);
+    return;
+  }
+  if (payload.method === 'thread/archive' && Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS ?? 0) > 0) {
+    // An archive slow to be acknowledged: the close's grace, and the window a
+    // turn used to be admitted in.
+    setTimeout(() => result(payload.id), Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS));
     return;
   }
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {

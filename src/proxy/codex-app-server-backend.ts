@@ -15,8 +15,8 @@ import {
   baseInstructions,
   buildPrompt,
   developerInstructions,
-  forcedSingleToolCall,
   hasToolDecisionSchema,
+  textMayBeRefused,
   outputSchemaFor,
   parseBackendOutput,
   requestInstructionText,
@@ -44,7 +44,6 @@ import type {
   OpenAiImageGenerationStreamEvent,
 } from './types.js';
 import { ProxyRequestError, unsupportedModelError } from './types.js';
-import { KnownToolArgumentsDeltaExtractor, ToolCallDeltaExtractor } from './tool-call-stream.js';
 
 interface CodexAppServerBackendOptions {
   readonly command?: string;
@@ -145,8 +144,6 @@ interface CodexTurnTimingDraft {
   turnWaitMs: number;
   usageWaitMs: number;
   firstTextDeltaMs?: number;
-  firstToolCallDeltaMs?: number;
-  firstToolArgumentDeltaMs?: number;
 }
 
 interface CodexTurnTiming extends Readonly<CodexTurnTimingDraft> {
@@ -248,38 +245,17 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       return;
     }
     const queue = new AsyncQueue<LocalStreamEvent>();
-    const forcedTool = forcedSingleToolCall(request);
-    const toolExtractor = forcedTool
-      ? new KnownToolArgumentsDeltaExtractor(forcedTool.index, forcedTool.id, forcedTool.name)
-      : hasToolDecisionSchema(request)
-      ? new ToolCallDeltaExtractor()
-      : null;
-    let firstToolCallDeltaMs: number | undefined;
-    let firstToolArgumentDeltaMs: number | undefined;
+    // A tool turn has no incremental reader: nothing is released until
+    // `completed` carries the one reading the buffered path also makes. Two
+    // readers of one wrapper disagreed on malformed output, and a released byte
+    // cannot be retracted (conformance matrix §7). A turn whose text the
+    // response path may refuse is held for the same reason: the completed
+    // result still carries the text, so nothing is lost — only held.
+    const shouldStreamText = !hasToolDecisionSchema(request) && !textMayBeRefused(request);
     const run = this.runTurn(
       request,
       signal,
-      (delta, elapsedMs) => {
-        if (toolExtractor) {
-          for (const event of toolExtractor.push(delta)) {
-            if (firstToolCallDeltaMs === undefined) firstToolCallDeltaMs = elapsedMs;
-            if (
-              event.type === 'tool_call_delta'
-              && event.argumentsDelta
-              && firstToolArgumentDeltaMs === undefined
-            ) {
-              firstToolArgumentDeltaMs = elapsedMs;
-            }
-            queue.push(event);
-          }
-        } else {
-          queue.push({ type: 'text_delta', delta });
-        }
-      },
-      (timing) => {
-        if (firstToolCallDeltaMs !== undefined) timing.firstToolCallDeltaMs = firstToolCallDeltaMs;
-        if (firstToolArgumentDeltaMs !== undefined) timing.firstToolArgumentDeltaMs = firstToolArgumentDeltaMs;
-      },
+      shouldStreamText ? (delta) => queue.push({ type: 'text_delta', delta }) : undefined,
     )
       .then((result) => queue.push({ type: 'completed', result }))
       .catch((err: Error) => queue.fail(err))
@@ -565,6 +541,7 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
         model: request.model,
         text: parsed.text,
         toolCalls: parsed.toolCalls,
+        ...(parsed.textRuns ? { textRuns: parsed.textRuns } : {}),
         usage,
         latencyMs: totalMs,
       };
@@ -940,7 +917,9 @@ export class CodexAppServerBackend implements LocalCliBackend, OpenAiImageGenera
       waiter.usageGraceTimer = undefined;
     }
     waiter.resolve({
-      text: waiter.text.trim(),
+      // Untrimmed: the streamed deltas carried it untrimmed, and a transform on
+      // one path only makes the same turn two different strings.
+      text: waiter.text,
       usage: waiter.usage,
       usageWaitMs: waiter.completedAt
         ? Math.max(0, (waiter.usageUpdatedAt ?? Date.now()) - waiter.completedAt)
