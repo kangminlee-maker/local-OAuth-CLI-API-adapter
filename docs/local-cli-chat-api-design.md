@@ -206,7 +206,9 @@ that lands while a turn waits for the replacement ends the wait, not the replace
 close during a replacement ends the child being started rather than waiting out its
 handshake; a replacement whose handshake fails leaves no child and no thread; and a
 streamed turn is admitted before any SSE commits, so a 404, 409 or 410 arrives in the
-native envelope on that path too (round 55). A turn requested in that window
+native envelope on that path too (round 55). A close stops the turn it finds — one
+still preparing its input ends without writing to the child being archived, and one
+admitted before the close but read after it hears the close (round 55). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
 is the runtime's own answer about whether a turn occupies it, not separate
 bookkeeping — the two used to disagree, so a session could report `ready` while

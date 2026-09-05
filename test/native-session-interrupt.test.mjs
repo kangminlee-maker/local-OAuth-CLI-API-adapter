@@ -440,6 +440,26 @@ test('a session being deleted admits no turn: the DELETE\'s archive grace is not
   assert.equal(methods.filter((method) => method === 'thread/archive').length, 1);
 });
 
+test('a turn admitted before the close and read after it hears the close, and reaches no child (r55-fable)', { timeout: 20_000 }, async () => {
+  // Admission is at the call; the turn's body runs at the first read. A close
+  // that lands between the two finds the manager's record gone and the
+  // runtime closed — the runtime's own refusal is what the reader hears, not
+  // a turn started on a child being torn down, and not "not running" over a
+  // session that was closed (r55-fable: the runtime's closed-refusal was
+  // reachable by no test, so a mutant without it survived).
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const stream = manager.streamTurn(session.id, { input: 'admitted first' })[Symbol.asyncIterator]();
+  const closed = await manager.close(session.id);
+  assert.equal(closed.status, 'closed');
+  const event = await stream.next();
+  assert.equal(event.value?.event, 'cli.error', JSON.stringify(event));
+  assert.match(event.value.raw.message, /session is closed/, 'the close is the reason the reader hears');
+  assert.deepEqual((await stream.next()).done, true, 'and the iteration ends');
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'turn/start').length, 0, 'no turn reached the child');
+});
+
 test('a stop between the request and its acknowledgement still precedes the next turn', { timeout: 20_000 }, async () => {
   // The third window a stop can land in. The invariant was pinned for a stop
   // AFTER the child names the turn, and asserted for one before the request is
@@ -788,6 +808,33 @@ test('an interrupt while the input is being prepared keeps the turn off the chil
     [],
     'a turn stopped before it was sent must never reach the child',
   );
+});
+
+test('a close while the input is being prepared keeps the turn off the child being archived (r55-fable)', { timeout: 20_000 }, async () => {
+  // The same window, closed by a DELETE instead of a stop. The child lives
+  // through the archive's grace — up to two seconds — and a turn whose input
+  // finished preparing inside it was sent to that child: `turn/start` after
+  // `thread/archive`, real work on a deleted session's credentials. The close
+  // stops the turn it finds, and the turn re-checks that before it writes.
+  process.env.FAKE_CODEX_ARCHIVE_DELAY_MS = '900';
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  const stream = manager.streamTurn(session.id, {
+    input: [
+      { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PIXEL_PNG } },
+      { type: 'text', text: 'describe it' },
+    ],
+  })[Symbol.asyncIterator]();
+  const first = stream.next();
+
+  const closed = await manager.close(session.id);
+  assert.equal(closed.status, 'closed');
+  const event = await first;
+  assert.equal(event.value?.event, 'cli.error', `the turn ends for its caller: ${JSON.stringify(event)}`);
+  await delay(100);
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'thread/archive').length, 1, 'the close archived the thread');
+  assert.deepEqual(methods.filter((method) => method === 'turn/start'), [], 'a turn stopped by the close must never reach the child');
 });
 
 test('a session survives an interrupt whose runtime stop throws', { timeout: 20_000 }, async () => {
