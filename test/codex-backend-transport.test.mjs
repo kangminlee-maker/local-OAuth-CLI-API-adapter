@@ -2147,3 +2147,39 @@ test('a call identified only by the completed output folding a finished holder i
   assert.ok(announced >= 0 && finished > announced, `announced before finished: ${JSON.stringify(tool)}`);
   assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
 });
+
+test('the fold\'s survivor is chosen by the one rule wherever two states meet: a holder the client knows absorbs the item-id half that learns its position, live (r31-codex F3)', async () => {
+  // The item-id half's bytes belong to the announced holder the moment the
+  // delta places them at its position — not at the terminal frame, where the
+  // completed item's fold would join the two anyway. The vendor is paused
+  // before the terminal: the bytes must reach the client first.
+  const { events, early } = await releasedAfter([
+    { type: 'response.output_item.added', item: { type: 'function_call', id: 'fc_a', name: 'get_weather' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', call_id: 'call_a', name: 'get_weather' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+  ], toolRequest(), (event) => event.type === 'tool_call_delta' && event.id === 'call_a' && (event.argumentsDelta ?? '').includes('Seoul'));
+  assert.ok(early, `the bytes must stream under call_a before the terminal frame: ${JSON.stringify(events.map((event) => [event.type, event.id, event.argumentsDelta]))}`);
+  assert.deepEqual(events.filter((event) => event.type === 'tool_call_delta' && event.argumentsDelta === '').map((event) => [event.id, event.index]), [['call_a', 0]]);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}']]);
+});
+
+test('a retired state\'s position alias survives only at the survivor\'s accepted position: the real call at the other position is its own (r31-codex F4)', async () => {
+  const codexHome = await createCodexHome();
+  globalThis.fetch = async () => new Response(sse([
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_x', call_id: 'call_a', name: 'get_weather' } },
+    // A delta for alpha's item id at position 1 — not alpha's position.
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_a', delta: '{"city":"Seoul"}' },
+    { type: 'response.output_item.done', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_b', delta: '{"tz":"KST"}' },
+    { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time', arguments: '{"tz":"KST"}' } },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'get_weather', arguments: '{"city":"Seoul"}' },
+      { type: 'function_call', id: 'fc_b', call_id: 'call_b', name: 'get_time', arguments: '{"tz":"KST"}' },
+    ] } },
+  ]), { status: 200 });
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const events = [];
+  for await (const event of backend.stream(withDeclared(toolRequest(), ['get_time']))) events.push(event);
+  assert.deepEqual(events.at(-1).result.toolCalls.map((call) => [call.id, call.name, call.arguments]), [['call_a', 'get_weather', '{"city":"Seoul"}'], ['call_b', 'get_time', '{"tz":"KST"}']]);
+});

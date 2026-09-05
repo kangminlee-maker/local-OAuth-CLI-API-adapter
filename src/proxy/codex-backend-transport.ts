@@ -302,7 +302,13 @@ class CodexBackendStreamState {
       // too, and the real call there was bound to this one and vanished
       // (r30-codex).
       this.recordPosition(known, event);
-      if (explicit && this.positions.get(known) === position) this.adoptHolder(known, position);
+      // Progress advances from the call's accepted position only: a frame
+      // naming this call at some other position is a mislabel, not a later
+      // item (r31-codex F5).
+      if (explicit && this.positions.get(known) === position) {
+        this.advance(position);
+        return this.adoptHolder(known, position);
+      }
       return known;
     }
     // An `output_index` the event actually carries names ONE item: an
@@ -340,7 +346,13 @@ class CodexBackendStreamState {
     if (explicit) this.toolOrdinals.set(`#${position}`, ordinal);
     this.bindOrdinal(ordinal, ids);
     this.recordPosition(ordinal, event);
+    this.advance(position);
     return ordinal;
+  }
+
+  /** The vendor has produced an item at this position: everything below it is behind it. */
+  private advance(position: number | undefined): void {
+    if (position !== undefined && position > this.highestPosition) this.highestPosition = position;
   }
 
   /** The first explicit output position seen for a call is its position. */
@@ -366,16 +378,25 @@ class CodexBackendStreamState {
    * carries bytes the order of the two is not reconstructible, and the turn
    * is refused rather than guessed.
    */
-  private adoptHolder(known: number, position: number): void {
+  private adoptHolder(known: number, position: number): number {
     const holder = this.toolOrdinals.get(`#${position}`);
     if (holder === undefined) {
       this.toolOrdinals.set(`#${position}`, known);
-      return;
+      return known;
     }
-    if (holder === known) return;
+    if (holder === known) return known;
+    // The survivor is chosen by the one rule (`coalesce`), not by which side
+    // the caller arrived from: the holder may be the call the client knows —
+    // announced under its `call_id` — and the known state its item-id half,
+    // and absorbing only one way refused the turn the position joined
+    // (r31-codex F3). Two states the client knows at one position are left
+    // apart (declared).
     const holderState = this.toolStates.get(holder);
-    if (holderState === undefined || !this.absorbable(holderState)) return;
-    this.absorb(known, holder);
+    const state = this.toolStates.get(known);
+    const holderAbsorbable = holderState !== undefined && this.absorbable(holderState);
+    const knownAbsorbable = state !== undefined && this.absorbable(state);
+    if (!holderAbsorbable && !knownAbsorbable) return known;
+    return this.coalesce([known, holder]);
   }
 
   /**
@@ -435,12 +456,20 @@ class CodexBackendStreamState {
       }
       if (state.hasCallId && state.named) state.identified = true;
     }
-    for (const [key, ordinal] of this.toolOrdinals) {
-      if (ordinal === other) this.toolOrdinals.set(key, survivor);
-    }
     const position = this.positions.get(other);
     if (position !== undefined && !this.positions.has(survivor)) this.positions.set(survivor, position);
     this.positions.delete(other);
+    // Id aliases follow the survivor; a POSITION alias follows it only at the
+    // survivor's accepted position. Carrying every `#N` over left a stale
+    // alias at the retired state's other position, and the real call that
+    // later arrived there was bound to the survivor and vanished (r31-codex
+    // F4).
+    const accepted = this.positions.get(survivor);
+    for (const [key, ordinal] of this.toolOrdinals) {
+      if (ordinal !== other) continue;
+      if (key.startsWith('#') && Number(key.slice(1)) !== accepted) this.toolOrdinals.delete(key);
+      else this.toolOrdinals.set(key, survivor);
+    }
     this.toolStates.delete(other);
   }
 
@@ -476,8 +505,7 @@ class CodexBackendStreamState {
       // A call known by id whose frames never carried a position is placed
       // by the completed output; the anonymous holder at that position is
       // its own (the rule `toolOrdinal` applies live — r30-fable F1).
-      this.adoptHolder(known, outputIndex);
-      return known;
+      return this.adoptHolder(known, outputIndex);
     }
     // The completed output is in `output_index` order, so the item's array
     // index is the position the live events named — and an anonymous holder
@@ -545,8 +573,12 @@ class CodexBackendStreamState {
     // the request succeeded (r23-codex). Failure frames after settlement
     // were already ignored below; every event is now.
     if (this.settled) return out;
-    const seen = explicitOutputIndex(event);
-    if (seen !== undefined && seen > this.highestPosition) this.highestPosition = seen;
+    // Progress from a frame that names no call — narration, a reasoning or
+    // message item. A tool event's position counts only once correlated
+    // (`toolOrdinal`): a duplicate frame for a known call, mislabelled with
+    // a higher position, advanced progress past the call itself and closed
+    // the block `response.incomplete` then had to leave open (r31-codex F5).
+    if (!isToolEvent(event)) this.advance(explicitOutputIndex(event));
     if (event.response?.id) this.responseId = event.response.id;
     if (event.response?.model) this.model = event.response.model;
     if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') {
@@ -1040,7 +1072,15 @@ class CodexBackendStreamState {
     // overwrite that call's name and arguments — turning one tool call into a
     // second copy of another. The streamed state is the one the client already
     // acted on, so it wins.
-    const alignable = this.toolStates.size === 0 || finalCalls.length === this.toolStates.size;
+    //
+    // Judged per item against the streamed calls still standing: a fold
+    // earlier in this loop (a completed item joining two states) retires a
+    // state, and a count taken once before the loop then disagreed with two
+    // views that had come to agree — the anonymous item completing ANOTHER
+    // call was discarded, and that call went out as its fragment (r32-fable
+    // F1). Only the states the stream opened count; a call this loop adds
+    // for an item the stream never showed is not one of the streamed calls.
+    const streamed = new Set(this.toolStates.keys());
     let functionCallPosition = 0;
     for (const [outputIndex, item] of output.entries()) {
       const obj = asRecord(item);
@@ -1050,6 +1090,8 @@ class CodexBackendStreamState {
         const finalCallId = identityText(obj.call_id, this.request.shape);
         const finalName = identityText(obj.name, this.request.shape);
         const anonymous = finalItemId === undefined && finalCallId === undefined;
+        const standing = [...streamed].filter((ordinal) => this.toolStates.has(ordinal)).length;
+        const alignable = standing === 0 || finalCalls.length === standing;
         if (anonymous && !alignable) {
           functionCallPosition += 1;
           continue;
@@ -2550,6 +2592,13 @@ function usageFromResponses(value: unknown): LocalUsage | undefined {
     source: 'provider',
     raw: value,
   };
+}
+
+/** Whether the event is one `toolOrdinal` correlates to a function call. */
+function isToolEvent(event: CodexBackendEvent): boolean {
+  return event.type === 'response.function_call_arguments.delta'
+    || event.type === 'response.function_call_arguments.done'
+    || ((event.type === 'response.output_item.added' || event.type === 'response.output_item.done') && event.item?.type === 'function_call');
 }
 
 /** The output position an event actually carries, or nothing. */

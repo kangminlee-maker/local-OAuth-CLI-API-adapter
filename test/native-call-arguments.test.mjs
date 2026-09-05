@@ -1288,3 +1288,47 @@ test('a call identified by folding a finished holder into it is one call on ever
     assert.deepEqual(starts, [[0, 'tool_use'], [1, 'text']]);
   });
 });
+
+test('a duplicate frame for a known call, mislabelled with a higher position, is not the vendor moving on: the cut call\'s block stays open (r31-codex F5)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'probe' } },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_a', delta: '{"a":' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_a', arguments: '{"a":' },
+    { type: 'response.function_call_arguments.done', output_index: 9, item_id: 'fc_a', arguments: '{"a":' },
+    { type: 'response.incomplete', response: { id: 'r', model: 'gpt-5.5', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [{ type: 'function_call', id: 'fc_a', call_id: 'call_a', name: 'probe', arguments: '{"a":' }] } },
+  ];
+  await withProxyEvents(vendor, async (url) => {
+    const streamed = await post(`${url}/v1/messages`, ANTHROPIC, { ...MESSAGES, tool_choice: { type: 'auto' }, stream: true });
+    const { frames, starts, stops, partial } = messagesBlocks(streamed.text);
+    assert.deepEqual(starts, [[0, 'tool_use']]);
+    assert.equal(partial, '{"a":');
+    assert.deepEqual(stops, [], 'the cut call\'s block is left open');
+    assert.equal(frames.find((frame) => frame.type === 'message_delta')?.delta?.stop_reason, 'max_tokens');
+  });
+});
+
+test('a completion-time fold does not stale the count the anonymous item after it is judged by: the other call is completed, not left a fragment (r32-fable F1)', async () => {
+  const vendor = [
+    { type: 'response.output_item.added', item: { type: 'function_call', call_id: 'call_a' } },
+    { type: 'response.output_item.added', output_index: 0, item: { type: 'function_call', id: 'fc_b' } },
+    { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_c', call_id: 'call_c', name: 'beta' } },
+    { type: 'response.function_call_arguments.delta', output_index: 1, item_id: 'fc_c', delta: '{"c' },
+    { type: 'response.completed', response: { id: 'r', model: 'gpt-5.5', output: [
+      { type: 'function_call', id: 'fc_b', call_id: 'call_a', name: 'alpha', arguments: '{"a":1}' },
+      { type: 'function_call', arguments: '{"c":3}' },
+    ] } },
+  ];
+  const TWO_CHAT = { ...CHAT, tools: [{ type: 'function', function: { name: 'alpha', parameters: { type: 'object' } } }, { type: 'function', function: { name: 'beta', parameters: { type: 'object' } } }], tool_choice: 'auto' };
+  const TWO_MESSAGES = { ...MESSAGES, tools: [{ name: 'alpha', input_schema: { type: 'object' } }, { name: 'beta', input_schema: { type: 'object' } }], tool_choice: { type: 'auto' } };
+  await withProxyEvents(vendor, async (url) => {
+    const chat = await post(`${url}/v1/chat/completions`, OPENAI, TWO_CHAT);
+    assert.equal(chat.status, 200, chat.text);
+    const calls = JSON.parse(chat.text).choices[0].message.tool_calls.map((call) => [call.id, call.function.name, call.function.arguments]);
+    assert.deepEqual(calls.find(([id]) => id === 'call_c'), ['call_c', 'beta', '{"c":3}'], JSON.stringify(calls));
+    assert.deepEqual(calls.find(([id]) => id === 'call_a'), ['call_a', 'alpha', '{"a":1}'], JSON.stringify(calls));
+    const messages = await post(`${url}/v1/messages`, ANTHROPIC, TWO_MESSAGES);
+    assert.equal(messages.status, 200, messages.text);
+    const blocks = JSON.parse(messages.text).content.filter((block) => block.type === 'tool_use').map((block) => [block.id, JSON.stringify(block.input)]);
+    assert.deepEqual(blocks.find(([id]) => id === 'call_c'), ['call_c', '{"c":3}'], JSON.stringify(blocks));
+  });
+});
