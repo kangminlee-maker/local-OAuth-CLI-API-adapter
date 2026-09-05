@@ -255,6 +255,33 @@ test('a claude turn abandoned mid-flight leaves a session that still answers', {
   }
 });
 
+test('the claude runtime\'s deadline bounds silence, not duration: a turn streaming past the budget completes, a turn that fell silent ends (r51-codex)', { timeout: 20_000 }, async () => {
+  // The runtime armed its own timer once at the turn's start, so a turn that
+  // streamed for longer than the budget was cut at the budget — while the
+  // manager's deadline, restarted by every event, would have let it run.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const session = await ClaudeNativeCliChatSession.create({
+    command: fakeClaude,
+    cwd,
+    model: 'claude-opus-4-8',
+    timeoutMs: 300,
+  });
+  openSessions.push(() => session.close());
+  try {
+    const startedAt = Date.now();
+    // Six deltas 100 ms apart, the result at ~700 ms: past the budget, never silent for it.
+    assert.equal(await turnText(session, 'SLOW'), 'SLOW-DONE');
+    assert.ok(Date.now() - startedAt >= 600, `the turn ran its whole length: ${Date.now() - startedAt} ms`);
+    // One event and then silence: the deadline still ends it, at the budget.
+    const silentAt = Date.now();
+    await assert.rejects(turnText(session, 'PARTIAL'), /timed out after 300ms of silence/);
+    assert.ok(Date.now() - silentAt < 1000, `silence ended at the budget: ${Date.now() - silentAt} ms`);
+  } finally {
+    await session.close();
+  }
+});
+
 test('an interrupted claude turn leaves a session that still answers', { timeout: 20_000 }, async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
   tempDirs.push(cwd);

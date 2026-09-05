@@ -2032,11 +2032,6 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
     force?: boolean;
     previousAccessToken?: string;
   } = {}, signal?: AbortSignal): Promise<CodexBackendAuth> {
-    // A caller that has gone starts no refresh — from `readAuth` after its
-    // own check, or after a backend 401 (r51-fable: the forced refresh ran
-    // for a caller that left while the 401 body was on the wire). A refresh
-    // already running completes and is persisted; only the wait ends.
-    if (signal?.aborted) throw abortError();
     return await withRefreshLock(this.codexHome, signal, async () => {
       const parsed = await this.loadAuthFile();
       const current = authFromFile(parsed);
@@ -2047,6 +2042,13 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       if (!current.refreshToken) {
         throw codexRefreshError('Codex OAuth auth.json must include tokens.refresh_token to refresh codex-backend access.');
       }
+      // The point of no return: a refresh that starts completes and is
+      // persisted — a refresh token is single-use — so a caller that has
+      // gone is refused HERE, whatever wait it left during: `readAuth`'s
+      // door only refuses one gone before the auth read, and the forced
+      // refresh after a backend 401 never passed it (round 51: both
+      // started a refresh for a caller that had gone).
+      if (signal?.aborted) throw abortError();
       const refreshResponse = await requestChatgptTokenRefresh(current.refreshToken);
       const updated = mergeRefreshedAuth(parsed, refreshResponse);
       await saveAuthFile(this.codexHome, updated);

@@ -32,6 +32,33 @@ rl.on('line', (line) => {
   // A child that took the prompt and never answered — the failure an interrupt
   // exists for, and the only way to hold a turn open here.
   if (text.includes('HANG')) return;
+  // A turn that streams for longer than one deadline while never falling
+  // silent for one: six deltas 100 ms apart, then the result.
+  if (text.includes('SLOW')) {
+    write({ type: 'system', subtype: 'init', session_id: 'fake_native_session' });
+    let step = 0;
+    const tick = () => {
+      if (step < 6) {
+        write({
+          type: 'stream_event',
+          event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `${step} ` } },
+          session_id: 'fake_native_session',
+        });
+        step += 1;
+        setTimeout(tick, 100);
+        return;
+      }
+      write({
+        type: 'result',
+        subtype: 'success',
+        result: 'SLOW-DONE',
+        session_id: 'fake_native_session',
+        usage: { input_tokens: 1, output_tokens: 6 },
+      });
+    };
+    setTimeout(tick, 100);
+    return;
+  }
   // One event and then silence: the turn produces, so its reader can stop
   // advancing at a yield, and the turn stays open behind it.
   if (text.includes('PARTIAL')) {
