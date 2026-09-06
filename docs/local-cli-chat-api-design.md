@@ -231,7 +231,11 @@ its runtime refused every turn.
 The child is the runtime's, and it owns one at a time. A teardown — a close, a replacement, a
 handshake that failed — returns once the child has EXITED: `SIGTERM`, a grace, `SIGKILL` to the
 same handle, a grace; the credentials copy a codex child ran with is removed after that exit, and
-a replacement spawns its successor only after it. A child still there after the second grace is
+a replacement spawns its successor only after it. The server's own close closes every session at
+once (`closeAll`), and no session is created after it began: a create that arrives then, or one
+whose runtime was still starting when the close began, is refused `503 shutting_down` — its
+runtime, if it got one, closed by the creation itself before the refusal, so no child and no
+credentials copy resolves after the close it never saw (track 1, B-shutdown). A child still there after the second grace is
 named in the close's error, next to a credentials directory that would not go — and no successor
 is spawned while it lives: a turn asked meanwhile reports that the child did not exit, and the
 next turn after the handle reports its exit gets a child. A child that died on its own is

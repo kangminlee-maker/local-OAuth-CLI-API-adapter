@@ -1,6 +1,6 @@
 # Design task: native chat session lifecycle atomicity
 
-**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 closed by bundle B-child (see § Bundle B-child, reviewed and folded); gap 5 is bundle B-shutdown (designed, see § Bundle B-shutdown; implementation next), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
+**Status:** closing — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 closed by bundle B-child (see § Bundle B-child, reviewed and folded); gap 5 closed by bundle B-shutdown (see § Bundle B-shutdown). Every gap is closed; the task ends with the review of its last two commits, gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
 **Scope:** `LocalCliChatSessionManager` (`streamTurn` admission, `interrupt`, `close`,
 `closeAll`, `create`) and `CodexNativeCliChatSession` (`startTurn`, `stopTurn`, `replaceChild`,
 `teardownChild`, `close`, the `native` snapshot) in `src/chat/`.

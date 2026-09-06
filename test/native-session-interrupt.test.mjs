@@ -1641,6 +1641,46 @@ test('a claude turn whose reader walked away keeps its idle deadline alive with 
 });
 
 // ---------------------------------------------------------------------------
+// Track 1, bundle B-shutdown: the closing epoch (gap 5).
+
+test('a global close that lands while a session is still being created ends that session too: the create is refused, its child is gone when closeAll resolves, and nothing is listed (t1 B-shutdown gap 5)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  // The handshake is slow: the close lands inside it.
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '450';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  // Only the child's credentials copy lands here: the manager's own temp dirs were made above.
+  const privateTmp = await mkdtemp(join(tmpdir(), 'interrupt-isolation-'));
+  const originalTmp = process.env.TMPDIR;
+  process.env.TMPDIR = privateTmp;
+  let pid = 0;
+  try {
+    const creating = manager.create({ runtime: 'codex' }).then(
+      (created) => ({ kind: 'created', id: created.id }),
+      (err) => ({ kind: 'refused', status: err.statusCode, code: err.code, message: err.message }),
+    );
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('initialize'), 3_000, 'the handshake to be in flight');
+    pid = await publishedPid(pidFile);
+    await manager.closeAll();
+    assert.equal(processAlive(pid), false, 'the child is gone when closeAll resolves');
+    const outcome = await creating;
+    assert.equal(outcome.kind, 'refused', JSON.stringify(outcome));
+    assert.equal(outcome.status, 503);
+    assert.equal(outcome.code, 'shutting_down');
+    assert.deepEqual(await readdir(privateTmp), [], 'no credentials copy outlives the close');
+    // A create after the close is refused the same way.
+    await assert.rejects(manager.create({ runtime: 'codex' }), (err) => err.statusCode === 503 && err.code === 'shutting_down');
+  } finally {
+    reapFixtureChild(pid);
+    if (originalTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmp;
+    tempDirs.push(privateTmp);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Track 1, round 3 (codex seat) on B-child.
 
 /** The one isolation root under a private TMPDIR, as the r53 fixtures find it. */

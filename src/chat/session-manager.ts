@@ -103,6 +103,16 @@ export class LocalCliChatSessionManager {
   private readonly defaultCwd: string;
   private readonly runtimes: Partial<Record<LocalCliChatRuntime, LocalCliChatRuntimeFactory>>;
   private readonly sessions = new Map<string, ManagedSession>();
+  /**
+   * Set by `closeAll()` before anything else, never cleared: a manager that
+   * has begun closing accepts no session again, and a runtime whose factory
+   * resolves after that is closed by its own creation (t1 B-shutdown, gap 5:
+   * a creation in flight resolved after the global close and left a live
+   * child — the order the server's own close takes).
+   */
+  private closing = false;
+  /** The creations in flight — the factory awaited — so the global close can wait for them. */
+  private readonly creations = new Set<Promise<void>>();
 
   constructor(options: LocalCliChatSessionManagerOptions) {
     this.defaultCwd = options.defaultCwd;
@@ -119,19 +129,35 @@ export class LocalCliChatSessionManager {
       throw new LocalCliChatError(`Runtime is not enabled for local CLI chat sessions: ${runtime}`, 400, 'runtime_not_enabled');
     }
     const cwd = resolve(input.cwd ?? this.defaultCwd);
-    const nativeSession = await factory({ ...input, runtime, cwd });
-    const session: ManagedSession = {
-      id: `sess_${randomUUID()}`,
-      runtime,
-      createdAt: Math.floor(Date.now() / 1000),
-      cwd,
-      model: input.model,
-      title: input.title,
-      nativeSession,
-      closed: false,
-    };
-    this.sessions.set(session.id, session);
-    return snapshot(session);
+    if (this.closing) throw shuttingDown();
+    let settle = (): void => {};
+    const creation = new Promise<void>((resolve_) => { settle = resolve_; });
+    this.creations.add(creation);
+    try {
+      const nativeSession = await factory({ ...input, runtime, cwd });
+      if (this.closing) {
+        // The close began while this runtime was starting: it is this
+        // creation's to end — the close never saw it — and its caller hears
+        // the refusal, or the teardown's own failure.
+        await nativeSession.close();
+        throw shuttingDown();
+      }
+      const session: ManagedSession = {
+        id: `sess_${randomUUID()}`,
+        runtime,
+        createdAt: Math.floor(Date.now() / 1000),
+        cwd,
+        model: input.model,
+        title: input.title,
+        nativeSession,
+        closed: false,
+      };
+      this.sessions.set(session.id, session);
+      return snapshot(session);
+    } finally {
+      this.creations.delete(creation);
+      settle();
+    }
   }
 
   get(id: string): LocalCliChatSessionSnapshot {
@@ -160,6 +186,11 @@ export class LocalCliChatSessionManager {
   }
 
   async closeAll(): Promise<void> {
+    // No session is created after this line, and every creation in flight
+    // settles first — by closing its own runtime — so nothing resolves after
+    // the close it never saw (t1 B-shutdown).
+    this.closing = true;
+    await Promise.all([...this.creations]);
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     // Every session is torn down and its bookkeeping finished before any
@@ -535,6 +566,10 @@ function findLastEvent(
     if (events[index]?.event === eventName) return events[index];
   }
   return undefined;
+}
+
+function shuttingDown(): LocalCliChatError {
+  return new LocalCliChatError('Local CLI chat sessions are not accepted: the proxy is shutting down.', 503, 'shutting_down');
 }
 
 function parseRuntime(value: unknown): LocalCliChatRuntime {
