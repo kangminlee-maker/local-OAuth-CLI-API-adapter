@@ -1,6 +1,6 @@
 # Design task: native chat session lifecycle atomicity
 
-**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 are bundle B-child (design in progress), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
+**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 are bundle B-child (designed, see § Bundle B-child; implementation next), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
 **Scope:** `LocalCliChatSessionManager` (`streamTurn` admission, `interrupt`, `close`,
 `closeAll`, `create`) and `CodexNativeCliChatSession` (`startTurn`, `stopTurn`, `replaceChild`,
 `teardownChild`, `close`, the `native` snapshot) in `src/chat/`.
@@ -84,6 +84,91 @@ as the floor. Per the campaign rule, a fix that keeps causing fixes is a design 
 - A **creation registry and a closing epoch** in the manager: register a creation before awaiting
   the factory; during global close refuse new admission, await in-flight factories, and immediately
   close any runtime that resolves after shutdown began. Closes 5.
+
+## Bundle B-child — the child handle and the abandoned turn (design, 2026-09-06)
+
+Synthesized from two blind drafts (Fable frontier, codex gpt-5.6-sol ultra) on `46b141e` from
+one packet (`review-artifacts/t1-design-packet-bchild.md`; drafts and the disposition in
+`review-artifacts/t1-design-log.md`). Both drafts kept the public surface (`ready | running |
+closed`, the snapshot, the SSE names, the HTTP codes, `LocalCliChatRuntimeSession`) and the B-res
+occupancy model unchanged, and both closed the three gaps at their existing authorities; the
+synthesis takes each mechanism from the draft that carried it with fewer concepts.
+
+**Gap 6 — one teardown, awaited, escalating (Fable's shape).** `teardownChild` keeps a synchronous
+prefix — reject pendings, close the line reader, capture and null `child`/`lineReader`, clear
+`threadId` and delete `native.thread_id` (today nothing clears them) — and gains an awaited
+continuation on the captured handle: `SIGTERM` → await the child's `close` within
+`CHILD_EXIT_GRACE_MS` (1000 ms) → `SIGKILL` the same handle → await within the same grace → only
+then remove the captured isolation directory (failure → `isolationDebt`, as today). The
+continuation never rejects; a child alive after `SIGKILL` is named in the close's existing terminal
+error next to the directories (the session is closed either way; the copy is removed either way).
+One shared helper carries the escalation for both runtimes (one rule, one owner). Every caller
+awaits its own call: `close()` (after the archive race), `replaceChild`/`restartChild` (**before**
+spawning — a session owns at most one child at any instant), the failed-handshake rollback in
+`start()`, and claude's `close()`/restart. Claude gains a `closed` flag that this serialization
+makes load-bearing (the round-55 "inert" verdict flips because its precondition — no await before
+the spawn — flips): checked before the restart's spawn and by the on-demand start. Bound: codex
+close ≤ archive `min(2000, timeoutMs)` + 2 × 1000 + removal ≈ 4000 ms worst, under the 5000 ms
+pin (`test/codex-native-session.test.mjs:55`); claude ≤ 2000 ms. The grace is a named constant
+measured only against the fixture child offline (exit 2 ms after `SIGTERM`); retune against a live
+measurement before release.
+
+**Gap 3 — restart on demand through the existing replacement (both drafts).** `startTurn` awaits
+at most one replacement per turn: the in-flight one if any (today's wait, raced with the turn's
+stop), else — no child, not closed — one it initiates through `replaceChild()`/`restartChild()`,
+raced with the stop the same way; then the existing checks. A turn that only awaited someone
+else's replacement keeps `not running` when it fails (the r55 pin, unchanged); the turn that
+**initiated** the attempt reports that attempt's own failure (the spawn or handshake error — the
+initiator owns the attempt and its reason; codex's refinement). No retry loop: each failed turn
+costs one spawn + handshake, paced by callers. `native.thread_id` follows the child — cleared by
+the teardown prefix, set only by the handshake — so the snapshot never names a thread that no
+longer exists; `ready` means "a turn will be attempted". No new status value, no `usableChild`
+predicate: absence is `child === null` and the runtime's own refusal.
+
+**Gap 7 — the turn outlives its caller; the manager drains (codex's locus).** The contract
+sentence (`docs/api-interface-contract.md`, the disconnect row) is enforced, not changed: a
+disconnect is not a cancellation. A mid-stream `return()` without a stop no longer calls
+`inner.return()`: the caller's iteration ends (the public iterator finished, `session.reservation`
+detached), and the manager starts one caught background loop over `inner.next()` that discards
+events, keeps the reservation's idle deadline armed per event (the one timeout concept the
+contract has — silence, not duration), tracks its read as `pending` so a stop's `closeInner` still
+queues behind it, and runs to the terminal event, where `runtimeEvents`' `finally` releases as
+today. The runtime generators are consumed normally, so codex keeps `turn` until `turn/completed`
+and claude until its `result`: `isBusy()` holds the session at `running`/409, and claude's
+route-to-current-turn is always route-to-the-turn-that-started-it — the misroute dies
+structurally, without per-turn line ownership. A deadline expiry, interrupt, or close during the
+drain takes the existing stop paths (the abort signal reaches the runtime's stop; the reservation
+need not be attached). No runtime file changes for this gap. Return-as-stop was rejected by both
+drafts: on claude a stop is a child replacement, so every dropped socket would cost the session its
+conversation — the loss the contract sentence exists to prevent.
+
+**Concept surface.** Public: preserving. Internal: +1 shared escalation helper, +1 grace constant,
++1 claude `closed` (codex's concept reused), +1 private manager drain phase; retired: the unnamed
+dead-but-`ready` state and the stale-thread claim. Rejected: a `tearingDown` join promise (the
+sync prefix plus the existing `restarting` join already serialize), a `usableChild()` predicate, a
+new status value, an availability interface member, self-close on failed replacement (a transient
+process failure would become 410).
+
+**Plan (each check fails on `46b141e` unless stated; one mutant per gap plus extras).** (1) Red
+fixtures first: gap 6 a `SIGTERM`-ignoring fixture child dead when `close()` resolves, on both
+runtimes, and old exit before successor spawn; gap 3 a failed replacement's snapshot without
+`thread_id`, an `initialize` per later turn, and a later turn completing once the fault clears;
+gap 7 `running` + 409 after a writer failure, no `turn/start, turn/start`, no `FIRST_LATE` in a
+later turn, a drain ended by the idle deadline with the interrupt written. (2) Gap 6 codex: helper,
+async teardown, callers await, replacement serialized before spawn, thread clearing in the prefix.
+(3) Gap 6 claude: same helper, `closed` guard (its close-during-restart check cannot fail on
+`46b141e` — the hazard is created by step 2's await — pinned against that head and guarded by the
+mutant). (4) Gap 3 both runtimes. (5) Gap 7 in the manager. (6) Docs: the design note's "reader
+return" language distinguishes reservation release from the drain; the contract row's residual
+shrinks to gap 5; full suite, probes, mutants. Mutants: no `SIGKILL` stage / forget without
+awaiting exit; no `closed` check before the spawn; on-demand branch a no-op; thread clearing
+omitted; `inner.return()` restored on the non-stop return; the drain's deadline not re-armed.
+
+**Change conditions (pre-noted).** A real consumer found relying on disconnect-as-cancel (expecting
+`ready` right after dropping the SSE socket) flips gap 7 to return-as-stop with the contract
+sentence changed and the HTTP disconnect handling enumerated. A real consumer that must distinguish
+"has a handshaken child" from "will attempt a start on this turn" before submitting fires the
+status split (an explicit unavailable/recovering value with every reader enumerated).
 
 ## Bundle B-res — the turn reservation (design, 2026-09-06)
 
