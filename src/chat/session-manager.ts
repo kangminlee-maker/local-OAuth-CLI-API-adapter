@@ -126,6 +126,27 @@ export class LocalCliChatSessionManager {
    * what remains is its error too (t1-r4-codex).
    */
   private readonly departures = new Map<ManagedSession, Promise<void>>();
+  /**
+   * Runtimes a global close could not finish — a child that would not exit, a
+   * credentials copy that would not go — and runtimes a creation had to close
+   * and could not: kept here until a close succeeds, so a survivor is never
+   * forgotten between global closes. A later `closeAll` re-closes each and drops
+   * the ones that finally go; the ones still here are its error too. The
+   * `close(id)` path keeps its own retry through `departures` and does not go
+   * here, so nothing is closed twice in one sweep (t1-r5-codex: a session the
+   * global close could not end, and a creation-owned close that failed, were
+   * each reported once and then dropped, and the next global close reported a
+   * clean shutdown over the live child).
+   */
+  private readonly residual = new Set<LocalCliChatRuntimeSession>();
+  /**
+   * The global close in flight: a second `closeAll` under it is the same close,
+   * not a new one that snapshots an empty map and resolves over a child the
+   * first is still ending (t1-r5-codex). Cleared when the sweep settles, so a
+   * later `closeAll` starts a fresh one — which re-closes anything in
+   * `residual` or `departures` that the last could not finish.
+   */
+  private closeAllInFlight: Promise<void> | null = null;
 
   constructor(options: LocalCliChatSessionManagerOptions) {
     this.defaultCwd = options.defaultCwd;
@@ -157,6 +178,10 @@ export class LocalCliChatSessionManager {
         try {
           await nativeSession.close();
         } catch (err) {
+          // The runtime this creation owned could not be closed: kept for the
+          // next global close to re-close and report, not lost once this
+          // creation's rejection is aggregated the first time (t1-r5-codex F4).
+          this.residual.add(nativeSession);
           fail(err);
           throw err;
         }
@@ -212,10 +237,30 @@ export class LocalCliChatSessionManager {
   }
 
   async closeAll(): Promise<void> {
-    // No session is created after this line, and every creation in flight
-    // settles first — by closing its own runtime — so nothing resolves after
-    // the close it never saw (t1 B-shutdown).
+    // No session is created after this line — set before anything else, and
+    // never cleared (t1 B-shutdown).
     this.closing = true;
+    // A second call under one already in flight is the same close: it waits for
+    // that one and its child, rather than snapshotting an empty map and
+    // resolving over a child the first is still ending (t1-r5-codex F1). The
+    // flight is cleared when the sweep settles, so a later call starts a fresh
+    // sweep that re-closes whatever this one could not finish.
+    if (this.closeAllInFlight) return this.closeAllInFlight;
+    const tracked = this.runCloseAll().finally(() => {
+      if (this.closeAllInFlight === tracked) this.closeAllInFlight = null;
+    });
+    this.closeAllInFlight = tracked;
+    return tracked;
+  }
+
+  private async runCloseAll(): Promise<void> {
+    // What earlier closes could not finish, snapshot before this sweep does any
+    // work: re-closed here, and dropped as each finally goes. A runtime a
+    // creation adds to `residual` while this sweep runs is the NEXT sweep's, not
+    // closed twice now (t1-r5-codex F3, F4).
+    const residual = [...this.residual];
+    // Every creation in flight settles first — by closing its own runtime — so
+    // nothing resolves after the close it never saw (t1 B-shutdown).
     const creations = await Promise.allSettled([...this.creations]);
     const departures = [...this.departures];
     const sessions = [...this.sessions.values()];
@@ -225,10 +270,14 @@ export class LocalCliChatSessionManager {
     // credentials copy on disk says so to the server's own close, which used
     // to hear a clean shutdown over it (r55-codex).
     const outcomes = await Promise.allSettled([
+      ...residual.map((nativeSession) => this.closeResidual(nativeSession)),
       ...departures.map(async ([session, departure]) => {
         try {
           await departure;
         } catch {
+          // A `close(id)` that failed keeps retrying through `departures`: its
+          // entry stays until this re-close succeeds, so it does not also go in
+          // `residual` (no runtime is closed twice in one sweep, t1-r5-codex).
           await session.nativeSession.close();
         }
         this.departures.delete(session);
@@ -236,13 +285,30 @@ export class LocalCliChatSessionManager {
       ...sessions.map(async (session) => {
         session.closed = true;
         if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
-        await session.nativeSession.close();
+        // A session the global close itself could not end is remembered, not
+        // forgotten once reported (t1-r5-codex F3).
+        await this.closeResidual(session.nativeSession);
       }),
     ]);
     const failures = [...creations, ...outcomes].filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
     if (failures.length === 1) throw failures[0].reason;
     if (failures.length > 1) {
       throw new Error(failures.map((failure) => (failure.reason instanceof Error ? failure.reason.message : String(failure.reason))).join('; '));
+    }
+  }
+
+  /**
+   * Closes a runtime and remembers it iff the close failed: a survivor a global
+   * close could not end stays in `residual` for the next one to re-close and
+   * report; a close that succeeds drops it (t1-r5-codex F3, F4).
+   */
+  private async closeResidual(nativeSession: LocalCliChatRuntimeSession): Promise<void> {
+    try {
+      await nativeSession.close();
+      this.residual.delete(nativeSession);
+    } catch (err) {
+      this.residual.add(nativeSession);
+      throw err;
     }
   }
 

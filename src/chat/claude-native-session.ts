@@ -319,9 +319,14 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     });
     // A pipe that dies under a write reports it here, and an `error` event with
     // no listener is an uncaught exception: one racing write would take the
-    // whole proxy down rather than the turn.
+    // whole proxy down rather than the turn. When the write returned cleanly and
+    // the failure came a tick later, this is the only place it surfaces: the
+    // turn hears it, and a child that cannot be written to is replaced so the
+    // next turn does not meet the same dead pipe (t1-r5-codex F2).
     child.stdin.on('error', (err) => {
-      if (this.child === child) this.failActive(err);
+      if (this.child !== child) return;
+      this.failActive(err);
+      if (!this.closed) void this.restartChild().catch(() => undefined);
     });
     child.on('close', (code, signal) => {
       if (this.child !== child) return;

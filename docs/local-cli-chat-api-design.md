@@ -237,14 +237,19 @@ whose runtime was still starting when the close began, is refused `503 shutting_
 runtime, if it got one, closed by the creation itself before the refusal, so no child and no
 credentials copy resolves after the close it never saw (track 1, B-shutdown); a session already
 leaving through its own close is joined, one whose close failed is closed again, and a runtime a
-creation had to close and could not is the global close's error as well as its creator's. A child still there after the second grace is
+creation had to close and could not is the global close's error as well as its creator's. Two
+global closes in flight are one: the second waits for the first and its children rather than
+resolving over a child the first is still ending, and a session or a creation-owned runtime a
+global close could not end is kept and re-closed by the next until one succeeds — reported each
+time it still lives, never dropped over a survivor. A child still there after the second grace is
 named in the close's error, next to a credentials directory that would not go — and no successor
 is spawned while it lives: a turn asked meanwhile reports that the child did not exit, and the
 next turn after the handle reports its exit gets a child. A child that died on its own is
 forgotten at once, thread and all; its credentials copy is the next teardown's, whose caller
 awaits it. An interrupt answers when the child has been told, not when it acknowledges: the
 session is free at the write — and a child that cannot be written to is replaced, thread and
-all, so nothing starts ahead of an interrupt it never received. A session whose
+all, so nothing starts ahead of an interrupt it never received; a write that fails on the pipe is
+that case whether it throws at the call or reports the dead pipe a tick later as a stream error. A session whose
 child is gone — a replacement that failed, a child that died — names no thread and answers
 `ready`: the next turn starts a child for itself, once per turn, and a turn that could not get
 one reports the start's own failure (`initialize timed out after …`), whether it waited for that

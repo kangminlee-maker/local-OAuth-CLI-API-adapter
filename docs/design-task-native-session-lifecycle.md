@@ -203,6 +203,26 @@ before its teardown is awaited, so a `closeAll` landing meanwhile saw nothing to
 resolve; the global close joins one in flight and re-closes one that failed, and what still
 remains is its error.
 
+**Review round 5 (Fable: clean; codex: F1–F4, all pre-existing, folded).** The Fable seat found
+the two round-4 folds correct on the observer surface. The codex seat, standing in for the checks
+its round-4 run did not finish, found four older lifecycle holes, all reproducing on the a/ side:
+(F1) two `closeAll()` calls in flight are not one — the second snapshots an empty map and resolves
+over a child the first is still ending; the global close in flight is now shared, and a second
+call under it waits for that one, while a later call starts a fresh sweep that re-closes whatever
+the last could not finish. (F2) the round-4 write-failure fold caught only a synchronous throw;
+Node reports a dead pipe asynchronously — `stdin.write` returns and the `error` event arrives a
+tick later — so an interrupt still went unwritten and the next turn reached the child. The stdin
+`error` handler now replaces the child too (both runtimes), the same rule as the synchronous
+throw: a child that cannot be written to is replaced, thread and all. (F3) a session the global
+close itself could not end — a child that would not exit — was reported once and then dropped, so
+the next global close resolved clean over the live child. (F4) the same for a runtime a creation
+had to close and could not: reported once, then forgotten. Both now go in one `residual` registry,
+re-closed by every later global close until one succeeds and dropped only then; the `close(id)`
+path keeps its own retry through `departures`, so nothing is closed twice in one sweep. The five
+fixtures (`t1 r5-codex`) are red on `8c02113`; five mutants (the join dropped; the stdin replace
+dropped, each runtime; the residual add dropped, session path and creation path) are each red on
+the fixture aimed at it.
+
 **Change conditions (pre-noted).** A real consumer found relying on disconnect-as-cancel (expecting
 `ready` right after dropping the SSE socket) flips gap 7 to return-as-stop with the contract
 sentence changed and the HTTP disconnect handling enumerated. A real consumer that must distinguish

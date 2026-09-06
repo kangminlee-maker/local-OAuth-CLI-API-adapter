@@ -548,8 +548,15 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // An `error` event with no listener is an uncaught exception: one racing
     // write to a child that has just died would take the whole proxy down
     // rather than the turn. The sibling claude session guards the same pipe.
+    // A pipe that dies reports it here when the write returned cleanly and the
+    // failure arrived a tick later — the shape `send()`'s synchronous catch
+    // cannot see. A child that cannot be written to cannot be told anything: it
+    // is replaced, thread and all, the same as one whose write threw, so
+    // nothing starts ahead of an interrupt it never received (t1-r5-codex F2).
     child.stdin.on('error', (err) => {
-      if (this.child === child) this.failActive(err);
+      if (this.child !== child) return;
+      this.failActive(err);
+      if (!this.closed) void this.replaceChild().catch(() => undefined);
     });
     child.on('close', (code, signal) => {
       if (this.child !== child) return;

@@ -1841,6 +1841,172 @@ test('a close that failed over a child that would not exit is re-closed and repo
 });
 
 // ---------------------------------------------------------------------------
+// Track 1, round 5 (codex seat) on the round-4 folds.
+
+test('two global closes in flight are one: the second resolves only once the first has ended every child (t1 r5-codex F1)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_IGNORE_SIGTERM = '1';
+  const { manager } = await startCodexManager(2_000);
+  await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  try {
+    // The first close waits a second for a child that ignores SIGTERM; the second lands inside that wait.
+    let firstSettled = false;
+    const first = manager.closeAll().finally(() => { firstSettled = true; });
+    await delay(100);
+    await manager.closeAll();
+    assert.equal(processAlive(pid), false, 'the second global close resolved over no live child');
+    assert.equal(firstSettled, true, 'the second global close joined the first');
+    await first;
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+// A pipe that dies asynchronously: the parent's `stdin.write` returns (Node
+// returns false and throws nothing), and the failure arrives later as an
+// `error` event on the stream — the shape a real dead reader produces, and the
+// one a synchronous-throw-only guard misses. The next matching write drops its
+// bytes and schedules that event on the owned child handle.
+function failNextWriteAsync(handle, marker) {
+  const realWrite = handle.stdin.write.bind(handle.stdin);
+  handle.stdin.write = (chunk, ...rest) => {
+    if (String(chunk).includes(marker)) {
+      handle.stdin.write = realWrite;
+      queueMicrotask(() => handle.stdin.emit('error', Object.assign(new Error('write EPIPE: fixture pipe died'), { code: 'EPIPE' })));
+      return false;
+    }
+    return realWrite(chunk, ...rest);
+  };
+}
+
+test('a codex interrupt whose write fails on the pipe asynchronously — not by throwing — replaces the child too: nothing is started ahead of an interrupt the child never received (t1 r5-codex F2)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // The interrupt's write returns cleanly and the pipe fails a tick later.
+  failNextWriteAsync(manager.sessions.get(session.id).nativeSession.child, '"turn/interrupt"');
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the turn to reach the child');
+    await manager.interrupt(session.id);
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the caller heard the stop');
+    // The child could not be told: it is replaced, and the next turn runs on the successor.
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(second.status, 'completed', JSON.stringify(second.final));
+    const methods = await receivedMethods(methodLog);
+    assert.equal(methods.filter((method) => method === 'thread/start').length, 2, 'a fresh thread on a fresh child');
+    assert.equal(methods.filter((method) => method === 'turn/start').length, 2, 'one turn per child');
+  } finally {
+    reapFixtureChild(oldPid);
+  }
+});
+
+test('a claude child whose prompt write fails on the pipe asynchronously is replaced: the turn reports the pipe error, and the next turn runs on the successor (t1 r5-codex F2, claude)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  const { manager } = await startClaudeManager(2_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  // The next prompt write returns cleanly and the pipe fails a tick later.
+  failNextWriteAsync(manager.sessions.get(session.id).nativeSession.child, '"type":"user"');
+  try {
+    const failed = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 3_000 });
+    assert.equal(failed.status, 'error', JSON.stringify(failed.final));
+    assert.match(failed.final.raw?.message ?? '', /EPIPE/, JSON.stringify(failed.final));
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const third = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(third.status, 'completed', JSON.stringify(third.final));
+    assert.equal(third.final.text, 'OK');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a session the global close could not end is not forgotten: the next global close closes it again and names what still lives, and resolves once it is gone (t1 r5-codex F3)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  handle.kill = () => true;
+  try {
+    await assert.rejects(manager.closeAll(), /survived SIGKILL/);
+    assert.equal(processAlive(pid), true);
+    await assert.rejects(manager.closeAll(), /survived SIGKILL/, 'the next global close names what its predecessor could not end');
+    process.kill(pid, 'SIGKILL');
+    await waitFor(() => !processAlive(pid), 3_000, 'the child to be gone');
+    await manager.closeAll();
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+test('a runtime its creation could not close is not forgotten after the first report: the next global close closes it again (t1 r5-codex F4)', { timeout: 20_000 }, async () => {
+  let release;
+  const gate = new Promise((resolve_) => { release = resolve_; });
+  let alive = true;
+  let closeCalls = 0;
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => {
+        await gate;
+        return {
+          runtime: 'codex',
+          native: {},
+          async *startTurn() {},
+          isBusy() { return false; },
+          async close() {
+            closeCalls += 1;
+            if (alive) throw new Error('creation teardown left its child alive');
+          },
+        };
+      },
+    },
+  });
+  const creating = manager.create({ runtime: 'codex' }).then((created) => ({ kind: 'created', id: created.id }), (err) => ({ kind: 'rejected', message: err.message }));
+  await delay(20);
+  const closing = manager.closeAll().then(() => ({ kind: 'resolved' }), (err) => ({ kind: 'rejected', message: err.message }));
+  release();
+  const created = await creating;
+  assert.equal(created.kind, 'rejected', JSON.stringify(created));
+  const closed = await closing;
+  assert.equal(closed.kind, 'rejected', JSON.stringify(closed));
+  const callsAfterFirst = closeCalls;
+  assert.ok(callsAfterFirst >= 1);
+  // Still alive: the next global close closes it again and reports it again.
+  await assert.rejects(manager.closeAll(), /left its child alive/, 'the runtime the creation could not close is still the global close\'s');
+  assert.ok(closeCalls > callsAfterFirst, `closed again: ${closeCalls} > ${callsAfterFirst}`);
+  const callsAfterSecond = closeCalls;
+  alive = false;
+  await manager.closeAll();
+  assert.ok(closeCalls > callsAfterSecond, 'closed once more, and gone');
+});
+
+// ---------------------------------------------------------------------------
 // Track 1, round 3 (codex seat) on B-child.
 
 /** The one isolation root under a private TMPDIR, as the r53 fixtures find it. */
