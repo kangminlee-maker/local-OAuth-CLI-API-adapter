@@ -121,8 +121,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private closed = false;
   /** Isolation directories a replacement could not remove — the close's to remove, or to report. */
   private isolationDebt: string[] = [];
-  /** Children still there after `SIGKILL` and its grace — the close's to report. */
-  private survivingPids: number[] = [];
+  /**
+   * Children still there after `SIGKILL` and its grace. No successor is
+   * spawned while one lives — the session owns one child at a time — and the
+   * close names them (t1-r3-codex: a replacement went on over one).
+   */
+  private survivors: ChildProcessWithoutNullStreams[] = [];
 
   private constructor(options: Required<CodexNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -298,7 +302,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // retirement above and the write below: the child is told to stop before it
     // can be asked for anything else. Do not put an `await` in between.
     this.retire(turn);
-    await this.sendTurnInterrupt(turn);
+    // Written, not awaited: the session is free at the write, and the endpoint
+    // answers then — an acknowledgement the child never sent held it for the
+    // whole RPC budget (t1-r3-codex). The request's own failure is caught.
+    void this.sendTurnInterrupt(turn);
   }
 
   /**
@@ -323,6 +330,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // one started here outlived the close, with a credentials directory of
       // its own, and nothing would ever kill it (r53-fable).
       if (this.closed) return;
+      const living = this.livingSurvivors();
+      if (living.length > 0) {
+        throw new Error(`codex app-server child ${living.map((child) => child.pid).join(', ')} did not exit; no replacement is started while it lives`);
+      }
       await this.start();
     })();
     this.restarting = restart;
@@ -419,9 +430,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       }
     }
     this.isolationDebt = remaining;
+    const living = this.livingSurvivors();
     const remains = [
       ...(remaining.length > 0 ? [`its credentials copy could not be removed: ${remaining.join(', ')}`] : []),
-      ...(this.survivingPids.length > 0 ? [`a child survived SIGKILL: ${this.survivingPids.join(', ')}`] : []),
+      ...(living.length > 0 ? [`a child survived SIGKILL: ${living.map((child) => child.pid).join(', ')}`] : []),
     ];
     if (remains.length > 0) {
       throw new Error(`codex native chat session closed, but ${remains.join('; ')}`);
@@ -441,22 +453,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
    * is captured here and nowhere else.
    */
   private async teardownChild(reason: Error): Promise<void> {
-    for (const pending of this.pending.values()) {
-      clearTimeout(pending.timer);
-      pending.reject(reason);
-    }
-    this.pending.clear();
-    this.lineReader?.close();
-    this.lineReader = null;
-    const child = this.child;
-    this.child = null;
+    const child = this.forgetChild(reason);
     const isolation = this.isolation;
     this.isolation = null;
-    this.threadId = '';
-    delete this.native.thread_id;
     if (child) {
       const exit = await terminateChild(child);
-      if (!exit.exited && exit.pid !== undefined) this.survivingPids.push(exit.pid);
+      if (!exit.exited) this.survivors.push(child);
     }
     if (isolation) {
       try {
@@ -471,6 +473,34 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     }
   }
 
+  /**
+   * The teardown's synchronous part: the child and its thread stop being the
+   * session's, and every request waiting on the child is failed. The child's
+   * own exit runs only this — its credentials copy stays for the next
+   * teardown, whose caller awaits it: a removal started here and awaited by
+   * nobody failed after a close had already reported success (t1-r3-codex).
+   */
+  private forgetChild(reason: Error): ChildProcessWithoutNullStreams | null {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(reason);
+    }
+    this.pending.clear();
+    this.lineReader?.close();
+    this.lineReader = null;
+    const child = this.child;
+    this.child = null;
+    this.threadId = '';
+    delete this.native.thread_id;
+    return child;
+  }
+
+  /** The children that outlived their `SIGKILL` and are still there — by their own handles, not by pid. */
+  private livingSurvivors(): ChildProcessWithoutNullStreams[] {
+    this.survivors = this.survivors.filter((child) => child.exitCode === null && child.signalCode === null);
+    return this.survivors;
+  }
+
   private async start(): Promise<void> {
     this.isolation = await createCodexIsolation({
       configuredModel: this.model,
@@ -478,6 +508,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       verbosity: this.verbosity,
       imageGeneration: this.imageGeneration,
     });
+    // A close that landed while the credentials were being copied found
+    // nothing to tear down and then waited out the successor's whole handshake
+    // (t1-r3-codex): checked again here, with the copy just made removed.
+    if (this.closed) {
+      const closed = new Error('codex native chat session closed');
+      await this.teardownChild(closed);
+      throw closed;
+    }
     this.child = spawn(this.command, [
       'app-server',
       ...codexContextIsolationArgs({
@@ -517,10 +555,10 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       if (this.child !== child) return;
       const exit = new Error(`codex app-server exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`);
       this.failActive(exit);
-      // Gone on its own: torn down the same way — its thread forgotten, its
-      // credentials copy removed now rather than at the close — and the next
-      // turn starts a child for itself (t1 B-child gap 3).
-      void this.teardownChild(exit);
+      // Gone on its own: forgotten, thread and all, and the next turn starts a
+      // child for itself (t1 B-child gap 3). Its credentials copy is the next
+      // teardown's — a close's or a replacement's — which its caller awaits.
+      this.forgetChild(exit);
     });
     this.lineReader = readline.createInterface({ input: child.stdout });
     this.lineReader.on('line', (line) => this.handleLine(line));

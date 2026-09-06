@@ -21,9 +21,10 @@ interface Turn {
    * it cut a turn that was streaming past the budget while the manager's
    * deadline, and the contract, let it run (round 51). It is retired with the turn: an abandoned
    * generator never reaches its `finally`, so a turn stopped any other way
-   * left its timer armed to fire on whatever turn was running by then.
+   * left its timer armed to fire on whatever turn was running by then. Armed
+   * once there is a child to be silent — not while the turn waits for one.
    */
-  readonly timer: NodeJS.Timeout;
+  timer: NodeJS.Timeout | null;
 }
 
 export interface ClaudeNativeCliChatSessionOptions {
@@ -59,8 +60,12 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
    * before the close's own teardown runs and is ended by it.
    */
   private closed = false;
-  /** Children still there after `SIGKILL` and its grace — the close's to report. */
-  private survivingPids: number[] = [];
+  /**
+   * Children still there after `SIGKILL` and its grace. No successor is
+   * spawned while one lives — the session owns one child at a time — and the
+   * close names them (t1-r3-codex: a replacement went on over one).
+   */
+  private survivors: ChildProcessWithoutNullStreams[] = [];
 
   private constructor(options: Required<ClaudeNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -95,23 +100,19 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     signal?: AbortSignal,
   ): AsyncIterable<LocalCliChatRuntimeEvent> {
     if (this.closed) throw new Error('claude native chat session is closed');
-    // One replacement per turn: the one in flight, or — no child, and the
-    // session open — one this turn starts (t1 B-child gap 3: a child that died
-    // left the session answering `ready` and every later turn `not running`).
-    const replacement = this.restarting ?? (this.child ? null : this.restartChild());
-    if (replacement) await replacement;
-    if (!this.child) throw new Error('claude native chat session is not running');
     if (this.turn) throw new Error('claude native chat session already has a running turn');
+    // A caller that has already left gets no turn at all: replacing the child
+    // for a turn that was never sent costs the session its child for nothing.
+    if (signal?.aborted) throw new Error('request aborted');
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
-    const timer = setTimeout(() => {
-      queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms of silence`));
-      this.retire();
-      // The child is still working on the abandoned prompt, and every line it
-      // writes goes to whatever turn is active when it arrives — including the
-      // `result` that closes a queue as a success. A timed-out turn's answer
-      // was delivered to the NEXT turn as its own. Retire the child instead.
-      void this.restartChild();
-    }, this.timeoutMs);
+    // Installed before any wait, so a stop can find it: a turn that waited for
+    // a replacement was nobody's, the interrupt found no turn, the caller was
+    // answered, and the turn then ran on the successor (t1-r3-codex). The
+    // stop retires it, and the guard before the write below then finds the
+    // turn no longer its own — the caller was answered at the stop, so the
+    // wait itself need not end early.
+    const turn: Turn = { queue, timer: null };
+    this.turn = turn;
     // Abandoning a turn and interrupting one are the same operation on this
     // runtime, so they take the same path: stopping the child without the
     // restart left the session reporting `ready` over a child that had been
@@ -119,16 +120,24 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     const abort = (): void => {
       void this.stopTurn(turn);
     };
-    // A caller that has already left gets no turn at all: replacing the child
-    // for a turn that was never sent costs the session its child for nothing.
-    if (signal?.aborted) {
-      clearTimeout(timer);
-      throw new Error('request aborted');
-    }
-    const turn: Turn = { queue, timer };
-    this.turn = turn;
     signal?.addEventListener('abort', abort, { once: true });
     try {
+      // One replacement per turn: the one in flight, or — no child, and the
+      // session open — one this turn starts (t1 B-child gap 3: a child that
+      // died left the session answering `ready` and every later turn `not
+      // running`).
+      const replacement = this.restarting ?? (this.child ? null : this.restartChild());
+      if (replacement) await replacement;
+      if (!this.child) throw new Error('claude native chat session is not running');
+      turn.timer = setTimeout(() => {
+        queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms of silence`));
+        this.retire();
+        // The child is still working on the abandoned prompt, and every line it
+        // writes goes to whatever turn is active when it arrives — including the
+        // `result` that closes a queue as a success. A timed-out turn's answer
+        // was delivered to the NEXT turn as its own. Retire the child instead.
+        void this.restartChild().catch(() => undefined);
+      }, this.timeoutMs);
       const request = chatNormalizedRequest(input, this.model);
       const content = await claudeMessageContentFor(request, chatPromptText(input));
       // Assembling the prompt is asynchronous — a path-based image is file I/O
@@ -151,7 +160,6 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       })}\n`);
       for await (const event of queue) yield event;
     } finally {
-      clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', abort);
       if (this.turn?.queue === queue) this.retire();
     }
@@ -182,8 +190,9 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     //
     // Not awaited: the replacement is a process launch, and the next turn
     // already waits for it. Making the interrupt endpoint wait for a spawn
-    // spends that latency on every caller who asked only to stop.
-    void this.restartChild();
+    // spends that latency on every caller who asked only to stop. Its refusal
+    // — a child that did not exit — is the next turn's to report.
+    void this.restartChild().catch(() => undefined);
   }
 
   /** Replaces the child so the session stays usable after an abandoned turn. */
@@ -201,6 +210,11 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       // child's buffer reported the previous child's death as the diagnosis for
       // an unrelated turn's failure.
       this.stderr = '';
+      if (this.closed) return;
+      const living = this.livingSurvivors();
+      if (living.length > 0) {
+        throw new Error(`claude code child ${living.map((child) => child.pid).join(', ')} did not exit; no replacement is started while it lives`);
+      }
       try {
         await this.start();
       } catch {
@@ -229,11 +243,18 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.retire();
     // A replacement in flight ends the previous child and, closed, starts no
     // other; the close resolves only once no child of this session is left.
-    if (this.restarting) await this.restarting;
+    if (this.restarting) await this.restarting.catch(() => undefined);
     await this.teardownChild();
-    if (this.survivingPids.length > 0) {
-      throw new Error(`claude native chat session closed, but a child survived SIGKILL: ${this.survivingPids.join(', ')}`);
+    const living = this.livingSurvivors();
+    if (living.length > 0) {
+      throw new Error(`claude native chat session closed, but a child survived SIGKILL: ${living.map((child) => child.pid).join(', ')}`);
     }
+  }
+
+  /** The children that outlived their `SIGKILL` and are still there — by their own handles, not by pid. */
+  private livingSurvivors(): ChildProcessWithoutNullStreams[] {
+    this.survivors = this.survivors.filter((child) => child.exitCode === null && child.signalCode === null);
+    return this.survivors;
   }
 
   /**
@@ -250,7 +271,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.child = null;
     if (!child) return;
     const exit = await terminateChild(child);
-    if (!exit.exited && exit.pid !== undefined) this.survivingPids.push(exit.pid);
+    if (!exit.exited) this.survivors.push(child);
   }
 
   private async start(): Promise<void> {
@@ -312,7 +333,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     const message = parseJsonObject(line);
     if (!message || !this.turn) return;
     const event = eventFromClaudeMessage(message);
-    this.turn.timer.refresh();
+    this.turn.timer?.refresh();
     this.turn.queue.push(event);
     if (message.type === 'result') {
       if (message.subtype === 'success') this.turn.queue.close();
@@ -337,7 +358,7 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
    */
   private retire(): void {
     if (!this.turn) return;
-    clearTimeout(this.turn.timer);
+    if (this.turn.timer) clearTimeout(this.turn.timer);
     this.turn = null;
   }
 }

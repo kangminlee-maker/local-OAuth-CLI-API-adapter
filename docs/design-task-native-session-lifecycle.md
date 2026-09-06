@@ -1,6 +1,6 @@
 # Design task: native chat session lifecycle atomicity
 
-**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 closed by bundle B-child (see § Bundle B-child), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
+**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 closed by bundle B-child (see § Bundle B-child, reviewed and folded); gap 5 is bundle B-shutdown (designed, see § Bundle B-shutdown; implementation next), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
 **Scope:** `LocalCliChatSessionManager` (`streamTurn` admission, `interrupt`, `close`,
 `closeAll`, `create`) and `CodexNativeCliChatSession` (`startTurn`, `stopTurn`, `replaceChild`,
 `teardownChild`, `close`, the `native` snapshot) in `src/chat/`.
@@ -167,11 +167,65 @@ shrinks to gap 5; full suite, probes, mutants. Mutants: no `SIGKILL` stage / for
 awaiting exit; no `closed` check before the spawn; on-demand branch a no-op; thread clearing
 omitted; `inner.return()` restored on the non-stop return; the drain's deadline not re-armed.
 
+**Review round 3 (codex: F1 high, F2 high, F3 medium, F4 medium, F5 high; Fable pending), folded.**
+(F1) The child's own exit ran the whole teardown as a continuation nobody awaited, so a close that
+landed meanwhile saw no isolation and reported success while that removal later failed: the
+self-exit now runs only the synchronous prefix (`forgetChild`), and the credentials copy stays for
+the next teardown — a close's or a replacement's — whose caller awaits it. (F2) Claude installed
+its turn only after the replacement wait, so a stop during that wait found no turn, the caller was
+answered, and the turn then ran on the successor: the turn is installed before any wait and the
+wait is raced with its stop, as codex does (the silence timer is armed once there is a child).
+(F3, pre-existing) A close landing while the replacement copied credentials found nothing to tear
+down and waited out the successor's handshake: `start()` re-checks `closed` after the copy and
+tears the copy down. (F4) The interrupt endpoint waited for the child's acknowledgement of
+`turn/interrupt` — up to the RPC budget — with the session already free: the interrupt is written,
+not awaited (the retire-then-write order stands). (F5) A replacement spawned a successor over a
+child that had not exited after `SIGKILL`: survivors are kept by handle, no successor is spawned
+while one lives (the turn reports `did not exit`), and the close names them; once the handle
+reports its exit, the next turn gets its child. Both runtimes.
+
 **Change conditions (pre-noted).** A real consumer found relying on disconnect-as-cancel (expecting
 `ready` right after dropping the SSE socket) flips gap 7 to return-as-stop with the contract
 sentence changed and the HTTP disconnect handling enumerated. A real consumer that must distinguish
 "has a handshaken child" from "will attempt a start on this turn" before submitting fires the
 status split (an explicit unavailable/recovering value with every reader enumerated).
+
+## Bundle B-shutdown — the closing epoch (design, 2026-09-06)
+
+Gap 5, the last: `create` awaits the runtime factory before registering the session, and
+`closeAll` snapshots only the map, so a creation in flight when the global close runs resolves
+after it and leaves a live child — the ordering the server's own `close()` takes (`server.close`
+and `closeAll` run together). Small enough for the lightweight path: no blind drafts; the record
+is this paragraph, the fixtures are red first.
+
+**Mechanism.** Two private values in the manager, one owner each. `closing` — set by `closeAll()`
+before anything else and never cleared: a manager that has begun closing accepts no session again
+(the server behind it is going away; an in-process caller that wants a fresh manager makes one).
+`creations` — the set of creations in flight, entered before the factory is awaited and left when
+the creation settles. `create()` refuses at once while `closing` (below); after its factory
+resolves it checks `closing` again, and a runtime that resolved after the close began is closed by
+the creation itself, awaited, and the create refused the same way — that close's failure, if any,
+is the create's error (its caller is the one listening). `closeAll()` sets `closing`, awaits every
+creation in flight (they settle by closing their own runtime or by registering nothing), then
+closes the sessions it finds as today. Nothing is registered after the close began, so no session
+and no child outlives `closeAll`.
+
+**Public surface: one split, with its trigger.** A create refused because the proxy is shutting
+down is a fact no existing code carries — `session_closed` (410) names a session that was, and
+this one never was — and a caller must handle it differently (not this proxy, not now): HTTP 503,
+code `shutting_down`, message "Local CLI chat sessions are not accepted: the proxy is shutting
+down." Every reader: the manager (raises it), the HTTP envelope (generic — status and code from
+the error), the API design note's code list, the fixtures. Sign: +1 public code, +2 private values;
+the four paths — reuse `session_closed`: a session that never existed; extend the 400s: not a
+request fault; rename: nothing to rename; split: this.
+
+**Plan.** (1) Red fixtures: `closeAll` landing while a create's handshake is in flight — the create
+is refused 503 `shutting_down`, the child is gone when `closeAll` resolves (its published pid),
+no credentials copy remains, the session is not listed; a create after `closeAll` — refused the
+same way. (2) The two values and the two checks. (3) The code in the API design note. Mutants: the
+post-factory check removed (the create registers a session the close never saw); the wait for
+creations removed (the child outlives `closeAll`); `closing` never set (both). Bundle 3 of the
+original plan; closes gap 5, the design task's last.
 
 ## Bundle B-res — the turn reservation (design, 2026-09-06)
 

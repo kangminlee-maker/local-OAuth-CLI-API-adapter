@@ -277,6 +277,8 @@ rl.on('line', (line) => {
     setTimeout(() => result(payload.id), Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS));
     return;
   }
+  // An interrupt the child never acknowledges: the endpoint must not wait for it.
+  if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_NO_INTERRUPT_ACK === '1') return;
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {
     result(payload.id);
     // A real child keeps talking for a moment after being told to stop, and

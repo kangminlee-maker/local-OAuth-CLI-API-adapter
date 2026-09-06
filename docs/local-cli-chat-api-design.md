@@ -187,7 +187,7 @@ however the stop was asked for. Both parts belong to it: the child stops
 working AND the turn's iteration ends.
 
 The endpoint answers as soon as the turn is over for its caller; it does not
-wait for the session to be free again. A turn the child has been asked for but
+wait for the session to be free again, nor for the child to acknowledge. A turn the child has been asked for but
 has not yet named cannot be interrupted until it is named, and nothing may be
 started ahead of that interrupt, so the session stays `running` until the
 acknowledgement arrives (or that request fails). A child that never names the
@@ -232,7 +232,12 @@ The child is the runtime's, and it owns one at a time. A teardown — a close, a
 handshake that failed — returns once the child has EXITED: `SIGTERM`, a grace, `SIGKILL` to the
 same handle, a grace; the credentials copy a codex child ran with is removed after that exit, and
 a replacement spawns its successor only after it. A child still there after the second grace is
-named in the close's error, next to a credentials directory that would not go. A session whose
+named in the close's error, next to a credentials directory that would not go — and no successor
+is spawned while it lives: a turn asked meanwhile reports that the child did not exit, and the
+next turn after the handle reports its exit gets a child. A child that died on its own is
+forgotten at once, thread and all; its credentials copy is the next teardown's, whose caller
+awaits it. An interrupt answers when the child has been told, not when it acknowledges: the
+session is free at the write. A session whose
 child is gone — a replacement that failed, a child that died — names no thread and answers
 `ready`: the next turn starts a child for itself, once per turn, and a turn that could not get
 one reports the start's own failure (`initialize timed out after …`), whether it waited for that
