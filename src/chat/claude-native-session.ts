@@ -155,14 +155,27 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       if (!child || this.turn?.queue !== queue) {
         throw new Error('request aborted');
       }
-      child.stdin.write(`${JSON.stringify({
-        type: 'user',
-        message: {
-          role: 'user',
-          content,
-        },
-        parent_tool_use_id: null,
-      })}\n`);
+      try {
+        child.stdin.write(`${JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content,
+          },
+          parent_tool_use_id: null,
+        })}\n`);
+      } catch (err) {
+        // A pipe that throws AT THE CALL, not a tick later: the same failure the
+        // stdin `error` handler catches when the write returns and the error
+        // arrives asynchronously — but a synchronous throw never reaches that
+        // handler, so it is replaced here instead. A child that cannot be
+        // written to is replaced, thread and all, so the next turn does not meet
+        // the same dead pipe; the turn reports the write's own error. The codex
+        // `send()` has caught the synchronous throw all along — this is claude's
+        // half of the same rule (t1-r6-codex F1).
+        if (!this.closed) void this.restartChild().catch(() => undefined);
+        throw err instanceof Error ? err : new Error(String(err));
+      }
       for await (const event of queue) yield event;
     } finally {
       if (signal) signal.removeEventListener('abort', abort);

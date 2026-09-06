@@ -334,7 +334,7 @@
           <td>Native local CLI chat</td>
           <td><code>src/chat/*</code>, <code>/local/cli/sessions</code>, <code>LocalCliChatSessionManager</code>, <code>src/chat/child-exit.ts</code></td>
           <td>OpenAI/Anthropic provider shape로 변환하지 않고, Codex app-server raw notification 또는 Claude stream-json raw message를 session/turn SSE envelope로 전달합니다. <strong>세션 수명주기는 하나의 설계로 닫혔습니다(트랙 1, 2026-09-06; <code>docs/design-task-native-session-lifecycle.md</code>)</strong>: 매니저가 admission부터 caller의 반복 종료까지 소유하는 <em>turn reservation</em>(stop은 caller에게 즉시·한 번 답하고, 세션은 런타임이 턴을 은퇴시킬 때까지 점유 — 그 창의 새 턴은 409); stop 없이 떠난 reader의 턴은 세션의 것이라 같은 유휴 데드라인 아래 끝까지 <em>드레인</em>되고(<code>interrupt</code>가 회수 수단), 계약의 disconnect 예외가 집행됩니다; child 종료는 <code>SIGTERM → 1 s → 같은 핸들 SIGKILL → 1 s</code> 하나의 규칙(<code>terminateChild</code>)로 두 런타임이 기다리며, codex 자격증명 사본은 exit 뒤에 제거되고 교체는 exit 뒤에 spawn하며 SIGKILL 생존자가 살아 있는 동안 후속 child를 띄우지 않습니다; child를 잃은 세션은 <code>ready</code>로 답하고 다음 턴이 turn당 한 번 child를 시작하며 실패 이유를 그 턴이 보고합니다(<code>native.thread_id</code>는 child를 따라감); 전역 close가 시작된 뒤 create는 <code>503 shutting_down</code>으로 거절되고 진행 중이던 창조는 자기 런타임을 닫습니다; <code>isBusy()</code>는 런타임 인터페이스의 필수 멤버입니다.</td>
-          <td class="ok"><code>test/native-session-interrupt.test.mjs</code>(t1 B-res·B-child·B-shutdown·r1/r3 픽스처 31), <code>test/local-cli-chat-http.test.mjs</code>, <code>test/deferred-seams.test.mjs</code>, 라운드별 변이 25/25, <code>pnpm test</code> 2033/0 — 두 좌석 교차 리뷰 4라운드(<code>review-artifacts/t1-design-log.md</code>)</td>
+          <td class="ok"><code>test/native-session-interrupt.test.mjs</code>(t1 B-res·B-child·B-shutdown·r1/r3/r4/r5/r6 픽스처 43), <code>test/local-cli-chat-http.test.mjs</code>, <code>test/deferred-seams.test.mjs</code>, 라운드별 변이 34/34, <code>pnpm test</code> 2045/0 — 두 좌석 교차 리뷰 6라운드(<code>review-artifacts/t1-design-log.md</code>); 잔여 1건은 후속 설계 과제 <code>docs/design-task-codex-interrupt-write-barrier.md</code></td>
         </tr>
       </tbody>
     </table>
@@ -733,7 +733,7 @@
         </tr>
         <tr>
           <td>설계 과제</td>
-          <td><strong>네이티브 세션 수명주기(트랙 1)는 닫혔습니다(2026-09-06)</strong> — gap 1~7 전부 B-res·B-child·B-shutdown 세 번들로 구현·리뷰됨. <strong>남은 설계 과제는 트랙 A</strong>: refresh-lease 원자성(<code>docs/design-task-refresh-lease-atomicity.md</code>, A-retry → A-lease, fencing-token 기본값). 트랙 1의 exit 유예 1 s는 fixture child(2 ms)로만 측정했으므로 릴리스 전 실제 CLI로 한 번 재측정합니다.</td>
+          <td><strong>네이티브 세션 수명주기(트랙 1)는 닫혔습니다(2026-09-06)</strong> — gap 1~7 전부 B-res·B-child·B-shutdown 세 번들로 구현되고 두 좌석 교차 리뷰 6라운드를 거쳤습니다. 리뷰가 원래 7개 갭 밖의 기존 결함 3건을 추가로 찾아 두 건(비동기·동기 파이프 실패 시 child 교체 대칭, 교체 대기 중 은퇴한 codex 턴의 소유권 가드)은 폴드했고, 세 번째(codex 인터럽트의 쓰기 배리어 — 새 순서 보장 원시라 결함 패치가 아닌 설계 과제)는 <strong>후속 설계 과제로 분리</strong>했습니다: <code>docs/design-task-codex-interrupt-write-barrier.md</code>. <strong>남은 설계 과제는 트랙 A</strong>: refresh-lease 원자성(<code>docs/design-task-refresh-lease-atomicity.md</code>, A-retry → A-lease, fencing-token 기본값). 트랙 1의 exit 유예 1 s는 fixture child(2 ms)로만 측정했으므로 릴리스 전 실제 CLI로 한 번 재측정합니다.</td>
           <td>낮습니다.</td>
           <td class="ok">높습니다. 토큰 갱신 경쟁에서 더 오래된 회전이 최신 회전을 덮어쓰는 결함 계열입니다.</td>
           <td>A-retry 픽스처가 적색→녹색, 두 좌석 교차 리뷰 clean</td>

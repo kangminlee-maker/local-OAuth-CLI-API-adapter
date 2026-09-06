@@ -218,6 +218,16 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       preparedInput = await prepareCodexInput(request, chatPromptText(input));
       turn.cleanup = preparedInput.cleanup;
       if (turn.stopped) throw new Error('local CLI chat turn aborted');
+      // Retired but not stopped: a pipe error on the child (or its successor's
+      // handshake) failed this turn during the replacement wait or the input
+      // preparation — `failActive` retires it WITHOUT setting `stopped` — and if
+      // the replacement then resolved, the `stopped` check alone let a turn no
+      // longer the session's go on to send `turn/start` on the successor. A turn
+      // once retired never becomes the session's again, so one check here, on
+      // the last line before the send, covers both windows: it must still be the
+      // session's, the way the sibling claude session re-checks before its own
+      // write (t1-r6-codex F3; the same lesson as t1-r4-fable, on the codex side).
+      if (this.turn !== turn) throw new Error('request aborted');
       let response: JsonRpcMessage;
       try {
         response = await this.send('turn/start', {

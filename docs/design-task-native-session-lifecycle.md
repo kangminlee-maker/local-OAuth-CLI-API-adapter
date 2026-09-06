@@ -223,6 +223,28 @@ fixtures (`t1 r5-codex`) are red on `8c02113`; five mutants (the join dropped; t
 dropped, each runtime; the residual add dropped, session path and creation path) are each red on
 the fixture aimed at it.
 
+**Review round 6 (Fable: clean; codex: F1–F3, all pre-existing).** The Fable seat found the
+round-5 fold correct on the observer surface, confirming with its own probes that the async stdin
+error is a live path (a real dead reader emits `EPIPE` on the parent's `child.stdin`), that the
+global-close registry makes bounded progress with disjoint closes, and that it leaks no unhandled
+rejection. The codex seat found three older holes (all reproducing on a/); the two parity gaps are
+folded here, the third is a follow-up design task:
+- (F1, folded) claude's prompt write was not in a try/catch, so a pipe that throws AT THE CALL —
+  the case the round-5 doc says is handled "whether it throws at the call or reports the dead pipe
+  a tick later" — never reached the stdin handler that replaces the child. codex `send()` has
+  caught the synchronous throw all along; claude now does too. Fixture `t1 r6-codex F1`.
+- (F3, folded) codex `startTurn` checked `turn.stopped` after the replacement wait but not that the
+  turn was still the session's. `failActive` retires a turn WITHOUT setting `stopped`, so a turn
+  failed by a pipe error during the wait — with the replacement then resolving — went on to send
+  `turn/start` on the successor. One ownership check on the last line before the send now covers
+  the wait and the input-preparation windows alike (a retired turn never becomes current again).
+  This is the same lesson as the round-4 claude fix (t1-r4-fable), on the codex side; claude arms a
+  timer post-wait so its guard sits there, codex has no post-wait timer so its single guard sits at
+  the send. Fixture `t1 r6-codex F3`. Mutants 2/2 red (`stage2/mutants-t1-r6.log`).
+- (F2, deferred) a codex interrupt returns before its async write error installs the replacement,
+  so a turn in that one-tick window reaches the dying child. The fix is a new per-child write
+  barrier, not a guard — a design task, filed as `docs/design-task-codex-interrupt-write-barrier.md`.
+
 **Change conditions (pre-noted).** A real consumer found relying on disconnect-as-cancel (expecting
 `ready` right after dropping the SSE socket) flips gap 7 to return-as-stop with the contract
 sentence changed and the HTTP disconnect handling enumerated. A real consumer that must distinguish

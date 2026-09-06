@@ -1841,6 +1841,93 @@ test('a close that failed over a child that would not exit is re-closed and repo
 });
 
 // ---------------------------------------------------------------------------
+// Track 1, round 6 (codex seat) on the round-5 fold: the two parity gaps.
+// (F2 — the codex interrupt write-barrier — is a follow-up design task,
+// docs/design-task-codex-interrupt-write-barrier.md.)
+
+// A pipe that throws AT THE CALL, not a tick later: `stdin.write` raises
+// synchronously. The contract covers this case ("whether it throws at the
+// call or reports the dead pipe a tick later"), and codex `send()` already
+// catches it — claude's prompt write did not. The next matching write throws.
+function failNextWriteSync(handle, marker) {
+  const realWrite = handle.stdin.write.bind(handle.stdin);
+  handle.stdin.write = (chunk, ...rest) => {
+    if (String(chunk).includes(marker)) {
+      handle.stdin.write = realWrite;
+      throw Object.assign(new Error('write EPIPE: synchronous fixture pipe failure'), { code: 'EPIPE' });
+    }
+    return realWrite(chunk, ...rest);
+  };
+}
+
+test('a claude prompt write that throws synchronously replaces the child too: the turn reports it and the next turn runs on the successor (t1 r6-codex F1)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  const { manager } = await startClaudeManager(2_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  // The next prompt write throws at the call.
+  failNextWriteSync(manager.sessions.get(session.id).nativeSession.child, '"type":"user"');
+  try {
+    const failed = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 3_000 });
+    assert.equal(failed.status, 'error', JSON.stringify(failed.final));
+    assert.match(failed.final.raw?.message ?? '', /EPIPE/, JSON.stringify(failed.final));
+    // A child that cannot be written to is replaced even when the write threw.
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const again = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(again.status, 'completed', JSON.stringify(again.final));
+    assert.equal(again.final.text, 'OK');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a codex turn retired during its replacement wait never reaches the successor: the guard aborts it before turn/start, not only when it was stopped (t1 r6-codex F3)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager, methodLog } = await startCodexManager(6_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const pidA = await publishedPid(pidFile);
+  try {
+    // The child dies on its own: the session is left with no child, so the next
+    // turn must start one — a replacement it waits for.
+    process.kill(pidA, 'SIGKILL');
+    await waitFor(() => ns.child === null, 3_000, 'the dead child to be forgotten');
+    // The successor comes up slowly: a wide window in which the waiting turn
+    // can be retired by a pipe error on that successor's own handshake.
+    process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '1200';
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    // Grab the successor while it is still handshaking, and fail its pipe: the
+    // waiting turn is retired (failActive), but the replacement it awaits still
+    // resolves — so the turn is no longer the session's when the wait ends.
+    await waitFor(() => ns.child !== null && ns.child.pid !== pidA, 3_000, 'the successor to spawn');
+    const successor = ns.child;
+    successor.stdin.emit('error', Object.assign(new Error('write EPIPE: handshake pipe failure'), { code: 'EPIPE' }));
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the retired turn was aborted, not run on the successor');
+    // No turn/start was sent for the retired turn.
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'turn/start').length, 0, 'the retired turn never reached the child');
+    // The session is usable: the next turn runs on a healthy child.
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the session to settle');
+    const next = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 5_000 });
+    assert.equal(next.status, 'completed', JSON.stringify(next.final));
+  } finally {
+    reapFixtureChild(pidA);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Track 1, round 5 (codex seat) on the round-4 folds.
 
 test('two global closes in flight are one: the second resolves only once the first has ended every child (t1 r5-codex F1)', { timeout: 20_000 }, async () => {
