@@ -561,8 +561,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // A pipe that dies reports it here when the write returned cleanly and the
     // failure arrived a tick later — the shape `send()`'s synchronous catch
     // cannot see. A child that cannot be written to cannot be told anything: it
-    // is replaced, thread and all, the same as one whose write threw, so
-    // nothing starts ahead of an interrupt it never received (t1-r5-codex F2).
+    // is replaced, thread and all, the same as one whose write threw (t1-r5-codex
+    // F2). This closes the pipe, but not the ORDER: the replacement lands when
+    // this handler runs, a tick after the interrupt already answered, so a turn
+    // in that window can still reach the dying child before the successor. That
+    // ordering is the open follow-up — a write barrier — filed as
+    // docs/design-task-codex-interrupt-write-barrier.md, not enforced here.
     child.stdin.on('error', (err) => {
       if (this.child !== child) return;
       this.failActive(err);

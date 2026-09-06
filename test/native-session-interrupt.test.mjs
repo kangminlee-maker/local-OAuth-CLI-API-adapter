@@ -1841,6 +1841,53 @@ test('a close that failed over a child that would not exit is re-closed and repo
 });
 
 // ---------------------------------------------------------------------------
+// Track 1, round 7 (both seats) on the round-6 fold: the coverage gap.
+// (The doc overclaim both seats also raised is a docs-only change, not a fixture.)
+
+test('a codex turn retired by a pipe error DURING input preparation never reaches turn/start: the ownership guard must sit after the prep, not only after the wait (t1 r7-codex coverage)', { timeout: 30_000 }, async () => {
+  // The round-6 guard is on the last line before `turn/start`. Its placement is
+  // load-bearing: input preparation is file I/O (a temp dir per image), a
+  // macrotask window in which a pipe error can retire the turn — `failActive`
+  // retires WITHOUT setting `stopped`, so only the ownership check catches it.
+  // The round-6 fixture exercised only the replacement-wait window; a guard
+  // moved to before the prep passes the whole suite yet lets a retired turn's
+  // `turn/start` reach the child. This pins the prep window (both r7 seats).
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager, methodLog } = await startCodexManager(6_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  // Many images: preparation writes a temp file per image, a wide window.
+  const input = [];
+  for (let i = 0; i < 500; i += 1) input.push({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PIXEL_PNG } });
+  input.push({ type: 'text', text: 'describe them' });
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input })) events.push(event.event);
+    })();
+    // Fail the child's pipe while the input is still being prepared: the turn is
+    // retired (not stopped), and the replacement the stdin handler starts
+    // resolves — so the turn is no longer the session's when the prep ends.
+    await delay(20);
+    ns.child.stdin.emit('error', Object.assign(new Error('write EPIPE: prep-window pipe failure'), { code: 'EPIPE' }));
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the retired turn was aborted, not sent');
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'turn/start').length, 0, 'no turn/start for a turn retired during its input preparation');
+    // No image temp dir outlives the retired turn's cleanup.
+    await waitFor(() => manager.get(session.id).status === 'ready', 6_000, 'the session to settle');
+    const next = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 5_000 });
+    assert.equal(next.status, 'completed', JSON.stringify(next.final));
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Track 1, round 6 (codex seat) on the round-5 fold: the two parity gaps.
 // (F2 — the codex interrupt write-barrier — is a follow-up design task,
 // docs/design-task-codex-interrupt-write-barrier.md.)
@@ -1970,7 +2017,11 @@ function failNextWriteAsync(handle, marker) {
   };
 }
 
-test('a codex interrupt whose write fails on the pipe asynchronously — not by throwing — replaces the child too: nothing is started ahead of an interrupt the child never received (t1 r5-codex F2)', { timeout: 20_000 }, async () => {
+// Verifies the REPLACEMENT, not the order: this test serializes (it waits for
+// the successor before the next turn), so it does not exercise the race window a
+// turn could reach the dying child in — that ordering is the deferred write
+// barrier, docs/design-task-codex-interrupt-write-barrier.md (t1-r7).
+test('a codex interrupt whose write fails on the pipe asynchronously — not by throwing — replaces the child too: a fresh thread on the successor, and a later turn runs on it (t1 r5-codex F2)', { timeout: 20_000 }, async () => {
   const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
   tempDirs.push(pidDir);
   const pidFile = join(pidDir, 'pid');

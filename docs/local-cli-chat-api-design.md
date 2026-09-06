@@ -247,9 +247,14 @@ is spawned while it lives: a turn asked meanwhile reports that the child did not
 next turn after the handle reports its exit gets a child. A child that died on its own is
 forgotten at once, thread and all; its credentials copy is the next teardown's, whose caller
 awaits it. An interrupt answers when the child has been told, not when it acknowledges: the
-session is free at the write — and a child that cannot be written to is replaced, thread and
-all, so nothing starts ahead of an interrupt it never received; a write that fails on the pipe is
-that case whether it throws at the call or reports the dead pipe a tick later as a stream error. A session whose
+session is free at the write. A child that cannot be written to is replaced, thread and all —
+whether the write throws at the call or reports the dead pipe a tick later as a stream error, both
+retire that child. When the interrupt write is ACCEPTED or throws synchronously, nothing starts
+ahead of an interrupt it never received: the throw's replacement is installed before the endpoint
+returns, and an accepted write reached the child. The one gap is the write that returns and fails a
+tick later: between the interrupt answering `ready` and that stream error installing the
+replacement, a turn submitted in that window can reach the dying child — the ordering there is the
+open follow-up `docs/design-task-codex-interrupt-write-barrier.md`, not yet enforced. A session whose
 child is gone — a replacement that failed, a child that died — names no thread and answers
 `ready`: the next turn starts a child for itself, once per turn, and a turn that could not get
 one reports the start's own failure (`initialize timed out after …`), whether it waited for that

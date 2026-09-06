@@ -245,6 +245,25 @@ folded here, the third is a follow-up design task:
   so a turn in that one-tick window reaches the dying child. The fix is a new per-child write
   barrier, not a guard — a design task, filed as `docs/design-task-codex-interrupt-write-barrier.md`.
 
+**Review round 7 (both seats: one doc_gap; Fable also a coverage_gap; zero behavioral defects),
+folded — docs and a fixture only, no runtime change.** Both seats found the API design note and a
+codex source comment still claimed the async-interrupt ORDERING ("nothing starts ahead of an
+interrupt it never received … whether it throws at the call or reports the dead pipe a tick later")
+— which is exactly the deferred F2 window, not the shipped behaviour: the async case replaces the
+child but the replacement lands a tick after the interrupt answered, so a turn in that window can
+still reach the dying child. The sentence is now scoped to the accepted/synchronous-throw case and
+points the async window at the write-barrier task; the source comment and the round-5 F2 fixture
+name are qualified the same way (the sync case, round-4 F2, still enforces the order and keeps its
+wording). Fable also showed the round-6 codex guard's PLACEMENT (at the send, after the input prep)
+is load-bearing but unpinned: a mutant that MOVES it to before the prep passes the whole suite,
+yet a turn retired by a pipe error DURING the prep then reaches `turn/start` on the successor — the
+round-6 fixture exercised only the replacement-wait window. The codex seat independently confirmed
+the same placement with its own probe and mutant. A fixture (`t1 r7-codex coverage`) now retires a
+codex turn mid-prep (500 images widen the window) and pins that no `turn/start` follows; the
+guard-moved mutant is red on it while `t1 r6-codex F3` stays green (`stage2/mutants-t1-r7.log`).
+Full suite 2046/0. This is the task's last review round; the two seats agree the folded code is
+correct on the observer surface, and the only residual (F2) is a separate, filed design task.
+
 **Change conditions (pre-noted).** A real consumer found relying on disconnect-as-cancel (expecting
 `ready` right after dropping the SSE socket) flips gap 7 to return-as-stop with the contract
 sentence changed and the HTTP disconnect handling enumerated. A real consumer that must distinguish
