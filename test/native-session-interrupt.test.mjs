@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import fs, { existsSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -29,6 +30,8 @@ const originalStartDelay = process.env.FAKE_CODEX_TURN_START_DELAY_MS;
 const originalTrailing = process.env.FAKE_CODEX_TRAILING_NOTIFICATION;
 const originalInitDelay = process.env.FAKE_CODEX_INITIALIZE_DELAY_MS;
 const originalArchiveDelay = process.env.FAKE_CODEX_ARCHIVE_DELAY_MS;
+const childHookNames = ['FAKE_CODEX_PID_FILE', 'FAKE_CODEX_IGNORE_SIGTERM', 'FAKE_CODEX_TURN_COMPLETION_DELAY_MS', 'FAKE_CODEX_NO_INTERRUPT_ACK', 'FAKE_CLAUDE_PID_FILE', 'FAKE_CLAUDE_IGNORE_SIGTERM'];
+const originalChildHooks = new Map(childHookNames.map((name) => [name, process.env[name]]));
 
 before(async () => {
   await chmod(fakeCodex, 0o755);
@@ -51,6 +54,10 @@ afterEach(async () => {
   else process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = originalInitDelay;
   if (originalArchiveDelay === undefined) delete process.env.FAKE_CODEX_ARCHIVE_DELAY_MS;
   else process.env.FAKE_CODEX_ARCHIVE_DELAY_MS = originalArchiveDelay;
+  for (const [name, value] of originalChildHooks) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -97,6 +104,10 @@ test('an interrupted codex turn is stopped once, not once per path', { timeout: 
   await manager.interrupt(session.id);
   await drain;
 
+  // The endpoint answers at the write, not at the child's acknowledgement
+  // (t1 round 3): the receipt is waited for, then counted.
+  await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/interrupt'), 3_000, 'the child to receive the interrupt');
+  await delay(100);
   assert.equal(
     (await receivedMethods(methodLog)).filter((method) => method === 'turn/interrupt').length,
     1,
@@ -124,10 +135,13 @@ test('an interrupt during the turn/start round-trip still reaches the child', { 
   await manager.interrupt(session.id);
   await drain;
 
-  assert.equal(
-    (await receivedMethods(methodLog)).filter((method) => method === 'turn/interrupt').length,
-    1,
-    'the turn must be interrupted on the child, whenever the interrupt lands',
+  // The caller is answered at the stop, before the child acknowledges the
+  // start (t1 B-res): the interrupt is written when the acknowledgement
+  // arrives, so it is waited for, not read the instant the caller returns.
+  await waitFor(
+    async () => (await receivedMethods(methodLog)).filter((method) => method === 'turn/interrupt').length === 1,
+    3_000,
+    'the turn to be interrupted on the child, whenever the interrupt lands',
   );
   assert.equal(events.at(-1).event, 'cli.error', 'the caller stops iterating too');
 });
@@ -198,7 +212,7 @@ test('a turn/start the child never names within the budget replaces the child: t
   // The child already spawned keeps its environment; its replacement will not.
   delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
   const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
@@ -262,7 +276,7 @@ test('a credentials directory the replacement cannot remove stops nothing and es
     // Unreadable: the replacement's `rm` of it rejects.
     await chmod(isolationRoot, 0o000);
     process.on('unhandledRejection', onRejection);
-    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
     assert.equal(first.status, 'error');
     assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
     const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
@@ -315,7 +329,7 @@ test('a turn waiting for a child replacement is the session\'s: it occupies the 
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   // The replacement child is slow to come up: the next turn waits for it.
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '800';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
   const outcome = waiting.next().catch((err) => ({ error: err }));
@@ -338,7 +352,7 @@ test('a stop that lands while the turn waits for the replacement ends the wait, 
   delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '250';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
   const outcome = waiting.next().catch((err) => ({ error: err }));
@@ -359,7 +373,7 @@ test('a close that lands while a turn waits for the replacement ends the child b
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   // The replacement's handshake would take two seconds.
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '2000';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 1000 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 3000 }); // caller budget above the RPC budget (1000): the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   const waiting = manager.streamTurn(session.id, { input: 'too soon' })[Symbol.asyncIterator]();
   const outcome = waiting.next().catch((err) => ({ error: err }));
@@ -375,7 +389,7 @@ test('a close that lands while a turn waits for the replacement ends the child b
   assert.equal(methods.filter((method) => method === 'turn/start').length, 1, 'the waiting turn reached no child');
 });
 
-test('a replacement whose handshake fails leaves no child: the waiting turn reports not running and reaches nothing on the old thread (r55-codex)', { timeout: 20_000 }, async () => {
+test('a replacement whose handshake fails leaves no child: the waiting turn reports why the child could not start and reaches nothing on the old thread (r55-codex; the reason since t1 B-child)', { timeout: 20_000 }, async () => {
   process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
   process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
   const { manager, methodLog } = await startCodexManager(300);
@@ -384,13 +398,15 @@ test('a replacement whose handshake fails leaves no child: the waiting turn repo
   delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
   // Slower than the RPC budget: the replacement's `initialize` times out.
   process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '850';
-  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
   assert.equal(first.status, 'error');
   // A deadline longer than the failing handshake: what ends this turn is the
-  // replacement's failure, not the idle budget.
+  // replacement's failure, not the idle budget — and the turn reports that
+  // failure, not only that no child is running (t1 B-child gap 3: the same
+  // rule for a turn that waited for the attempt and one that made it).
   const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 2000 });
   assert.equal(second.status, 'error');
-  assert.match(second.events.at(-1).raw.message, /not running/);
+  assert.match(second.events.at(-1).raw.message, /initialize timed out after 300ms/);
   await delay(200);
   const methods = await receivedMethods(methodLog);
   assert.equal(methods.filter((method) => method === 'turn/start').length, 1, 'nothing reached the partial child');
@@ -411,7 +427,7 @@ test('closeAll reports a teardown that left a credentials copy on disk, after ev
     delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
     [isolationRoot] = (await readdir(privateTmp)).map((name) => join(privateTmp, name));
     await chmod(isolationRoot, 0o000);
-    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 300 });
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 }); // caller budget above the RPC budget: the RPC timeout ends this turn, not the caller's deadline (t1 B-res)
     assert.equal(first.status, 'error');
     const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 300 });
     assert.equal(second.status, 'completed');
@@ -454,7 +470,7 @@ test('a turn admitted before the close and read after it hears the close, and re
   assert.equal(closed.status, 'closed');
   const event = await stream.next();
   assert.equal(event.value?.event, 'cli.error', JSON.stringify(event));
-  assert.match(event.value.raw.message, /session is closed/, 'the close is the reason the reader hears');
+  assert.match(event.value.raw.message, /session closed/, 'the close is the reason the reader hears — the one in-band answer on both runtimes (t1 B-res)');
   assert.deepEqual((await stream.next()).done, true, 'and the iteration ends');
   const methods = await receivedMethods(methodLog);
   assert.equal(methods.filter((method) => method === 'turn/start').length, 0, 'no turn reached the child');
@@ -589,7 +605,7 @@ test('the manager\'s deadline restarts on every event: with the runtime\'s own t
   const silentAt = Date.now();
   const partial = await manager.runTurn(session.id, { input: 'PARTIAL' }, { timeoutMs: 300 });
   assert.equal(partial.status, 'error');
-  assert.match(partial.events.at(-1).raw.message, /interrupted/);
+  assert.match(partial.events.at(-1).raw.message, /aborted/, 'the manager\'s deadline answers, on both runtimes (t1 B-res)');
   assert.ok(Date.now() - silentAt < 1000, `silence ended at the budget: ${Date.now() - silentAt} ms`);
 });
 
@@ -847,15 +863,22 @@ test('a session survives an interrupt whose runtime stop throws', { timeout: 20_
       codex: async () => ({
         runtime: 'codex',
         native: {},
+        busy: false,
         async *startTurn() {
-          yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'hi' };
-          // Still running: the turn has to be live when the interrupt fails, or
-          // the status this is about was already restored by its own stream.
-          await new Promise(() => {});
+          this.busy = true;
+          try {
+            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'hi' };
+            // Still running: the turn has to be live when the interrupt fails, or
+            // the status this is about was already restored by its own stream.
+            await new Promise(() => {});
+          } finally {
+            this.busy = false;
+          }
         },
         async interrupt() {
           throw new Error('the pipe died under the interrupt');
         },
+        isBusy() { return this.busy; },
         async close() {},
       }),
     },
@@ -1012,10 +1035,297 @@ test('closing a session tells a streaming caller its turn ended, not that it fin
   // which says nothing about how a closed queue reads.
   await delay(100);
 
+  // The rejection is expected before the close is awaited: the close now
+  // spans the child's exit (t1 B-child gap 6), and a rejection left without a
+  // handler across that wait is the process's, not this test's.
+  const ended = assert.rejects(pending, /session closed/i);
   await session.close();
-
-  await assert.rejects(pending, /session closed/i);
+  await ended;
 });
+
+test('a reservation whose reader cancels before the first read is released: the session answers ready and the next turn runs (t1 B-res, gap 1)', { timeout: 20_000 }, async () => {
+  // Admission is at the call; the reader may never read. An async generator's
+  // `finally` does not run for a `return()` before its first `next()`, so the
+  // slot taken at admission was held for the session's life — every later turn
+  // a 409 (r56-codex, on the round-55 synchronous admission).
+  const { manager, session, state } = await countingManager();
+  const iterator = manager.streamTurn(session.id, { input: 'reserved, never read' })[Symbol.asyncIterator]();
+  assert.equal(manager.get(session.id).status, 'running', 'admitted at the call');
+  assert.deepEqual(await iterator.return(), { done: true, value: undefined });
+  assert.equal(manager.get(session.id).status, 'ready', 'a reader that cancelled holds nothing');
+  const second = await manager.runTurn(session.id, { input: 'second' });
+  assert.equal(second.status, 'completed');
+  assert.equal(state.starts, 1, 'only the second turn reached the runtime');
+});
+
+test('a deadline that fires on a reservation nobody read releases it: the session answers ready, and the stale iterable dispatches nothing (t1 B-res, gap 1)', { timeout: 20_000 }, async () => {
+  const { manager, session, state } = await countingManager();
+  const iterable = manager.streamTurn(session.id, { input: 'reserved, never read' }, { timeoutMs: 50 });
+  await waitFor(() => manager.get(session.id).status === 'ready', 1_000, 'the deadline to release the reservation');
+  const events = [];
+  for await (const event of iterable) events.push(event.event);
+  assert.deepEqual(events, ['cli.error'], 'the stale reader hears the end and nothing else');
+  assert.equal(state.starts, 0, 'nothing was dispatched for the timed-out reservation');
+  const second = await manager.runTurn(session.id, { input: 'second' });
+  assert.equal(second.status, 'completed');
+  assert.equal(state.starts, 1);
+});
+
+test('an interrupt before the first read ends the turn: nothing is dispatched, the reader hears the stop, the session answers ready (t1 B-res, gap 2)', { timeout: 20_000 }, async () => {
+  // Between admission and the first read the runtime has no turn, so its
+  // interrupt found nothing, and the reservation's signal was not fired because
+  // the runtime implements `interrupt`: the endpoint answered `ready` and the
+  // turn it said it stopped ran on the next read (r56-codex).
+  const { manager, session, state } = await countingManager();
+  const iterable = manager.streamTurn(session.id, { input: 'admitted then interrupted' });
+  assert.equal(manager.get(session.id).status, 'running');
+  const snapshot = await manager.interrupt(session.id);
+  assert.equal(snapshot.status, 'ready');
+  const events = [];
+  for await (const event of iterable) events.push(event);
+  assert.equal(events.length, 1, JSON.stringify(events));
+  assert.equal(events[0].event, 'cli.error');
+  assert.match(String(events[0].raw?.message), /aborted/);
+  assert.equal(state.starts, 0, 'the turn the endpoint said it stopped never ran');
+  assert.equal(manager.get(session.id).status, 'ready');
+});
+
+test('a stop while turn/start is in flight ends the caller within the stop, not at the acknowledgement — and still precedes the next turn on the child (t1 B-res, gap 4)', { timeout: 20_000 }, async () => {
+  // The stop failed the turn's queue, but the caller was parked in the
+  // `turn/start` RPC, not on the queue: it heard the stop only when the child
+  // acknowledged the start — a whole RPC budget against a child that never
+  // does (r56-codex). What must not move is the order on the child: the
+  // interrupt is written before the next turn's start.
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '800';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  const stream = manager.streamTurn(session.id, { input: 'slow acknowledgement' })[Symbol.asyncIterator]();
+  const pending = stream.next();
+  await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 2_000, 'turn/start to reach the child');
+  const stoppedAt = Date.now();
+  await manager.interrupt(session.id);
+  const first = await pending;
+  const callerMs = Date.now() - stoppedAt;
+  assert.equal(first.value?.event, 'cli.error', JSON.stringify(first));
+  assert.ok(callerMs < 300, `the caller hears the stop within the stop, not at the child's acknowledgement (${callerMs}ms)`);
+  assert.equal(manager.get(session.id).status, 'running', 'the session stays occupied until the child has been told');
+  assert.throws(() => manager.streamTurn(session.id, { input: 'too soon' }), /already has a running turn/);
+  await waitFor(() => manager.get(session.id).status === 'ready', 3_000, 'the acknowledgement to retire the turn');
+  const second = await manager.runTurn(session.id, { input: 'after the stop' }, { timeoutMs: 500 });
+  assert.equal(second.status, 'error', 'the fake never completes a turn; the deadline ends it');
+  const methods = (await receivedMethods(methodLog)).filter((m) => m === 'turn/start' || m === 'turn/interrupt');
+  assert.deepEqual(methods.slice(0, 3), ['turn/start', 'turn/interrupt', 'turn/start'], `the interrupt precedes the next start: ${methods.join(',')}`);
+});
+
+test('a stop that lands between two reads still closes the runtime\'s iteration: a runtime that retires in its finally is retired, even for a reader that never reads again (t1 r1-codex F1)', { timeout: 20_000 }, async () => {
+  // Between reads the runtime's generator is suspended at its `yield`; a stop
+  // that only answered the caller left it there for good, and a runtime whose
+  // retirement lives in `finally` held the session at 409 for its life.
+  let release;
+  const stopped = new Promise((resolve) => { release = resolve; });
+  const state = { busy: false, finalizers: 0, starts: 0 };
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: {},
+        async *startTurn() {
+          state.starts += 1;
+          state.busy = true;
+          try {
+            yield { raw: { stage: 'first' }, textDelta: 'one' };
+            await stopped;
+            throw new Error('runtime interrupted');
+          } finally {
+            state.busy = false;
+            state.finalizers += 1;
+          }
+        },
+        async interrupt() { release(); },
+        isBusy() { return state.busy; },
+        async close() { release(); },
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'codex' });
+  const iterator = manager.streamTurn(session.id, { input: 'first' })[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value?.event, 'cli.event');
+  await manager.interrupt(session.id);
+  // Nobody reads again. The runtime must still be retired.
+  await waitFor(() => state.finalizers === 1, 1_000, 'the runtime generator to be finalized by the stop');
+  assert.equal(manager.get(session.id).status, 'ready', 'the runtime retired in its finally, and the session is free');
+  const events = [];
+  for await (const event of { [Symbol.asyncIterator]: () => iterator }) events.push(event.event);
+  assert.deepEqual(events, ['cli.error'], 'the walked-away reader, coming back, hears the stop once');
+  const second = await manager.runTurn(session.id, { input: 'second' });
+  assert.equal(second.status, 'error', 'the double ends every turn by throwing after its stop');
+  assert.equal(state.starts, 2, 'the next turn was admitted');
+});
+
+test('a runtime whose interrupt acknowledges late keeps the session occupied until it does: 409 in the window, ready after — the runtime answers, the manager keeps no fallback lifetime (t1 r1-codex F2)', { timeout: 20_000 }, async () => {
+  let ack; const stopAck = new Promise((resolve) => { ack = resolve; });
+  let releaseTurn; const turnReleased = new Promise((resolve) => { releaseTurn = resolve; });
+  // A runtime that counts itself occupied until its stop is acknowledged
+  // says so through `isBusy` — the manager keeps no fallback for it, and its
+  // generator may be returned by the stop before the acknowledgement.
+  const state = { open: false, stopping: false, finalizers: 0 };
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: {},
+        async *startTurn() {
+          if (state.open || state.stopping) throw new Error('runtime already has a running turn');
+          state.open = true;
+          try {
+            yield { raw: { stage: 'first' }, textDelta: 'one' };
+            await turnReleased;
+            throw new Error('runtime interrupted');
+          } finally {
+            state.open = false;
+            state.finalizers += 1;
+          }
+        },
+        async interrupt() {
+          state.stopping = true;
+          try {
+            await stopAck;
+            releaseTurn();
+          } finally {
+            state.stopping = false;
+          }
+        },
+        isBusy() { return state.open || state.stopping; },
+        async close() { ack(); releaseTurn(); },
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'codex' });
+  const first = manager.streamTurn(session.id, { input: 'first' })[Symbol.asyncIterator]();
+  assert.equal((await first.next()).value?.event, 'cli.event');
+  const pending = first.next();
+  const interrupting = manager.interrupt(session.id);
+  await delay(20);
+  assert.equal(manager.get(session.id).status, 'running', 'the runtime has not acknowledged the stop');
+  assert.throws(() => manager.streamTurn(session.id, { input: 'second' }), /already has a running turn/);
+  ack();
+  await interrupting;
+  assert.equal((await pending).value?.event, 'cli.error');
+  await waitFor(() => manager.get(session.id).status === 'ready', 1_000, 'the runtime to retire the turn');
+  assert.equal(state.finalizers, 1);
+});
+
+for (const terminal of ['completed', 'error']) {
+  for (const route of ['interrupt', 'close', 'deadline']) {
+    test(`a stop that lands after the terminal event (${terminal}) and before the read after it appends nothing: the terminal event is the end (route: ${route}) (t1 r1-codex F3)`, { timeout: 20_000 }, async () => {
+      // The HTTP loop awaits the terminal SSE write before it reads again;
+      // an interrupt racing that write, or a deadline outlasting it, found the
+      // reservation still attached and appended a second terminal event.
+      const state = { busy: false, interrupts: 0 };
+      const manager = new LocalCliChatSessionManager({
+        defaultCwd: process.cwd(),
+        runtimes: {
+          codex: async () => ({
+            runtime: 'codex',
+            native: {},
+            async *startTurn() {
+              state.busy = true;
+              try {
+                if (terminal === 'error') throw new Error('runtime failed');
+              } finally {
+                state.busy = false;
+              }
+            },
+            async interrupt() { state.interrupts += 1; },
+            isBusy() { return state.busy; },
+            async close() {},
+          }),
+        },
+      });
+      openSessions.push(() => manager.closeAll());
+      const session = await manager.create({ runtime: 'codex' });
+      const iterator = manager.streamTurn(session.id, { input: 'x' }, route === 'deadline' ? { timeoutMs: 20 } : {})[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      assert.equal(first.value?.event, terminal === 'completed' ? 'cli.completed' : 'cli.error', JSON.stringify(first));
+      if (terminal === 'error') assert.match(String(first.value.raw?.message), /runtime failed/);
+      assert.equal(manager.get(session.id).status, 'ready', 'the terminal event released the slot');
+      if (route === 'interrupt') await manager.interrupt(session.id);
+      else if (route === 'close') assert.equal((await manager.close(session.id)).status, 'closed');
+      else await delay(60);
+      const after = await iterator.next();
+      assert.deepEqual(after, { done: true, value: undefined }, `no second terminal event: ${JSON.stringify(after)}`);
+      assert.deepEqual(await iterator.next(), { done: true, value: undefined });
+    });
+  }
+}
+
+test('a turn admitted before the close and read after it hears the close on the claude runtime too (t1 B-res, two paths)', { timeout: 20_000 }, async () => {
+  // The codex runtime answered "closed" here (r55-fable); the claude runtime
+  // answered "not running" — a different fact for the same sequence.
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: cwd,
+    runtimes: {
+      claude: async (input) => ClaudeNativeCliChatSession.create({ command: fakeClaude, cwd: input.cwd, model: 'claude-opus-4-8', timeoutMs: 2_000 }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'claude' });
+  const stream = manager.streamTurn(session.id, { input: 'admitted first' })[Symbol.asyncIterator]();
+  const closed = await manager.close(session.id);
+  assert.equal(closed.status, 'closed');
+  const event = await stream.next();
+  assert.equal(event.value?.event, 'cli.error', JSON.stringify(event));
+  assert.match(String(event.value.raw?.message), /session closed/, 'the close is the reason — not "not running"');
+  assert.equal((await stream.next()).done, true);
+});
+
+/** A manager over an in-process runtime that only counts what it was asked. */
+async function countingManager() {
+  const state = { starts: 0, interrupts: 0, closes: 0 };
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: {},
+        busy: false,
+        async *startTurn() {
+          state.starts += 1;
+          this.busy = true;
+          try {
+            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'ok' };
+          } finally {
+            this.busy = false;
+          }
+        },
+        async interrupt() { state.interrupts += 1; },
+        isBusy() { return this.busy; },
+        async close() { state.closes += 1; },
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'codex' });
+  return { manager, session, state };
+}
+
+/** Polls a condition instead of sleeping for it: the bound is on the wait, not on the timing. */
+async function waitFor(check, timeoutMs = 3_000, what = 'condition') {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await check())) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`);
+    await delay(10);
+  }
+}
 
 async function turnText(session, input) {
   let text = '';
@@ -1027,3 +1337,1039 @@ async function turnText(session, input) {
   }
   return text;
 }
+
+// ---------------------------------------------------------------------------
+// Track 1, bundle B-child: the child handle and the abandoned turn (gaps 3, 6, 7).
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Kills a fixture child this test spawned — by the pid it published, never by name. */
+function reapFixtureChild(pid) {
+  if (Number.isSafeInteger(pid) && pid > 1 && processAlive(pid)) {
+    try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+}
+
+async function publishedPid(pidFile) {
+  await waitFor(() => existsSync(pidFile), 3_000, 'the fixture child to publish its pid');
+  const pid = Number(await readFile(pidFile, 'utf8'));
+  assert.ok(Number.isSafeInteger(pid) && pid > 1, `the fixture published no safe pid: ${pid}`);
+  return pid;
+}
+
+/** A manager whose claude runtime is the real session over the fake child. */
+async function startClaudeManager(timeoutMs = 20_000) {
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: cwd,
+    runtimes: {
+      claude: async (input) => ClaudeNativeCliChatSession.create({ command: fakeClaude, cwd: input.cwd, model: 'claude-opus-4-8', timeoutMs }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  return { manager };
+}
+
+test('closing a codex session whose child ignores SIGTERM leaves no child: the close escalates and resolves only after the exit (t1 B-child gap 6)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  process.env.FAKE_CODEX_PID_FILE = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_IGNORE_SIGTERM = '1';
+  const { manager, methodLog } = await startCodexManager(1_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(process.env.FAKE_CODEX_PID_FILE);
+  try {
+    const closingAt = Date.now();
+    const closed = await manager.close(session.id);
+    assert.equal(closed.status, 'closed');
+    assert.equal(processAlive(pid), false, 'the child is gone when the close resolves');
+    assert.ok(Date.now() - closingAt < 4_000, `the close stayed within its bound: ${Date.now() - closingAt} ms`);
+    assert.ok((await receivedMethods(methodLog)).includes('thread/archive'), 'the courtesy archive still went first');
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+test('closing a claude session whose child ignores SIGTERM leaves no child: the close escalates and resolves only after the exit (t1 B-child gap 6)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  process.env.FAKE_CLAUDE_PID_FILE = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_IGNORE_SIGTERM = '1';
+  const { manager } = await startClaudeManager(1_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const pid = await publishedPid(process.env.FAKE_CLAUDE_PID_FILE);
+  try {
+    const closingAt = Date.now();
+    const closed = await manager.close(session.id);
+    assert.equal(closed.status, 'closed');
+    assert.equal(processAlive(pid), false, 'the child is gone when the close resolves');
+    assert.ok(Date.now() - closingAt < 4_000, `the close stayed within its bound: ${Date.now() - closingAt} ms`);
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+test('a codex child replaced after ignoring SIGTERM has exited before its successor serves a turn: the replacement is serialized behind the exit (t1 B-child gap 6)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  process.env.FAKE_CODEX_PID_FILE = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_IGNORE_SIGTERM = '1';
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(300);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(process.env.FAKE_CODEX_PID_FILE);
+  // The child already spawned keeps its environment; its replacement will not.
+  delete process.env.FAKE_CODEX_IGNORE_SIGTERM;
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  try {
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 });
+    assert.equal(first.status, 'error');
+    assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3000 });
+    assert.equal(second.status, 'completed', 'the next turn ran on the replacement');
+    assert.equal(processAlive(oldPid), false, 'the replaced child had exited before its successor served a turn');
+    const newPid = Number(await readFile(process.env.FAKE_CODEX_PID_FILE, 'utf8'));
+    assert.notEqual(newPid, oldPid, 'a fresh child');
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'thread/start').length, 2, 'a fresh thread on the fresh child');
+  } finally {
+    reapFixtureChild(oldPid);
+  }
+});
+
+test('a codex session whose replacement failed names no thread, tries again on the next turn, and runs once the child can start: a session that answers ready can be asked (t1 B-child gap 3)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '650';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(300);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  assert.equal(manager.get(session.id).native.thread_id, 'thread_1', 'the live child\'s thread is named');
+  // Slower than the RPC budget: the replacement's `initialize` times out.
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '850';
+  const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 2000 });
+  assert.equal(first.status, 'error');
+  assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 300ms/);
+  // Let the replacement fail: its `initialize` is received, then the budget expires.
+  await waitFor(async () => (await receivedMethods(methodLog)).filter((method) => method === 'initialize').length === 2, 3_000, 'the replacement to start its handshake');
+  await delay(600);
+  const afterFailure = manager.get(session.id);
+  assert.equal(afterFailure.status, 'ready', 'a turn will be attempted');
+  assert.equal(afterFailure.native.thread_id, undefined, 'no thread is named while no child holds one');
+  // The next turn makes one attempt of its own — and reports that attempt's failure.
+  const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3000 });
+  assert.equal(second.status, 'error');
+  assert.match(second.events.at(-1).raw.message, /initialize timed out after 300ms/, 'the turn reports why the child could not start');
+  assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'initialize').length, 3, 'one attempt per turn');
+  assert.equal(manager.get(session.id).native.thread_id, undefined);
+  // The fault clears: the next turn starts a child, a fresh thread, and runs.
+  delete process.env.FAKE_CODEX_INITIALIZE_DELAY_MS;
+  const third = await manager.runTurn(session.id, { input: 'once more' }, { timeoutMs: 3000 });
+  assert.equal(third.status, 'completed', JSON.stringify(third.final));
+  assert.match(third.final.text, /OK$/);
+  // A fresh child counts its threads from one again: what says it is fresh is the second `thread/start` below.
+  assert.equal(manager.get(session.id).native.thread_id, 'thread_1', 'the fresh child\'s thread is named');
+  const methods = await receivedMethods(methodLog);
+  assert.equal(methods.filter((method) => method === 'initialize').length, 4);
+  assert.equal(methods.filter((method) => method === 'thread/start').length, 2);
+});
+
+test('a claude session whose child died starts one for the next turn: the session that answers ready can be asked (t1 B-child gap 3)', { timeout: 20_000 }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const session = await ClaudeNativeCliChatSession.create({ command: fakeClaude, cwd, model: 'claude-opus-4-8', timeoutMs: 2_000 });
+  openSessions.push(() => session.close());
+  await assert.rejects(turnText(session, 'EXIT'), /claude code exited/);
+  assert.equal(session.isBusy(), false);
+  assert.equal(await turnText(session, 'Say OK'), 'OK', 'the next turn ran on a child started for it');
+});
+
+test('a claude turn whose reader walked away without a stop is the session\'s until its result: the next turn is refused meanwhile and never receives it (t1 B-child gap 7)', { timeout: 20_000 }, async () => {
+  const { manager } = await startClaudeManager(2_000);
+  const session = await manager.create({ runtime: 'claude' });
+  let writerError;
+  try {
+    for await (const event of manager.streamTurn(session.id, { input: 'LATE_RESULT' })) {
+      if (event.event === 'cli.event') throw new Error('writeSseEvent failed');
+    }
+  } catch (err) {
+    writerError = err.message;
+  }
+  assert.equal(writerError, 'writeSseEvent failed');
+  assert.equal(manager.get(session.id).status, 'running', 'the turn outlives its caller');
+  assert.throws(() => manager.streamTurn(session.id, { input: 'DELAYED' }), /running turn/, 'refused, not dispatched on top of it');
+  await waitFor(() => manager.get(session.id).status === 'ready', 3_000, 'the abandoned turn to reach its result');
+  const second = await manager.runTurn(session.id, { input: 'DELAYED' }, { timeoutMs: 2_000 });
+  assert.equal(second.status, 'completed', JSON.stringify(second.final));
+  assert.equal(second.final.text, 'DELAYED_REAL');
+  const results = second.events.map((event) => event.raw).filter((raw) => raw?.type === 'result').map((raw) => raw.result);
+  assert.deepEqual(results, ['DELAYED_REAL'], 'the earlier turn\'s result reached nobody');
+});
+
+test('a codex turn whose reader walked away without a stop is the session\'s until it completes: the next turn is refused meanwhile and its completion is its own (t1 B-child gap 7)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_COMPLETION_DELAY_MS = '300';
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  let writerError;
+  try {
+    for await (const event of manager.streamTurn(session.id, { input: 'hello' })) {
+      if (event.event === 'cli.event') throw new Error('writeSseEvent failed');
+    }
+  } catch (err) {
+    writerError = err.message;
+  }
+  assert.equal(writerError, 'writeSseEvent failed');
+  assert.equal(manager.get(session.id).status, 'running', 'the turn outlives its caller');
+  assert.throws(() => manager.streamTurn(session.id, { input: 'again' }), /running turn/, 'refused, not dispatched on top of it');
+  await waitFor(() => manager.get(session.id).status === 'ready', 3_000, 'the abandoned turn to complete');
+  const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 2_000 });
+  assert.equal(second.status, 'completed');
+  const completions = second.events.map((event) => event.raw).filter((raw) => raw?.method === 'turn/completed').map((raw) => raw.params.turn.id);
+  assert.deepEqual(completions, ['turn_2'], 'the second turn ended on its own completion, not the abandoned turn\'s');
+  assert.deepEqual((await receivedMethods(methodLog)).filter((method) => method.startsWith('turn/')), ['turn/start', 'turn/start']);
+});
+
+test('a codex turn whose reader walked away is ended by the idle deadline the caller gave it, with the child told: the session comes back ready (t1 B-child gap 7)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager();
+  const session = await manager.create({ runtime: 'codex' });
+  let writerError;
+  try {
+    for await (const event of manager.streamTurn(session.id, { input: 'hello' }, { timeoutMs: 300 })) {
+      if (event.event === 'cli.event') throw new Error('writeSseEvent failed');
+    }
+  } catch (err) {
+    writerError = err.message;
+  }
+  assert.equal(writerError, 'writeSseEvent failed');
+  assert.equal(manager.get(session.id).status, 'running', 'the turn outlives its caller');
+  await waitFor(async () => (await receivedMethods(methodLog)).filter((method) => method === 'turn/interrupt').length === 1, 3_000, 'the idle deadline to end the abandoned turn on the child');
+  await waitFor(() => manager.get(session.id).status === 'ready', 3_000, 'the session to come back');
+  assert.deepEqual((await receivedMethods(methodLog)).filter((method) => method.startsWith('turn/')), ['turn/start', 'turn/interrupt']);
+});
+
+test('a claude close that lands while a replacement waits for the previous child to exit resolves after that exit, and no successor outlives it (t1 B-child gap 6)', { timeout: 20_000 }, async () => {
+  // Cannot fail before B-child: the wait the close lands in is the one the
+  // escalating teardown introduced. Pinned here against that head.
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  process.env.FAKE_CLAUDE_IGNORE_SIGTERM = '1';
+  const { manager } = await startClaudeManager(20_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const drain = (async () => {
+      for await (const _event of manager.streamTurn(session.id, { input: 'HANG' })) { /* the child answers this prompt with nothing */ }
+    })();
+    await delay(100);
+    // The interrupt is a replacement on this runtime: it now waits for the old child's exit — a second, since it ignores SIGTERM.
+    await manager.interrupt(session.id);
+    await drain.catch(() => undefined);
+    const closed = await manager.close(session.id);
+    assert.equal(closed.status, 'closed');
+    assert.equal(processAlive(oldPid), false, 'the previous child is gone when the close resolves');
+    await delay(200);
+    assert.equal(Number(await readFile(pidFile, 'utf8')), oldPid, 'no successor was spawned after the close');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a closed claude session starts no child for a turn asked of it: the turn is refused as closed (t1 B-child gap 3)', { timeout: 20_000 }, async () => {
+  // Restart on demand must not outlive the close: a turn asked of a closed
+  // session directly — the manager refuses one before it gets here — would
+  // otherwise start a child nobody closes.
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  const cwd = await mkdtemp(join(tmpdir(), 'interrupt-claude-cwd-'));
+  tempDirs.push(cwd);
+  const session = await ClaudeNativeCliChatSession.create({ command: fakeClaude, cwd, model: 'claude-opus-4-8', timeoutMs: 2_000 });
+  const pid = await publishedPid(pidFile);
+  try {
+    await session.close();
+    assert.equal(processAlive(pid), false);
+    await assert.rejects(turnText(session, 'Say OK'), /closed/);
+    await delay(300);
+    assert.equal(Number(await readFile(pidFile, 'utf8')), pid, 'no child was started for the turn');
+  } finally {
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a claude turn whose reader walked away keeps its idle deadline alive with its own events: a turn streaming past the budget drains to its result on the same child (t1 B-child gap 7)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  const { manager } = await startClaudeManager(20_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const pid = await publishedPid(pidFile);
+  let writerError;
+  try {
+    // Six deltas 100 ms apart, the result at ~700 ms: past a 300 ms budget, never silent for it.
+    for await (const event of manager.streamTurn(session.id, { input: 'SLOW' }, { timeoutMs: 300 })) {
+      if (event.event === 'cli.event') throw new Error('writeSseEvent failed');
+    }
+  } catch (err) {
+    writerError = err.message;
+  }
+  assert.equal(writerError, 'writeSseEvent failed');
+  assert.equal(manager.get(session.id).status, 'running');
+  const drainingAt = Date.now();
+  await waitFor(() => manager.get(session.id).status === 'ready', 3_000, 'the abandoned turn to drain to its result');
+  assert.ok(Date.now() - drainingAt >= 500, `the drain ran to the result, past the budget: ${Date.now() - drainingAt} ms`);
+  // A replacement — the deadline's stop on this runtime — writes a new pid once it is up.
+  await delay(300);
+  assert.equal(Number(await readFile(pidFile, 'utf8')), pid, 'the deadline never fired: the same child, no replacement');
+  const next = await manager.runTurn(session.id, { input: 'Say OK' }, { timeoutMs: 2_000 });
+  assert.equal(next.status, 'completed');
+  assert.equal(next.final.text, 'OK');
+});
+
+// ---------------------------------------------------------------------------
+// Track 1, bundle B-shutdown: the closing epoch (gap 5).
+
+test('a global close that lands while a session is still being created ends that session too: the create is refused, its child is gone when closeAll resolves, and nothing is listed (t1 B-shutdown gap 5)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  // The handshake is slow: the close lands inside it.
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '450';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  // Only the child's credentials copy lands here: the manager's own temp dirs were made above.
+  const privateTmp = await mkdtemp(join(tmpdir(), 'interrupt-isolation-'));
+  const originalTmp = process.env.TMPDIR;
+  process.env.TMPDIR = privateTmp;
+  let pid = 0;
+  try {
+    const creating = manager.create({ runtime: 'codex' }).then(
+      (created) => ({ kind: 'created', id: created.id }),
+      (err) => ({ kind: 'refused', status: err.statusCode, code: err.code, message: err.message }),
+    );
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('initialize'), 3_000, 'the handshake to be in flight');
+    pid = await publishedPid(pidFile);
+    await manager.closeAll();
+    assert.equal(processAlive(pid), false, 'the child is gone when closeAll resolves');
+    const outcome = await creating;
+    assert.equal(outcome.kind, 'refused', JSON.stringify(outcome));
+    assert.equal(outcome.status, 503);
+    assert.equal(outcome.code, 'shutting_down');
+    assert.deepEqual(await readdir(privateTmp), [], 'no credentials copy outlives the close');
+    // A create after the close is refused the same way.
+    await assert.rejects(manager.create({ runtime: 'codex' }), (err) => err.statusCode === 503 && err.code === 'shutting_down');
+  } finally {
+    reapFixtureChild(pid);
+    if (originalTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmp;
+    tempDirs.push(privateTmp);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Track 1, round 4 (Fable seat) on the round-3 fold.
+
+test('a claude turn stopped while it waits for a replacement arms no silence timer: nothing fires on the successor, and an innocent turn on it runs its whole length (t1 r4-fable F-A)', { timeout: 30_000 }, async () => {
+  // The round-3 fold armed the turn's silence timer after the replacement
+  // wait — on a turn a stop had already retired during that wait. Nothing
+  // cleared it (the turn was no longer the session's), and it fired on
+  // whoever was running by then: retired that turn, replaced its child.
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  process.env.FAKE_CLAUDE_IGNORE_SIGTERM = '1';
+  // A short silence budget: a leaked timer would fire well inside the test.
+  const { manager } = await startClaudeManager(700);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CLAUDE_IGNORE_SIGTERM;
+  try {
+    const first = manager.streamTurn(session.id, { input: 'PARTIAL' })[Symbol.asyncIterator]();
+    assert.equal((await first.next()).value?.event, 'cli.event');
+    await manager.interrupt(session.id);
+    await delay(50);
+    const second = manager.streamTurn(session.id, { input: 'HANG' })[Symbol.asyncIterator]();
+    const pending = second.next();
+    await delay(50);
+    await manager.interrupt(session.id);
+    assert.equal((await pending).value?.event, 'cli.error');
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    const successor = Number(await readFile(pidFile, 'utf8'));
+    await waitFor(() => manager.get(session.id).status === 'ready', 2_000, 'the session to be free');
+    // Six deltas 100 ms apart, the result at ~700 ms: past the 700 ms budget a leaked timer would fire at.
+    const innocent = await manager.runTurn(session.id, { input: 'SLOW' }, { timeoutMs: 5_000 });
+    assert.equal(innocent.status, 'completed', JSON.stringify(innocent.final));
+    assert.equal(innocent.final.text, '0 1 2 3 4 5 ', 'every delta, then the result');
+    await delay(900);
+    assert.equal(Number(await readFile(pidFile, 'utf8')), successor, 'no timer fired on the successor: no spurious replacement');
+    assert.equal(manager.get(session.id).status, 'ready');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Track 1, round 4 (codex seat) on the round-3 fold and B-shutdown.
+
+test('a codex interrupt whose write fails replaces the child: nothing is started ahead of an interrupt the child never received (t1 r4-codex F2)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // The one write that carries the interrupt throws — a pipe that died under it.
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  const originalWrite = handle.stdin.write.bind(handle.stdin);
+  handle.stdin.write = (chunk, ...rest) => {
+    if (String(chunk).includes('"turn/interrupt"')) {
+      handle.stdin.write = originalWrite;
+      throw new Error('EPIPE: fixture write failed');
+    }
+    return originalWrite(chunk, ...rest);
+  };
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the turn to reach the child');
+    await manager.interrupt(session.id);
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the caller heard the stop');
+    // The child could not be told: it is replaced, and the next turn runs on the successor.
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(second.status, 'completed', JSON.stringify(second.final));
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'thread/start').length, 2, 'a fresh thread on a fresh child');
+  } finally {
+    reapFixtureChild(oldPid);
+  }
+});
+
+test('a runtime that resolved after the global close began and could not be closed is the global close\'s error too, not only its creator\'s (t1 r4-codex F3)', { timeout: 20_000 }, async () => {
+  let release;
+  const gate = new Promise((resolve_) => { release = resolve_; });
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => {
+        await gate;
+        return {
+          runtime: 'codex',
+          native: {},
+          async *startTurn() {},
+          isBusy() { return false; },
+          async close() { throw new Error('fixture teardown left its child alive'); },
+        };
+      },
+    },
+  });
+  const creating = manager.create({ runtime: 'codex' }).then((created) => ({ kind: 'created', id: created.id }), (err) => ({ kind: 'rejected', message: err.message }));
+  await delay(20);
+  const closing = manager.closeAll().then(() => ({ kind: 'resolved' }), (err) => ({ kind: 'rejected', message: err.message }));
+  release();
+  const created = await creating;
+  assert.equal(created.kind, 'rejected', JSON.stringify(created));
+  assert.match(created.message, /left its child alive/, 'the creator hears the teardown it owned');
+  const closed = await closing;
+  assert.equal(closed.kind, 'rejected', JSON.stringify(closed));
+  assert.match(closed.message, /left its child alive/, 'and so does the global close');
+});
+
+test('a global close joins a close already in flight: it resolves only once that session\'s child is gone (t1 r4-codex F4)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_IGNORE_SIGTERM = '1';
+  const { manager } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  try {
+    // The close waits a second for a child that ignores SIGTERM; the global close lands inside that wait.
+    const closingOne = manager.close(session.id);
+    await delay(100);
+    await manager.closeAll();
+    assert.equal(processAlive(pid), false, 'the global close joined the close in flight');
+    assert.equal((await closingOne).status, 'closed');
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+test('a close that failed over a child that would not exit is re-closed and reported by the global close, and resolves once the child is gone (t1 r4-codex F4)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  handle.kill = () => true;
+  try {
+    await assert.rejects(manager.close(session.id), /survived SIGKILL/);
+    assert.throws(() => manager.get(session.id), /Unknown local CLI chat session/);
+    await assert.rejects(manager.closeAll(), /survived SIGKILL/, 'the global close names what its predecessor could not end');
+    process.kill(pid, 'SIGKILL');
+    await waitFor(() => !processAlive(pid), 3_000, 'the child to be gone');
+    await manager.closeAll();
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Track 1, round 7 (both seats) on the round-6 fold: the coverage gap.
+// (The doc overclaim both seats also raised is a docs-only change, not a fixture.)
+
+test('a codex turn retired by a pipe error DURING input preparation never reaches turn/start: the ownership guard must sit after the prep, not only after the wait (t1 r7-codex coverage)', { timeout: 30_000 }, async () => {
+  // The round-6 guard is on the last line before `turn/start`. Its placement is
+  // load-bearing: input preparation is file I/O (a temp dir per image), a
+  // macrotask window in which a pipe error can retire the turn — `failActive`
+  // retires WITHOUT setting `stopped`, so only the ownership check catches it.
+  // The round-6 fixture exercised only the replacement-wait window; a guard
+  // moved to before the prep passes the whole suite yet lets a retired turn's
+  // `turn/start` reach the child. This pins the prep window (both r7 seats).
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager, methodLog } = await startCodexManager(6_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  // Many images: preparation writes a temp file per image, a wide window.
+  const input = [];
+  for (let i = 0; i < 500; i += 1) input.push({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: PIXEL_PNG } });
+  input.push({ type: 'text', text: 'describe them' });
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input })) events.push(event.event);
+    })();
+    // Fail the child's pipe while the input is still being prepared: the turn is
+    // retired (not stopped), and the replacement the stdin handler starts
+    // resolves — so the turn is no longer the session's when the prep ends.
+    await delay(20);
+    ns.child.stdin.emit('error', Object.assign(new Error('write EPIPE: prep-window pipe failure'), { code: 'EPIPE' }));
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the retired turn was aborted, not sent');
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'turn/start').length, 0, 'no turn/start for a turn retired during its input preparation');
+    // No image temp dir outlives the retired turn's cleanup.
+    await waitFor(() => manager.get(session.id).status === 'ready', 6_000, 'the session to settle');
+    const next = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 5_000 });
+    assert.equal(next.status, 'completed', JSON.stringify(next.final));
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Track 1, round 6 (codex seat) on the round-5 fold: the two parity gaps.
+// (F2 — the codex interrupt write-barrier — is a follow-up design task,
+// docs/design-task-codex-interrupt-write-barrier.md.)
+
+// A pipe that throws AT THE CALL, not a tick later: `stdin.write` raises
+// synchronously. The contract covers this case ("whether it throws at the
+// call or reports the dead pipe a tick later"), and codex `send()` already
+// catches it — claude's prompt write did not. The next matching write throws.
+function failNextWriteSync(handle, marker) {
+  const realWrite = handle.stdin.write.bind(handle.stdin);
+  handle.stdin.write = (chunk, ...rest) => {
+    if (String(chunk).includes(marker)) {
+      handle.stdin.write = realWrite;
+      throw Object.assign(new Error('write EPIPE: synchronous fixture pipe failure'), { code: 'EPIPE' });
+    }
+    return realWrite(chunk, ...rest);
+  };
+}
+
+test('a claude prompt write that throws synchronously replaces the child too: the turn reports it and the next turn runs on the successor (t1 r6-codex F1)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  const { manager } = await startClaudeManager(2_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  // The next prompt write throws at the call.
+  failNextWriteSync(manager.sessions.get(session.id).nativeSession.child, '"type":"user"');
+  try {
+    const failed = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 3_000 });
+    assert.equal(failed.status, 'error', JSON.stringify(failed.final));
+    assert.match(failed.final.raw?.message ?? '', /EPIPE/, JSON.stringify(failed.final));
+    // A child that cannot be written to is replaced even when the write threw.
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const again = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(again.status, 'completed', JSON.stringify(again.final));
+    assert.equal(again.final.text, 'OK');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a codex turn retired during its replacement wait never reaches the successor: the guard aborts it before turn/start, not only when it was stopped (t1 r6-codex F3)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager, methodLog } = await startCodexManager(6_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const pidA = await publishedPid(pidFile);
+  try {
+    // The child dies on its own: the session is left with no child, so the next
+    // turn must start one — a replacement it waits for.
+    process.kill(pidA, 'SIGKILL');
+    await waitFor(() => ns.child === null, 3_000, 'the dead child to be forgotten');
+    // The successor comes up slowly: a wide window in which the waiting turn
+    // can be retired by a pipe error on that successor's own handshake.
+    process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '1200';
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    // Grab the successor while it is still handshaking, and fail its pipe: the
+    // waiting turn is retired (failActive), but the replacement it awaits still
+    // resolves — so the turn is no longer the session's when the wait ends.
+    await waitFor(() => ns.child !== null && ns.child.pid !== pidA, 3_000, 'the successor to spawn');
+    const successor = ns.child;
+    successor.stdin.emit('error', Object.assign(new Error('write EPIPE: handshake pipe failure'), { code: 'EPIPE' }));
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the retired turn was aborted, not run on the successor');
+    // No turn/start was sent for the retired turn.
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'turn/start').length, 0, 'the retired turn never reached the child');
+    // The session is usable: the next turn runs on a healthy child.
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the session to settle');
+    const next = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 5_000 });
+    assert.equal(next.status, 'completed', JSON.stringify(next.final));
+  } finally {
+    reapFixtureChild(pidA);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Track 1, round 5 (codex seat) on the round-4 folds.
+
+test('two global closes in flight are one: the second resolves only once the first has ended every child (t1 r5-codex F1)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_IGNORE_SIGTERM = '1';
+  const { manager } = await startCodexManager(2_000);
+  await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  try {
+    // The first close waits a second for a child that ignores SIGTERM; the second lands inside that wait.
+    let firstSettled = false;
+    const first = manager.closeAll().finally(() => { firstSettled = true; });
+    await delay(100);
+    await manager.closeAll();
+    assert.equal(processAlive(pid), false, 'the second global close resolved over no live child');
+    assert.equal(firstSettled, true, 'the second global close joined the first');
+    await first;
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+// A pipe that dies asynchronously: the parent's `stdin.write` returns (Node
+// returns false and throws nothing), and the failure arrives later as an
+// `error` event on the stream — the shape a real dead reader produces, and the
+// one a synchronous-throw-only guard misses. The next matching write drops its
+// bytes and schedules that event on the owned child handle.
+function failNextWriteAsync(handle, marker) {
+  const realWrite = handle.stdin.write.bind(handle.stdin);
+  handle.stdin.write = (chunk, ...rest) => {
+    if (String(chunk).includes(marker)) {
+      handle.stdin.write = realWrite;
+      queueMicrotask(() => handle.stdin.emit('error', Object.assign(new Error('write EPIPE: fixture pipe died'), { code: 'EPIPE' })));
+      return false;
+    }
+    return realWrite(chunk, ...rest);
+  };
+}
+
+// Verifies the REPLACEMENT, not the order: this test serializes (it waits for
+// the successor before the next turn), so it does not exercise the race window a
+// turn could reach the dying child in — that ordering is the deferred write
+// barrier, docs/design-task-codex-interrupt-write-barrier.md (t1-r7).
+test('a codex interrupt whose write fails on the pipe asynchronously — not by throwing — replaces the child too: a fresh thread on the successor, and a later turn runs on it (t1 r5-codex F2)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // The interrupt's write returns cleanly and the pipe fails a tick later.
+  failNextWriteAsync(manager.sessions.get(session.id).nativeSession.child, '"turn/interrupt"');
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the turn to reach the child');
+    await manager.interrupt(session.id);
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the caller heard the stop');
+    // The child could not be told: it is replaced, and the next turn runs on the successor.
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(second.status, 'completed', JSON.stringify(second.final));
+    const methods = await receivedMethods(methodLog);
+    assert.equal(methods.filter((method) => method === 'thread/start').length, 2, 'a fresh thread on a fresh child');
+    assert.equal(methods.filter((method) => method === 'turn/start').length, 2, 'one turn per child');
+  } finally {
+    reapFixtureChild(oldPid);
+  }
+});
+
+test('a claude child whose prompt write fails on the pipe asynchronously is replaced: the turn reports the pipe error, and the next turn runs on the successor (t1 r5-codex F2, claude)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  const { manager } = await startClaudeManager(2_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  // The next prompt write returns cleanly and the pipe fails a tick later.
+  failNextWriteAsync(manager.sessions.get(session.id).nativeSession.child, '"type":"user"');
+  try {
+    const failed = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 3_000 });
+    assert.equal(failed.status, 'error', JSON.stringify(failed.final));
+    assert.match(failed.final.raw?.message ?? '', /EPIPE/, JSON.stringify(failed.final));
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const third = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(third.status, 'completed', JSON.stringify(third.final));
+    assert.equal(third.final.text, 'OK');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a session the global close could not end is not forgotten: the next global close closes it again and names what still lives, and resolves once it is gone (t1 r5-codex F3)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  handle.kill = () => true;
+  try {
+    await assert.rejects(manager.closeAll(), /survived SIGKILL/);
+    assert.equal(processAlive(pid), true);
+    await assert.rejects(manager.closeAll(), /survived SIGKILL/, 'the next global close names what its predecessor could not end');
+    process.kill(pid, 'SIGKILL');
+    await waitFor(() => !processAlive(pid), 3_000, 'the child to be gone');
+    await manager.closeAll();
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+test('a runtime its creation could not close is not forgotten after the first report: the next global close closes it again (t1 r5-codex F4)', { timeout: 20_000 }, async () => {
+  let release;
+  const gate = new Promise((resolve_) => { release = resolve_; });
+  let alive = true;
+  let closeCalls = 0;
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => {
+        await gate;
+        return {
+          runtime: 'codex',
+          native: {},
+          async *startTurn() {},
+          isBusy() { return false; },
+          async close() {
+            closeCalls += 1;
+            if (alive) throw new Error('creation teardown left its child alive');
+          },
+        };
+      },
+    },
+  });
+  const creating = manager.create({ runtime: 'codex' }).then((created) => ({ kind: 'created', id: created.id }), (err) => ({ kind: 'rejected', message: err.message }));
+  await delay(20);
+  const closing = manager.closeAll().then(() => ({ kind: 'resolved' }), (err) => ({ kind: 'rejected', message: err.message }));
+  release();
+  const created = await creating;
+  assert.equal(created.kind, 'rejected', JSON.stringify(created));
+  const closed = await closing;
+  assert.equal(closed.kind, 'rejected', JSON.stringify(closed));
+  const callsAfterFirst = closeCalls;
+  assert.ok(callsAfterFirst >= 1);
+  // Still alive: the next global close closes it again and reports it again.
+  await assert.rejects(manager.closeAll(), /left its child alive/, 'the runtime the creation could not close is still the global close\'s');
+  assert.ok(closeCalls > callsAfterFirst, `closed again: ${closeCalls} > ${callsAfterFirst}`);
+  const callsAfterSecond = closeCalls;
+  alive = false;
+  await manager.closeAll();
+  assert.ok(closeCalls > callsAfterSecond, 'closed once more, and gone');
+});
+
+// ---------------------------------------------------------------------------
+// Track 1, round 3 (codex seat) on B-child.
+
+/** The one isolation root under a private TMPDIR, as the r53 fixtures find it. */
+async function onlyIsolationRoot(privateTmp) {
+  const roots = (await readdir(privateTmp)).map((name) => join(privateTmp, name));
+  assert.equal(roots.length, 1, `one isolation root: ${JSON.stringify(roots)}`);
+  return roots[0];
+}
+
+test('a codex child that died on its own leaves its credentials copy to the close: a removal that fails there is the close\'s error, not lost to a continuation nobody awaited (t1 r3-codex F1)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  process.env.FAKE_CODEX_PID_FILE = join(pidDir, 'pid');
+  const { manager } = await startCodexManager(2_000);
+  const privateTmp = await mkdtemp(join(tmpdir(), 'interrupt-isolation-'));
+  const originalTmp = process.env.TMPDIR;
+  process.env.TMPDIR = privateTmp;
+  const originalRm = fs.promises.rm;
+  let releaseRemoval;
+  const removalGate = new Promise((resolve_) => { releaseRemoval = resolve_; });
+  let removalStarted = false;
+  try {
+    const session = await manager.create({ runtime: 'codex' });
+    const pid = await publishedPid(process.env.FAKE_CODEX_PID_FILE);
+    const isolationRoot = await onlyIsolationRoot(privateTmp);
+    // The removal of THIS root blocks until released, then fails.
+    fs.promises.rm = async (target, options) => {
+      if (resolve(String(target)) !== resolve(isolationRoot)) return originalRm(target, options);
+      removalStarted = true;
+      await removalGate;
+      throw Object.assign(new Error('fixture isolation removal denied'), { code: 'EACCES' });
+    };
+    syncBuiltinESMExports();
+    // The child dies on its own — killed by pid, which this test owns.
+    process.kill(pid, 'SIGKILL');
+    await waitFor(() => !processAlive(pid), 3_000, 'the child to be gone');
+    await delay(200);
+    let closeSettled = false;
+    const closing = manager.close(session.id).then(
+      () => { closeSettled = true; return { kind: 'resolved' }; },
+      (err) => { closeSettled = true; return { kind: 'rejected', message: err.message }; },
+    );
+    await waitFor(() => removalStarted, 3_000, 'the isolation removal to be attempted');
+    await delay(100);
+    assert.equal(closeSettled, false, 'the close waits for the removal it owns');
+    releaseRemoval();
+    const outcome = await closing;
+    assert.equal(outcome.kind, 'rejected', JSON.stringify(outcome));
+    assert.match(outcome.message, /credentials copy could not be removed/);
+  } finally {
+    releaseRemoval();
+    fs.promises.rm = originalRm;
+    syncBuiltinESMExports();
+    if (originalTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = originalTmp;
+    tempDirs.push(privateTmp);
+  }
+});
+
+test('a claude turn stopped while it waits for a replacement never reaches the successor: the stop ends the wait, and the session is free once the replacement is done (t1 r3-codex F2)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  process.env.FAKE_CLAUDE_IGNORE_SIGTERM = '1';
+  const { manager } = await startClaudeManager(10_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CLAUDE_IGNORE_SIGTERM;
+  try {
+    const first = manager.streamTurn(session.id, { input: 'PARTIAL' })[Symbol.asyncIterator]();
+    assert.equal((await first.next()).value?.event, 'cli.event');
+    // The interrupt is a replacement on this runtime, and the old child ignores SIGTERM: the replacement waits a second for its exit.
+    await manager.interrupt(session.id);
+    await delay(50);
+    const second = manager.streamTurn(session.id, { input: 'HANG' })[Symbol.asyncIterator]();
+    const pending = second.next();
+    await delay(50);
+    assert.equal(manager.get(session.id).status, 'running', 'the waiting turn occupies the session');
+    const interruptedAt = Date.now();
+    await manager.interrupt(session.id);
+    assert.ok(Date.now() - interruptedAt < 300, `the stop ended the wait, not the replacement: ${Date.now() - interruptedAt} ms`);
+    assert.equal((await pending).value?.event, 'cli.error', 'the waiting caller heard the stop');
+    // The replacement finishes — a successor publishes its pid — and only then is the session asked again.
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await delay(300);
+    assert.equal(manager.get(session.id).status, 'ready', 'the stopped turn was never written to the successor');
+    const third = await manager.runTurn(session.id, { input: 'Say OK' }, { timeoutMs: 3_000 });
+    assert.equal(third.status, 'completed', JSON.stringify(third.final));
+    assert.equal(third.final.text, 'OK');
+  } finally {
+    reapFixtureChild(oldPid);
+  }
+});
+
+test('a codex close that lands while the replacement is still copying credentials starts no successor: the close returns within its own work (t1 r3-codex F3)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '1200';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(1_000);
+  const session = await manager.create({ runtime: 'codex' });
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // A successor that would take three seconds to answer `initialize`.
+  process.env.FAKE_CODEX_INITIALIZE_DELAY_MS = '3000';
+  const originalCopyFile = fs.promises.copyFile;
+  let releaseCopy;
+  const copyGate = new Promise((resolve_) => { releaseCopy = resolve_; });
+  let copyStarted = false;
+  fs.promises.copyFile = async (source, target, ...rest) => {
+    if (String(target).includes('local-oauth-cli-codex-proxy-')) {
+      copyStarted = true;
+      await copyGate;
+    }
+    return originalCopyFile(source, target, ...rest);
+  };
+  syncBuiltinESMExports();
+  try {
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 5_000 });
+    assert.equal(first.status, 'error');
+    assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 1000ms/);
+    await waitFor(() => copyStarted, 3_000, 'the replacement to start copying the credentials');
+    const closingAt = Date.now();
+    const closing = manager.close(session.id);
+    await delay(100);
+    releaseCopy();
+    const closed = await closing;
+    assert.equal(closed.status, 'closed');
+    assert.ok(Date.now() - closingAt < 800, `the close did not wait out a successor's handshake: ${Date.now() - closingAt} ms`);
+    await delay(200);
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'initialize').length, 1, 'no successor was spoken to');
+  } finally {
+    releaseCopy();
+    fs.promises.copyFile = originalCopyFile;
+    syncBuiltinESMExports();
+  }
+});
+
+test('interrupting a drained codex turn answers when the child has been told, not when it acknowledges: the session is free at the write (t1 r3-codex F4)', { timeout: 20_000 }, async () => {
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1';
+  const { manager, methodLog } = await startCodexManager(1_500);
+  const session = await manager.create({ runtime: 'codex' });
+  let writerError;
+  try {
+    for await (const event of manager.streamTurn(session.id, { input: 'hello' }, { timeoutMs: 10_000 })) {
+      if (event.event === 'cli.event') throw new Error('writeSseEvent failed');
+    }
+  } catch (err) {
+    writerError = err.message;
+  }
+  assert.equal(writerError, 'writeSseEvent failed');
+  assert.equal(manager.get(session.id).status, 'running');
+  const interruptAt = Date.now();
+  const interrupted = await manager.interrupt(session.id);
+  assert.ok(Date.now() - interruptAt < 500, `the endpoint answered at the write, not at the RPC budget: ${Date.now() - interruptAt} ms`);
+  assert.equal(interrupted.status, 'ready');
+  // Written before the endpoint answered; received by the child a moment later.
+  await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/interrupt'), 2_000, 'the child to receive the interrupt');
+  assert.deepEqual((await receivedMethods(methodLog)).filter((method) => method.startsWith('turn/')), ['turn/start', 'turn/interrupt']);
+});
+
+test('a codex child that did not exit gets no successor: the replacement refuses while it lives, and starts one once it is gone (t1 r3-codex F5)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_TURN_START_DELAY_MS = '800';
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager } = await startCodexManager(500);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CODEX_TURN_START_DELAY_MS;
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // A child no signal reaches: its handle's `kill` does nothing, so it stays.
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  assert.ok(handle, 'the runtime\'s child handle');
+  handle.kill = () => true;
+  try {
+    const first = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 5_000 });
+    assert.equal(first.status, 'error');
+    assert.match(first.events.at(-1).raw.message, /turn\/start timed out after 500ms/);
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 8_000 });
+    assert.equal(second.status, 'error', JSON.stringify(second.final));
+    assert.match(second.events.at(-1).raw.message, /did not exit/, 'the turn reports why no child could be started');
+    assert.equal(Number(await readFile(pidFile, 'utf8')), oldPid, 'no successor while the child lives');
+    assert.equal(processAlive(oldPid), true);
+    // Gone at last — by the pid this test owns — and the next turn gets its child.
+    process.kill(oldPid, 'SIGKILL');
+    await waitFor(() => !processAlive(oldPid), 3_000, 'the old child to be gone');
+    const third = await manager.runTurn(session.id, { input: 'once more' }, { timeoutMs: 8_000 });
+    assert.equal(third.status, 'completed', JSON.stringify(third.final));
+    assert.notEqual(Number(await readFile(pidFile, 'utf8')), oldPid, 'a successor, now');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a claude child that did not exit gets no successor either: the same rule on the other runtime (t1 r3-codex F5, two paths)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  const { manager } = await startClaudeManager(10_000);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  assert.ok(handle, 'the runtime\'s child handle');
+  handle.kill = () => true;
+  try {
+    const first = manager.streamTurn(session.id, { input: 'PARTIAL' })[Symbol.asyncIterator]();
+    assert.equal((await first.next()).value?.event, 'cli.event');
+    await manager.interrupt(session.id);
+    // The replacement waits out both graces and refuses to spawn over a child that stayed.
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 8_000 });
+    assert.equal(second.status, 'error', JSON.stringify(second.final));
+    assert.match(second.events.at(-1).raw.message, /did not exit/);
+    assert.equal(Number(await readFile(pidFile, 'utf8')), oldPid, 'no successor while the child lives');
+    process.kill(oldPid, 'SIGKILL');
+    await waitFor(() => !processAlive(oldPid), 3_000, 'the old child to be gone');
+    const third = await manager.runTurn(session.id, { input: 'Say OK' }, { timeoutMs: 8_000 });
+    assert.equal(third.status, 'completed', JSON.stringify(third.final));
+    assert.equal(third.final.text, 'OK');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});

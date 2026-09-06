@@ -27,12 +27,48 @@ export interface LocalCliChatTurnOptions {
   readonly timeoutMs?: number;
 }
 
-/** What the manager owns for one turn: the caller's deadline and its signal. */
-interface ManagedTurn {
+/**
+ * What the manager owns for one turn, from the moment it is admitted to the
+ * moment its caller's iteration ends — whether or not the generator that
+ * delivers the turn's events was ever entered. It used to be two records
+ * (`running` and a `currentTurn` installed at admission) released only by a
+ * generator's `finally`, which never runs for a reader that cancels before its
+ * first read: the slot stayed taken for the session's life (r56-codex).
+ *
+ * States: `admitted` (slot taken, runtime not asked, nobody has read),
+ * `streaming` (the first read entered the generator), and the two terminal
+ * ones — `stopped` (a stop ended the turn for its caller; one `cli.error`
+ * carrying the reason is owed to a reader) and `released` (ended without a
+ * stop: completed, failed runtime-side, or the reader returned). A terminal
+ * transition runs once, clears the deadline, and detaches from the session
+ * iff the session still holds this reservation.
+ */
+interface TurnReservation {
+  readonly turnId: string;
   readonly abort: AbortController;
-  /** Cancels this turn's idle deadline, wherever the turn ends. */
-  readonly stopDeadline: () => void;
+  readonly idleTimeoutMs: number | undefined;
+  state: 'admitted' | 'streaming' | 'stopped' | 'released';
+  /** The stop's reason — what the reader is owed as its one `cli.error`. */
+  reason: string | null;
+  /** Settles when a stop ends the turn: a read parked in the runtime ends there. */
+  readonly stopped$: Promise<void>;
+  markStopped: () => void;
+  deadline: NodeJS.Timeout | undefined;
+  /**
+   * Closes the runtime's iteration, once, from wherever the turn ends: a stop
+   * that lands between two reads left the runtime's generator suspended at its
+   * `yield` for good, and a runtime that retires only in its `finally` then
+   * held the session for its life (t1-r1-codex). Installed by the iterator
+   * that owns the generator; a read still pending in the runtime is finalized
+   * behind its own settlement.
+   */
+  closeInner: (() => Promise<void>) | null;
 }
+
+/** The manager's answer for every turn it stops itself, on both runtimes. */
+const TURN_ABORTED = 'local CLI chat turn aborted';
+/** The runtimes' own in-band answer when a close ends a running turn, reused for one not yet entered. */
+const SESSION_CLOSED = 'local CLI chat session closed';
 
 interface ManagedSession {
   readonly id: string;
@@ -43,24 +79,23 @@ interface ManagedSession {
   readonly title?: string;
   readonly nativeSession: LocalCliChatRuntimeSession;
   closed: boolean;
-  /**
-   * Whether a turn is running, for a runtime that cannot say. A runtime that
-   * can is asked instead — see `sessionStatus`.
-   */
-  running: boolean;
   lastTurnId?: string;
-  currentTurn?: ManagedTurn;
+  reservation?: TurnReservation;
 }
 
 /**
- * One answer about occupancy, from whoever knows. A runtime that reports it
- * IS the authority: the manager's own bookkeeping used to be a second, parallel
- * lifetime, and the two disagreed — a session answered `ready` while its
- * runtime refused every turn as concurrent, and the reverse.
+ * Occupancy is two single-owner values, projected: the manager's reservation
+ * (admission → the caller's iteration ends) and the runtime's `isBusy`
+ * (dispatch → the child-side retirement). Neither restates the other — the
+ * manager's own bookkeeping used to be a second, parallel lifetime, and the
+ * two disagreed. The disjunction is what lets a stop free the caller before
+ * the child has acknowledged the turn without freeing the SESSION: codex keeps
+ * its turn until the acknowledgement, retiring it immediately before it writes
+ * the interrupt, so admission answers 409 for that whole window (r56-codex).
  */
 function sessionStatus(session: ManagedSession): LocalCliChatSessionStatus {
   if (session.closed) return 'closed';
-  const busy = session.nativeSession.isBusy?.() ?? session.running;
+  const busy = session.reservation !== undefined || session.nativeSession.isBusy();
   return busy ? 'running' : 'ready';
 }
 
@@ -68,6 +103,50 @@ export class LocalCliChatSessionManager {
   private readonly defaultCwd: string;
   private readonly runtimes: Partial<Record<LocalCliChatRuntime, LocalCliChatRuntimeFactory>>;
   private readonly sessions = new Map<string, ManagedSession>();
+  /**
+   * Set by `closeAll()` before anything else, never cleared: a manager that
+   * has begun closing accepts no session again, and a runtime whose factory
+   * resolves after that is closed by its own creation (t1 B-shutdown, gap 5:
+   * a creation in flight resolved after the global close and left a live
+   * child — the order the server's own close takes).
+   */
+  private closing = false;
+  /**
+   * The creations in flight — the factory awaited — so the global close can
+   * wait for them. Each settles when its creation does, and rejects only with
+   * a teardown the creation itself owed and could not finish (t1-r4-codex: a
+   * runtime that resolved after the close began, closed by its creation, left
+   * its child alive — and the global close reported clean).
+   */
+  private readonly creations = new Set<Promise<void>>();
+  /**
+   * Sessions leaving through `close(id)`: gone from the map at once (no turn is
+   * admitted during the teardown), so the global close would not see them —
+   * it joins a departure still in flight, and re-closes one that failed, so
+   * what remains is its error too (t1-r4-codex).
+   */
+  private readonly departures = new Map<ManagedSession, Promise<void>>();
+  /**
+   * Runtimes a global close could not finish — a child that would not exit, a
+   * credentials copy that would not go — and runtimes a creation had to close
+   * and could not: kept here until a close succeeds, so a survivor is never
+   * forgotten between global closes. A later `closeAll` re-closes each and drops
+   * the ones that finally go; the ones still here are its error too. The
+   * `close(id)` path keeps its own retry through `departures` and does not go
+   * here, so nothing is closed twice in one sweep (t1-r5-codex: a session the
+   * global close could not end, and a creation-owned close that failed, were
+   * each reported once and then dropped, and the next global close reported a
+   * clean shutdown over the live child).
+   */
+  private readonly residual = new Set<LocalCliChatRuntimeSession>();
+  /**
+   * The global close in flight: a second `closeAll` under it is the same close,
+   * not a new one that snapshots an empty map and resolves over a child the
+   * first is still ending (t1-r5-codex). Cleared when the sweep settles, so a
+   * later `closeAll` starts a fresh one — which re-closes anything in
+   * `residual` or `departures` that the last could not finish.
+   */
+  private closeAllInFlight: Promise<void> | null = null;
 
   constructor(options: LocalCliChatSessionManagerOptions) {
     this.defaultCwd = options.defaultCwd;
@@ -84,20 +163,46 @@ export class LocalCliChatSessionManager {
       throw new LocalCliChatError(`Runtime is not enabled for local CLI chat sessions: ${runtime}`, 400, 'runtime_not_enabled');
     }
     const cwd = resolve(input.cwd ?? this.defaultCwd);
-    const nativeSession = await factory({ ...input, runtime, cwd });
-    const session: ManagedSession = {
-      id: `sess_${randomUUID()}`,
-      runtime,
-      createdAt: Math.floor(Date.now() / 1000),
-      cwd,
-      model: input.model,
-      title: input.title,
-      nativeSession,
-      closed: false,
-      running: false,
-    };
-    this.sessions.set(session.id, session);
-    return snapshot(session);
+    if (this.closing) throw shuttingDown();
+    let settle = (): void => {};
+    let fail = (_err: unknown): void => {};
+    const creation = new Promise<void>((resolve_, reject) => { settle = resolve_; fail = reject; });
+    this.creations.add(creation);
+    try {
+      const nativeSession = await factory({ ...input, runtime, cwd });
+      if (this.closing) {
+        // The close began while this runtime was starting: it is this
+        // creation's to end — the close never saw it — and its caller hears
+        // the refusal, or the teardown's own failure, which the global close
+        // hears as well.
+        try {
+          await nativeSession.close();
+        } catch (err) {
+          // The runtime this creation owned could not be closed: kept for the
+          // next global close to re-close and report, not lost once this
+          // creation's rejection is aggregated the first time (t1-r5-codex F4).
+          this.residual.add(nativeSession);
+          fail(err);
+          throw err;
+        }
+        throw shuttingDown();
+      }
+      const session: ManagedSession = {
+        id: `sess_${randomUUID()}`,
+        runtime,
+        createdAt: Math.floor(Date.now() / 1000),
+        cwd,
+        model: input.model,
+        title: input.title,
+        nativeSession,
+        closed: false,
+      };
+      this.sessions.set(session.id, session);
+      return snapshot(session);
+    } finally {
+      this.creations.delete(creation);
+      settle();
+    }
   }
 
   get(id: string): LocalCliChatSessionSnapshot {
@@ -116,33 +221,94 @@ export class LocalCliChatSessionManager {
     // error, not a session kept listed (r54-fable).
     session.closed = true;
     this.sessions.delete(id);
-    try {
-      await session.nativeSession.close();
-    } finally {
-      this.endTurn(session);
-    }
+    // The turn found is stopped before the teardown is awaited: a reader that
+    // arrives after the close hears the close — on both runtimes — and the
+    // runtime is never asked to start it (r56: claude answered "not running",
+    // the wrong fact, for the same sequence codex answered "closed").
+    if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
+    const departure = session.nativeSession.close();
+    this.departures.set(session, departure);
+    // A departure that fails stays: the global close re-closes it, and what
+    // still remains — a child that would not exit, a credentials copy — is
+    // that close's to report.
+    await departure;
+    this.departures.delete(session);
     return snapshot(session);
   }
 
   async closeAll(): Promise<void> {
+    // No session is created after this line — set before anything else, and
+    // never cleared (t1 B-shutdown).
+    this.closing = true;
+    // A second call under one already in flight is the same close: it waits for
+    // that one and its child, rather than snapshotting an empty map and
+    // resolving over a child the first is still ending (t1-r5-codex F1). The
+    // flight is cleared when the sweep settles, so a later call starts a fresh
+    // sweep that re-closes whatever this one could not finish.
+    if (this.closeAllInFlight) return this.closeAllInFlight;
+    const tracked = this.runCloseAll().finally(() => {
+      if (this.closeAllInFlight === tracked) this.closeAllInFlight = null;
+    });
+    this.closeAllInFlight = tracked;
+    return tracked;
+  }
+
+  private async runCloseAll(): Promise<void> {
+    // What earlier closes could not finish, snapshot before this sweep does any
+    // work: re-closed here, and dropped as each finally goes. A runtime a
+    // creation adds to `residual` while this sweep runs is the NEXT sweep's, not
+    // closed twice now (t1-r5-codex F3, F4).
+    const residual = [...this.residual];
+    // Every creation in flight settles first — by closing its own runtime — so
+    // nothing resolves after the close it never saw (t1 B-shutdown).
+    const creations = await Promise.allSettled([...this.creations]);
+    const departures = [...this.departures];
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     // Every session is torn down and its bookkeeping finished before any
     // teardown's error is raised — and one IS raised: a close that leaves a
     // credentials copy on disk says so to the server's own close, which used
     // to hear a clean shutdown over it (r55-codex).
-    const outcomes = await Promise.allSettled(sessions.map(async (session) => {
-      try {
-        await session.nativeSession.close();
-      } finally {
-        this.endTurn(session);
+    const outcomes = await Promise.allSettled([
+      ...residual.map((nativeSession) => this.closeResidual(nativeSession)),
+      ...departures.map(async ([session, departure]) => {
+        try {
+          await departure;
+        } catch {
+          // A `close(id)` that failed keeps retrying through `departures`: its
+          // entry stays until this re-close succeeds, so it does not also go in
+          // `residual` (no runtime is closed twice in one sweep, t1-r5-codex).
+          await session.nativeSession.close();
+        }
+        this.departures.delete(session);
+      }),
+      ...sessions.map(async (session) => {
         session.closed = true;
-      }
-    }));
-    const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+        if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
+        // A session the global close itself could not end is remembered, not
+        // forgotten once reported (t1-r5-codex F3).
+        await this.closeResidual(session.nativeSession);
+      }),
+    ]);
+    const failures = [...creations, ...outcomes].filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
     if (failures.length === 1) throw failures[0].reason;
     if (failures.length > 1) {
       throw new Error(failures.map((failure) => (failure.reason instanceof Error ? failure.reason.message : String(failure.reason))).join('; '));
+    }
+  }
+
+  /**
+   * Closes a runtime and remembers it iff the close failed: a survivor a global
+   * close could not end stays in `residual` for the next one to re-close and
+   * report; a close that succeeds drops it (t1-r5-codex F3, F4).
+   */
+  private async closeResidual(nativeSession: LocalCliChatRuntimeSession): Promise<void> {
+    try {
+      await nativeSession.close();
+      this.residual.delete(nativeSession);
+    } catch (err) {
+      this.residual.add(nativeSession);
+      throw err;
     }
   }
 
@@ -155,38 +321,78 @@ export class LocalCliChatSessionManager {
     // the session's own handler for that signal runs the same stop. Asking
     // both ways at once is what told the child twice. A runtime that
     // implements no interrupt is stopped through the signal alone.
-    // The turn's deadline goes with the turn. An abandoned stream's `finally` —
-    // the only other place it was cleared — never runs, so the deadline
-    // outlived the turn it belonged to and later aborted a signal whose turn
-    // was long over, stopping whoever was running by then.
-    const turn = this.endTurn(session);
-    try {
-      if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
-      else turn?.abort.abort();
-    } finally {
-      // Even when the runtime's stop threw. Whether the session is free again
-      // is the runtime's answer, not this bookkeeping — a turn the child has
-      // not named yet keeps it busy until it can be told to stop.
-      session.running = false;
-    }
+    // The reservation is stopped BEFORE the runtime is asked — synchronously,
+    // so nothing can be dispatched in between: a turn admitted but not yet read
+    // had no runtime turn to stop, the endpoint answered `ready`, and the turn
+    // ran on the next read (r56-codex). Stopped, the reservation owes its
+    // reader one `cli.error` and holds the session no longer; whether the
+    // session is free is then the runtime's answer — a turn the child has not
+    // named yet keeps it busy until it can be told to stop. And the stop is
+    // recorded even when the runtime's own stop throws: the rejection is the
+    // caller's, not a session wedged at `running`.
+    const reservation = session.reservation;
+    if (reservation) this.stop(session, reservation, TURN_ABORTED);
+    if (session.nativeSession.interrupt) await session.nativeSession.interrupt();
+    else reservation?.abort.abort();
     return snapshot(session);
   }
 
-  /** Ends the manager's side of the current turn: its deadline and its record. */
-  private endTurn(session: ManagedSession): ManagedTurn | undefined {
-    const turn = session.currentTurn;
-    turn?.stopDeadline();
-    session.currentTurn = undefined;
-    return turn;
+  /** The one place a stop ends a turn for its caller. Runs once; safe on a turn already over. */
+  private stop(session: ManagedSession, reservation: TurnReservation, reason: string): void {
+    if (reservation.state === 'stopped' || reservation.state === 'released') return;
+    reservation.state = 'stopped';
+    reservation.reason = reason;
+    this.end(session, reservation);
+    reservation.markStopped();
+    void reservation.closeInner?.();
+  }
+
+  /** The one place a turn ends without a stop: completed, failed runtime-side, or the reader returned. */
+  private release(session: ManagedSession, reservation: TurnReservation): void {
+    if (reservation.state === 'stopped' || reservation.state === 'released') return;
+    reservation.state = 'released';
+    this.end(session, reservation);
+  }
+
+  /**
+   * The terminal transition's effects: the deadline dies with the turn, and
+   * only the turn that still owns the session releases it — an abandoned
+   * stream finalizes late, after its turn was stopped and the next one
+   * started, and releasing there handed the running turn's slot to whoever
+   * asked next.
+   */
+  private end(session: ManagedSession, reservation: TurnReservation): void {
+    if (reservation.deadline) clearTimeout(reservation.deadline);
+    reservation.deadline = undefined;
+    if (session.reservation === reservation) session.reservation = undefined;
+  }
+
+  /**
+   * The idle deadline bounds SILENCE, not duration: a native turn is an agentic
+   * CLI session that legitimately runs for many minutes while streaming, and a
+   * total cap would cut a turn that is working. Re-armed on every delivered
+   * event, so what it ends is a turn that has stopped producing. Firing, it
+   * is a stop like any other — the caller is answered at once, and the signal
+   * reaches the runtime as it always did — where it used to only fire the
+   * signal, which a reservation nobody had read could not observe (r56-codex).
+   */
+  private armDeadline(session: ManagedSession, reservation: TurnReservation): void {
+    if (reservation.idleTimeoutMs === undefined) return;
+    if (reservation.deadline) clearTimeout(reservation.deadline);
+    reservation.deadline = setTimeout(() => {
+      this.stop(session, reservation, TURN_ABORTED);
+      reservation.abort.abort();
+    }, reservation.idleTimeoutMs);
   }
 
   /**
    * Admits the turn NOW — the 404/409/410 are thrown from this call, before
-   * the caller has committed anything — and returns the turn's events, which
-   * the caller must consume: the reservation made here is released by the
-   * iteration's end (r55-codex: a lazy generator ran its admission only at
-   * the first read, after the HTTP writer had committed 200 SSE headers, so a
-   * known 404 went out as a 200 with a generic error).
+   * the caller has committed anything (r55-codex: a lazy generator ran its
+   * admission only at the first read, after the HTTP writer had committed 200
+   * SSE headers, so a known 404 went out as a 200 with a generic error) — and
+   * returns the turn's events. The reservation made here is released by the
+   * iteration's end, by a reader that returns before it ever read, by the idle
+   * deadline, or by a stop — not only by a generator's `finally`.
    */
   streamTurn(
     sessionId: string,
@@ -203,52 +409,195 @@ export class LocalCliChatSessionManager {
     }
     const turnId = `turn_${randomUUID()}`;
     session.lastTurnId = turnId;
-    session.running = true;
-    const abort = new AbortController();
+    let markStopped = (): void => {};
+    const stopped$ = new Promise<void>((resolve) => { markStopped = resolve; });
     // The caller's deadline reaches the runtime through the turn's own signal —
     // the same mechanism `interrupt` uses. Without it a child that stopped
     // answering held the HTTP request open with no end, and left the session
     // `running`, so every later turn was refused with 409.
-    //
-    // It bounds SILENCE, not duration: a native turn is an agentic CLI session
-    // that legitimately runs for many minutes while streaming, and a total cap
-    // would cut a turn that is working. Every event restarts the clock, so what
-    // the deadline ends is a turn that has stopped producing.
-    const idleTimeoutMs = options.timeoutMs !== undefined && options.timeoutMs > 0
-      ? options.timeoutMs
-      : undefined;
-    let deadline: NodeJS.Timeout | undefined;
-    const stopDeadline = (): void => {
-      if (deadline) clearTimeout(deadline);
-      deadline = undefined;
+    const reservation: TurnReservation = {
+      turnId,
+      abort: new AbortController(),
+      idleTimeoutMs: options.timeoutMs !== undefined && options.timeoutMs > 0 ? options.timeoutMs : undefined,
+      state: 'admitted',
+      reason: null,
+      stopped$,
+      markStopped,
+      deadline: undefined,
+      closeInner: null,
     };
-    const turn: ManagedTurn = { abort, stopDeadline };
-    session.currentTurn = turn;
-    const armDeadline = (): void => {
-      if (idleTimeoutMs === undefined) return;
-      stopDeadline();
-      deadline = setTimeout(() => abort.abort(), idleTimeoutMs);
-    };
-    armDeadline();
-    return this.turnEvents(session, turn, turnId, input, abort, armDeadline, stopDeadline);
+    session.reservation = reservation;
+    this.armDeadline(session, reservation);
+    return this.turnEvents(session, reservation, input);
   }
 
-  private async *turnEvents(
+  /**
+   * The turn's events, as an iterator whose `return()` and `next()` are real
+   * code from the moment of admission. An async generator's `finally` does
+   * not run for a `return()` before its first `next()`, and a stop that lands
+   * while a read is parked inside the runtime — codex's `turn/start` RPC —
+   * cannot settle that read by failing a queue nobody is reading yet, so the
+   * caller waited out the child's acknowledgement (r56-codex). Every read
+   * races the runtime against the reservation's stop; a stopped reservation
+   * answers with its reason, once. The runtime's iteration is closed by the
+   * stop itself — behind a read still pending in the runtime, whose
+   * settlement then runs the generator's own `catch` and `finally` (a
+   * replacement on timeout, the retirement on acknowledgement) and reaches no
+   * caller; at once when the stop lands between reads, so a reader that never
+   * reads again still leaves a retired runtime turn behind (t1-r1-codex).
+   */
+  private turnEvents(
     session: ManagedSession,
-    turn: ManagedTurn,
-    turnId: string,
+    reservation: TurnReservation,
     input: LocalCliChatTurnInput,
-    abort: AbortController,
-    armDeadline: () => void,
-    stopDeadline: () => void,
   ): AsyncIterable<LocalCliChatEvent> {
+    const inner = this.runtimeEvents(session, reservation, input);
+    // Read through a call: the state moves under an `await`, past what a
+    // narrowing on the field would admit.
+    const stopped = (): boolean => reservation.state === 'stopped';
+    const done: IteratorResult<LocalCliChatEvent> = { done: true, value: undefined };
+    let finished = false;
+    let owed = true;
+    const stopEvent = (): IteratorResult<LocalCliChatEvent> => {
+      if (!owed) {
+        finished = true;
+        return done;
+      }
+      owed = false;
+      return {
+        done: false,
+        value: {
+          event: 'cli.error',
+          session_id: session.id,
+          turn_id: reservation.turnId,
+          runtime: session.runtime,
+          raw: { message: reservation.reason ?? TURN_ABORTED },
+        },
+      };
+    };
+    // The read in flight, if any: a stop that lands while it is parked in the
+    // runtime finalizes the generator behind its settlement; one that lands
+    // between reads finalizes it now. One handler, attached once: the
+    // generator's own `catch` turns every runtime error into an event, so the
+    // read settles, and nothing is left for the process to report.
+    let pending: Promise<IteratorResult<LocalCliChatEvent>> | null = null;
+    let closing: Promise<void> | null = null;
+    const closeInner = (): Promise<void> => {
+      if (closing) return closing;
+      const settled = pending ?? Promise.resolve();
+      closing = settled
+        .then(() => inner.return(undefined), () => inner.return(undefined))
+        .then(() => undefined, () => undefined);
+      return closing;
+    };
+    reservation.closeInner = closeInner;
+    // Reads the abandoned turn to its end: the terminal event releases, as it
+    // does for a reader; a stop (the deadline, a close) still closes the inner
+    // behind the read in flight, and the loop ends on it.
+    const drain = async (): Promise<void> => {
+      try {
+        while (!stopped()) {
+          const read = inner.next();
+          pending = read;
+          const result = await read;
+          pending = null;
+          if (result.done) return;
+          const event = result.value;
+          if (event.event === 'cli.completed' || event.event === 'cli.error') {
+            this.release(session, reservation);
+            return;
+          }
+          this.armDeadline(session, reservation);
+        }
+      } catch {
+        // The generator's own `catch` turns every runtime error into an event;
+        // nothing reaches here, and nothing may leave for the process.
+      }
+    };
+    let chain: Promise<unknown> = Promise.resolve();
+    const serialized = <T>(step: () => Promise<T>): Promise<T> => {
+      const result = chain.then(step, step);
+      chain = result.catch(() => undefined);
+      return result;
+    };
+    const iterator: AsyncIterableIterator<LocalCliChatEvent> = {
+      [Symbol.asyncIterator]() {
+        return iterator;
+      },
+      next: () => serialized(async () => {
+        if (finished) return done;
+        if (reservation.state === 'stopped') return stopEvent();
+        if (reservation.state === 'released') {
+          finished = true;
+          return done;
+        }
+        reservation.state = 'streaming';
+        const read = inner.next();
+        pending = read;
+        const outcome = await Promise.race([
+          read.then((result): { result: IteratorResult<LocalCliChatEvent> | null } => ({ result })),
+          reservation.stopped$.then((): { result: IteratorResult<LocalCliChatEvent> | null } => ({ result: null })),
+        ]);
+        if (outcome.result !== null) pending = null;
+        if (outcome.result === null || stopped()) return stopEvent();
+        if (outcome.result.done) {
+          finished = true;
+          return done;
+        }
+        const event = outcome.result.value;
+        if (event.event === 'cli.completed' || event.event === 'cli.error') {
+          // The terminal event IS the end: the slot goes with it, not with the
+          // read after it — a stop landing between the two (an interrupt
+          // racing the terminal SSE write) found the reservation still attached
+          // and appended a second terminal event (t1-r1-codex). The read after
+          // it is done through the released state; the generator, parked at
+          // its last yield with the runtime's turn already over, holds nothing.
+          this.release(session, reservation);
+          return outcome.result;
+        }
+        this.armDeadline(session, reservation);
+        return outcome.result;
+      }),
+      return: () => serialized(async () => {
+        if (finished) return done;
+        finished = true;
+        if (reservation.state === 'admitted') {
+          // Never entered: nothing to finalize, and the slot goes now.
+          this.release(session, reservation);
+          return done;
+        }
+        if (reservation.state === 'streaming') {
+          // The caller left without a stop — the writer failed, the socket is
+          // gone. The turn is the session's, not the socket's (the contract's
+          // disconnect row: cancellation is the interrupt, and only that): it
+          // runs on to its own end, read by nobody, and the session stays
+          // occupied through the runtime's turn until then. The reservation
+          // lets go of the caller — its iteration has ended — and keeps its
+          // idle deadline for the drain. Closing the runtime's iteration here
+          // instead retired the turn without telling the child, and the next
+          // turn was admitted on top of it: two turns on one codex thread, and
+          // on claude the abandoned turn's result decided the next turn's
+          // response (t1 B-child gap 7).
+          if (session.reservation === reservation) session.reservation = undefined;
+          void drain();
+        }
+        return done;
+      }),
+    };
+    return iterator;
+  }
+
+  private async *runtimeEvents(
+    session: ManagedSession,
+    reservation: TurnReservation,
+    input: LocalCliChatTurnInput,
+  ): AsyncGenerator<LocalCliChatEvent, void, undefined> {
     try {
-      for await (const runtimeEvent of session.nativeSession.startTurn(input, abort.signal)) {
-        armDeadline();
+      for await (const runtimeEvent of session.nativeSession.startTurn(input, reservation.abort.signal)) {
         yield {
           event: 'cli.event',
           session_id: session.id,
-          turn_id: turnId,
+          turn_id: reservation.turnId,
           runtime: session.runtime,
           raw: runtimeEvent.raw,
           ...(runtimeEvent.textDelta !== undefined ? { text_delta: runtimeEvent.textDelta } : {}),
@@ -258,7 +607,7 @@ export class LocalCliChatSessionManager {
       yield {
         event: 'cli.completed',
         session_id: session.id,
-        turn_id: turnId,
+        turn_id: reservation.turnId,
         runtime: session.runtime,
         raw: { status: 'completed' },
       };
@@ -266,22 +615,14 @@ export class LocalCliChatSessionManager {
       yield {
         event: 'cli.error',
         session_id: session.id,
-        turn_id: turnId,
+        turn_id: reservation.turnId,
         runtime: session.runtime,
         raw: {
           message: err instanceof Error ? err.message : String(err),
         },
       };
     } finally {
-      stopDeadline();
-      // Only the turn that still owns the session may release it. An
-      // interrupted stream nobody is reading finalizes late — after its turn
-      // was stopped and the next one started — and releasing there handed the
-      // running turn's slot to whoever asked next.
-      if (session.currentTurn === turn) {
-        session.currentTurn = undefined;
-        session.running = false;
-      }
+      this.release(session, reservation);
     }
   }
 
@@ -328,6 +669,10 @@ function findLastEvent(
     if (events[index]?.event === eventName) return events[index];
   }
   return undefined;
+}
+
+function shuttingDown(): LocalCliChatError {
+  return new LocalCliChatError('Local CLI chat sessions are not accepted: the proxy is shutting down.', 503, 'shutting_down');
 }
 
 function parseRuntime(value: unknown): LocalCliChatRuntime {

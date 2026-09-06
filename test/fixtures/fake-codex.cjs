@@ -19,6 +19,11 @@ if (process.argv.includes('debug') && process.argv.includes('models')) {
   process.exit(0);
 }
 
+// A child a test can find by pid, and one that will not leave on SIGTERM: the
+// teardown must escalate, and a close must not resolve over a live child.
+if (process.env.FAKE_CODEX_PID_FILE) require('node:fs').writeFileSync(process.env.FAKE_CODEX_PID_FILE, String(process.pid));
+if (process.env.FAKE_CODEX_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
+
 let threadSeq = 0;
 let turnSeq = 0;
 let lastThreadStartParams = null;
@@ -254,6 +259,14 @@ rl.on('line', (line) => {
       // A turn that opens and then produces nothing: the child accepted the
       // work and stopped answering, so nothing ever closes the turn.
       if (process.env.FAKE_CODEX_NO_TURN_COMPLETION === '1') return;
+      // A turn whose completion comes late: the delta now, `turn/completed`
+      // after the delay — the window a reader can walk away in.
+      const completionDelayMs = Number(process.env.FAKE_CODEX_TURN_COMPLETION_DELAY_MS ?? 0);
+      if (completionDelayMs > 0) {
+        write({ method: 'item/agentMessage/delta', params: { threadId, turnId, delta: text } });
+        setTimeout(() => write({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } }), completionDelayMs);
+        return;
+      }
       setTimeout(() => emitTurn(threadId, turnId, text), 0);
     }, ackDelayMs);
     return;
@@ -264,6 +277,8 @@ rl.on('line', (line) => {
     setTimeout(() => result(payload.id), Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS));
     return;
   }
+  // An interrupt the child never acknowledges: the endpoint must not wait for it.
+  if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_NO_INTERRUPT_ACK === '1') return;
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {
     result(payload.id);
     // A real child keeps talking for a moment after being told to stop, and

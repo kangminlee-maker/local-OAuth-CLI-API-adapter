@@ -187,7 +187,7 @@ however the stop was asked for. Both parts belong to it: the child stops
 working AND the turn's iteration ends.
 
 The endpoint answers as soon as the turn is over for its caller; it does not
-wait for the session to be free again. A turn the child has been asked for but
+wait for the session to be free again, nor for the child to acknowledge. A turn the child has been asked for but
 has not yet named cannot be interrupted until it is named, and nothing may be
 started ahead of that interrupt, so the session stays `running` until the
 acknowledgement arrives (or that request fails). A child that never names the
@@ -206,13 +206,62 @@ that lands while a turn waits for the replacement ends the wait, not the replace
 close during a replacement ends the child being started rather than waiting out its
 handshake; a replacement whose handshake fails leaves no child; and a
 streamed turn is admitted before any SSE commits, so a 404, 409 or 410 arrives in the
-native envelope on that path too (round 55). A close stops the turn it finds — one
+native envelope on that path too (round 55). The turn the manager admits is a reservation
+it owns from the call to the end of its caller's iteration — released by that end, by a
+reader that returns before it ever read, by the idle deadline, or by a stop — not only by a
+generator's `finally`, which never runs for a reader that cancels before its first read; a
+stop (interrupt, deadline, close) ends the turn for its caller at once, on both runtimes and
+with one answer (`local CLI chat turn aborted`; `local CLI chat session closed`), while the
+session stays occupied until the runtime has retired the turn — codex keeps its turn until the
+child names it and the interrupt is written, so a turn asked for in that window is refused 409
+rather than started ahead of the interrupt (track 1, B-res). A reader that leaves WITHOUT a stop —
+the SSE writer failing, the socket gone — leaves the turn to the session: the reservation lets go
+of the caller and drains the turn to its own end under the same idle deadline, read by nobody, and
+the session stays occupied through the runtime's turn until then; `interrupt` is the way to have
+it sooner. Closing the runtime's iteration there instead retired the turn without telling the
+child, and the next turn was admitted on top of it — two turns on one codex thread, and on claude
+the abandoned turn's result decided the next turn's response (track 1, B-child). A close stops the turn it finds — one
 still preparing its input ends without writing to the child being archived, and one
 admitted before the close but read after it hears the close (round 55). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
 is the runtime's own answer about whether a turn occupies it, not separate
 bookkeeping — the two used to disagree, so a session could report `ready` while
 its runtime refused every turn.
+
+The child is the runtime's, and it owns one at a time. A teardown — a close, a replacement, a
+handshake that failed — returns once the child has EXITED: `SIGTERM`, a grace, `SIGKILL` to the
+same handle, a grace; the credentials copy a codex child ran with is removed after that exit, and
+a replacement spawns its successor only after it. The server's own close closes every session at
+once (`closeAll`), and no session is created after it began: a create that arrives then, or one
+whose runtime was still starting when the close began, is refused `503 shutting_down` — its
+runtime, if it got one, closed by the creation itself before the refusal, so no child and no
+credentials copy resolves after the close it never saw (track 1, B-shutdown); a session already
+leaving through its own close is joined, one whose close failed is closed again, and a runtime a
+creation had to close and could not is the global close's error as well as its creator's. Two
+global closes in flight are one: the second waits for the first and its children rather than
+resolving over a child the first is still ending, and a session or a creation-owned runtime a
+global close could not end is kept and re-closed by the next until one succeeds — reported each
+time it still lives, never dropped over a survivor. A child still there after the second grace is
+named in the close's error, next to a credentials directory that would not go — and no successor
+is spawned while it lives: a turn asked meanwhile reports that the child did not exit, and the
+next turn after the handle reports its exit gets a child. A child that died on its own is
+forgotten at once, thread and all; its credentials copy is the next teardown's, whose caller
+awaits it. An interrupt answers when the child has been told, not when it acknowledges: the
+session is free at the write. A child that cannot be written to is replaced, thread and all —
+whether the write throws at the call or reports the dead pipe a tick later as a stream error, both
+retire that child. When the interrupt write is ACCEPTED or throws synchronously, nothing starts
+ahead of an interrupt it never received: the throw's replacement is installed before the endpoint
+returns, and an accepted write reached the child. The one gap is the write that returns and fails a
+tick later: between the interrupt answering `ready` and that stream error installing the
+replacement, a turn submitted in that window can reach the dying child — the ordering there is the
+open follow-up `docs/design-task-codex-interrupt-write-barrier.md`, not yet enforced. A session whose
+child is gone — a replacement that failed, a child that died — names no thread and answers
+`ready`: the next turn starts a child for itself, once per turn, and a turn that could not get
+one reports the start's own failure (`initialize timed out after …`), whether it waited for that
+attempt or made it. Nothing respawns unprompted, and no turn is ever re-issued (track 1, B-child:
+a failed replacement had left the session `ready` over no child, naming a thread that no longer
+existed, with every later turn `not running` for its life; a close had forgotten the handle at
+the `SIGTERM`, so a child that ignored it outlived a close reported as success).
 
 Runtime mapping:
 

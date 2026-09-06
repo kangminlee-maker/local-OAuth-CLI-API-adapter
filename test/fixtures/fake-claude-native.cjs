@@ -13,6 +13,11 @@ if (args[args.indexOf('--input-format') + 1] !== 'stream-json') {
   process.exit(2);
 }
 
+// A child a test can find by pid, and one that will not leave on SIGTERM: the
+// teardown must escalate, and a close must not resolve over a live child.
+if (process.env.FAKE_CLAUDE_PID_FILE) require('node:fs').writeFileSync(process.env.FAKE_CLAUDE_PID_FILE, String(process.pid));
+if (process.env.FAKE_CLAUDE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
+
 function write(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
@@ -32,6 +37,46 @@ rl.on('line', (line) => {
   // A child that took the prompt and never answered — the failure an interrupt
   // exists for, and the only way to hold a turn open here.
   if (text.includes('HANG')) return;
+  // A child that dies on this prompt: the session is left with no child.
+  if (text.includes('EXIT')) process.exit(0);
+  // A result that comes late: the delta now, the `result` 150 ms later — the
+  // window a reader can walk away in, and the line that then went to whoever
+  // was running by the time it arrived.
+  if (text.includes('LATE_RESULT')) {
+    write({ type: 'system', subtype: 'init', session_id: 'fake_native_session' });
+    write({
+      type: 'stream_event',
+      event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'LATE_HEAD' } },
+      session_id: 'fake_native_session',
+    });
+    setTimeout(() => write({
+      type: 'result',
+      subtype: 'success',
+      result: 'LATE_RESULT',
+      session_id: 'fake_native_session',
+      usage: { input_tokens: 1, output_tokens: 11 },
+    }), 150);
+    return;
+  }
+  // A turn that answers only after 300 ms, all at once.
+  if (text.includes('DELAYED')) {
+    setTimeout(() => {
+      write({ type: 'system', subtype: 'init', session_id: 'fake_native_session' });
+      write({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'DELAYED_REAL' } },
+        session_id: 'fake_native_session',
+      });
+      write({
+        type: 'result',
+        subtype: 'success',
+        result: 'DELAYED_REAL',
+        session_id: 'fake_native_session',
+        usage: { input_tokens: 2, output_tokens: 22 },
+      });
+    }, 300);
+    return;
+  }
   // A turn that streams for longer than one deadline while never falling
   // silent for one: six deltas 100 ms apart, then the result.
   if (text.includes('SLOW')) {

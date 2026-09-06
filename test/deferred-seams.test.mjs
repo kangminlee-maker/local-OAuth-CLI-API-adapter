@@ -31,13 +31,20 @@ test('a native session turn survives its client disconnecting', async () => {
       codex: async () => ({
         runtime: 'codex',
         native: { thread_id: 'thread_hold' },
+        busy: false,
         async *startTurn(turn) {
-          const text = typeof turn.input === 'string' ? turn.input : 'x';
-          yield { raw: { method: 'item/agentMessage/delta', params: { delta: text } }, textDelta: text };
-          if (text === 'hold') await gate;
-          yield { raw: { method: 'thread/tokenUsage/updated', params: {} }, usage: { totalTokens: 1 } };
+          this.busy = true;
+          try {
+            const text = typeof turn.input === 'string' ? turn.input : 'x';
+            yield { raw: { method: 'item/agentMessage/delta', params: { delta: text } }, textDelta: text };
+            if (text === 'hold') await gate;
+            yield { raw: { method: 'thread/tokenUsage/updated', params: {} }, usage: { totalTokens: 1 } };
+          } finally {
+            this.busy = false;
+          }
         },
         async interrupt() { interrupted += 1; },
+        isBusy() { return this.busy; },
         async close() {},
       }),
     },
