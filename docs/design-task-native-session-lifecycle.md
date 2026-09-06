@@ -117,9 +117,13 @@ also put it before the replacement's spawn; that guard survived mutation — a c
 replacement and then tears down whatever it spawned, so the guard only spared a spawn the close
 kills within its bootstrap, unobservably — and was removed.) Bound: codex
 close ≤ archive `min(2000, timeoutMs)` + 2 × 1000 + removal ≈ 4000 ms worst, under the 5000 ms
-pin (`test/codex-native-session.test.mjs:55`); claude ≤ 2000 ms. The grace is a named constant
-measured only against the fixture child offline (exit 2 ms after `SIGTERM`); retune against a live
-measurement before release.
+pin (`test/codex-native-session.test.mjs:55`); claude ≤ 2000 ms. The grace is a named constant.
+Re-measured against the real CLIs before 0.5.0 (2026-09-06,
+`review-artifacts/stage2/exit-grace-live.log`): a codex `app-server` child exits ~4 ms after
+`SIGTERM`, a claude `stream-json` child ~520 ms (max 530 ms — a normal graceful shutdown), both well
+within the 1000 ms grace. The grace is kept: ~2× the measured maximum, and a shorter one would
+`SIGKILL` a claude child mid-shutdown. The measurement is of an idle/waiting child (no live auth
+needed); a mid-turn shutdown was not measured.
 
 **Gap 3 — restart on demand through the existing replacement (both drafts).** `startTurn` awaits
 at most one replacement per turn: the in-flight one if any (today's wait, raced with the turn's

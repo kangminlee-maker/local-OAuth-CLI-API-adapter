@@ -733,7 +733,7 @@
         </tr>
         <tr>
           <td>설계 과제</td>
-          <td><strong>네이티브 세션 수명주기(트랙 1)는 닫혔습니다(2026-09-06)</strong> — gap 1~7 전부 B-res·B-child·B-shutdown 세 번들로 구현되고 두 좌석 교차 리뷰 6라운드를 거쳤습니다. 리뷰가 원래 7개 갭 밖의 기존 결함 3건을 추가로 찾아 두 건(비동기·동기 파이프 실패 시 child 교체 대칭, 교체 대기 중 은퇴한 codex 턴의 소유권 가드)은 폴드했고, 세 번째(codex 인터럽트의 쓰기 배리어 — 새 순서 보장 원시라 결함 패치가 아닌 설계 과제)는 <strong>후속 설계 과제로 분리</strong>했습니다: <code>docs/design-task-codex-interrupt-write-barrier.md</code>. <strong>남은 설계 과제는 트랙 A</strong>: refresh-lease 원자성(<code>docs/design-task-refresh-lease-atomicity.md</code>, A-retry → A-lease, fencing-token 기본값). 트랙 1의 exit 유예 1 s는 fixture child(2 ms)로만 측정했으므로 릴리스 전 실제 CLI로 한 번 재측정합니다.</td>
+          <td><strong>네이티브 세션 수명주기(트랙 1)는 닫혔습니다(2026-09-06)</strong> — gap 1~7 전부 B-res·B-child·B-shutdown 세 번들로 구현되고 두 좌석 교차 리뷰 6라운드를 거쳤습니다. 리뷰가 원래 7개 갭 밖의 기존 결함 3건을 추가로 찾아 두 건(비동기·동기 파이프 실패 시 child 교체 대칭, 교체 대기 중 은퇴한 codex 턴의 소유권 가드)은 폴드했고, 세 번째(codex 인터럽트의 쓰기 배리어 — 새 순서 보장 원시라 결함 패치가 아닌 설계 과제)는 <strong>후속 설계 과제로 분리</strong>했습니다: <code>docs/design-task-codex-interrupt-write-barrier.md</code>. <strong>남은 설계 과제는 트랙 A</strong>: refresh-lease 원자성(<code>docs/design-task-refresh-lease-atomicity.md</code>, A-retry → A-lease, fencing-token 기본값). 트랙 1의 exit 유예 1 s는 <strong>0.5.0 전 실제 CLI로 재측정 완료</strong>(2026-09-06, <code>review-artifacts/stage2/exit-grace-live.log</code>): codex app-server의 SIGTERM→종료는 ~4 ms, claude(stream-json)는 ~520 ms(최대 530 ms, 정상 graceful shutdown)로 둘 다 1 s 안에 여유 있게 종료 — 1 s 유예는 실측 최대의 ~2배로 적정하여 유지합니다(더 낮추면 정상 종료 중인 claude child를 SIGKILL할 위험). 유휴 child 기준 측정이며 턴 진행 중 종료는 미측정(라이브 인증 필요).</td>
           <td>낮습니다.</td>
           <td class="ok">높습니다. 토큰 갱신 경쟁에서 더 오래된 회전이 최신 회전을 덮어쓰는 결함 계열입니다.</td>
           <td>A-retry 픽스처가 적색→녹색, 두 좌석 교차 리뷰 clean</td>
