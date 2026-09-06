@@ -104,12 +104,14 @@ export interface LocalCliChatRuntimeSession {
    */
   interrupt?(): Promise<void>;
   /**
-   * Whether a turn still occupies the session. The manager reports its status
-   * from this rather than tracking a second lifetime of its own — the two used
-   * to disagree, so a session could answer `ready` while its runtime refused
-   * every turn, or the reverse.
+   * Whether a turn still occupies the session on the runtime's side. The
+   * manager reports its status from this and from its own reservation, and
+   * keeps no lifetime of its own for the runtime's side — a fallback for a
+   * runtime that could not say answered `ready` while that runtime's stop
+   * was still in flight (track 1, round 1), as the two lifetimes it replaced
+   * had disagreed before it. So every runtime answers.
    */
-  isBusy?(): boolean;
+  isBusy(): boolean;
   close(): Promise<void>;
 }
 

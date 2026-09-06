@@ -54,6 +54,15 @@ interface TurnReservation {
   readonly stopped$: Promise<void>;
   markStopped: () => void;
   deadline: NodeJS.Timeout | undefined;
+  /**
+   * Closes the runtime's iteration, once, from wherever the turn ends: a stop
+   * that lands between two reads left the runtime's generator suspended at its
+   * `yield` for good, and a runtime that retires only in its `finally` then
+   * held the session for its life (t1-r1-codex). Installed by the iterator
+   * that owns the generator; a read still pending in the runtime is finalized
+   * behind its own settlement.
+   */
+  closeInner: (() => Promise<void>) | null;
 }
 
 /** The manager's answer for every turn it stops itself, on both runtimes. */
@@ -86,7 +95,7 @@ interface ManagedSession {
  */
 function sessionStatus(session: ManagedSession): LocalCliChatSessionStatus {
   if (session.closed) return 'closed';
-  const busy = session.reservation !== undefined || session.nativeSession.isBusy?.() === true;
+  const busy = session.reservation !== undefined || session.nativeSession.isBusy();
   return busy ? 'running' : 'ready';
 }
 
@@ -201,6 +210,7 @@ export class LocalCliChatSessionManager {
     reservation.reason = reason;
     this.end(session, reservation);
     reservation.markStopped();
+    void reservation.closeInner?.();
   }
 
   /** The one place a turn ends without a stop: completed, failed runtime-side, or the reader returned. */
@@ -280,6 +290,7 @@ export class LocalCliChatSessionManager {
       stopped$,
       markStopped,
       deadline: undefined,
+      closeInner: null,
     };
     session.reservation = reservation;
     this.armDeadline(session, reservation);
@@ -294,10 +305,12 @@ export class LocalCliChatSessionManager {
    * cannot settle that read by failing a queue nobody is reading yet, so the
    * caller waited out the child's acknowledgement (r56-codex). Every read
    * races the runtime against the reservation's stop; a stopped reservation
-   * answers with its reason, once, and the read still pending in the runtime
-   * is absorbed — its settlement runs the generator's own `catch` and
-   * `finally` (a replacement on timeout, the retirement on acknowledgement)
-   * and reaches no caller.
+   * answers with its reason, once. The runtime's iteration is closed by the
+   * stop itself — behind a read still pending in the runtime, whose
+   * settlement then runs the generator's own `catch` and `finally` (a
+   * replacement on timeout, the retirement on acknowledgement) and reaches no
+   * caller; at once when the stop lands between reads, so a reader that never
+   * reads again still leaves a retired runtime turn behind (t1-r1-codex).
    */
   private turnEvents(
     session: ManagedSession,
@@ -328,12 +341,22 @@ export class LocalCliChatSessionManager {
         },
       };
     };
-    const absorb = (pending: Promise<IteratorResult<LocalCliChatEvent>>): void => {
-      // One handler, attached once: the generator's own `catch` turns every
-      // runtime error into an event, so this settles, but nothing may be left
-      // for the process to report. `return()` queues behind the pending read.
-      pending.then(() => inner.return(undefined), () => inner.return(undefined)).catch(() => undefined);
+    // The read in flight, if any: a stop that lands while it is parked in the
+    // runtime finalizes the generator behind its settlement; one that lands
+    // between reads finalizes it now. One handler, attached once: the
+    // generator's own `catch` turns every runtime error into an event, so the
+    // read settles, and nothing is left for the process to report.
+    let pending: Promise<IteratorResult<LocalCliChatEvent>> | null = null;
+    let closing: Promise<void> | null = null;
+    const closeInner = (): Promise<void> => {
+      if (closing) return closing;
+      const settled = pending ?? Promise.resolve();
+      closing = settled
+        .then(() => inner.return(undefined), () => inner.return(undefined))
+        .then(() => undefined, () => undefined);
+      return closing;
     };
+    reservation.closeInner = closeInner;
     let chain: Promise<unknown> = Promise.resolve();
     const serialized = <T>(step: () => Promise<T>): Promise<T> => {
       const result = chain.then(step, step);
@@ -352,18 +375,28 @@ export class LocalCliChatSessionManager {
           return done;
         }
         reservation.state = 'streaming';
-        const pending = inner.next();
+        const read = inner.next();
+        pending = read;
         const outcome = await Promise.race([
-          pending.then((result): { result: IteratorResult<LocalCliChatEvent> | null } => ({ result })),
+          read.then((result): { result: IteratorResult<LocalCliChatEvent> | null } => ({ result })),
           reservation.stopped$.then((): { result: IteratorResult<LocalCliChatEvent> | null } => ({ result: null })),
         ]);
-        if (outcome.result === null || stopped()) {
-          absorb(pending);
-          return stopEvent();
-        }
+        if (outcome.result !== null) pending = null;
+        if (outcome.result === null || stopped()) return stopEvent();
         if (outcome.result.done) {
           finished = true;
           return done;
+        }
+        const event = outcome.result.value;
+        if (event.event === 'cli.completed' || event.event === 'cli.error') {
+          // The terminal event IS the end: the slot goes with it, not with the
+          // read after it — a stop landing between the two (an interrupt
+          // racing the terminal SSE write) found the reservation still attached
+          // and appended a second terminal event (t1-r1-codex). The read after
+          // it is done through the released state; the generator, parked at
+          // its last yield with the runtime's turn already over, holds nothing.
+          this.release(session, reservation);
+          return outcome.result;
         }
         this.armDeadline(session, reservation);
         return outcome.result;
@@ -376,7 +409,7 @@ export class LocalCliChatSessionManager {
           this.release(session, reservation);
           return done;
         }
-        if (reservation.state === 'streaming') await inner.return(undefined);
+        if (reservation.state === 'streaming') await closeInner();
         return done;
       }),
     };

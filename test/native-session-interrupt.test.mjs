@@ -850,15 +850,22 @@ test('a session survives an interrupt whose runtime stop throws', { timeout: 20_
       codex: async () => ({
         runtime: 'codex',
         native: {},
+        busy: false,
         async *startTurn() {
-          yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'hi' };
-          // Still running: the turn has to be live when the interrupt fails, or
-          // the status this is about was already restored by its own stream.
-          await new Promise(() => {});
+          this.busy = true;
+          try {
+            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'hi' };
+            // Still running: the turn has to be live when the interrupt fails, or
+            // the status this is about was already restored by its own stream.
+            await new Promise(() => {});
+          } finally {
+            this.busy = false;
+          }
         },
         async interrupt() {
           throw new Error('the pipe died under the interrupt');
         },
+        isBusy() { return this.busy; },
         async close() {},
       }),
     },
@@ -1097,6 +1104,152 @@ test('a stop while turn/start is in flight ends the caller within the stop, not 
   assert.deepEqual(methods.slice(0, 3), ['turn/start', 'turn/interrupt', 'turn/start'], `the interrupt precedes the next start: ${methods.join(',')}`);
 });
 
+test('a stop that lands between two reads still closes the runtime\'s iteration: a runtime that retires in its finally is retired, even for a reader that never reads again (t1 r1-codex F1)', { timeout: 20_000 }, async () => {
+  // Between reads the runtime's generator is suspended at its `yield`; a stop
+  // that only answered the caller left it there for good, and a runtime whose
+  // retirement lives in `finally` held the session at 409 for its life.
+  let release;
+  const stopped = new Promise((resolve) => { release = resolve; });
+  const state = { busy: false, finalizers: 0, starts: 0 };
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: {},
+        async *startTurn() {
+          state.starts += 1;
+          state.busy = true;
+          try {
+            yield { raw: { stage: 'first' }, textDelta: 'one' };
+            await stopped;
+            throw new Error('runtime interrupted');
+          } finally {
+            state.busy = false;
+            state.finalizers += 1;
+          }
+        },
+        async interrupt() { release(); },
+        isBusy() { return state.busy; },
+        async close() { release(); },
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'codex' });
+  const iterator = manager.streamTurn(session.id, { input: 'first' })[Symbol.asyncIterator]();
+  assert.equal((await iterator.next()).value?.event, 'cli.event');
+  await manager.interrupt(session.id);
+  // Nobody reads again. The runtime must still be retired.
+  await waitFor(() => state.finalizers === 1, 1_000, 'the runtime generator to be finalized by the stop');
+  assert.equal(manager.get(session.id).status, 'ready', 'the runtime retired in its finally, and the session is free');
+  const events = [];
+  for await (const event of { [Symbol.asyncIterator]: () => iterator }) events.push(event.event);
+  assert.deepEqual(events, ['cli.error'], 'the walked-away reader, coming back, hears the stop once');
+  const second = await manager.runTurn(session.id, { input: 'second' });
+  assert.equal(second.status, 'error', 'the double ends every turn by throwing after its stop');
+  assert.equal(state.starts, 2, 'the next turn was admitted');
+});
+
+test('a runtime whose interrupt acknowledges late keeps the session occupied until it does: 409 in the window, ready after — the runtime answers, the manager keeps no fallback lifetime (t1 r1-codex F2)', { timeout: 20_000 }, async () => {
+  let ack; const stopAck = new Promise((resolve) => { ack = resolve; });
+  let releaseTurn; const turnReleased = new Promise((resolve) => { releaseTurn = resolve; });
+  // A runtime that counts itself occupied until its stop is acknowledged
+  // says so through `isBusy` — the manager keeps no fallback for it, and its
+  // generator may be returned by the stop before the acknowledgement.
+  const state = { open: false, stopping: false, finalizers: 0 };
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => ({
+        runtime: 'codex',
+        native: {},
+        async *startTurn() {
+          if (state.open || state.stopping) throw new Error('runtime already has a running turn');
+          state.open = true;
+          try {
+            yield { raw: { stage: 'first' }, textDelta: 'one' };
+            await turnReleased;
+            throw new Error('runtime interrupted');
+          } finally {
+            state.open = false;
+            state.finalizers += 1;
+          }
+        },
+        async interrupt() {
+          state.stopping = true;
+          try {
+            await stopAck;
+            releaseTurn();
+          } finally {
+            state.stopping = false;
+          }
+        },
+        isBusy() { return state.open || state.stopping; },
+        async close() { ack(); releaseTurn(); },
+      }),
+    },
+  });
+  openSessions.push(() => manager.closeAll());
+  const session = await manager.create({ runtime: 'codex' });
+  const first = manager.streamTurn(session.id, { input: 'first' })[Symbol.asyncIterator]();
+  assert.equal((await first.next()).value?.event, 'cli.event');
+  const pending = first.next();
+  const interrupting = manager.interrupt(session.id);
+  await delay(20);
+  assert.equal(manager.get(session.id).status, 'running', 'the runtime has not acknowledged the stop');
+  assert.throws(() => manager.streamTurn(session.id, { input: 'second' }), /already has a running turn/);
+  ack();
+  await interrupting;
+  assert.equal((await pending).value?.event, 'cli.error');
+  await waitFor(() => manager.get(session.id).status === 'ready', 1_000, 'the runtime to retire the turn');
+  assert.equal(state.finalizers, 1);
+});
+
+for (const terminal of ['completed', 'error']) {
+  for (const route of ['interrupt', 'close', 'deadline']) {
+    test(`a stop that lands after the terminal event (${terminal}) and before the read after it appends nothing: the terminal event is the end (route: ${route}) (t1 r1-codex F3)`, { timeout: 20_000 }, async () => {
+      // The HTTP loop awaits the terminal SSE write before it reads again;
+      // an interrupt racing that write, or a deadline outlasting it, found the
+      // reservation still attached and appended a second terminal event.
+      const state = { busy: false, interrupts: 0 };
+      const manager = new LocalCliChatSessionManager({
+        defaultCwd: process.cwd(),
+        runtimes: {
+          codex: async () => ({
+            runtime: 'codex',
+            native: {},
+            async *startTurn() {
+              state.busy = true;
+              try {
+                if (terminal === 'error') throw new Error('runtime failed');
+              } finally {
+                state.busy = false;
+              }
+            },
+            async interrupt() { state.interrupts += 1; },
+            isBusy() { return state.busy; },
+            async close() {},
+          }),
+        },
+      });
+      openSessions.push(() => manager.closeAll());
+      const session = await manager.create({ runtime: 'codex' });
+      const iterator = manager.streamTurn(session.id, { input: 'x' }, route === 'deadline' ? { timeoutMs: 20 } : {})[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      assert.equal(first.value?.event, terminal === 'completed' ? 'cli.completed' : 'cli.error', JSON.stringify(first));
+      if (terminal === 'error') assert.match(String(first.value.raw?.message), /runtime failed/);
+      assert.equal(manager.get(session.id).status, 'ready', 'the terminal event released the slot');
+      if (route === 'interrupt') await manager.interrupt(session.id);
+      else if (route === 'close') assert.equal((await manager.close(session.id)).status, 'closed');
+      else await delay(60);
+      const after = await iterator.next();
+      assert.deepEqual(after, { done: true, value: undefined }, `no second terminal event: ${JSON.stringify(after)}`);
+      assert.deepEqual(await iterator.next(), { done: true, value: undefined });
+    });
+  }
+}
+
 test('a turn admitted before the close and read after it hears the close on the claude runtime too (t1 B-res, two paths)', { timeout: 20_000 }, async () => {
   // The codex runtime answered "closed" here (r55-fable); the claude runtime
   // answered "not running" — a different fact for the same sequence.
@@ -1128,11 +1281,18 @@ async function countingManager() {
       codex: async () => ({
         runtime: 'codex',
         native: {},
+        busy: false,
         async *startTurn() {
           state.starts += 1;
-          yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'ok' };
+          this.busy = true;
+          try {
+            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'ok' };
+          } finally {
+            this.busy = false;
+          }
         },
         async interrupt() { state.interrupts += 1; },
+        isBusy() { return this.busy; },
         async close() { state.closes += 1; },
       }),
     },

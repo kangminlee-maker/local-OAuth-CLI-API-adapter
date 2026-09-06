@@ -16,23 +16,30 @@ beforeEach(async () => {
       codex: async (input) => ({
         runtime: 'codex',
         native: { thread_id: 'thread_fake', cwd: input.cwd },
+        busy: false,
         async *startTurn(turn) {
-          const text = typeof turn.input === 'string'
-            ? turn.input
-            : turn.input.find((part) => part.type === 'text')?.text ?? '';
-          yield {
-            raw: { method: 'item/agentMessage/delta', params: { delta: 'HELLO ' } },
-            textDelta: 'HELLO ',
-          };
-          yield {
-            raw: { method: 'item/agentMessage/delta', params: { delta: text } },
-            textDelta: text,
-          };
-          yield {
-            raw: { method: 'thread/tokenUsage/updated', params: { totalTokens: 3 } },
-            usage: { totalTokens: 3 },
-          };
+          this.busy = true;
+          try {
+            const text = typeof turn.input === 'string'
+              ? turn.input
+              : turn.input.find((part) => part.type === 'text')?.text ?? '';
+            yield {
+              raw: { method: 'item/agentMessage/delta', params: { delta: 'HELLO ' } },
+              textDelta: 'HELLO ',
+            };
+            yield {
+              raw: { method: 'item/agentMessage/delta', params: { delta: text } },
+              textDelta: text,
+            };
+            yield {
+              raw: { method: 'thread/tokenUsage/updated', params: { totalTokens: 3 } },
+              usage: { totalTokens: 3 },
+            };
+          } finally {
+            this.busy = false;
+          }
         },
+        isBusy() { return this.busy; },
         async interrupt() {
           interrupted += 1;
         },
@@ -173,17 +180,24 @@ async function startHangingChatProxy(requestTimeoutMs) {
       codex: async () => ({
         runtime: 'codex',
         native: { thread_id: 'thread_silent' },
+        busy: false,
         async *startTurn(_input, signal) {
-          yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'thinking ' };
-          await new Promise((_resolve, reject) => {
-            const stop = () => {
-              state.aborted = true;
-              reject(new Error('turn aborted'));
-            };
-            if (signal?.aborted) stop();
-            else signal?.addEventListener('abort', stop, { once: true });
-          });
+          this.busy = true;
+          try {
+            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: 'thinking ' };
+            await new Promise((_resolve, reject) => {
+              const stop = () => {
+                state.aborted = true;
+                reject(new Error('turn aborted'));
+              };
+              if (signal?.aborted) stop();
+              else signal?.addEventListener('abort', stop, { once: true });
+            });
+          } finally {
+            this.busy = false;
+          }
         },
+        isBusy() { return this.busy; },
         async close() {},
       }),
     },
@@ -246,12 +260,19 @@ test('a turn that keeps producing is not cut off by the deadline', async () => {
       codex: async () => ({
         runtime: 'codex',
         native: { thread_id: 'thread_slow' },
+        busy: false,
         async *startTurn() {
-          for (let i = 0; i < 6; i += 1) {
-            await new Promise((resolve) => { setTimeout(resolve, 120).unref(); });
-            yield { raw: { method: 'item/agentMessage/delta' }, textDelta: `${i} ` };
+          this.busy = true;
+          try {
+            for (let i = 0; i < 6; i += 1) {
+              await new Promise((resolve) => { setTimeout(resolve, 120).unref(); });
+              yield { raw: { method: 'item/agentMessage/delta' }, textDelta: `${i} ` };
+            }
+          } finally {
+            this.busy = false;
           }
         },
+        isBusy() { return this.busy; },
         async close() {},
       }),
     },

@@ -135,6 +135,19 @@ under `isBusy()` without a reservation transition, and an honest `unavailable` i
 Bundle 3's closing epoch iterates "stop the reservation, then await teardown" per session and registers
 an in-flight creation as "no reservation yet" — it must call the same stop the routes call.
 
+**Review round 1 (codex: 2 medium, 1 high; Fable: clean), folded.** (1) The stop itself closes the
+runtime's iteration — behind a read still pending in the runtime, at once when the stop lands
+between reads — so a runtime that retires only in its `finally` is retired even for a reader that
+never reads again (the draft closed it only from the next read or the reader's `return()`). (2)
+`isBusy` is required on `LocalCliChatRuntimeSession`: the manager keeps no fallback lifetime for a
+runtime that cannot say — the fallback answered `ready` while that runtime's stop was in flight —
+so every runtime, and every test double, answers it (concept surface: reducing). (3) The terminal
+event (`cli.completed`, a runtime's `cli.error`) is the end: the reservation is released on its
+delivery, not on the read after it, so a stop landing between the two appends nothing (the read
+after it is done through the released state; the generator, parked at its last yield with the
+runtime's turn already over, holds nothing — a finalize there and a `finished` flag both survived
+mutation and were removed).
+
 **Change condition.** Evidence that a runtime's own stop wording is a consumer contract on
 manager-stopped routes; then the adapter forwards the inner's settled answer when one exists and uses
 the reservation's reason only when the inner cannot answer. The state model and gaps 1–2 survive.
