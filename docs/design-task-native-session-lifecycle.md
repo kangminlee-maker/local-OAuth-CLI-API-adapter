@@ -1,6 +1,12 @@
 # Design task: native chat session lifecycle atomicity
 
-**Status:** closing — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 closed by bundle B-child (see § Bundle B-child, reviewed and folded); gap 5 closed by bundle B-shutdown (see § Bundle B-shutdown). Every gap is closed; the task ends with the review of its last two commits, gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
+**Status:** closed (2026-09-06) — gaps 1, 2 and 4 by bundle B-res, gaps 3, 6 and 7 by bundle
+B-child, gap 5 by bundle B-shutdown, each reviewed by two independent seats and folded. Seven
+review rounds in all (see § the review paragraphs and `review-artifacts/t1-design-log.md`); rounds
+5–7 surfaced older adjacent gaps the original seven did not name — two were folded as parity fixes,
+one is a separate filed follow-up (`docs/design-task-codex-interrupt-write-barrier.md`). Full suite
+2046/0. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1
+round 1. The remaining lifecycle design task is track A (`docs/design-task-refresh-lease-atomicity.md`).
 **Scope:** `LocalCliChatSessionManager` (`streamTurn` admission, `interrupt`, `close`,
 `closeAll`, `create`) and `CodexNativeCliChatSession` (`startTurn`, `stopTurn`, `replaceChild`,
 `teardownChild`, `close`, the `native` snapshot) in `src/chat/`.
