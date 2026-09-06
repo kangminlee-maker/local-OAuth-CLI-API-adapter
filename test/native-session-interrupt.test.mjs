@@ -1725,6 +1725,122 @@ test('a claude turn stopped while it waits for a replacement arms no silence tim
 });
 
 // ---------------------------------------------------------------------------
+// Track 1, round 4 (codex seat) on the round-3 fold and B-shutdown.
+
+test('a codex interrupt whose write fails replaces the child: nothing is started ahead of an interrupt the child never received (t1 r4-codex F2)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  // The one write that carries the interrupt throws — a pipe that died under it.
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  const originalWrite = handle.stdin.write.bind(handle.stdin);
+  handle.stdin.write = (chunk, ...rest) => {
+    if (String(chunk).includes('"turn/interrupt"')) {
+      handle.stdin.write = originalWrite;
+      throw new Error('EPIPE: fixture write failed');
+    }
+    return originalWrite(chunk, ...rest);
+  };
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the turn to reach the child');
+    await manager.interrupt(session.id);
+    await drain;
+    assert.equal(events.at(-1), 'cli.error', 'the caller heard the stop');
+    // The child could not be told: it is replaced, and the next turn runs on the successor.
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    await waitFor(() => manager.get(session.id).status === 'ready', 5_000, 'the replacement to finish');
+    const second = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    assert.equal(second.status, 'completed', JSON.stringify(second.final));
+    assert.equal((await receivedMethods(methodLog)).filter((method) => method === 'thread/start').length, 2, 'a fresh thread on a fresh child');
+  } finally {
+    reapFixtureChild(oldPid);
+  }
+});
+
+test('a runtime that resolved after the global close began and could not be closed is the global close\'s error too, not only its creator\'s (t1 r4-codex F3)', { timeout: 20_000 }, async () => {
+  let release;
+  const gate = new Promise((resolve_) => { release = resolve_; });
+  const manager = new LocalCliChatSessionManager({
+    defaultCwd: process.cwd(),
+    runtimes: {
+      codex: async () => {
+        await gate;
+        return {
+          runtime: 'codex',
+          native: {},
+          async *startTurn() {},
+          isBusy() { return false; },
+          async close() { throw new Error('fixture teardown left its child alive'); },
+        };
+      },
+    },
+  });
+  const creating = manager.create({ runtime: 'codex' }).then((created) => ({ kind: 'created', id: created.id }), (err) => ({ kind: 'rejected', message: err.message }));
+  await delay(20);
+  const closing = manager.closeAll().then(() => ({ kind: 'resolved' }), (err) => ({ kind: 'rejected', message: err.message }));
+  release();
+  const created = await creating;
+  assert.equal(created.kind, 'rejected', JSON.stringify(created));
+  assert.match(created.message, /left its child alive/, 'the creator hears the teardown it owned');
+  const closed = await closing;
+  assert.equal(closed.kind, 'rejected', JSON.stringify(closed));
+  assert.match(closed.message, /left its child alive/, 'and so does the global close');
+});
+
+test('a global close joins a close already in flight: it resolves only once that session\'s child is gone (t1 r4-codex F4)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_IGNORE_SIGTERM = '1';
+  const { manager } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  try {
+    // The close waits a second for a child that ignores SIGTERM; the global close lands inside that wait.
+    const closingOne = manager.close(session.id);
+    await delay(100);
+    await manager.closeAll();
+    assert.equal(processAlive(pid), false, 'the global close joined the close in flight');
+    assert.equal((await closingOne).status, 'closed');
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+test('a close that failed over a child that would not exit is re-closed and reported by the global close, and resolves once the child is gone (t1 r4-codex F4)', { timeout: 30_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const pid = await publishedPid(pidFile);
+  const handle = manager.sessions.get(session.id).nativeSession.child;
+  handle.kill = () => true;
+  try {
+    await assert.rejects(manager.close(session.id), /survived SIGKILL/);
+    assert.throws(() => manager.get(session.id), /Unknown local CLI chat session/);
+    await assert.rejects(manager.closeAll(), /survived SIGKILL/, 'the global close names what its predecessor could not end');
+    process.kill(pid, 'SIGKILL');
+    await waitFor(() => !processAlive(pid), 3_000, 'the child to be gone');
+    await manager.closeAll();
+  } finally {
+    reapFixtureChild(pid);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Track 1, round 3 (codex seat) on B-child.
 
 /** The one isolation root under a private TMPDIR, as the r53 fixtures find it. */

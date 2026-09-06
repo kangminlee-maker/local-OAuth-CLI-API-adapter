@@ -620,7 +620,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // A pipe that died under the write throws from here, and this function
       // returns a promise: a synchronous throw escapes the caller's `.catch`
       // and — on the interrupt path, where the child is likeliest to be dying —
-      // took the whole endpoint with it.
+      // took the whole endpoint with it. A child that cannot be written to
+      // cannot be told anything: it is replaced, thread and all, the way one
+      // that stopped answering is (r52) — an interrupt whose write failed was
+      // reported delivered while the next turn reached the same child ahead
+      // of it (t1-r4-codex).
+      if (!this.closed) void this.replaceChild().catch(() => undefined);
       return Promise.reject(err instanceof Error ? err : new Error(String(err)));
     }
     return new Promise((resolve, reject) => {

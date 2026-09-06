@@ -111,8 +111,21 @@ export class LocalCliChatSessionManager {
    * child — the order the server's own close takes).
    */
   private closing = false;
-  /** The creations in flight — the factory awaited — so the global close can wait for them. */
+  /**
+   * The creations in flight — the factory awaited — so the global close can
+   * wait for them. Each settles when its creation does, and rejects only with
+   * a teardown the creation itself owed and could not finish (t1-r4-codex: a
+   * runtime that resolved after the close began, closed by its creation, left
+   * its child alive — and the global close reported clean).
+   */
   private readonly creations = new Set<Promise<void>>();
+  /**
+   * Sessions leaving through `close(id)`: gone from the map at once (no turn is
+   * admitted during the teardown), so the global close would not see them —
+   * it joins a departure still in flight, and re-closes one that failed, so
+   * what remains is its error too (t1-r4-codex).
+   */
+  private readonly departures = new Map<ManagedSession, Promise<void>>();
 
   constructor(options: LocalCliChatSessionManagerOptions) {
     this.defaultCwd = options.defaultCwd;
@@ -131,15 +144,22 @@ export class LocalCliChatSessionManager {
     const cwd = resolve(input.cwd ?? this.defaultCwd);
     if (this.closing) throw shuttingDown();
     let settle = (): void => {};
-    const creation = new Promise<void>((resolve_) => { settle = resolve_; });
+    let fail = (_err: unknown): void => {};
+    const creation = new Promise<void>((resolve_, reject) => { settle = resolve_; fail = reject; });
     this.creations.add(creation);
     try {
       const nativeSession = await factory({ ...input, runtime, cwd });
       if (this.closing) {
         // The close began while this runtime was starting: it is this
         // creation's to end — the close never saw it — and its caller hears
-        // the refusal, or the teardown's own failure.
-        await nativeSession.close();
+        // the refusal, or the teardown's own failure, which the global close
+        // hears as well.
+        try {
+          await nativeSession.close();
+        } catch (err) {
+          fail(err);
+          throw err;
+        }
         throw shuttingDown();
       }
       const session: ManagedSession = {
@@ -181,7 +201,13 @@ export class LocalCliChatSessionManager {
     // runtime is never asked to start it (r56: claude answered "not running",
     // the wrong fact, for the same sequence codex answered "closed").
     if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
-    await session.nativeSession.close();
+    const departure = session.nativeSession.close();
+    this.departures.set(session, departure);
+    // A departure that fails stays: the global close re-closes it, and what
+    // still remains — a child that would not exit, a credentials copy — is
+    // that close's to report.
+    await departure;
+    this.departures.delete(session);
     return snapshot(session);
   }
 
@@ -190,19 +216,30 @@ export class LocalCliChatSessionManager {
     // settles first — by closing its own runtime — so nothing resolves after
     // the close it never saw (t1 B-shutdown).
     this.closing = true;
-    await Promise.all([...this.creations]);
+    const creations = await Promise.allSettled([...this.creations]);
+    const departures = [...this.departures];
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     // Every session is torn down and its bookkeeping finished before any
     // teardown's error is raised — and one IS raised: a close that leaves a
     // credentials copy on disk says so to the server's own close, which used
     // to hear a clean shutdown over it (r55-codex).
-    const outcomes = await Promise.allSettled(sessions.map(async (session) => {
-      session.closed = true;
-      if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
-      await session.nativeSession.close();
-    }));
-    const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
+    const outcomes = await Promise.allSettled([
+      ...departures.map(async ([session, departure]) => {
+        try {
+          await departure;
+        } catch {
+          await session.nativeSession.close();
+        }
+        this.departures.delete(session);
+      }),
+      ...sessions.map(async (session) => {
+        session.closed = true;
+        if (session.reservation) this.stop(session, session.reservation, SESSION_CLOSED);
+        await session.nativeSession.close();
+      }),
+    ]);
+    const failures = [...creations, ...outcomes].filter((outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected');
     if (failures.length === 1) throw failures[0].reason;
     if (failures.length > 1) {
       throw new Error(failures.map((failure) => (failure.reason instanceof Error ? failure.reason.message : String(failure.reason))).join('; '));

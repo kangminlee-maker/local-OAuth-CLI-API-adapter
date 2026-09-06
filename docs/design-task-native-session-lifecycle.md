@@ -190,7 +190,18 @@ with the guard before the prompt write — but the timer was armed between the t
 had already retired during the wait, and nothing cleared it: it fired on whoever was running
 `timeoutMs` later, retired that turn and replaced its child. The guard is back, before the arming
 (the mutant that removed it in round 3 survived because that fixture did not wait out the timer —
-a surviving mutant is an unexercised input until the input is found, not an inert guard).
+a surviving mutant is an unexercised input until the input is found, not an inert guard). The
+codex seat found the same (its F1) and three more, folded: (F2, pre-existing) a codex
+`turn/interrupt` whose write threw was reported delivered and the next turn reached the same
+child ahead of it — a write that fails now replaces the child, thread and all, the way a child
+that stopped answering is replaced (one rule for a child that cannot be told anything); (F3) a
+runtime that resolved after the global close began, closed by its creation, and whose close
+failed was the creator's error only — the creation's registry entry now rejects with that
+failure, and `closeAll` reports it with the rest; (F4, pre-existing) `close(id)` leaves the map
+before its teardown is awaited, so a `closeAll` landing meanwhile saw nothing to wait for, and a
+`close(id)` that failed over a survivor left nothing to report — departures are kept until they
+resolve; the global close joins one in flight and re-closes one that failed, and what still
+remains is its error.
 
 **Change conditions (pre-noted).** A real consumer found relying on disconnect-as-cancel (expecting
 `ready` right after dropping the SSE socket) flips gap 7 to return-as-stop with the contract
