@@ -1,6 +1,6 @@
 # Design task: native chat session lifecycle atomicity
 
-**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res); gaps 3, 5 and 6 remain for bundles 2 and 3. Filed 2026-09-06 from round 56 of the PR #15 review campaign.
+**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 are bundle B-child (design in progress), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
 **Scope:** `LocalCliChatSessionManager` (`streamTurn` admission, `interrupt`, `close`,
 `closeAll`, `create`) and `CodexNativeCliChatSession` (`startTurn`, `stopTurn`, `replaceChild`,
 `teardownChild`, `close`, the `native` snapshot) in `src/chat/`.
@@ -54,6 +54,19 @@ as the floor. Per the campaign rule, a fix that keeps causing fixes is a design 
    escalates to `SIGKILL`, and isolation cleanup can run while the process is still alive. A child
    that ignores `SIGTERM` outlives a close reported as successful, holding its credentials copy.
 
+7. **A caller's mid-stream return leaves the child's turn to nobody, and the next turn is admitted
+   on top of it (pre-existing; track 1 round 1, codex F4; reproduces on `be8c2d8` and `46b141e`).**
+   When the manager's iterator is returned mid-stream without a stop — the HTTP writer failing, the
+   client gone — the runtime generator's `finally` retires the turn without telling the child and
+   without draining it. `isBusy()` reads false and the next turn is admitted: on codex the child
+   hears `turn/start, turn/start` with no `turn/interrupt` between; on claude, whose events carry
+   no turn id, the first turn's late result is routed to the second turn and decides its response
+   (`FIRST_LATE` with the first turn's usage, an empty text). The contract makes the native surface
+   the disconnect exception — its turns belong to the session, which survives the socket, and
+   cancellation is the explicit `interrupt` (`docs/api-interface-contract.md`, the disconnect
+   row) — so the manager's `return()` must not be the child's stop, and the runtime must keep the
+   turn (drain it, stay occupied) or stop it explicitly with the contract changed.
+
 ## How to close it
 
 - A **turn reservation** as an explicit object with states (`reserved → entered → running →
@@ -64,7 +77,10 @@ as the floor. Per the campaign rule, a fix that keeps causing fixes is a design 
   escalates the same PID to `SIGKILL`, and only then forgets the handle and removes its isolation —
   used by close, replacement, and failed-handshake rollback. A failed replacement moves the session
   to an honest `unavailable`/`restarting` state (or closes it), clearing `native.thread_id` with
-  `threadId`, so status never reports `ready` for a session that can run no turn. Closes 3, 6.
+  `threadId`, so status never reports `ready` for a session that can run no turn. A turn whose
+  caller left without a stop stays the runtime's — drained to its own terminal event, occupying
+  the session until then — or is stopped explicitly with the contract changed; on claude no later
+  turn can be closed by an earlier turn's result. Closes 3, 6, 7.
 - A **creation registry and a closing epoch** in the manager: register a creation before awaiting
   the factory; during global close refuse new admission, await in-flight factories, and immediately
   close any runtime that resolves after shutdown began. Closes 5.
