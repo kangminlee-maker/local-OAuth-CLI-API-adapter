@@ -108,8 +108,8 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     // Installed before any wait, so a stop can find it: a turn that waited for
     // a replacement was nobody's, the interrupt found no turn, the caller was
     // answered, and the turn then ran on the successor (t1-r3-codex). The
-    // stop retires it, and the guard before the write below then finds the
-    // turn no longer its own — the caller was answered at the stop, so the
+    // stop retires it; the wait, once over, finds the turn no longer its own
+    // before it arms anything — the caller was answered at the stop, so the
     // wait itself need not end early.
     const turn: Turn = { queue, timer: null };
     this.turn = turn;
@@ -128,6 +128,11 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
       // running`).
       const replacement = this.restarting ?? (this.child ? null : this.restartChild());
       if (replacement) await replacement;
+      // Stopped during the wait: the turn is no longer the session's, and a
+      // silence timer armed on it now would be nobody's to clear — it fired
+      // on whoever was running by then, retired that turn and replaced its
+      // child (t1-r4-fable).
+      if (this.turn !== turn) throw new Error('request aborted');
       if (!this.child) throw new Error('claude native chat session is not running');
       turn.timer = setTimeout(() => {
         queue.fail(new Error(`claude turn timed out after ${this.timeoutMs}ms of silence`));

@@ -184,6 +184,14 @@ child that had not exited after `SIGKILL`: survivors are kept by handle, no succ
 while one lives (the turn reports `did not exit`), and the close names them; once the handle
 reports its exit, the next turn gets its child. Both runtimes.
 
+**Review round 4 (Fable: F-A high; codex: see the log), folded.** The round-3 fold moved claude's
+silence timer after the replacement wait and dropped the post-wait ownership guard as redundant
+with the guard before the prompt write — but the timer was armed between the two, on a turn a stop
+had already retired during the wait, and nothing cleared it: it fired on whoever was running
+`timeoutMs` later, retired that turn and replaced its child. The guard is back, before the arming
+(the mutant that removed it in round 3 survived because that fixture did not wait out the timer —
+a surviving mutant is an unexercised input until the input is found, not an inert guard).
+
 **Change conditions (pre-noted).** A real consumer found relying on disconnect-as-cancel (expecting
 `ready` right after dropping the SSE socket) flips gap 7 to return-as-stop with the contract
 sentence changed and the HTTP disconnect handling enumerated. A real consumer that must distinguish

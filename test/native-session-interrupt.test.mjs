@@ -1681,6 +1681,50 @@ test('a global close that lands while a session is still being created ends that
 });
 
 // ---------------------------------------------------------------------------
+// Track 1, round 4 (Fable seat) on the round-3 fold.
+
+test('a claude turn stopped while it waits for a replacement arms no silence timer: nothing fires on the successor, and an innocent turn on it runs its whole length (t1 r4-fable F-A)', { timeout: 30_000 }, async () => {
+  // The round-3 fold armed the turn's silence timer after the replacement
+  // wait — on a turn a stop had already retired during that wait. Nothing
+  // cleared it (the turn was no longer the session's), and it fired on
+  // whoever was running by then: retired that turn, replaced its child.
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CLAUDE_PID_FILE = pidFile;
+  process.env.FAKE_CLAUDE_IGNORE_SIGTERM = '1';
+  // A short silence budget: a leaked timer would fire well inside the test.
+  const { manager } = await startClaudeManager(700);
+  const session = await manager.create({ runtime: 'claude' });
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CLAUDE_IGNORE_SIGTERM;
+  try {
+    const first = manager.streamTurn(session.id, { input: 'PARTIAL' })[Symbol.asyncIterator]();
+    assert.equal((await first.next()).value?.event, 'cli.event');
+    await manager.interrupt(session.id);
+    await delay(50);
+    const second = manager.streamTurn(session.id, { input: 'HANG' })[Symbol.asyncIterator]();
+    const pending = second.next();
+    await delay(50);
+    await manager.interrupt(session.id);
+    assert.equal((await pending).value?.event, 'cli.error');
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up');
+    const successor = Number(await readFile(pidFile, 'utf8'));
+    await waitFor(() => manager.get(session.id).status === 'ready', 2_000, 'the session to be free');
+    // Six deltas 100 ms apart, the result at ~700 ms: past the 700 ms budget a leaked timer would fire at.
+    const innocent = await manager.runTurn(session.id, { input: 'SLOW' }, { timeoutMs: 5_000 });
+    assert.equal(innocent.status, 'completed', JSON.stringify(innocent.final));
+    assert.equal(innocent.final.text, '0 1 2 3 4 5 ', 'every delta, then the result');
+    await delay(900);
+    assert.equal(Number(await readFile(pidFile, 'utf8')), successor, 'no timer fired on the successor: no spurious replacement');
+    assert.equal(manager.get(session.id).status, 'ready');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Track 1, round 3 (codex seat) on B-child.
 
 /** The one isolation root under a private TMPDIR, as the r53 fixtures find it. */
