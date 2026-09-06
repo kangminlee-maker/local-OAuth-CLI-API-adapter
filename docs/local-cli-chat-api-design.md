@@ -214,13 +214,32 @@ stop (interrupt, deadline, close) ends the turn for its caller at once, on both 
 with one answer (`local CLI chat turn aborted`; `local CLI chat session closed`), while the
 session stays occupied until the runtime has retired the turn — codex keeps its turn until the
 child names it and the interrupt is written, so a turn asked for in that window is refused 409
-rather than started ahead of the interrupt (track 1, B-res). A close stops the turn it finds — one
+rather than started ahead of the interrupt (track 1, B-res). A reader that leaves WITHOUT a stop —
+the SSE writer failing, the socket gone — leaves the turn to the session: the reservation lets go
+of the caller and drains the turn to its own end under the same idle deadline, read by nobody, and
+the session stays occupied through the runtime's turn until then; `interrupt` is the way to have
+it sooner. Closing the runtime's iteration there instead retired the turn without telling the
+child, and the next turn was admitted on top of it — two turns on one codex thread, and on claude
+the abandoned turn's result decided the next turn's response (track 1, B-child). A close stops the turn it finds — one
 still preparing its input ends without writing to the child being archived, and one
 admitted before the close but read after it hears the close (round 55). A turn requested in that window
 is refused with `409 turn_already_running` rather than dispatched. Session status
 is the runtime's own answer about whether a turn occupies it, not separate
 bookkeeping — the two used to disagree, so a session could report `ready` while
 its runtime refused every turn.
+
+The child is the runtime's, and it owns one at a time. A teardown — a close, a replacement, a
+handshake that failed — returns once the child has EXITED: `SIGTERM`, a grace, `SIGKILL` to the
+same handle, a grace; the credentials copy a codex child ran with is removed after that exit, and
+a replacement spawns its successor only after it. A child still there after the second grace is
+named in the close's error, next to a credentials directory that would not go. A session whose
+child is gone — a replacement that failed, a child that died — names no thread and answers
+`ready`: the next turn starts a child for itself, once per turn, and a turn that could not get
+one reports the start's own failure (`initialize timed out after …`), whether it waited for that
+attempt or made it. Nothing respawns unprompted, and no turn is ever re-issued (track 1, B-child:
+a failed replacement had left the session `ready` over no child, naming a thread that no longer
+existed, with every later turn `not running` for its life; a close had forgotten the handle at
+the `SIGTERM`, so a child that ignored it outlived a close reported as success).
 
 Runtime mapping:
 

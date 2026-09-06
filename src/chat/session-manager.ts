@@ -357,6 +357,29 @@ export class LocalCliChatSessionManager {
       return closing;
     };
     reservation.closeInner = closeInner;
+    // Reads the abandoned turn to its end: the terminal event releases, as it
+    // does for a reader; a stop (the deadline, a close) still closes the inner
+    // behind the read in flight, and the loop ends on it.
+    const drain = async (): Promise<void> => {
+      try {
+        while (!stopped()) {
+          const read = inner.next();
+          pending = read;
+          const result = await read;
+          pending = null;
+          if (result.done) return;
+          const event = result.value;
+          if (event.event === 'cli.completed' || event.event === 'cli.error') {
+            this.release(session, reservation);
+            return;
+          }
+          this.armDeadline(session, reservation);
+        }
+      } catch {
+        // The generator's own `catch` turns every runtime error into an event;
+        // nothing reaches here, and nothing may leave for the process.
+      }
+    };
     let chain: Promise<unknown> = Promise.resolve();
     const serialized = <T>(step: () => Promise<T>): Promise<T> => {
       const result = chain.then(step, step);
@@ -409,7 +432,21 @@ export class LocalCliChatSessionManager {
           this.release(session, reservation);
           return done;
         }
-        if (reservation.state === 'streaming') await closeInner();
+        if (reservation.state === 'streaming') {
+          // The caller left without a stop — the writer failed, the socket is
+          // gone. The turn is the session's, not the socket's (the contract's
+          // disconnect row: cancellation is the interrupt, and only that): it
+          // runs on to its own end, read by nobody, and the session stays
+          // occupied through the runtime's turn until then. The reservation
+          // lets go of the caller — its iteration has ended — and keeps its
+          // idle deadline for the drain. Closing the runtime's iteration here
+          // instead retired the turn without telling the child, and the next
+          // turn was admitted on top of it: two turns on one codex thread, and
+          // on claude the abandoned turn's result decided the next turn's
+          // response (t1 B-child gap 7).
+          if (session.reservation === reservation) session.reservation = undefined;
+          void drain();
+        }
         return done;
       }),
     };

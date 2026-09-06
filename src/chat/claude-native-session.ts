@@ -3,6 +3,7 @@ import readline from 'node:readline';
 import { AsyncQueue } from '../proxy/async-queue.js';
 import { claudeMessageContentFor } from '../proxy/multimodal.js';
 import { proxyChildProcessEnv } from '../proxy/process-env.js';
+import { terminateChild } from './child-exit.js';
 import { chatNormalizedRequest, chatPromptText } from './input.js';
 import type {
   LocalCliChatRuntimeEvent,
@@ -50,6 +51,16 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   private turn: Turn | null = null;
   /** The in-flight child replacement, so a turn waits for it instead of racing it. */
   private restarting: Promise<void> | null = null;
+  /**
+   * Set by `close()`: a turn asked of a closed session must not start a child
+   * for itself — the on-demand start (t1 B-child gap 3) is what makes this
+   * flag load-bearing; round 55 found one inert while no path could spawn
+   * after a close. A replacement in flight at the close spawns its successor
+   * before the close's own teardown runs and is ended by it.
+   */
+  private closed = false;
+  /** Children still there after `SIGKILL` and its grace — the close's to report. */
+  private survivingPids: number[] = [];
 
   private constructor(options: Required<ClaudeNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -83,7 +94,12 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     input: LocalCliChatTurnInput,
     signal?: AbortSignal,
   ): AsyncIterable<LocalCliChatRuntimeEvent> {
-    if (this.restarting) await this.restarting;
+    if (this.closed) throw new Error('claude native chat session is closed');
+    // One replacement per turn: the one in flight, or — no child, and the
+    // session open — one this turn starts (t1 B-child gap 3: a child that died
+    // left the session answering `ready` and every later turn `not running`).
+    const replacement = this.restarting ?? (this.child ? null : this.restartChild());
+    if (replacement) await replacement;
     if (!this.child) throw new Error('claude native chat session is not running');
     if (this.turn) throw new Error('claude native chat session already has a running turn');
     const queue = new AsyncQueue<LocalCliChatRuntimeEvent>();
@@ -177,11 +193,9 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     // would not clear.
     if (this.restarting) return this.restarting;
     const restart = (async () => {
-      const previous = this.child;
-      this.child = null;
-      this.lineReader?.close();
-      this.lineReader = null;
-      previous?.kill('SIGTERM');
+      // The previous child has EXITED before its successor is spawned: the
+      // session owns one child at any instant (t1 B-child gap 6).
+      await this.teardownChild();
       // The replacement starts with a clean slate: a SIGTERMed child usually
       // writes its own shutdown to stderr, and carrying that into the next
       // child's buffer reported the previous child's death as the diagnosis for
@@ -207,15 +221,36 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     // Failed, not closed: a closed queue reads as a turn that finished, and the
     // caller was streaming an answer that will now never come. And no
     // replacement child — the session is going away, not carrying on.
     this.turn?.queue.fail(new Error('local CLI chat session closed'));
     this.retire();
+    // A replacement in flight ends the previous child and, closed, starts no
+    // other; the close resolves only once no child of this session is left.
+    if (this.restarting) await this.restarting;
+    await this.teardownChild();
+    if (this.survivingPids.length > 0) {
+      throw new Error(`claude native chat session closed, but a child survived SIGKILL: ${this.survivingPids.join(', ')}`);
+    }
+  }
+
+  /**
+   * Ends the child and returns once it has exited — `SIGTERM`, a grace,
+   * `SIGKILL` the same handle, a grace (t1 B-child gap 6: the handle was
+   * forgotten at the `SIGTERM`, so a child that ignored it outlived a close
+   * reported as success). The handle is captured before the first await, so
+   * nothing addresses the old child after this line. Safe with no child.
+   */
+  private async teardownChild(): Promise<void> {
     this.lineReader?.close();
-    this.child?.kill('SIGTERM');
-    this.child = null;
     this.lineReader = null;
+    const child = this.child;
+    this.child = null;
+    if (!child) return;
+    const exit = await terminateChild(child);
+    if (!exit.exited && exit.pid !== undefined) this.survivingPids.push(exit.pid);
   }
 
   private async start(): Promise<void> {
@@ -265,8 +300,9 @@ export class ClaudeNativeCliChatSession implements LocalCliChatRuntimeSession {
     child.on('close', (code, signal) => {
       if (this.child !== child) return;
       this.failActive(new Error(`claude code exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`));
-      this.child = null;
-      this.lineReader = null;
+      // Gone on its own: forgotten the same way, and the next turn starts a
+      // child for itself (t1 B-child gap 3).
+      void this.teardownChild();
     });
     this.lineReader = readline.createInterface({ input: child.stdout });
     this.lineReader.on('line', (line) => this.handleLine(line));

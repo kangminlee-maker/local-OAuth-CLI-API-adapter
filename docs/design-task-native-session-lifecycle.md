@@ -1,6 +1,6 @@
 # Design task: native chat session lifecycle atomicity
 
-**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 are bundle B-child (designed, see § Bundle B-child; implementation next), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
+**Status:** open — gaps 1, 2 and 4 closed by bundle B-res (track 1, 2026-09-06; see § Bundle B-res, reviewed and folded); gaps 3, 6 and 7 closed by bundle B-child (see § Bundle B-child), gap 5 bundle B-shutdown. Filed 2026-09-06 from round 56 of the PR #15 review campaign; gap 7 added from track 1 round 1.
 **Scope:** `LocalCliChatSessionManager` (`streamTurn` admission, `interrupt`, `close`,
 `closeAll`, `create`) and `CodexNativeCliChatSession` (`startTurn`, `stopTurn`, `replaceChild`,
 `teardownChild`, `close`, the `native` snapshot) in `src/chat/`.
@@ -105,9 +105,11 @@ error next to the directories (the session is closed either way; the copy is rem
 One shared helper carries the escalation for both runtimes (one rule, one owner). Every caller
 awaits its own call: `close()` (after the archive race), `replaceChild`/`restartChild` (**before**
 spawning — a session owns at most one child at any instant), the failed-handshake rollback in
-`start()`, and claude's `close()`/restart. Claude gains a `closed` flag that this serialization
-makes load-bearing (the round-55 "inert" verdict flips because its precondition — no await before
-the spawn — flips): checked before the restart's spawn and by the on-demand start. Bound: codex
+`start()`, and claude's `close()`/restart. Claude gains a `closed` flag, load-bearing through the on-demand
+start (gap 3): a turn asked of a closed session must not start a child for itself. (Both drafts
+also put it before the replacement's spawn; that guard survived mutation — a close awaits the
+replacement and then tears down whatever it spawned, so the guard only spared a spawn the close
+kills within its bootstrap, unobservably — and was removed.) Bound: codex
 close ≤ archive `min(2000, timeoutMs)` + 2 × 1000 + removal ≈ 4000 ms worst, under the 5000 ms
 pin (`test/codex-native-session.test.mjs:55`); claude ≤ 2000 ms. The grace is a named constant
 measured only against the fixture child offline (exit 2 ms after `SIGTERM`); retune against a live
@@ -116,10 +118,11 @@ measurement before release.
 **Gap 3 — restart on demand through the existing replacement (both drafts).** `startTurn` awaits
 at most one replacement per turn: the in-flight one if any (today's wait, raced with the turn's
 stop), else — no child, not closed — one it initiates through `replaceChild()`/`restartChild()`,
-raced with the stop the same way; then the existing checks. A turn that only awaited someone
-else's replacement keeps `not running` when it fails (the r55 pin, unchanged); the turn that
-**initiated** the attempt reports that attempt's own failure (the spawn or handshake error — the
-initiator owns the attempt and its reason; codex's refinement). No retry loop: each failed turn
+raced with the stop the same way; then the existing checks. A turn that awaited a replacement
+that failed reports that failure — the spawn or handshake error — whether it waited for the
+attempt or made it (one rule; codex's draft had the initiator report and the waiter keep `not
+running`, two rules for one fact — the r55 pin changes with that reason: the turn says why the
+child it waited for could not start, not only that none is running). No retry loop: each failed turn
 costs one spawn + handshake, paced by callers. `native.thread_id` follows the child — cleared by
 the teardown prefix, set only by the handshake — so the snapshot never names a thread that no
 longer exists; `ready` means "a turn will be attempted". No new status value, no `usableChild`
@@ -156,9 +159,9 @@ runtimes, and old exit before successor spawn; gap 3 a failed replacement's snap
 gap 7 `running` + 409 after a writer failure, no `turn/start, turn/start`, no `FIRST_LATE` in a
 later turn, a drain ended by the idle deadline with the interrupt written. (2) Gap 6 codex: helper,
 async teardown, callers await, replacement serialized before spawn, thread clearing in the prefix.
-(3) Gap 6 claude: same helper, `closed` guard (its close-during-restart check cannot fail on
-`46b141e` — the hazard is created by step 2's await — pinned against that head and guarded by the
-mutant). (4) Gap 3 both runtimes. (5) Gap 7 in the manager. (6) Docs: the design note's "reader
+(3) Gap 6 claude: same helper, `closed` flag (its close-during-restart pin cannot fail on
+`46b141e` — the wait the close lands in is created by step 2's await — pinned against that head;
+the flag's mutant is the turn asked of a closed session). (4) Gap 3 both runtimes. (5) Gap 7 in the manager. (6) Docs: the design note's "reader
 return" language distinguishes reservation release from the drain; the contract row's residual
 shrinks to gap 5; full suite, probes, mutants. Mutants: no `SIGKILL` stage / forget without
 awaiting exit; no `closed` check before the spawn; on-demand branch a no-op; thread clearing

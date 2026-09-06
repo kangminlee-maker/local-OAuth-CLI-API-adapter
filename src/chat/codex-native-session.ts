@@ -13,6 +13,7 @@ import type {
   NormalizedVerbosity,
 } from '../proxy/types.js';
 import { codexProxyFallbackReasoningEffort } from '../settings.js';
+import { terminateChild } from './child-exit.js';
 import { chatNormalizedRequest, chatPromptText } from './input.js';
 import type {
   LocalCliChatRuntimeEvent,
@@ -120,6 +121,8 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private closed = false;
   /** Isolation directories a replacement could not remove — the close's to remove, or to report. */
   private isolationDebt: string[] = [];
+  /** Children still there after `SIGKILL` and its grace — the close's to report. */
+  private survivingPids: number[] = [];
 
   private constructor(options: Required<CodexNativeCliChatSessionOptions>) {
     this.command = options.command;
@@ -196,7 +199,16 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // afterwards) — and a stop that lands while it waits ends the wait, not
       // the replacement (r55-codex: the caller was held for the rest of the
       // replacement's startup, a whole RPC budget under a close).
-      if (this.restarting) await Promise.race([this.restarting, turn.stopped$]);
+      //
+      // One replacement per turn: the one in flight, or — no child, and the
+      // session open — one this turn starts. A failed replacement left the
+      // session answering `ready` over no child, naming a thread that no longer
+      // existed, and every later turn `not running` for the session's life
+      // (t1 B-child gap 3); now `ready` means a turn will be attempted, and a
+      // turn that could not get a child reports why — the replacement's own
+      // failure, whether the turn waited for that attempt or made it.
+      const replacement = this.restarting ?? (this.child ? null : this.replaceChild());
+      if (replacement) await Promise.race([replacement, turn.stopped$]);
       if (turn.stopped) throw new Error('local CLI chat turn aborted');
       if (!this.child) throw new Error('codex native chat session is not running');
       preparedInput = await prepareCodexInput(request, chatPromptText(input));
@@ -223,7 +235,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
         // next turn reached the thread ahead of that work with no interrupt
         // between them (r52-codex). The child is replaced instead — the way
         // the sibling claude session replaces one that stopped answering.
-        if (err instanceof CodexRpcTimeoutError) void this.replaceChild();
+        if (err instanceof CodexRpcTimeoutError) void this.replaceChild().catch(() => undefined);
         throw err;
       }
       turn.turnId = readPath<string>(response, ['result', 'turn', 'id']) ?? '';
@@ -296,45 +308,22 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
    */
   private async replaceChild(): Promise<void> {
     if (this.restarting) return this.restarting;
-    // Nothing in here may reject: the caller does not wait for a replacement,
-    // and a rejection nobody awaits is the whole proxy's (r53-fable: a
+    // The replacement rejects with its start's failure: that is the awaiting
+    // turn's error (t1 B-child gap 3). A trigger that does not wait catches it
+    // — a rejection nobody awaits is the whole proxy's (r53-fable: a
     // credentials directory that could not be removed escaped as one).
     const restart = (async () => {
-      const previous = this.child;
-      this.child = null;
-      this.lineReader?.close();
-      this.lineReader = null;
-      previous?.kill('SIGTERM');
-      for (const pending of this.pending.values()) {
-        clearTimeout(pending.timer);
-        pending.reject(new Error('codex app-server replaced'));
-      }
-      this.pending.clear();
+      // The previous child has EXITED before its successor is spawned — the
+      // teardown awaits that, and removes the credentials copy only after it —
+      // so the session owns one child at any instant (t1 B-child gap 6).
+      await this.teardownChild(new Error('codex app-server replaced'));
       this.bufferedNotifications = [];
       this.stderr = '';
-      if (this.isolation) {
-        const isolation = this.isolation;
-        this.isolation = null;
-        try {
-          const { rm } = await import('node:fs/promises');
-          await rm(isolation.rootDir, { recursive: true, force: true });
-        } catch {
-          // A directory that will not go stops nothing here; it is the close's
-          // to remove, or to report (r54-codex: consumed and forgotten, it
-          // outlived a close that reported success).
-          this.isolationDebt.push(isolation.rootDir);
-        }
-      }
       // A session closed while its child was being replaced gets no new child:
       // one started here outlived the close, with a credentials directory of
       // its own, and nothing would ever kill it (r53-fable).
       if (this.closed) return;
-      try {
-        await this.start();
-      } catch {
-        // Left not-running: the next turn reports that plainly rather than
-        // hanging against a child that no longer exists.
-      }
+      await this.start();
     })();
     this.restarting = restart;
     try {
@@ -378,13 +367,16 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
 
   async close(): Promise<void> {
     this.closed = true;
-    if (this.restarting) {
+    const restarting = this.restarting;
+    if (restarting) {
       // A replacement in flight is not waited out: the child it is starting,
       // if any, goes now — the handshake it was in rejects, the replacement
-      // resolves without starting anything more — and only that cleanup is
+      // settles without starting anything more — and only that cleanup is
       // awaited (r55-codex: a close waited the replacement's whole RPC budget).
-      this.teardownChild(new Error('codex native chat session closed'));
-      await this.restarting;
+      // Captured before the await: the replacement may settle under it and
+      // clear the field.
+      await this.teardownChild(new Error('codex native chat session closed'));
+      await restarting.catch(() => undefined);
     }
     if (this.turn) {
       // Stopped, then failed — not closed: a closed queue reads as a turn that
@@ -407,14 +399,14 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
         closeGraceDelay(Math.min(CLOSE_ARCHIVE_TIMEOUT_MS, this.timeoutMs)),
       ]);
     }
-    this.teardownChild(new Error('codex native chat session closed'));
-    // Every isolation directory this session made goes here — the current one
-    // and any a replacement could not remove. One that still will not go is
-    // the close's error, thrown after everything else is torn down: the
-    // session is closed either way, and the operator hears what remains
+    await this.teardownChild(new Error('codex native chat session closed'));
+    // Every isolation directory this session made goes here — one a start left
+    // with no child, and any a teardown could not remove. One that still will
+    // not go is the close's error, thrown after everything else is torn down:
+    // the session is closed either way, and the operator hears what remains
     // (r54-fable: a rejection before the teardown kept the session listed
     // `ready` over a dead child; r54-codex: a success over a copied credential
-    // left on disk).
+    // left on disk) — a child still there after `SIGKILL` with it.
     const directories = [...this.isolationDebt, ...(this.isolation ? [this.isolation.rootDir] : [])];
     this.isolation = null;
     const remaining: string[] = [];
@@ -427,22 +419,56 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       }
     }
     this.isolationDebt = remaining;
-    if (remaining.length > 0) {
-      throw new Error(`codex native chat session closed, but its credentials copy could not be removed: ${remaining.join(', ')}`);
+    const remains = [
+      ...(remaining.length > 0 ? [`its credentials copy could not be removed: ${remaining.join(', ')}`] : []),
+      ...(this.survivingPids.length > 0 ? [`a child survived SIGKILL: ${this.survivingPids.join(', ')}`] : []),
+    ];
+    if (remains.length > 0) {
+      throw new Error(`codex native chat session closed, but ${remains.join('; ')}`);
     }
   }
 
-  /** Ends the child and every request waiting on it; safe with no child. */
-  private teardownChild(reason: Error): void {
+  /**
+   * Ends the child and every request waiting on it, and returns once the child
+   * has exited — `SIGTERM`, a grace, `SIGKILL` the same handle, a grace — and
+   * its credentials copy is removed, in that order (t1 B-child gap 6: the
+   * handle was forgotten at the `SIGTERM`, so a child that ignored it outlived
+   * a close reported as success, and the copy was removed while it still ran).
+   * The session's fields — the child, its thread — are cleared before the
+   * first await: nothing addresses the old child or names its thread after
+   * this line, and the snapshot stops naming a thread that no longer exists
+   * (gap 3). Safe with no child; one continuation per handle, since the handle
+   * is captured here and nowhere else.
+   */
+  private async teardownChild(reason: Error): Promise<void> {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
       pending.reject(reason);
     }
     this.pending.clear();
     this.lineReader?.close();
-    this.child?.kill('SIGTERM');
-    this.child = null;
     this.lineReader = null;
+    const child = this.child;
+    this.child = null;
+    const isolation = this.isolation;
+    this.isolation = null;
+    this.threadId = '';
+    delete this.native.thread_id;
+    if (child) {
+      const exit = await terminateChild(child);
+      if (!exit.exited && exit.pid !== undefined) this.survivingPids.push(exit.pid);
+    }
+    if (isolation) {
+      try {
+        const { rm } = await import('node:fs/promises');
+        await rm(isolation.rootDir, { recursive: true, force: true });
+      } catch {
+        // A directory that will not go stops nothing here; it is the close's
+        // to remove, or to report (r54-codex: consumed and forgotten, it
+        // outlived a close that reported success).
+        this.isolationDebt.push(isolation.rootDir);
+      }
+    }
   }
 
   private async start(): Promise<void> {
@@ -489,9 +515,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     });
     child.on('close', (code, signal) => {
       if (this.child !== child) return;
-      this.failActive(new Error(`codex app-server exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`));
-      this.child = null;
-      this.lineReader = null;
+      const exit = new Error(`codex app-server exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+      this.failActive(exit);
+      // Gone on its own: torn down the same way — its thread forgotten, its
+      // credentials copy removed now rather than at the close — and the next
+      // turn starts a child for itself (t1 B-child gap 3).
+      void this.teardownChild(exit);
     });
     this.lineReader = readline.createInterface({ input: child.stdout });
     this.lineReader.on('line', (line) => this.handleLine(line));
@@ -501,7 +530,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     } catch (err) {
       // A handshake that fails leaves no child: one left behind, with the old
       // thread's id still on the session, accepted the next turn (r55-codex).
-      this.teardownChild(err instanceof Error ? err : new Error(String(err)));
+      await this.teardownChild(err instanceof Error ? err : new Error(String(err)));
       throw err;
     }
   }
