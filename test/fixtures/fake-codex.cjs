@@ -225,6 +225,12 @@ rl.on('line', (line) => {
       result(payload.id, { turn: { id: turnId } });
       return;
     }
+    if (input.includes('HANG_NO_COMPLETION')) {
+      // A single turn that opens and never closes — per input, not per child, so
+      // a later turn on the same child still completes normally.
+      result(payload.id, { turn: { id: turnId } });
+      return;
+    }
     if (input.includes('PADDED_NARRATION')) {
       // A completed turn whose text carries leading and trailing whitespace.
       // Every other narration here is whitespace-free, so a `.trim()` on the

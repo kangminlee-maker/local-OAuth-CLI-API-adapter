@@ -1841,6 +1841,134 @@ test('a close that failed over a child that would not exit is re-closed and repo
 });
 
 // ---------------------------------------------------------------------------
+// Follow-up F2: the codex interrupt's write barrier.
+// A dead pipe reports an interrupt write's failure a tick after the write
+// returns. Until the replacement lands, the next turn must not be admitted to
+// the dead child. The write barrier holds the next turn until the interrupt
+// write is accepted (its OS callback) or its failure has installed a replacement
+// — never waiting on the child's RPC acknowledgement.
+
+// Phase-driven, not millisecond-driven: after the interrupt write is attempted,
+// the old handle accepts nothing (returns false, no callback), and `fail()`
+// delivers the async pipe error on demand. Every frame written to the old handle
+// after arming is captured, so a `turn/start` reaching the dead child is visible.
+function holdInterruptPipeFailure(handle) {
+  const realWrite = handle.stdin.write.bind(handle.stdin);
+  const attempted = [];
+  let armed = false;
+  let releaseSeen;
+  const interruptAttempted = new Promise((resolve_) => { releaseSeen = resolve_; });
+  handle.stdin.write = (chunk, ...rest) => {
+    let method;
+    try { method = JSON.parse(String(chunk)).method; } catch { method = String(chunk); }
+    if (!armed && method !== 'turn/interrupt') return realWrite(chunk, ...rest);
+    attempted.push(method);
+    if (!armed) { armed = true; releaseSeen(); }
+    return false; // the dead pipe: no bytes accepted, no callback, no throw
+  };
+  return {
+    interruptAttempted,
+    attempted,
+    fail() {
+      queueMicrotask(() => handle.stdin.emit('error', Object.assign(new Error('write EPIPE: controlled interrupt failure'), { code: 'EPIPE' })));
+    },
+  };
+}
+
+test('a codex interrupt whose write fails a tick late does not let the next turn reach the dead child: nothing starts ahead of an interrupt it never received (t1 F2)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_TURN_COMPLETION = '1';
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  delete process.env.FAKE_CODEX_NO_TURN_COMPLETION;
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    const control = holdInterruptPipeFailure(ns.child);
+    // Interrupt: the write is attempted but the pipe accepts nothing yet.
+    await manager.interrupt(session.id);
+    await control.interruptAttempted;
+    assert.equal(ns.restarting, null, 'the interrupt answered while the write fate was unknown (it did not wait for the replacement)');
+    // The next turn is submitted in the window, before the failure is delivered.
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    await new Promise((resolve_) => setImmediate(resolve_)); // let all runnable jobs drain
+    // Now deliver the async pipe failure.
+    control.fail();
+    const result = await second;
+    await drain;
+    assert.ok(control.attempted.includes('turn/interrupt'), 'the interrupt write was attempted (denominator)');
+    assert.ok(!control.attempted.includes('turn/start'), `no turn/start reached the dead child: ${JSON.stringify(control.attempted)}`);
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    assert.equal(events.at(-1), 'cli.error', 'the interrupted turn ended for its caller');
+    const newPid = Number(await readFile(pidFile, 'utf8').catch(() => '0'));
+    assert.notEqual(newPid, oldPid, 'the next turn ran on a successor');
+    assert.equal((await receivedMethods(methodLog)).filter((m) => m === 'thread/start').length, 2, 'one successor, one fresh thread');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a codex interrupt whose write is ACCEPTED holds the next turn only until acceptance — not the RPC ack — and never replaces the healthy child (t1 F2 accepted)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1'; // the child never ACKs the interrupt RPC
+  const { manager, methodLog } = await startCodexManager(2_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    // Turn 1 hangs (opens, never completes) via a PER-INPUT marker, so the same
+    // child can still complete turn 2 after the barrier releases.
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    // Forward the interrupt bytes to the child but HOLD the write's acceptance
+    // callback, so the write is not yet "accepted" when the next turn is submitted.
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    let acceptWrite;
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) {
+        acceptWrite = rest.find((a) => typeof a === 'function');
+        handle.stdin.write = realWrite;
+        realWrite(chunk); // the child does receive the interrupt bytes
+        return true;
+      }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    assert.equal(ns.restarting, null, 'the interrupt did not spawn a replacement');
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    await new Promise((resolve_) => setImmediate(resolve_));
+    // The interrupt RPC is never acked; the next turn is held only by the write's
+    // acceptance, which has not fired yet.
+    assert.equal(manager.get(session.id).status, 'running', 'the next turn is held until the write is accepted');
+    assert.ok(typeof acceptWrite === 'function', 'the write barrier passed an acceptance callback');
+    acceptWrite(); // accept the write
+    const result = await second;
+    await drain;
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    assert.equal(Number(await readFile(pidFile, 'utf8').catch(() => '0')), oldPid, 'the healthy child was not replaced');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Track 1, round 7 (both seats) on the round-6 fold: the coverage gap.
 // (The doc overclaim both seats also raised is a docs-only change, not a fixture.)
 

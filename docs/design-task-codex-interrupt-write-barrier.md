@@ -1,6 +1,7 @@
 # Design task — the codex interrupt's write barrier
 
-Status: open. Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2).
+Status: implemented 2026-09-07, two-seat review pending. Filed 2026-09-06 from round 6 of the
+native-session-lifecycle review (codex seat F2).
 Independent of track 1 (whose seven gaps are closed) and of track A
 (`docs/design-task-refresh-lease-atomicity.md`). Not a defect patch: the fix is a new ordering
 primitive, so it is a design task, not a fold.
@@ -48,6 +49,51 @@ that it wants a design, red fixtures first, and its own two-seat review.
   `stdin.write` return `false` and emit `error` a tick later (the shape Node produces for a dead
   reader), as the round-5/6 fixtures do.
 
+## Design (synthesized from two blind drafts, 2026-09-07)
+
+Two independent drafts (`review-artifacts/f2-design-{fable,codex}/DESIGN_DRAFT.md`) converged on one
+session-level gate installed synchronously at the interrupt write; each caught a flaw the other
+missed, both folded in here.
+
+**One field.** `private interruptGate: { child; promise: Promise<void>; done: (err?: Error) => void } | null`.
+The `promise` never rejects. `done` is idempotent (first signal wins): it clears the field (if still
+this gate), on error starts `replaceChild()` (which sets `this.restarting` synchronously) BEFORE it
+resolves, then resolves. So a woken waiter always sees the truth.
+
+**Install (in `sendTurnInterrupt`, synchronously, before the write).** Only when a write is actually
+attempted (a captured live child, not closed). The gate exists before `stopTurn` retires the turn
+and before `interrupt()` answers, so no next turn can be admitted into the window.
+
+**The write.** Still through `send()`, which gains an optional `onWriteSettled?: (err?) => void`:
+the four other callers pass nothing and are byte-identical by diff. The callback is the OS-acceptance
+signal (contract 3 allows waiting on acceptance, never on the RPC ack). `send()`'s synchronous-throw
+catch also calls `onWriteSettled(err)`. The interrupt keeps its pending RPC entry (unchanged wire).
+
+**Settle** on the first of: write callback (ok → resolve; err → replace then resolve),
+`send()` sync-catch (err), the child's teardown/exit (via the handlers below), or a `timeoutMs`
+bound (a wedged-but-alive child that never flushes and never errors settles as accepted and falls
+through to today's behavior — the bound caps the worst-case hold at one request budget). The bound
+is Fable's; without it a full-buffer child blocks the next turn forever.
+
+**The next turn waits** — inserted immediately before the current admission (`const replacement = …`
+at line 214): `const gate = this.interruptGate; if (gate) { await Promise.race([gate.promise, turn.stopped$]); if (turn.stopped) throw 'local CLI chat turn aborted'; }`.
+On resolve it re-reads `this.restarting`/`this.child` at the existing 214–217 and the r6 ownership
+guard at 230 — reusing the replacement-wait machinery, and surfacing the successor's own start
+failure through the existing `await` at 215.
+
+**The stdin `error` / `close` / child-`error` handlers route a matching pending gate FIRST and
+early-return** — this is codex's catch, essential: once the next turn is parked on the gate it is
+`this.turn`, so the old child's async `error` reaching `failActive(err)` would retire that innocent
+turn and reproduce the defect. So: `if (this.child !== child) return; if (this.interruptGate && this.interruptGate.child === child) { this.interruptGate.done(err); return; } this.failActive(err); if (!this.closed) void this.replaceChild()…`.
+An accepted gate is already cleared, so a genuinely later error takes the generic path.
+
+**`close()`** settles/clears the gate (no replacement while closed) after `closed = true`.
+
+**Rejected** (from both drafts): awaiting the RPC ack (round-3 bar); moving `retire` into the
+callback (turns the race into a client-visible 409, changes `isBusy`); a liveness probe at admission
+(the flags are still healthy in the window — racy); pessimistic replace on every interrupt (burns
+the warm child); treating `write() === false` as failure (that is backpressure).
+
 ## Done when
 
 A turn submitted in the window between a failed-write interrupt returning and its stream error
@@ -55,3 +101,16 @@ never reaches the old child: the child method log shows no `turn/start` on the d
 interrupt, the submitting turn runs on the successor (or reports the replacement's own start
 failure), and the caller gets one terminal event per turn. Red fixtures first; a mutant per new
 guard; both review seats clean on the fold.
+
+## Verification (2026-09-07)
+
+- Red-first fixture `t1 F2` (`test/native-session-interrupt.test.mjs`): a failed-write interrupt's
+  next turn reaches the successor, no `turn/start` on the dying child. Companion `t1 F2 accepted`
+  pins the accepted-write path — the barrier holds the next turn only until OS write acceptance
+  (not the RPC ack, exercised with `FAKE_CODEX_NO_INTERRUPT_ACK=1`) and never replaces a healthy
+  child. Turn 1 there hangs via a per-input `HANG_NO_COMPLETION` marker on the codex fake, so the
+  same child still completes turn 2 after the barrier releases.
+- Four mutants, one per new guard, all KILLED (`review-artifacts/stage2/f2-mutants.py`): M1 the
+  replacement dropped in `done`, M2 the admission wait removed, M3 the stdin-error gate routing
+  removed, M4 the gate never installed.
+- Full offline suite 2048/0; `verify:runtime-boundary` passed.
