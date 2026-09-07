@@ -30,7 +30,7 @@ const originalStartDelay = process.env.FAKE_CODEX_TURN_START_DELAY_MS;
 const originalTrailing = process.env.FAKE_CODEX_TRAILING_NOTIFICATION;
 const originalInitDelay = process.env.FAKE_CODEX_INITIALIZE_DELAY_MS;
 const originalArchiveDelay = process.env.FAKE_CODEX_ARCHIVE_DELAY_MS;
-const childHookNames = ['FAKE_CODEX_PID_FILE', 'FAKE_CODEX_IGNORE_SIGTERM', 'FAKE_CODEX_TURN_COMPLETION_DELAY_MS', 'FAKE_CODEX_NO_INTERRUPT_ACK', 'FAKE_CLAUDE_PID_FILE', 'FAKE_CLAUDE_IGNORE_SIGTERM'];
+const childHookNames = ['FAKE_CODEX_PID_FILE', 'FAKE_CODEX_IGNORE_SIGTERM', 'FAKE_CODEX_TURN_COMPLETION_DELAY_MS', 'FAKE_CODEX_NO_INTERRUPT_ACK', 'FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS', 'FAKE_CLAUDE_PID_FILE', 'FAKE_CLAUDE_IGNORE_SIGTERM'];
 const originalChildHooks = new Map(childHookNames.map((name) => [name, process.env[name]]));
 
 before(async () => {
@@ -1923,7 +1923,10 @@ test('a codex interrupt whose write is ACCEPTED holds the next turn only until a
   const pidFile = join(pidDir, 'pid');
   process.env.FAKE_CODEX_PID_FILE = pidFile;
   process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1'; // the child never ACKs the interrupt RPC
-  const { manager, methodLog } = await startCodexManager(2_000);
+  // The bound is pushed FAR out (30s) so that only the write's ACCEPTANCE can
+  // release the next turn within the test — a mutant that ignores acceptance and
+  // waits for the bound blows the runTurn budget and fails here (F10).
+  const { manager, methodLog } = await startCodexManager(30_000);
   const session = await manager.create({ runtime: 'codex' });
   const ns = manager.sessions.get(session.id).nativeSession;
   const oldPid = await publishedPid(pidFile);
@@ -1957,11 +1960,301 @@ test('a codex interrupt whose write is ACCEPTED holds the next turn only until a
     // acceptance, which has not fired yet.
     assert.equal(manager.get(session.id).status, 'running', 'the next turn is held until the write is accepted');
     assert.ok(typeof acceptWrite === 'function', 'the write barrier passed an acceptance callback');
+    const releasedAt = Date.now();
     acceptWrite(); // accept the write
+    const result = await second;
+    const heldMs = Date.now() - releasedAt;
+    await drain;
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    // Released by the ACCEPTANCE, not the far-off bound: a prompt completion can
+    // only be the write callback firing (F10).
+    assert.ok(heldMs < 2_000, `the next turn was not released promptly by the write acceptance: ${heldMs}ms`);
+    assert.equal(Number(await readFile(pidFile, 'utf8').catch(() => '0')), oldPid, 'the healthy child was not replaced');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// F2 fold, review round 1 (both seats converged): the write barrier holds the
+// next turn PARKED and id-less for up to a request budget while the interrupted
+// child keeps talking, widening a pre-existing notification-ownership defect —
+// an interrupted turn's tail (an id-less usage line, or a `turn/completed` the
+// child names at `params.turn.id` not `params.turnId`) was replayed into the
+// parked next turn as its own, completing work that never ran and leaking usage.
+
+test("a codex interrupt's id-less tail arriving while the next turn is PARKED on the write barrier is not replayed as that turn's own usage (t1 F2-1 idless)", { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1'; // the interrupt is never acked; only the write barrier holds turn 2
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION = '1'; // the interrupt emits an id-less {totalTokens:999}
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS = '200'; // land it WHILE turn 2 is parked, not before it is installed
+  const { manager, methodLog } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    // Turn 1 hangs (opens, never completes) via the per-input marker so it is an
+    // active turn to interrupt while turn 2 runs on the SAME child.
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    // Forward the interrupt bytes but HOLD the write's acceptance callback, so
+    // the barrier parks turn 2 (id-less) while turn 1's tail arrives.
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    let acceptWrite;
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) {
+        acceptWrite = rest.find((a) => typeof a === 'function');
+        handle.stdin.write = realWrite;
+        realWrite(chunk);
+        return true;
+      }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    await new Promise((resolve_) => setImmediate(resolve_));
+    assert.equal(manager.get(session.id).status, 'running', 'the next turn is parked on the barrier');
+    // The tail (200ms) must land AFTER turn 2 is parked and BEFORE it is released;
+    // turn 2 is released only by acceptWrite (the interrupt is never acked, the
+    // bound is 8s away), so a wide wait keeps the ordering deterministic.
+    await delay(800);
+    assert.ok(typeof acceptWrite === 'function', 'the write barrier passed an acceptance callback');
+    acceptWrite();
     const result = await second;
     await drain;
     assert.equal(result.status, 'completed', JSON.stringify(result.final));
-    assert.equal(Number(await readFile(pidFile, 'utf8').catch(() => '0')), oldPid, 'the healthy child was not replaced');
+    assert.notEqual(result.usage?.totalTokens, 999, `the interrupted turn's id-less tail became the next turn's usage: ${JSON.stringify(result.usage)}`);
+    assert.ok(
+      !result.events.some((event) => event.usage?.totalTokens === 999),
+      `the interrupted turn's tail leaked into the next turn's events: ${JSON.stringify(result.events.map((e) => e.usage))}`,
+    );
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test("a codex interrupt's late nested-id turn/completed arriving while the next turn is PARKED does not close that turn as if it were its own (t1 F2-1 nested)", { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1';
+  process.env.FAKE_CODEX_TURN_COMPLETION_DELAY_MS = '250'; // turn 1's completion lands while turn 2 is parked
+  const { manager, methodLog } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    // Turn 1 is an ordinary completing turn, but its completion is delayed.
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    let acceptWrite;
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) {
+        acceptWrite = rest.find((a) => typeof a === 'function');
+        handle.stdin.write = realWrite;
+        realWrite(chunk);
+        return true;
+      }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    // Turn 2 hangs on its OWN account, so any completion it shows can only be
+    // turn 1's late `turn/completed` (named at params.turn.id) leaking in.
+    const second = manager.runTurn(session.id, { input: 'HANG_NO_COMPLETION' }, { timeoutMs: 1_200 });
+    await new Promise((resolve_) => setImmediate(resolve_));
+    assert.equal(manager.get(session.id).status, 'running', 'the next turn is parked on the barrier');
+    await delay(350); // let turn 1's delayed nested-id completion arrive while turn 2 is parked
+    assert.ok(typeof acceptWrite === 'function', 'the write barrier passed an acceptance callback');
+    acceptWrite();
+    const result = await second;
+    await drain;
+    assert.notEqual(
+      result.status,
+      'completed',
+      `the next turn completed on the interrupted turn's late nested-id completion: ${JSON.stringify(result.final)}`,
+    );
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test("a prior codex turn's nested-id turn/completed arriving AFTER the next turn is NAMED is dropped, not routed into it (t1 F2-1 nested-named)", { timeout: 20_000 }, async () => {
+  // The parked case above is caught by the id-less drop even with a top-level-only
+  // id read, so it does not pin the nested-id extractor. This one does: turn 2 is
+  // NAMED and running when turn 1's late `turn/completed` (id at params.turn.id)
+  // arrives, so only the canonical extractor keeps that completion from closing
+  // turn 2's queue as if it were its own.
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_TURN_COMPLETION_DELAY_MS = '500'; // turn 1's completion lands well after turn 2 is named
+  const { manager, methodLog } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await manager.interrupt(session.id); // the write is accepted; the gate releases at once, no hold
+    // Turn 2 hangs on its OWN account and gets NAMED promptly; turn 1's delayed
+    // nested-id completion then arrives while turn 2 is named and running.
+    const second = manager.runTurn(session.id, { input: 'HANG_NO_COMPLETION' }, { timeoutMs: 1_500 });
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the next turn to be named');
+    const result = await second;
+    await drain;
+    assert.notEqual(
+      result.status,
+      'completed',
+      `the next turn completed on a prior turn's nested-id completion: ${JSON.stringify(result.final)}`,
+    );
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+// The write barrier has more guards than the two write-fate paths above pin: the
+// close/child-error handler routings and the timeoutMs bound. Each is exercised
+// below so a mutant on it turns a committed fixture red (F2 review round 1, Fable
+// seat's Finding 2 — the non-write-path guards were pinned by nothing).
+
+test('a codex child that EXITS while the next turn is parked on the barrier settles the gate; the next turn starts a fresh child, not the dead one (t1 F2 child-exit)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1';
+  const { manager, methodLog } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    // Hold the interrupt write's acceptance so turn 2 stays parked on the gate.
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) { handle.stdin.write = realWrite; realWrite(chunk); return true; }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 6_000 });
+    await new Promise((resolve_) => setImmediate(resolve_));
+    assert.equal(manager.get(session.id).status, 'running', 'the next turn is parked on the barrier');
+    // The child exits (SIGKILL of the pid it published) while turn 2 is parked:
+    // the close handler must settle the gate — not fail the innocent parked turn.
+    process.kill(oldPid, 'SIGKILL');
+    const result = await second;
+    await drain;
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    const newPid = Number(await readFile(pidFile, 'utf8').catch(() => '0'));
+    assert.notEqual(newPid, oldPid, 'the next turn ran on a fresh child after the old one exited');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test("a codex child ERROR while the next turn is parked on the barrier settles the gate onto a successor, not onto the innocent parked turn (t1 F2 child-error)", { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1';
+  const { manager, methodLog } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) { handle.stdin.write = realWrite; realWrite(chunk); return true; }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 6_000 });
+    await new Promise((resolve_) => setImmediate(resolve_));
+    assert.equal(manager.get(session.id).status, 'running', 'the next turn is parked on the barrier');
+    // A ChildProcess-level `error` for the owned child while turn 2 is parked: the
+    // child-error handler must route it to the gate (which replaces the child),
+    // not `failActive` it onto the parked turn.
+    handle.emit('error', Object.assign(new Error('synthetic child error'), { code: 'EPIPE' }));
+    const result = await second;
+    await drain;
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    const newPid = Number(await readFile(pidFile, 'utf8').catch(() => '0'));
+    assert.notEqual(newPid, oldPid, 'the next turn ran on the successor the child error installed');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a codex interrupt write neither accepted nor errored releases the next turn at the bound, not forever (t1 F2 bound)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager, methodLog } = await startCodexManager(600); // a near bound so the wait is short
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    // Wedge the interrupt write: the pipe accepts nothing and reports nothing —
+    // no callback, no error, child alive. Only the bound can settle the gate.
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) { handle.stdin.write = realWrite; return false; }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    const started = Date.now();
+    // No runTurn deadline: the release can only come from the barrier's bound.
+    const second = manager.runTurn(session.id, { input: 'again' });
+    const outcome = await Promise.race([
+      second.then((r) => ({ result: r })),
+      delay(6_000).then(() => ({ timedOut: true })),
+    ]);
+    assert.ok(!outcome.timedOut, 'the next turn was held forever — the bound did not release it');
+    assert.equal(outcome.result.status, 'completed', JSON.stringify(outcome.result.final));
+    assert.ok(Date.now() - started < 5_000, `the next turn was not released near the bound: ${Date.now() - started}ms`);
+    await drain;
   } finally {
     reapFixtureChild(oldPid);
     reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));

@@ -1,7 +1,7 @@
 # Design task — the codex interrupt's write barrier
 
-Status: implemented 2026-09-07, two-seat review pending. Filed 2026-09-06 from round 6 of the
-native-session-lifecycle review (codex seat F2).
+Status: implemented 2026-09-07; review round 1 folded (F2-1 + coverage gaps), round 2 on the fold
+pending. Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2).
 Independent of track 1 (whose seven gaps are closed) and of track A
 (`docs/design-task-refresh-lease-atomicity.md`). Not a defect patch: the fix is a new ordering
 primitive, so it is a design task, not a fold.
@@ -104,13 +104,48 @@ guard; both review seats clean on the fold.
 
 ## Verification (2026-09-07)
 
-- Red-first fixture `t1 F2` (`test/native-session-interrupt.test.mjs`): a failed-write interrupt's
-  next turn reaches the successor, no `turn/start` on the dying child. Companion `t1 F2 accepted`
-  pins the accepted-write path — the barrier holds the next turn only until OS write acceptance
-  (not the RPC ack, exercised with `FAKE_CODEX_NO_INTERRUPT_ACK=1`) and never replaces a healthy
-  child. Turn 1 there hangs via a per-input `HANG_NO_COMPLETION` marker on the codex fake, so the
-  same child still completes turn 2 after the barrier releases.
-- Four mutants, one per new guard, all KILLED (`review-artifacts/stage2/f2-mutants.py`): M1 the
-  replacement dropped in `done`, M2 the admission wait removed, M3 the stdin-error gate routing
-  removed, M4 the gate never installed.
-- Full offline suite 2048/0; `verify:runtime-boundary` passed.
+Red-first fixtures in `test/native-session-interrupt.test.mjs`; every guard pinned by a mutant that
+turns its fixture red (`review-artifacts/stage2/f2-mutants-full.py`, ten mutants, all KILLED).
+
+- The barrier's write-fate paths: `t1 F2` (a failed-write interrupt's next turn reaches the
+  successor, no `turn/start` on the dying child) and `t1 F2 accepted` (the barrier holds the next
+  turn only until OS write acceptance — not the RPC ack, `FAKE_CODEX_NO_INTERRUPT_ACK=1` — with the
+  bound pushed far out so only acceptance can release within the test, and never replaces a healthy
+  child). Mutants M1–M4, F10.
+- The barrier's non-write-path guards (F2 review round 1, Fable Finding 2 — pinned by nothing
+  before): `t1 F2 child-exit` (a child that exits while the next turn is parked settles the gate;
+  the next turn starts a fresh child), `t1 F2 child-error` (a child `error` routes to the gate, not
+  onto the innocent parked turn), `t1 F2 bound` (a write neither accepted nor errored releases the
+  next turn at the bound, not forever). Mutants M5, M6, M7.
+
+## Review round 1 fold (2026-09-07)
+
+Two independent seats (Fable frontier agent, codex CLI at ultra) reviewed the barrier commit behind
+a blind packet. Both converged on **one** substantive defect and Fable added a coverage finding;
+both folded here.
+
+- **F2-1 — post-interrupt notification contamination (codex HIGH, Fable medium; pre-existing,
+  reproduced on `a/`; the barrier widened it).** An interrupted turn's tail was replayed into the
+  next turn as its own: a `turn/completed` the child names at `params.turn.id` (which
+  `handleNotification` read only at the top-level `params.turnId`) CLOSED the next turn's queue, so
+  work that never ran on the child returned `completed`; an id-less usage tail became the next
+  turn's usage. The barrier holds the next turn parked and id-less for up to a request budget while
+  the interrupted child keeps talking, widening the window from one RPC round-trip. Fixed at the
+  notification-routing authority, not the gate: one canonical turn-id extractor (`notificationTurnId`,
+  both `params.turnId` and `params.turn.id`) used by immediate routing and buffered replay so a
+  prior turn's completion is dropped, not routed; and while a turn is unnamed, an id-less
+  notification (never the current turn's own output — a running turn's output carries its id) is
+  dropped rather than buffered. Red-first fixtures `t1 F2-1 idless`, `t1 F2-1 nested` (parked), and
+  `t1 F2-1 nested-named` (the named/immediate-routing path — the parked case is backstopped by the
+  id-less drop, so it does not pin the extractor; the named case does). Mutants notifA (extractor
+  top-level only) and notifB (id-less not dropped).
+- **Fable Finding 2 — the barrier's non-write-path guards were pinned by nothing (medium,
+  coverage).** Folded as the three fixtures above (child-exit, child-error, bound) plus a
+  strengthened `t1 F2 accepted` that now distinguishes acceptance-release from bound-release (F10).
+- **Not folded (verified, not defects):** the gate's timer-clear and `close()` settlement are
+  resource hygiene, not behavioral — a leaked bound is `unref`'d and its `done()` idempotent; a gate
+  the close did not clear has its late callback guarded by `!this.closed`. The codex seat killed
+  both with instrumentation probes; a committed behavioral fixture would assert an implementation
+  detail, so none is added.
+
+- Full offline suite **2054/0**; `verify:runtime-boundary` passed.

@@ -283,18 +283,21 @@ rl.on('line', (line) => {
     setTimeout(() => result(payload.id), Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS));
     return;
   }
+  // A real child keeps talking for a moment after being told to stop, and some
+  // of what it says carries no turn id at all — which is why where those
+  // notifications land matters. It happens whether or not the interrupt is
+  // acknowledged, so it is emitted before the no-ack early return below.
+  if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_TRAILING_NOTIFICATION === '1') {
+    // Default 10ms; a test that must land this tail in a specific window (e.g.
+    // while the next turn is parked on the write barrier) sets the delay.
+    setTimeout(() => {
+      write({ method: 'thread/tokenUsage/updated', params: { totalTokens: 999 } });
+    }, Number(process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS ?? 10));
+  }
   // An interrupt the child never acknowledges: the endpoint must not wait for it.
   if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_NO_INTERRUPT_ACK === '1') return;
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {
     result(payload.id);
-    // A real child keeps talking for a moment after being told to stop, and
-    // some of what it says carries no turn id at all — which is why where
-    // those notifications land matters.
-    if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_TRAILING_NOTIFICATION === '1') {
-      setTimeout(() => {
-        write({ method: 'thread/tokenUsage/updated', params: { totalTokens: 999 } });
-      }, 10);
-    }
     return;
   }
 

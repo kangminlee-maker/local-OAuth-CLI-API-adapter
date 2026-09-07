@@ -788,20 +788,31 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
         : {}),
       ...(method === 'thread/tokenUsage/updated' ? { usage: params } : {}),
     };
-    const turnId = typeof data?.turnId === 'string' ? data.turnId : undefined;
+    const turnId = notificationTurnId(data);
     const turn = this.turn;
     // Nothing is running, so this belongs to a turn that is over. Holding it
     // would deliver an interrupted turn's tail — its usage above all — to
     // whoever asked next, as that turn's own.
     if (!turn) return;
-    // Still being named: what arrives now belongs to the turn being started,
-    // and nothing else can be running, so hold it until there is an id to
-    // route by.
+    // Not yet named: this turn's id is unknown, so an id can't be compared yet.
+    // An id-BEARING notification (an early delta the child sends before the
+    // `turn/start` ack) is held and sorted at flush once the id is known; an
+    // id-LESS one now cannot be this turn's own output — a running turn's output
+    // carries its id (a delta at `params.turnId`, a completion at
+    // `params.turn.id`), so an id-less notification is a prior turn's tail,
+    // dropped the way an idle session's is. Without this, an interrupt tail
+    // buffered while the next turn is parked on the write barrier is replayed
+    // into it as its own usage (F2-1; the barrier widened this window from one
+    // RPC round-trip to a full request budget).
     if (!turn.turnId) {
+      if (turnId === undefined) return;
       this.bufferedNotifications.push(event);
       this.bufferedNotifications = this.bufferedNotifications.slice(-100);
       return;
     }
+    // Named: a notification for a different turn is a prior turn's late output —
+    // above all a `turn/completed`, whose id the child carries at `params.turn.id`,
+    // which would otherwise CLOSE this turn's queue as if it were its own (F2-1).
     if (turnId && turnId !== turn.turnId) return;
     turn.queue.push(event);
     if (method === 'turn/completed') turn.queue.close();
@@ -812,7 +823,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.bufferedNotifications = [];
     for (const event of buffered) {
       const params = asRecord(asRecord(event.raw)?.params);
-      const eventTurnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
+      const eventTurnId = notificationTurnId(params);
       if (eventTurnId && eventTurnId !== turn.turnId) continue;
       turn.queue.push(event);
       if (asRecord(event.raw)?.method === 'turn/completed') turn.queue.close();
@@ -839,6 +850,19 @@ function parseJson(line: string): JsonRpcMessage | null {
 function asRecord(value: unknown): JsonRpcMessage | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as JsonRpcMessage;
+}
+
+/**
+ * The turn a notification names, read the one way for both immediate routing and
+ * buffered replay so the two never disagree: the running turn's deltas and usage
+ * carry `params.turnId`; a `turn/completed` names the turn at `params.turn.id`.
+ * Neither present means unscoped — an interrupted turn's tail, never the current
+ * turn's own output (F2-1).
+ */
+function notificationTurnId(data: JsonRpcMessage | null): string | undefined {
+  if (typeof data?.turnId === 'string') return data.turnId;
+  const nested = asRecord(data?.turn);
+  return typeof nested?.id === 'string' ? nested.id : undefined;
 }
 
 function readPath<T>(value: unknown, path: readonly string[]): T | undefined {
