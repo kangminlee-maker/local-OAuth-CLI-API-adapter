@@ -1,7 +1,9 @@
 # Design task — the codex interrupt's write barrier
 
-Status: implemented 2026-09-07; review rounds 1 and 2 folded, round 3 on the round-2 fold pending.
-Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2).
+Status: closed 2026-09-07. Implemented, review rounds 1–2 folded, round 3 (both seats) clean on the
+fold. Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2). Three
+pre-existing defects the round-3 review surfaced (orthogonal to F2) are filed separately as
+`docs/design-task-codex-native-completion-parity.md`.
 Independent of track 1 (whose seven gaps are closed) and of track A
 (`docs/design-task-refresh-lease-atomicity.md`). Not a defect patch: the fix is a new ordering
 primitive, so it is a design task, not a fold.
@@ -186,3 +188,19 @@ completing turn, which the new `t1 F2-1 plain-complete` fixture catches fast. Th
 F10 (barrier); extractor-nested and extractor-toplevel (→ `plain-complete`); mismatch-check-removed
 (→ `nested-named`); notifB id-less-drop (→ `idless`/`idless-named`); R2-M1 early-delta-dropped
 (→ `early-delta`). Full offline suite **2058/0**; `verify:runtime-boundary` passed.
+
+## Review round 3 (2026-09-07) — the fold is clean
+
+Both seats reviewed the round-2 fold; the Fable seat completed this time. Verdict: **no defect in the
+change.** The unconditional id-less drop closes the residual (red-first on `a/`); the naming wait is
+the right fix for a real 409 race (deflake verified under `FAKE_CODEX_TURN_START_DELAY_MS=100`, 88/88,
+control fails 3/3); the four new fixtures are non-vacuous (each red under an independent mutant). The
+Fable seat validated the id-less-drop premise against the live-run sibling `CodexAppServerBackend`,
+which requires those ids — one informational method-family (`account/*` raw events during a turn)
+is `unmeasured`, but it was already dropped when no turn ran, so the fold makes the surface uniform
+rather than newly lossy.
+
+Both seats surfaced the same pre-existing defects **orthogonal to F2** (reproduce on `a/`, native
+vs app-server-backend parity): a plain turn's usage discarded, and a failed turn reported as
+completed; the codex seat additionally found a >100-notification pre-ack buffer truncation. Filed as
+`docs/design-task-codex-native-completion-parity.md`, not folded here.
