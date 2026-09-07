@@ -2353,7 +2353,14 @@ test('a codex interrupt write neither accepted nor errored releases the next tur
   tempDirs.push(pidDir);
   const pidFile = join(pidDir, 'pid');
   process.env.FAKE_CODEX_PID_FILE = pidFile;
-  const { manager, methodLog } = await startCodexManager(600); // a near bound so the wait is short
+  // The session's timeoutMs is BOTH the barrier's bound and every RPC budget,
+  // the child's `initialize` handshake included. Too small (600ms) and a slow
+  // cold-start handshake times the whole fixture out on `initialize` before it
+  // ever reaches the bound — a load-dependent flake (F-1). Give the handshake
+  // room; the wait is still short (~2*bound: release at the bound, then the
+  // next turn's own turn/start RPC timeout on the wedged pipe).
+  const bound = 1_500;
+  const { manager, methodLog } = await startCodexManager(bound);
   const session = await manager.create({ runtime: 'codex' });
   const ns = manager.sessions.get(session.id).nativeSession;
   const oldPid = await publishedPid(pidFile);
@@ -2389,12 +2396,16 @@ test('a codex interrupt write neither accepted nor errored releases the next tur
     const second = manager.runTurn(session.id, { input: 'again' });
     const outcome = await Promise.race([
       second.then((r) => ({ result: r })),
-      delay(6_000).then(() => ({ timedOut: true })),
+      delay(8_000).then(() => ({ timedOut: true })),
     ]);
     await drain;
     assert.ok(interruptAttempted, 'the interrupt write was attempted (denominator)');
     assert.ok(!outcome.timedOut, 'the next turn was held forever — the bound did not release it');
-    assert.ok(Date.now() - started < 5_000, `the next turn was not released near the bound: ${Date.now() - started}ms`);
+    // Released AT the bound, not far past it: ~2*bound is release + the wedged
+    // turn/start RPC timeout. A bound stretched to a multiple of timeoutMs (a
+    // value mutant) blows this. Slack over the ~2*bound expectation, not a flat
+    // wall-clock number with several times the headroom it needs.
+    assert.ok(Date.now() - started < 2 * bound + 1_500, `the next turn was not released near the bound: ${Date.now() - started}ms`);
     // Released by the bound as ACCEPTED (a fall-through, not a failed write), then
     // it dies by its OWN RPC timeout — it does not complete on a child that never
     // received the interrupt. A bound misclassified as a failed write would replace
