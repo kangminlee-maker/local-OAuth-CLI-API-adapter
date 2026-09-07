@@ -2348,7 +2348,7 @@ test("a codex child ERROR while the next turn is parked on the barrier settles t
   }
 });
 
-test('a codex interrupt write neither accepted nor errored releases the next turn at the bound, not forever (t1 F2 bound)', { timeout: 20_000 }, async () => {
+test('a codex interrupt write neither accepted nor errored releases the next turn at the bound; that turn then dies by its own RPC timeout — nothing bypasses the interrupt (t1 F2 bound)', { timeout: 20_000 }, async () => {
   const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
   tempDirs.push(pidDir);
   const pidFile = join(pidDir, 'pid');
@@ -2363,26 +2363,156 @@ test('a codex interrupt write neither accepted nor errored releases the next tur
       for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
     })();
     await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
-    // Wedge the interrupt write: the pipe accepts nothing and reports nothing —
-    // no callback, no error, child alive. Only the bound can settle the gate.
+    // Model a genuinely wedged pipe with BACKPRESSURE that RETAINS ORDER: from the
+    // interrupt onward it accepts nothing and reports nothing (no callback, no
+    // error, child alive) AND does not let a later write overtake the unsent
+    // interrupt. So the interrupt is never delivered and the next turn's own
+    // turn/start can never reach the child ahead of it — only the bound settles
+    // the gate, and the next turn then dies by its own turn/start RPC timeout.
+    // (An earlier version restored the real writer and DROPPED the interrupt chunk,
+    // so a later write overtook the hole and turn 2 completed on the same child,
+    // bypassing the interrupt — green under the very ordering violation F2
+    // prevents. F2-FINAL-1.)
     const handle = ns.child;
     const realWrite = handle.stdin.write.bind(handle.stdin);
+    let interruptAttempted = false;
+    let wedged = false;
     handle.stdin.write = (chunk, ...rest) => {
-      if (String(chunk).includes('"turn/interrupt"')) { handle.stdin.write = realWrite; return false; }
+      if (!wedged && String(chunk).includes('"turn/interrupt"')) { wedged = true; interruptAttempted = true; }
+      if (wedged) return false; // accepts nothing, reports nothing, retains order
       return realWrite(chunk, ...rest);
     };
     await manager.interrupt(session.id);
     const started = Date.now();
-    // No runTurn deadline: the release can only come from the barrier's bound.
+    // No runTurn deadline: the release can only come from the barrier's bound, and
+    // the turn's own end only from its turn/start RPC timeout on the wedged pipe.
     const second = manager.runTurn(session.id, { input: 'again' });
     const outcome = await Promise.race([
       second.then((r) => ({ result: r })),
       delay(6_000).then(() => ({ timedOut: true })),
     ]);
-    assert.ok(!outcome.timedOut, 'the next turn was held forever — the bound did not release it');
-    assert.equal(outcome.result.status, 'completed', JSON.stringify(outcome.result.final));
-    assert.ok(Date.now() - started < 5_000, `the next turn was not released near the bound: ${Date.now() - started}ms`);
     await drain;
+    assert.ok(interruptAttempted, 'the interrupt write was attempted (denominator)');
+    assert.ok(!outcome.timedOut, 'the next turn was held forever — the bound did not release it');
+    assert.ok(Date.now() - started < 5_000, `the next turn was not released near the bound: ${Date.now() - started}ms`);
+    // Released by the bound as ACCEPTED (a fall-through, not a failed write), then
+    // it dies by its OWN RPC timeout — it does not complete on a child that never
+    // received the interrupt. A bound misclassified as a failed write would replace
+    // the child at the bound and let this turn complete on the successor.
+    assert.equal(outcome.result.status, 'error', JSON.stringify(outcome.result.final));
+    const methods = await receivedMethods(methodLog);
+    assert.ok(!methods.includes('turn/interrupt'), `the wedged interrupt still reached the child: ${JSON.stringify(methods)}`);
+    assert.equal(methods.filter((m) => m === 'turn/start').length, 1, `a turn/start bypassed the wedged interrupt onto the same child: ${JSON.stringify(methods)}`);
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('after an accepted interrupt the barrier settles AND clears itself, so a genuine stdin error on the same child during a LATER turn is not swallowed by the stale gate: it fails that turn and replaces the child (t1 F2 gate-clear)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager } = await startCodexManager(6_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
+    const firstTurnId = ns.turn.turnId;
+    const gateChild = ns.child; // the interrupt is ACCEPTED, so this child is not replaced
+    // The interrupt write is accepted (not wedged): the gate settles via its write
+    // callback and MUST clear itself (interruptGate = null). The fake acks and keeps
+    // the child alive, so the NEXT turn runs on this same child (HANG is per input).
+    await manager.interrupt(session.id);
+    await drain;
+    const started = Date.now();
+    const second = manager.runTurn(session.id, { input: 'HANG_NO_COMPLETION' }, { timeoutMs: 12_000 });
+    second.catch(() => undefined); // asserted via the race below; never orphan-reject
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId && ns.turn.turnId !== firstTurnId), 4_000, 'the next turn to be named on the same child');
+    assert.equal(ns.child, gateChild, 'the accepted interrupt kept the same child');
+    // A genuine, later pipe error on that same child. With the clear, the settled
+    // gate is gone, so this falls through to failActive + replaceChild: the turn
+    // reports it and a successor comes up. Remove the clear (MG1) and the stale
+    // settled gate still matches this child, swallows the error in an idempotent
+    // no-op done(), and returns — the turn hangs to its deadline and the child is
+    // never replaced. (The handler's own promise: "An accepted gate has already
+    // cleared itself, so a genuinely later error falls through to the generic
+    // replacement.")
+    gateChild.stdin.emit('error', Object.assign(new Error('write EPIPE: later same-child pipe failure'), { code: 'EPIPE' }));
+    await waitFor(async () => Number(await readFile(pidFile, 'utf8').catch(() => '0')) !== oldPid, 5_000, 'the successor to come up — a stale gate swallows the later stdin error and never replaces the child (MG1)');
+    const outcome = await Promise.race([
+      second.then((r) => ({ result: r })),
+      delay(3_000).then(() => ({ timedOut: true })),
+    ]);
+    assert.ok(!outcome.timedOut, 'the later turn did not end after its child was replaced');
+    assert.ok(Date.now() - started < 8_000, 'the later turn was held near its deadline, not failed promptly by the genuine error');
+    assert.equal(outcome.result.status, 'error', JSON.stringify(outcome.result.final));
+    assert.match(JSON.stringify(outcome.result.final), /EPIPE/, 'the later turn reported the genuine pipe error, not a swallowed-into-timeout abort');
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a parked next turn stopped while a wedged interrupt holds the barrier ends at once: the admission wait races the turn\'s own stop, it is not held for the whole timeoutMs bound (t1 F2 stopped-parked)', { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const bound = 8_000; // a large bound so a next turn held to it (the MG2 shape) is unmistakably late
+  const { manager } = await startCodexManager(bound);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
+    const turn1 = ns.turn;
+    // Wedge the interrupt with order-retaining backpressure: it is never delivered,
+    // so ONLY the bound can settle the gate. The next turn parks on it.
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    let wedged = false;
+    handle.stdin.write = (chunk, ...rest) => {
+      if (!wedged && String(chunk).includes('"turn/interrupt"')) wedged = true;
+      if (wedged) return false; // accepts nothing, reports nothing, retains order
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id); // retires turn 1, installs and HOLDS the gate
+    await drain;
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 15_000 });
+    second.catch(() => undefined);
+    await waitFor(() => Boolean(ns.turn && ns.turn !== turn1 && !ns.turn.turnId), 4_000, 'the next turn to park on the held gate');
+    // Stop the PARKED next turn (no turn id yet, so nothing is written). The
+    // caller is answered promptly EITHER WAY — the manager races every read
+    // against the reservation's stop, and closes the caller's iteration behind
+    // the native read still pending in the runtime. What the admission wait's
+    // stopped$ race governs is the NATIVE turn: with it, the parked turn's own
+    // stop wakes the admission wait at once, the generator throws, and its
+    // `finally` RETIRES the turn (this.turn = null) — the session is genuinely
+    // free. Drop the race (MG2, `await gate.promise` alone) and the parked
+    // generator sleeps on the wedged gate until the bound: the caller was told
+    // its turn ended, yet the native session stays occupied for a whole
+    // timeoutMs, unable to serve the next turn.
+    const stopAt = Date.now();
+    await manager.interrupt(session.id);
+    const result = await second; // the manager answers the caller promptly, both ways
+    assert.equal(result.status, 'error', JSON.stringify(result.final));
+    assert.match(JSON.stringify(result.final), /aborted/, 'the parked turn reported its own stop to the caller');
+    // The distinguisher: the native retirement of the parked turn. Prompt with
+    // the race — the generator wakes on turn.stopped$, throws, and its `finally`
+    // retires it (this.turn = null); held toward the bound without it (MG2).
+    await waitFor(() => ns.turn === null, 3_000, `the stopped parked turn was not retired promptly — the native session stayed occupied toward the ${bound}ms bound (the admission wait does not race turn.stopped$: MG2)`);
+    assert.ok(Date.now() - stopAt < 4_000, `the parked turn's native retirement took ${Date.now() - stopAt}ms — held toward the bound (MG2)`);
   } finally {
     reapFixtureChild(oldPid);
     reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
