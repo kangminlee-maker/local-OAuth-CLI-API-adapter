@@ -30,7 +30,7 @@ const originalStartDelay = process.env.FAKE_CODEX_TURN_START_DELAY_MS;
 const originalTrailing = process.env.FAKE_CODEX_TRAILING_NOTIFICATION;
 const originalInitDelay = process.env.FAKE_CODEX_INITIALIZE_DELAY_MS;
 const originalArchiveDelay = process.env.FAKE_CODEX_ARCHIVE_DELAY_MS;
-const childHookNames = ['FAKE_CODEX_PID_FILE', 'FAKE_CODEX_IGNORE_SIGTERM', 'FAKE_CODEX_TURN_COMPLETION_DELAY_MS', 'FAKE_CODEX_NO_INTERRUPT_ACK', 'FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS', 'FAKE_CLAUDE_PID_FILE', 'FAKE_CLAUDE_IGNORE_SIGTERM'];
+const childHookNames = ['FAKE_CODEX_PID_FILE', 'FAKE_CODEX_IGNORE_SIGTERM', 'FAKE_CODEX_TURN_COMPLETION_DELAY_MS', 'FAKE_CODEX_NO_INTERRUPT_ACK', 'FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS', 'FAKE_CODEX_TRAILING_NOTIFICATION_TOPLEVEL_ID', 'FAKE_CLAUDE_PID_FILE', 'FAKE_CLAUDE_IGNORE_SIGTERM'];
 const originalChildHooks = new Map(childHookNames.map((name) => [name, process.env[name]]));
 
 before(async () => {
@@ -1891,7 +1891,7 @@ test('a codex interrupt whose write fails a tick late does not let the next turn
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     const control = holdInterruptPipeFailure(ns.child);
     // Interrupt: the write is attempted but the pipe accepts nothing yet.
     await manager.interrupt(session.id);
@@ -1937,7 +1937,7 @@ test('a codex interrupt whose write is ACCEPTED holds the next turn only until a
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     // Forward the interrupt bytes to the child but HOLD the write's acceptance
     // callback, so the write is not yet "accepted" when the next turn is submitted.
     const handle = ns.child;
@@ -2003,7 +2003,7 @@ test("a codex interrupt's id-less tail arriving while the next turn is PARKED on
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     // Forward the interrupt bytes but HOLD the write's acceptance callback, so
     // the barrier parks turn 2 (id-less) while turn 1's tail arrives.
     const handle = ns.child;
@@ -2059,7 +2059,7 @@ test("a codex interrupt's late nested-id turn/completed arriving while the next 
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     const handle = ns.child;
     const realWrite = handle.stdin.write.bind(handle.stdin);
     let acceptWrite;
@@ -2114,7 +2114,7 @@ test("a prior codex turn's nested-id turn/completed arriving AFTER the next turn
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'hello' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     await manager.interrupt(session.id); // the write is accepted; the gate releases at once, no hold
     // Turn 2 hangs on its OWN account and gets NAMED promptly; turn 1's delayed
     // nested-id completion then arrives while turn 2 is named and running.
@@ -2127,6 +2127,134 @@ test("a prior codex turn's nested-id turn/completed arriving AFTER the next turn
       'completed',
       `the next turn completed on a prior turn's nested-id completion: ${JSON.stringify(result.final)}`,
     );
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test("a codex interrupt's id-less tail arriving AFTER the next turn is NAMED is not attributed to it (t1 F2-1 idless-named)", { timeout: 20_000 }, async () => {
+  // The parked idless case above is closed by dropping id-less while unnamed; this
+  // one lands the id-less tail while the next turn is NAMED and running, the
+  // residual the round-1 fold left and round 2 closed (F2-R2-2).
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1';
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION = '1';
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS = '250';
+  process.env.FAKE_CODEX_TURN_COMPLETION_DELAY_MS = '800'; // keep turn 2 running while the tail lands
+  const { manager } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
+    const firstTurnId = ns.turn.turnId;
+    await manager.interrupt(session.id); // write accepted; turn 2 admits and gets named
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId && ns.turn.turnId !== firstTurnId), 3_000, 'the next turn to be named');
+    const result = await second;
+    await drain;
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    assert.notEqual(result.usage?.totalTokens, 999, `the interrupted turn's id-less tail became the next turn's usage: ${JSON.stringify(result.usage)}`);
+    assert.ok(
+      !result.events.some((event) => event.usage?.totalTokens === 999),
+      `the interrupted turn's tail leaked into the next turn's events: ${JSON.stringify(result.events.map((e) => e.usage))}`,
+    );
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test("a prior codex turn's top-level-id tail arriving after the next turn is named is dropped, not attributed (t1 F2-1 toplevel-named)", { timeout: 20_000 }, async () => {
+  // A regression test for a prior top-level-id tail (F2-R2-4): it is dropped by the
+  // named-turn mismatch check. The top-level extractor read itself is pinned by
+  // ordinary completing-turn tests — dropping it would strip the CURRENT turn's own
+  // deltas (id-less) — so this fixture documents the tail-shape end to end.
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1';
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION = '1';
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_TOPLEVEL_ID = '1'; // the tail carries the INTERRUPTED turn's top-level id
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS = '250';
+  process.env.FAKE_CODEX_TURN_COMPLETION_DELAY_MS = '800';
+  const { manager } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
+    const firstTurnId = ns.turn.turnId;
+    await manager.interrupt(session.id);
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 3_000 });
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId && ns.turn.turnId !== firstTurnId), 3_000, 'the next turn to be named');
+    const result = await second;
+    await drain;
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    assert.notEqual(result.usage?.totalTokens, 999, `the prior turn's top-level-id tail became the next turn's usage: ${JSON.stringify(result.usage)}`);
+    assert.ok(
+      !result.events.some((event) => event.usage?.totalTokens === 999),
+      `the prior turn's top-level-id tail leaked into the next turn's events: ${JSON.stringify(result.events.map((e) => e.usage))}`,
+    );
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a codex early delta arriving before the turn/start ack is buffered and replayed into the turn, through the native session (t1 F2-1 early-delta)', { timeout: 20_000 }, async () => {
+  // The native session's own pre-ack buffer-and-replay path (distinct from the
+  // CodexAppServerBackend buffer the backend test exercises) is pinned here: a
+  // mutant dropping an id-bearing delta while the turn is unnamed loses EARLY_OK
+  // (F2-R2-3).
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const result = await manager.runTurn(session.id, { input: 'EARLY_DELTA' }, { timeoutMs: 5_000 });
+    assert.equal(result.status, 'completed', JSON.stringify(result.final));
+    assert.ok(result.final.text.includes('EARLY_OK'), `the early delta was not replayed into the turn: ${JSON.stringify(result.final.text)}`);
+    assert.equal(result.usage?.tokenUsage?.last?.totalTokens, 11, `the early usage was not replayed: ${JSON.stringify(result.usage)}`);
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});
+
+test('a plain codex turn routes its own delta and completion through the canonical extractor (t1 F2-1 plain-complete)', { timeout: 20_000 }, async () => {
+  // Pins the extractor's two reads at once, fast: a turn's own delta (top-level
+  // id) and its own turn/completed (nested id) must route into it. Since the fold
+  // drops an id-less notification for any running turn, dropping either read makes
+  // that notification look id-less and be dropped — losing the text (top-level
+  // read) or hanging the turn until its deadline (nested read).
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  const { manager } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const result = await manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 2_000 });
+    assert.equal(result.status, 'completed', `the turn's own nested-id completion did not route in: ${JSON.stringify(result.final)}`);
+    assert.ok(result.final.text.includes('OK'), `the turn's own top-level-id delta did not route in: ${JSON.stringify(result.final.text)}`);
   } finally {
     reapFixtureChild(oldPid);
     reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
@@ -2153,7 +2281,7 @@ test('a codex child that EXITS while the next turn is parked on the barrier sett
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     // Hold the interrupt write's acceptance so turn 2 stays parked on the gate.
     const handle = ns.child;
     const realWrite = handle.stdin.write.bind(handle.stdin);
@@ -2194,7 +2322,7 @@ test("a codex child ERROR while the next turn is parked on the barrier settles t
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     const handle = ns.child;
     const realWrite = handle.stdin.write.bind(handle.stdin);
     handle.stdin.write = (chunk, ...rest) => {
@@ -2234,7 +2362,7 @@ test('a codex interrupt write neither accepted nor errored releases the next tur
     const drain = (async () => {
       for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
     })();
-    await waitFor(async () => (await receivedMethods(methodLog)).includes('turn/start'), 3_000, 'the first turn to be acknowledged');
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
     // Wedge the interrupt write: the pipe accepts nothing and reports nothing —
     // no callback, no error, child alive. Only the bound can settle the gate.
     const handle = ns.child;

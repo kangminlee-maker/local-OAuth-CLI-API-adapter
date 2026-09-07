@@ -1,7 +1,7 @@
 # Design task — the codex interrupt's write barrier
 
-Status: implemented 2026-09-07; review round 1 folded (F2-1 + coverage gaps), round 2 on the fold
-pending. Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2).
+Status: implemented 2026-09-07; review rounds 1 and 2 folded, round 3 on the round-2 fold pending.
+Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2).
 Independent of track 1 (whose seven gaps are closed) and of track A
 (`docs/design-task-refresh-lease-atomicity.md`). Not a defect patch: the fix is a new ordering
 primitive, so it is a design task, not a fold.
@@ -149,3 +149,40 @@ both folded here.
   detail, so none is added.
 
 - Full offline suite **2054/0**; `verify:runtime-boundary` passed.
+
+## Review round 2 fold (2026-09-07)
+
+The codex seat reviewed the round-1 fold (the Fable seat hit a session limit mid-review and was
+retried in round 3, not round 2). One behavioral finding and three coverage findings, all folded.
+
+- **F2-R2-2 — the fold was incomplete: an id-less tail arriving AFTER the next turn is named still
+  leaked (medium, behavioral; pre-existing on `a/`).** Round 1 dropped id-less notifications only
+  while the next turn was unnamed (parked). Now an id-less notification is dropped **unconditionally**
+  once there is a running turn — a running turn's own output always carries its id, so an id-less
+  notification is never the current turn's, whether it is named or not. This also removes the
+  named/unnamed asymmetry. Red-first fixture `t1 F2-1 idless-named`.
+- **F2-R2-1 — the `nested-named` fixture was race-dependent (medium, coverage; introduced by the
+  round-1 fold).** It waited for `turn/start` in the fake's method log, which the fake records on
+  receipt but acknowledges (installing `turn.turnId`) a macrotask later; an interrupt landing in
+  between left turn 1 unnamed and busy, so the second admission got a 409 before the routing ran.
+  All eight interrupt-then-admit fixtures now wait on `ns.turn.turnId` (turn 1 actually named)
+  instead. Verified deflaked under the deterministic trigger `FAKE_CODEX_TURN_START_DELAY_MS=100`.
+- **F2-R2-3 — the native pre-ack replay path was pinned by the wrong component (medium, coverage).**
+  The cited `EARLY_DELTA` test exercises `CodexAppServerBackend`'s own buffer, not the native
+  session's `handleNotification`/`flushBufferedNotifications`. New fixture `t1 F2-1 early-delta`
+  drives the fake's `EARLY_DELTA` through the manager and asserts the buffered id-bearing delta and
+  usage are replayed; a mutant dropping id-bearing deltas while unnamed (R2-M1) now turns it red.
+- **F2-R2-4 — a prior top-level-id tail after naming was unpinned on the round-1 code (medium,
+  coverage).** The round-2 restructure resolves the gap itself: with the id-less drop now
+  unconditional, ignoring the extractor's top-level read strips the CURRENT turn's own deltas, which
+  ordinary completing-turn tests catch. Regression fixture `t1 F2-1 toplevel-named` documents the
+  prior-tail-dropped behaviour end to end.
+
+Thirteen mutants, all KILLED (`review-artifacts/stage2/f2-mutants-full.py`). Note the extractor
+reads (top-level and nested) are no longer pinned by the `nested-named`/`toplevel-named` fixtures:
+once an id-less notification is dropped for any running turn, ignoring a read makes that turn's own
+output look id-less and be dropped — so a mutant on either read hangs or empties an ordinary
+completing turn, which the new `t1 F2-1 plain-complete` fixture catches fast. The full set: M1–M7,
+F10 (barrier); extractor-nested and extractor-toplevel (→ `plain-complete`); mismatch-check-removed
+(→ `nested-named`); notifB id-less-drop (→ `idless`/`idless-named`); R2-M1 early-delta-dropped
+(→ `early-delta`). Full offline suite **2058/0**; `verify:runtime-boundary` passed.

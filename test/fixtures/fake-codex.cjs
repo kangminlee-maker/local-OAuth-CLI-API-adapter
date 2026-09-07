@@ -289,9 +289,14 @@ rl.on('line', (line) => {
   // acknowledged, so it is emitted before the no-ack early return below.
   if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_TRAILING_NOTIFICATION === '1') {
     // Default 10ms; a test that must land this tail in a specific window (e.g.
-    // while the next turn is parked on the write barrier) sets the delay.
+    // while the next turn is parked on the write barrier) sets the delay. By
+    // default the tail carries no id (the shape that made routing matter); a test
+    // pinning stale-id rejection tags it with the interrupted turn's top-level id.
+    const params = process.env.FAKE_CODEX_TRAILING_NOTIFICATION_TOPLEVEL_ID === '1'
+      ? { turnId: payload.params?.turnId, totalTokens: 999 }
+      : { totalTokens: 999 };
     setTimeout(() => {
-      write({ method: 'thread/tokenUsage/updated', params: { totalTokens: 999 } });
+      write({ method: 'thread/tokenUsage/updated', params });
     }, Number(process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS ?? 10));
   }
   // An interrupt the child never acknowledges: the endpoint must not wait for it.

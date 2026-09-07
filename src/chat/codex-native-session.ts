@@ -794,26 +794,26 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // would deliver an interrupted turn's tail — its usage above all — to
     // whoever asked next, as that turn's own.
     if (!turn) return;
-    // Not yet named: this turn's id is unknown, so an id can't be compared yet.
-    // An id-BEARING notification (an early delta the child sends before the
-    // `turn/start` ack) is held and sorted at flush once the id is known; an
-    // id-LESS one now cannot be this turn's own output — a running turn's output
-    // carries its id (a delta at `params.turnId`, a completion at
-    // `params.turn.id`), so an id-less notification is a prior turn's tail,
-    // dropped the way an idle session's is. Without this, an interrupt tail
-    // buffered while the next turn is parked on the write barrier is replayed
-    // into it as its own usage (F2-1; the barrier widened this window from one
-    // RPC round-trip to a full request budget).
+    // An id-LESS notification is never the current turn's own output: a running
+    // turn's output carries its id (a delta and usage at `params.turnId`, a
+    // completion at `params.turn.id`). So an id-less notification is a prior
+    // turn's tail after an interrupt — dropped, never attributed to whatever turn
+    // is current, whether or not it has been named yet (F2-1; the barrier holds
+    // the next turn parked and id-less for up to a request budget while the
+    // interrupted child keeps talking, but the leak reaches the named turn too).
+    if (turnId === undefined) return;
+    // Named by an id other than the running turn's: a prior turn's late output —
+    // above all a `turn/completed`, whose id the child carries at `params.turn.id`,
+    // which would otherwise CLOSE this turn's queue as if it were its own (F2-1).
+    if (turn.turnId && turnId !== turn.turnId) return;
+    // Not yet named: this turn's own id-bearing early output (a delta the child
+    // sends before the `turn/start` ack) is held and sorted at flush once the id
+    // is known.
     if (!turn.turnId) {
-      if (turnId === undefined) return;
       this.bufferedNotifications.push(event);
       this.bufferedNotifications = this.bufferedNotifications.slice(-100);
       return;
     }
-    // Named: a notification for a different turn is a prior turn's late output —
-    // above all a `turn/completed`, whose id the child carries at `params.turn.id`,
-    // which would otherwise CLOSE this turn's queue as if it were its own (F2-1).
-    if (turnId && turnId !== turn.turnId) return;
     turn.queue.push(event);
     if (method === 'turn/completed') turn.queue.close();
   }
