@@ -3063,3 +3063,115 @@ test('a claude child that did not exit gets no successor either: the same rule o
     reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
   }
 });
+
+// ---------------------------------------------------------------------------
+// Codex native completion parity (docs/design-task-codex-native-completion-parity.md):
+// three pre-existing defects where CodexNativeCliChatSession disagrees with the
+// CodexAppServerBackend on the same completion/notification envelope. Fakes only.
+
+test('an ordinary completing codex native turn returns its own usage, delivered after turn/completed (t1 parity G1 usage)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(3_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // The fake's emitTurn models the live envelope: deltas, turn/completed, then
+  // thread/tokenUsage/updated one macrotask later (the live probe row confirms
+  // usage arrives after completion). The native session closed the queue on
+  // turn/completed and dropped the trailing usage; the app-server sibling holds
+  // a bounded grace for exactly it (USAGE_NOTIFICATION_GRACE_MS).
+  const res = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 5_000 });
+  assert.equal(res.status, 'completed', JSON.stringify(res.final));
+  assert.equal(res.final.text, 'MEDIUM_OK'); // the fake's default-effort narration
+  assert.ok(res.usage, `an ordinary turn dropped its own usage: ${JSON.stringify(res.usage)}`);
+  assert.equal(res.usage.tokenUsage?.last?.totalTokens, 9, `usage not delivered whole: ${JSON.stringify(res.usage)}`);
+});
+
+test('a child-reported FAILED turn surfaces as status error with the child error as authority, not a synthetic completion (t1 parity G2 failed)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(3_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // turn/completed carries params.turn.status:'failed' with an error payload. The
+  // native session closed the queue on the METHOD alone and never read the
+  // status, so the manager synthesized cli.completed and even replaced the
+  // child's failed raw in final.raw; the app-server sibling rejects it.
+  const res = await manager.runTurn(session.id, { input: 'FAIL_TURN' }, { timeoutMs: 5_000 });
+  assert.equal(res.status, 'error', `a failed turn was projected as a completion: ${JSON.stringify(res.final)}`);
+  assert.match(JSON.stringify(res.events.at(-1)?.raw ?? res.final.raw ?? {}), /refus/i, `the child's error is not the terminal authority: ${JSON.stringify(res.final)}`);
+});
+
+test('a codex native turn whose early burst exceeds the pre-ack buffer is delivered whole, not truncated to a shorter success (t1 parity G3 preack)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(5_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // 105 id-bearing deltas + completion arrive BEFORE the turn/start ack, so the
+  // client buffers them while the turn is unnamed. The old slice(-100) dropped
+  // the earliest, returning the last 99 deltas as a successful, shorter turn
+  // (first delta '006|', 396/420 chars).
+  const res = await manager.runTurn(session.id, { input: 'PREACK_BURST' }, { timeoutMs: 8_000 });
+  assert.equal(res.status, 'completed', JSON.stringify(res.final));
+  assert.equal(res.final.text.length, 105 * 4, `pre-ack burst truncated: ${res.final.text.length} chars, starts ${JSON.stringify(res.final.text.slice(0, 8))}`);
+  assert.ok(res.final.text.startsWith('000|'), `earliest deltas dropped: starts ${JSON.stringify(res.final.text.slice(0, 8))}`);
+});
+
+test('a child-reported FAILED turn that arrives before the turn/start ack still surfaces as status error through the buffered replay, not a synthetic completion (t1 parity G2 preack-failed)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(3_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // The failed completion is buffered pre-ack and reaches the turn only through
+  // flushBufferedNotifications — the REPLAY half of the completion routing. The
+  // ack-first G2 fixture exercises only the immediate path; a flush-side revert
+  // to the old inline close-on-method body (both halves must agree — commit msg)
+  // passes the whole suite yet regresses this input to a false success.
+  const res = await manager.runTurn(session.id, { input: 'PREACK_FAIL' }, { timeoutMs: 5_000 });
+  assert.equal(res.status, 'error', `a buffered failed completion was projected as a completion: ${JSON.stringify(res.final)}`);
+  assert.equal(res.events.filter((e) => e.event === 'cli.error').length, 1, `expected exactly one cli.error: ${JSON.stringify(res.events.map((e) => e.event))}`);
+  assert.equal(res.events.filter((e) => e.event === 'cli.completed').length, 0, `a failed turn must not also complete: ${JSON.stringify(res.events.map((e) => e.event))}`);
+  assert.match(JSON.stringify(res.events.at(-1)?.raw ?? {}), /refus/i, `the child's error is not the terminal authority: ${JSON.stringify(res.final)}`);
+});
+
+test("a codex turn stopped while PARKED on the write barrier releases its pre-ack notification buffer, it is not retained for the session's life (t1 parity G3 stopped-preack-buffer)", { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1'; // only the write barrier holds turn 2
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION = '1';
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_TOPLEVEL_ID = '1'; // id-BEARING, so it is BUFFERED (not dropped) under the parked, unnamed turn
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS = '200';
+  const { manager } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
+    const turn1 = ns.turn;
+    // Forward the interrupt bytes but HOLD the acceptance callback, so the barrier
+    // parks turn 2 (unnamed) while turn 1's id-bearing tail arrives and is buffered.
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) {
+        handle.stdin.write = realWrite;
+        realWrite(chunk); // no acceptance callback: the barrier holds turn 2 parked
+        return true;
+      }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 8_000 });
+    second.catch(() => undefined);
+    await waitFor(() => Boolean(ns.turn && ns.turn !== turn1 && !ns.turn.turnId), 4_000, 'the next turn to park on the held gate');
+    // The id-bearing tail (200ms) lands and is buffered under the parked, unnamed turn.
+    await waitFor(() => ns.bufferedNotifications.length > 0, 3_000, 'the id-bearing tail to be buffered pre-ack');
+    // Stop the parked turn: it retires via the generator finally — neither flushed
+    // nor replaced — so the buffer must be released here, not kept for the session's
+    // life (bounded before by slice(-100); unbounded once that truncation is gone).
+    await manager.interrupt(session.id);
+    const result = await second;
+    await drain;
+    assert.equal(result.status, 'error', JSON.stringify(result.final));
+    assert.equal(ns.bufferedNotifications.length, 0, `the stopped parked turn retained ${ns.bufferedNotifications.length} pre-ack notifications past its retirement`);
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});

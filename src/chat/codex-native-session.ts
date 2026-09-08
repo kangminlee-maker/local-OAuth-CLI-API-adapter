@@ -24,6 +24,15 @@ import type {
 /** How long `close()` waits for the child's best-effort thread archive. */
 const CLOSE_ARCHIVE_TIMEOUT_MS = 2_000;
 
+/**
+ * How long a completed turn's queue is held open for the trailing
+ * `thread/tokenUsage/updated` the live envelope sends AFTER `turn/completed`, so
+ * the turn carries its own usage. Mirrors `USAGE_NOTIFICATION_GRACE_MS` in the
+ * app-server backend; the usage lands well within it and closes the queue early,
+ * so this is only the worst-case wait when no usage ever arrives (G1).
+ */
+const USAGE_GRACE_MS = 100;
+
 /** A delay that never keeps the process alive on its own. */
 function closeGraceDelay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -65,6 +74,16 @@ interface Turn {
    * `yield`, and the generator's `finally` never runs for that caller.
    */
   cleanup: (() => Promise<void>) | null;
+  /** True once this turn's own usage notification has been delivered (G1). */
+  usageSeen: boolean;
+  /**
+   * Set on `turn/completed` when usage has not yet arrived: the live envelope
+   * delivers `thread/tokenUsage/updated` AFTER `turn/completed`, so the queue is
+   * held a bounded grace to carry the turn's own usage (mirrors the app-server
+   * backend's `USAGE_NOTIFICATION_GRACE_MS`). Cleared when the usage lands or at
+   * retirement (G1).
+   */
+  usageGraceTimer: ReturnType<typeof setTimeout> | null;
 }
 
 type JsonRpcMessage = Record<string, unknown>;
@@ -201,6 +220,8 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       stopped$,
       markStopped,
       cleanup: null,
+      usageSeen: false,
+      usageGraceTimer: null,
     };
     this.turn = turn;
     const onAbort = (): void => {
@@ -379,7 +400,20 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
 
   /** The one place a turn stops being the session's. */
   private retire(turn: Turn): void {
-    if (this.turn === turn) this.turn = null;
+    if (turn.usageGraceTimer) {
+      clearTimeout(turn.usageGraceTimer);
+      turn.usageGraceTimer = null;
+    }
+    if (this.turn === turn) {
+      // The pre-ack buffer holds only the current turn's unnamed-window
+      // notifications. A turn retired before it was named — stopped while parked
+      // on the interrupt gate — is neither flushed (`flushBufferedNotifications`)
+      // nor replaced (`replaceChild` clears it), so without this the buffer is
+      // retained for the session's life: bounded before by `slice(-100)`, now
+      // unbounded (G3). Release it with the turn that owns it.
+      this.bufferedNotifications = [];
+      this.turn = null;
+    }
     turn.markRetired();
     const cleanup = turn.cleanup;
     turn.cleanup = null;
@@ -810,23 +844,80 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // sends before the `turn/start` ack) is held and sorted at flush once the id
     // is known.
     if (!turn.turnId) {
+      // Held whole until the turn is named (the `turn/start` ack) sorts it. A
+      // fixed `slice(-100)` here silently dropped the earliest events of a large
+      // pre-ack burst and returned a truncated success. A time bound caps how
+      // long this can grow before the turn is named or fails — the interrupt-gate
+      // wait, a child replacement's handshake (which also clears this buffer), or
+      // the `turn/start` RPC; foreign-id contents are discarded at flush by id (G3).
       this.bufferedNotifications.push(event);
-      this.bufferedNotifications = this.bufferedNotifications.slice(-100);
+      return;
+    }
+    this.routeNamedNotification(turn, method, data, event);
+  }
+
+  /**
+   * Routes one notification already established as the running (named) turn's
+   * own — the single path for both immediate handling and buffered replay, so
+   * the two never disagree. Two parity guards live here:
+   *  - G1: `turn/completed` holds the queue a bounded grace for the trailing
+   *    usage (the live envelope sends it AFTER completion), closing early the
+   *    moment the usage lands.
+   *  - G2: a `turn/completed` carrying `params.turn.status: "failed"` is the
+   *    child's own error, not a completion — the queue fails with it so the
+   *    manager emits one `cli.error` and a non-streaming `status: "error"`.
+   */
+  private routeNamedNotification(
+    turn: Turn,
+    method: string,
+    data: JsonRpcMessage | null,
+    event: LocalCliChatRuntimeEvent,
+  ): void {
+    if (method === 'turn/completed') {
+      const completedTurn = asRecord(data?.turn);
+      if (completedTurn?.status === 'failed') {
+        // The child's error is the authority (the shape the app-server sibling
+        // rejects with); `failActive` retires this turn with it (G2).
+        this.failActive(new Error(JSON.stringify(completedTurn.error ?? 'codex turn failed')));
+        return;
+      }
+      turn.queue.push(event);
+      // Usage already delivered (a pre-completion usage line): close now.
+      if (turn.usageSeen) {
+        turn.queue.close();
+        return;
+      }
+      // Otherwise hold the queue open a bounded grace; the trailing usage closes
+      // it early, the timer at expiry if none ever arrives (G1).
+      turn.usageGraceTimer = setTimeout(() => {
+        turn.usageGraceTimer = null;
+        turn.queue.close();
+      }, USAGE_GRACE_MS);
+      turn.usageGraceTimer.unref?.();
       return;
     }
     turn.queue.push(event);
-    if (method === 'turn/completed') turn.queue.close();
+    if (method === 'thread/tokenUsage/updated') {
+      turn.usageSeen = true;
+      // A `turn/completed` holding the queue open was waiting for exactly this.
+      if (turn.usageGraceTimer) {
+        clearTimeout(turn.usageGraceTimer);
+        turn.usageGraceTimer = null;
+        turn.queue.close();
+      }
+    }
   }
 
   private flushBufferedNotifications(turn: Turn): void {
     const buffered = this.bufferedNotifications;
     this.bufferedNotifications = [];
     for (const event of buffered) {
-      const params = asRecord(asRecord(event.raw)?.params);
+      const rawRec = asRecord(event.raw);
+      const params = asRecord(rawRec?.params);
       const eventTurnId = notificationTurnId(params);
       if (eventTurnId && eventTurnId !== turn.turnId) continue;
-      turn.queue.push(event);
-      if (asRecord(event.raw)?.method === 'turn/completed') turn.queue.close();
+      const method = typeof rawRec?.method === 'string' ? rawRec.method : '';
+      this.routeNamedNotification(turn, method, params, event);
     }
   }
 

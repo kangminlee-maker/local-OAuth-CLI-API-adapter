@@ -231,6 +231,43 @@ rl.on('line', (line) => {
       result(payload.id, { turn: { id: turnId } });
       return;
     }
+    if (input.includes('FAIL_TURN')) {
+      // A child-reported turn failure: `turn/completed` carries
+      // `params.turn.status: "failed"` with an error payload. The app-server
+      // backend rejects this; the native path used to project it as a success
+      // (parity G2). Acked first, so the completion arrives post-ack (the live
+      // routing path, not the pre-ack buffer).
+      result(payload.id, { turn: { id: turnId } });
+      setTimeout(() => write({
+        method: 'turn/completed',
+        params: { threadId, turn: { id: turnId, status: 'failed', error: { message: 'model refused', code: 'refusal' } } },
+      }), 0);
+      return;
+    }
+    if (input.includes('PREACK_BURST')) {
+      // A large early burst emitted BEFORE the `turn/start` ack: id-bearing
+      // deltas the client must buffer while the turn is still unnamed (parity
+      // G3). More than 100, so the old `slice(-100)` pre-ack buffer drops the
+      // earliest ones and returns a truncated success. The ack is written LAST,
+      // so every delta and the completion above it are pre-ack.
+      const count = Number(process.env.FAKE_CODEX_PREACK_COUNT ?? 105);
+      for (let i = 0; i < count; i += 1) {
+        write({ method: 'item/agentMessage/delta', params: { threadId, turnId, delta: `${String(i).padStart(3, '0')}|` } });
+      }
+      write({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'completed' } } });
+      result(payload.id, { turn: { id: turnId } });
+      return;
+    }
+    if (input.includes('PREACK_FAIL')) {
+      // A child-reported FAILURE that arrives BEFORE the turn/start ack, so it is
+      // buffered while the turn is unnamed and reaches the turn only through
+      // flushBufferedNotifications — the replay half of the completion routing
+      // (parity G2 on the buffered path, which the ack-first FAIL_TURN knob does
+      // not exercise). Ack written LAST.
+      write({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'failed', error: { message: 'model refused', code: 'refusal' } } } });
+      result(payload.id, { turn: { id: turnId } });
+      return;
+    }
     if (input.includes('PADDED_NARRATION')) {
       // A completed turn whose text carries leading and trailing whitespace.
       // Every other narration here is whitespace-free, so a `.trim()` on the

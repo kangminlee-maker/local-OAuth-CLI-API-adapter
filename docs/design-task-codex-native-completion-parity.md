@@ -1,6 +1,15 @@
 # Design task — the codex native session's completion parity with the app-server backend
 
-Status: open. Filed 2026-09-07 from round 3 of the F2 interrupt-write-barrier review (both seats).
+Status: closed 2026-09-08. All three fixed red-first in `src/chat/codex-native-session.ts`
+(G1 a bounded usage grace on `turn/completed`; G2 a `params.turn.status:"failed"` branch that fails
+the turn with the child's error; G3 the pre-ack buffer holds the burst whole, no `slice(-100)`, and
+`retire()` releases the buffer with the turn that owns it so a turn stopped before it was named does
+not retain the burst — a leak the two-seat review caught, since dropping `slice(-100)` had made the
+prior bounded retention unbounded); the immediate path and the buffered replay route through one
+`routeNamedNotification`; the claude sibling already agreed and is unchanged. Two-seat review (Fable
+frontier + codex CLI): Fable pinned the buffered-replay half (F1); codex found the G3 retention leak.
+Full offline suite 2065/0; five mutants all killed (`review-artifacts/stage2/parity-mutants.py`).
+Filed 2026-09-07 from round 3 of the F2 interrupt-write-barrier review (both seats).
 Independent of F2 (the interrupt barrier, whose fold is closed) and of track A
 (`docs/design-task-refresh-lease-atomicity.md`). Three pre-existing defects, all confirmed on the
 pre-F2 `a/` side by both review seats, all of the same shape: `CodexNativeCliChatSession` and
