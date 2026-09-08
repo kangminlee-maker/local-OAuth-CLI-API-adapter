@@ -2270,7 +2270,8 @@ function openAiChatUsage(usage: LocalUsage): unknown {
     completion_tokens: completionTokens,
     total_tokens: usage.totalTokens ?? promptTokens + completionTokens,
     prompt_tokens_details: {
-      cached_tokens: cachedInputTokens(usage),
+      cached_tokens: cacheReadTokens(usage),
+      cache_write_tokens: cacheWriteTokens(usage),
       audio_tokens: 0,
     },
     completion_tokens_details: {
@@ -2290,7 +2291,8 @@ function openAiResponsesUsage(usage: LocalUsage): unknown {
     output_tokens: outputTokens,
     total_tokens: usage.totalTokens ?? inputTokens + outputTokens,
     input_tokens_details: {
-      cached_tokens: cachedInputTokens(usage),
+      cached_tokens: cacheReadTokens(usage),
+      cache_write_tokens: cacheWriteTokens(usage),
     },
     output_tokens_details: {
       reasoning_tokens: usage.reasoningOutputTokens ?? 0,
@@ -2298,8 +2300,29 @@ function openAiResponsesUsage(usage: LocalUsage): unknown {
   };
 }
 
+/**
+ * Images does NOT take the Responses usage shape from the provider — §5.3: the
+ * provider sends `input_tokens_details{text_tokens, image_tokens}` there, and
+ * ours has been the Responses shape all along. That divergence is P-16's to
+ * settle, so this keeps the shape it has rather than inheriting a field
+ * measured on another surface. `cached_tokens` follows the same reads-only
+ * meaning everywhere, which is a correction, not a shape change.
+ */
 function openAiImagesUsage(usage: unknown): unknown {
-  return isLocalUsage(usage) ? openAiResponsesUsage(usage) : usage;
+  if (!isLocalUsage(usage)) return usage;
+  const inputTokens = openAiInputTokens(usage);
+  const outputTokens = usage.outputTokens;
+  return {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: usage.totalTokens ?? inputTokens + outputTokens,
+    input_tokens_details: {
+      cached_tokens: cacheReadTokens(usage),
+    },
+    output_tokens_details: {
+      reasoning_tokens: usage.reasoningOutputTokens ?? 0,
+    },
+  };
 }
 
 function isLocalUsage(value: unknown): value is LocalUsage {
@@ -2373,14 +2396,13 @@ function openAiResponseObject(options: OpenAiResponseObjectOptions): unknown {
     // `temperature`, and `top_p` altogether, on this surface. The echo used to
     // repeat whatever the caller sent, for a value no backend applied.
     temperature: 1,
-    // Measured, not assumed: with no `top_p` in the request — the only
-    // possibility, since this surface refuses the parameter — the direct API
-    // echoes 0.98, not 1.
-
     text: responseTextConfig(raw.text),
     tool_choice: responseToolChoice(raw.tool_choice),
     tools: Array.isArray(raw.tools) ? raw.tools : [],
     top_logprobs: numberOrDefault(raw.top_logprobs, 0),
+    // Measured, not assumed: with no `top_p` in the request — the only
+    // possibility, since this surface refuses the parameter — the direct API
+    // echoes 0.98, not 1.
     top_p: 0.98,
     truncation: typeof raw.truncation === 'string' ? raw.truncation : 'disabled',
     usage: options.usage,
@@ -2421,7 +2443,12 @@ function openAiResponseMessageItem(id: string, text: string): unknown {
 function responseReasoning(value: unknown): unknown {
   const reasoning = asRecordPayload(value);
   return {
-    context: typeof reasoning.context === 'string' ? reasoning.context : 'current_turn',
+    // Measured 2026-08-29 (`spec/captures/direct-responses-minimal.json`): with
+    // no `reasoning` in the request the direct API echoes `all_turns`. The
+    // contract's own sample body showed `current_turn`, which is where this
+    // default came from — the sample is not the wire (row R-23). Nothing here
+    // acts on the value; it is echoed.
+    context: typeof reasoning.context === 'string' ? reasoning.context : 'all_turns',
     effort: typeof reasoning.effort === 'string' ? reasoning.effort : 'medium',
     summary: reasoning.summary ?? null,
   };
@@ -2498,9 +2525,22 @@ function openAiInputTokens(usage: LocalUsage): number {
     : usage.inputTokens;
 }
 
-function cachedInputTokens(usage: LocalUsage): number {
-  return usage.cachedInputTokens
-    ?? (usage.cacheCreationInputTokens ?? 0) + (usage.cacheReadInputTokens ?? 0);
+/**
+ * Tokens READ from cache, which is what the OpenAI surfaces call
+ * `cached_tokens` — writes are a separate field there (measured 2026-08-29,
+ * `spec/captures/direct-*-minimal.json`). The specific field wins where a
+ * runtime reports the two halves apart (the Claude CLI does); `cachedInputTokens`
+ * is the fallback for runtimes that report one number, and on those it already
+ * means reads. Summing both halves into `cached_tokens`, as this did, counted a
+ * cache WRITE as a read on a turn that had only paid to fill the cache.
+ */
+function cacheReadTokens(usage: LocalUsage): number {
+  return usage.cacheReadInputTokens ?? usage.cachedInputTokens ?? 0;
+}
+
+/** Tokens written to cache — the OpenAI surfaces' `cache_write_tokens`. */
+function cacheWriteTokens(usage: LocalUsage): number {
+  return usage.cacheCreationInputTokens ?? 0;
 }
 
 /**

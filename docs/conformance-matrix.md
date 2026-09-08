@@ -164,7 +164,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | R-20 | `parallel_tool_calls` | boolean | `true` | >1 call per turn | 400 / `invalid_request_error` / `parallel_tool_calls` / — | **divergent**: ignored **and** echoed as a hard `true` (`http-server.ts:2011`) even when the client sent `false` | DOC |
 | R-21 | `reasoning.effort` | `none`…`max` | model-dependent; doc SSE transcript shows `"effort":null` echoed for a non-reasoning model | reasoning tokens, latency | 400 / `invalid_request_error` / `reasoning.effort` / — | supported minus `max` (same enum divergence as chat row 43) | DOC |
 | R-22 | `reasoning.summary` | `auto`\|`concise`\|`detailed` | `null` | adds `summary` parts to the `reasoning` output item | 400 / `invalid_request_error` / `reasoning.summary` / — | **silently ignored** — the proxy never emits reasoning summaries; a client that asked for `detailed` gets an empty/absent summary with no error | DOC |
-| R-23 | `reasoning.context` | `auto`\|`current_turn`\|`all_turns` | UNKNOWN (contract's own sample body shows `"context":"current_turn"`) | which reasoning items replay | 400 / `invalid_request_error` / `reasoning.context` / — | echoed via `responseReasoning`; not acted on | DOC? |
+| R-23 | `reasoning.context` | `auto`\|`current_turn`\|`all_turns` | **`all_turns`** (measured 2026-08-29, P-1 — the contract's own sample body showed `"context":"current_turn"`, which is where our echo's default came from until 2026-09-09; the sample is not the wire) | which reasoning items replay | 400 / `invalid_request_error` / `reasoning.context` / — | echoed via `responseReasoning` at the vendor's measured default `all_turns`; not acted on (`conformance-echoed-defaults.test` compares the echo against `spec/captures/direct-responses-minimal.json`) | VERIFIED |
 | R-24 | `reasoning.generate_summary` | deprecated alias of `summary` | `null` | as R-22 | as R-22 | silently ignored | DOC |
 | R-25 | `include` | array: `reasoning.encrypted_content`, `message.output_text.logprobs`, `web_search_call.action.sources`, `file_search_call.results`, `code_interpreter_call.outputs`, `computer_call_output.output.image_url`, `message.input_image.image_url` | `null` | adds the named payloads to `output` | 400 / `invalid_request_error` / `include` / — | **silently ignored** — notably `reasoning.encrypted_content`, which stateless multi-turn clients depend on | DOC |
 | R-26 | `store` | boolean | `true` on Responses (doc transcript echoes `"store":true`) | retrievable via `GET /v1/responses/{id}` | 400 / `invalid_request_error` / `store` / — | echoed (`raw.store === false ? false : true`, `http-server.ts:2019`) but **nothing is stored** — the proxy has no `GET /v1/responses/{id}`, so an echoed `store:true` is a false promise | DOC |
@@ -306,7 +306,9 @@ POST /v1/chat/completions
 
 `output[]` items: `reasoning` (with `summary[]`), `message` (with `content[].type:"output_text"` + `annotations`), `function_call` (`call_id`, `name`, `arguments`), built-in tool-call items.
 
-**The doc's own `response.completed` transcript is the reference for the echoed defaults** and shows: `temperature: 1.0`, `top_p: 1.0`, `store: true`, `truncation: "disabled"`, `parallel_tool_calls: true`, `tool_choice: "auto"`, `reasoning: {effort: null, summary: null}`, `metadata: {}`, `user: null`, `max_output_tokens: null`. Our echo matches on `temperature` (1) and `top_p` (1, constants since 2026-08-29 — the `0.98` of earlier revisions is gone with row R-11), differs on `top_logprobs` (0 vs null) and `prompt_cache_retention` ("24h" always), and adds `billing`, `moderation`, `max_tool_calls`, `frequency_penalty`, `presence_penalty` keys.
+**The WIRE is the reference for the echoed defaults — not the provider's transcript.** The documented `response.completed` sample shows `temperature: 1.0`, `top_p: 1.0`, `store: true`, `truncation: "disabled"`, `parallel_tool_calls: true`, `tool_choice: "auto"`, `reasoning: {effort: null, summary: null}`, `metadata: {}`, `user: null`, `max_output_tokens: null`. A minimal request measured on 2026-08-29 (P-1, promoted to `spec/captures/direct-responses-minimal.json`) answers otherwise in three places: `top_p` is **0.98**, `reasoning` is `{context: "all_turns", effort: "medium", mode: "standard", summary: null}`, and the body also carries `background`, `billing`, `moderation`, `prompt_cache_key`, `prompt_cache_retention: "24h"`, `max_tool_calls`, `frequency_penalty`, `presence_penalty`, `safety_identifier`, `top_logprobs: 0` and `tool_usage`.
+
+An earlier revision of this paragraph read our echo against the transcript and reported divergences on `top_logprobs` (0 vs null), on `prompt_cache_retention`, and on "keys we add" — **none of which exist against the wire**, where the direct API sends exactly what we send; it also had `top_p` backwards, calling our 0.98 gone when 0.98 is the measured value. That is what an unasserted prose comparison decays into. `conformance-echoed-defaults.test` compares the two on every run instead: the capture is the authority, our side is computed live from the real server, and the only differences left are declared in `spec/declared-divergences.json` (`tool_usage`, `reasoning.mode`).
 
 **Streaming — event sequence** (named SSE; every payload carries `sequence_number`, monotonically increasing from 0):
 
@@ -623,15 +625,15 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 **대가**: 스키마를 실은 턴은 상시 세션을 잃고 매번 새 CLI를 띄운다. 약속이 있는 곳에서만 치르는 값이고,
 스키마 없는 턴은 그대로 자식을 재사용한다. 회귀는 `test/claude-code-backend.test.mjs`의 argv 단언이 잡는다.
 
-#### 5.5.9 수용된 200의 **봉투 모양** 실측 (2026-08-31) — 미결
+#### 5.5.9 수용된 200의 **봉투 모양** 실측 (2026-08-31) — OpenAI 두 표면 종결(2026-09-09), `/v1/messages`는 결정으로 미결
 
 라이브 계기는 **거절만** 보낸다(수용 본문은 실제 턴을 청구한다). 그래서 200의 봉투는 거의 측정된 적이 없었다.
 같은 본문을 direct와 프록시에 보내고 **키와 JSON 타입만** 비교한 결과(값은 모델이 다르니 당연히 다르다):
 
 | 표면 | 프록시에 **없는** 필드 (direct에는 있음) | 프록시에만 있는 필드 |
 | --- | --- | --- |
-| `/v1/chat/completions` | `usage.prompt_tokens_details.cache_write_tokens` | 없음 |
-| `/v1/responses` | `usage.input_tokens_details.cache_write_tokens`, `reasoning.mode`, `tool_usage.web_search.num_requests`, `tool_usage.image_gen.*`(8개) | 없음 |
+| `/v1/chat/completions` | ~~`usage.prompt_tokens_details.cache_write_tokens`~~ → **없음**(2026-09-09 채움) | 없음 |
+| `/v1/responses` | ~~`usage.input_tokens_details.cache_write_tokens`~~(2026-09-09 채움), `reasoning.mode`, `tool_usage.web_search.num_requests`, `tool_usage.image_gen.*`(8개) — 남은 것은 **선언**됨 | 없음 |
 | `/v1/messages` | `usage.cache_creation_input_tokens`, `usage.cache_read_input_tokens`, `usage.cache_creation.ephemeral_1h_input_tokens`, `usage.cache_creation.ephemeral_5m_input_tokens`, `usage.output_tokens_details.thinking_tokens`, `usage.service_tier`, `usage.inference_geo` | 없음 |
 
 **한 방향으로만 어긋난다** — 프록시가 없는 필드를 지어내지는 않는다. 하지만 direct가 늘 주는 필드를 읽는
@@ -644,6 +646,14 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 정직한지는 **트레이드오프이지 결함이 아니다** — 이 표는 그 결정을 되돌리지 않고 사실만 남긴다.
 `tool_usage`·`reasoning.mode`·`thinking_tokens`는 이 프록시가 실행하지 않는 기능의 보고 필드라 값의 의미를
 따로 측정해야 하며, 추측으로 채우지 않는다.
+
+**종결(2026-09-09).** OpenAI 두 표면의 `cache_write_tokens`는 **추측이 아니라 우리 데이터였다**: `LocalUsage.cacheCreationInputTokens`가
+이미 있었고 `/v1/messages`는 그것을 `cache_creation_input_tokens`로 내보내고 있었다. OpenAI 표면만 그 값을 `cached_tokens`에 **접어 넣어**
+캐시를 채우기만 한 턴이 읽은 턴처럼 보였다. 두 필드를 분리해 채웠다(읽기=`cached_tokens`, 쓰기=`cache_write_tokens`).
+이 표면들에서 `0`을 쓰는 것은 위 트레이드오프와 무관하다 — direct 자신이 최소 요청에 `cached_tokens: 0`·`cache_write_tokens: 0`을 보내므로
+항상 채우는 쪽이 미러다. `/v1/messages` 행은 그대로 결정으로 남는다. Images는 §5.3의 미측정 모양이라 새 필드를 물려받지 않는다(P-16).
+남은 `tool_usage`·`reasoning.mode`는 `spec/declared-divergences.json`에 선언됐고, `conformance-echoed-defaults.test`가
+**선언이 낡아도 실패**하도록 양방향으로 고정한다.
 
 #### 5.5.5-A Chat `content` 필수 규칙 — 4라운드 실측 (2026-08-31)
 

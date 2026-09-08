@@ -28,9 +28,13 @@ function hasDoneTerminator(wire) {
 }
 
 // Surfaces to compare, and which capture is which side.
+// `surface` is the vocabulary `spec/declared-divergences.json` uses, so the
+// lookup below can actually find one. It used to read `openai.responses.stream`,
+// a spelling no declaration has ever carried, which left the stale-declaration
+// branch unreachable — the check could only ever take the equality path.
 const SURFACES = [
-  { surface: 'openai.responses.stream', vendor: 'direct-responses-stream', proxy: 'proxy-responses-stream' },
-  { surface: 'openai.chat.stream', vendor: 'direct-chat-stream', proxy: 'proxy-chat-stream' },
+  { surface: '/v1/responses', vendor: 'direct-responses-stream', proxy: 'proxy-responses-stream' },
+  { surface: '/v1/chat/completions', vendor: 'direct-chat-stream', proxy: 'proxy-chat-stream' },
 ];
 
 test('the capture set this check reads is present and intact', () => {

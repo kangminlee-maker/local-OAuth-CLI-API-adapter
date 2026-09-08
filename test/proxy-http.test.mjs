@@ -407,6 +407,70 @@ test('a runtime cache hit is reported in the shape the client asked in', async (
   }
 });
 
+test('a cache WRITE is not counted as a cache read on the OpenAI surfaces', async () => {
+  // The direct API reports the two halves apart — `cached_tokens` next to
+  // `cache_write_tokens` (measured 2026-08-29, `spec/captures/direct-*-minimal.json`,
+  // matrix §5.5.9). This proxy summed them into `cached_tokens` and reported no
+  // write at all, so a turn that only PAID to fill the cache looked, to a client
+  // costing it from `usage`, exactly like a turn that had read from it.
+  //
+  // The runtime that distinguishes them is the one that reports both halves;
+  // the sibling test above covers the runtimes that report a single number, and
+  // there `cached_tokens` keeps meaning what it meant.
+  const split = await startProxyWithBackend({
+    name: 'split-cache-backend',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'split_test',
+        model: request.model,
+        text: 'OK',
+        toolCalls: [],
+        usage: {
+          inputTokens: 50,
+          outputTokens: 20,
+          cacheCreationInputTokens: 100,
+          cacheReadInputTokens: 900,
+          cachedInputTokens: 1_000,
+          source: 'provider',
+        },
+        latencyMs: 1,
+      };
+    },
+    async close() {},
+  });
+  try {
+    const chat = await (await postJsonTo(split.url, '/v1/chat/completions', {
+      model: 'fake-local-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })).json();
+    assert.equal(chat.usage.prompt_tokens_details.cached_tokens, 900);
+    assert.equal(chat.usage.prompt_tokens_details.cache_write_tokens, 100);
+    // The OpenAI shape counts both halves inside the prompt total.
+    assert.equal(chat.usage.prompt_tokens, 1_050);
+
+    const responses = await (await postJsonTo(split.url, '/v1/responses', {
+      model: 'fake-local-model',
+      input: 'hi',
+    })).json();
+    assert.equal(responses.usage.input_tokens_details.cached_tokens, 900);
+    assert.equal(responses.usage.input_tokens_details.cache_write_tokens, 100);
+    assert.equal(responses.usage.input_tokens, 1_050);
+
+    // Anthropic's own names were already right and are unchanged by this.
+    const messages = await (await postJsonTo(split.url, '/v1/messages', {
+      model: 'fake-local-model',
+      max_tokens: 64,
+      messages: [{ role: 'user', content: 'hi' }],
+    })).json();
+    assert.equal(messages.usage.cache_creation_input_tokens, 100);
+    assert.equal(messages.usage.cache_read_input_tokens, 900);
+    assert.equal(messages.usage.input_tokens, 50);
+  } finally {
+    await split.close();
+  }
+});
+
 test('POST /v1/chat/completions preserves OpenAI image_url input parts', async () => {
   const res = await postJson('/v1/chat/completions', {
     model: 'fake-local-model',
@@ -485,6 +549,11 @@ test('POST /v1/images/generations maps GPT image requests to the image generatio
   assert.equal(body.usage.output_tokens, 6);
   assert.equal(body.usage.total_tokens, 17);
   assert.equal(body.usage.input_tokens_details.cached_tokens, 4);
+  // Images keeps the usage shape it has until P-16 measures the provider's own
+  // image `usage`, which is NOT the Responses shape (matrix §5.3). The
+  // reads-only meaning of `cached_tokens` is shared; `cache_write_tokens`,
+  // measured on the other two surfaces, deliberately is not carried here.
+  assert.equal('cache_write_tokens' in body.usage.input_tokens_details, false);
   assert.equal(body.usage.output_tokens_details.reasoning_tokens, 2);
   assert.equal(body.data.length, 2);
   assert.equal(body.data[0].b64_json, Buffer.from('fake-image-1:A small red square.').toString('base64'));

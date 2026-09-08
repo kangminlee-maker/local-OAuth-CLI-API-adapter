@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "e78cfb9fb147ed87e2325741cf973b0e2f801fee1d20fb3996272b4a3993dff5",
+    "matrixDigest": "7b4dc3c502ebfaf652d9eab3c6579124e669387af13302b2c94daca18b740fcd",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -146,6 +146,18 @@
       "surface": "/v1/chat/completions",
       "evidence": "docs/conformance-matrix.md §5.5.5",
       "measuredAt": "2026-09-01"
+    },
+    {
+      "id": "responses-hosted-tool-usage-is-not-reported",
+      "surface": "/v1/responses",
+      "evidence": "docs/conformance-matrix.md §5.5.9",
+      "measuredAt": "2026-08-29"
+    },
+    {
+      "id": "responses-reasoning-mode-is-not-reported",
+      "surface": "/v1/responses",
+      "evidence": "docs/conformance-matrix.md §5.5.9",
+      "measuredAt": "2026-08-29"
     }
   ],
   "claims": [
@@ -1744,15 +1756,15 @@
       "field": "`reasoning.context`",
       "vendor": {
         "valueSpace": "`auto`|`current_turn`|`all_turns`",
-        "defaultWhenOmitted": "UNKNOWN (contract's own sample body shows `\"context\":\"current_turn\"`)",
+        "defaultWhenOmitted": "**`all_turns`** (measured 2026-08-29, P-1 — the contract's own sample body showed `\"context\":\"current_turn\"`, which is where our echo's default came from until 2026-09-09; the sample is not the wire)",
         "observableEffect": "which reasoning items replay",
         "invalidValue": "400 / `invalid_request_error` / `reasoning.context` / —"
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
-      "claimedNote": "echoed via `responseReasoning`; not acted on",
-      "evidenceGrade": "DOC?",
-      "evidenceNote": "DOC?",
+      "claimedNote": "echoed via `responseReasoning` at the vendor's measured default `all_turns`; not acted on (`conformance-echoed-defaults.test` compares the echo against `spec/captures/direct-responses-minimal.json`)",
+      "evidenceGrade": "VERIFIED",
+      "evidenceNote": "VERIFIED",
       "liveParityRow": true
     },
     {
