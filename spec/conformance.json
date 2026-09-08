@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "7b4dc3c502ebfaf652d9eab3c6579124e669387af13302b2c94daca18b740fcd",
+    "matrixDigest": "296f89628a63e81cff41d8577b555c9e355738cd18d3e48b368af439da064558",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -1756,15 +1756,15 @@
       "field": "`reasoning.context`",
       "vendor": {
         "valueSpace": "`auto`|`current_turn`|`all_turns`",
-        "defaultWhenOmitted": "**`all_turns`** (measured 2026-08-29, P-1 — the contract's own sample body showed `\"context\":\"current_turn\"`, which is where our echo's default came from until 2026-09-09; the sample is not the wire)",
+        "defaultWhenOmitted": "**`all_turns`** — observed on the wire 2026-08-29 (P-1, `spec/captures/direct-responses-minimal.json`, whose request proves `reasoning` was omitted). The contract's own sample body showed `\"context\":\"current_turn\"`, which is where our echo's default came from until 2026-09-09; the sample is not the wire. The row's Ev stays `DOC?`: this legend scopes `VERIFIED` to \"the field was accepted and the asserted response shape came back\", explicitly **never** to \"the omitted default was X\", and nothing here has measured the accepted values, the invalid-value error, or the effect",
         "observableEffect": "which reasoning items replay",
         "invalidValue": "400 / `invalid_request_error` / `reasoning.context` / —"
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
       "claimedNote": "echoed via `responseReasoning` at the vendor's measured default `all_turns`; not acted on (`conformance-echoed-defaults.test` compares the echo against `spec/captures/direct-responses-minimal.json`)",
-      "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED",
+      "evidenceGrade": "DOC?",
+      "evidenceNote": "DOC?",
       "liveParityRow": true
     },
     {
