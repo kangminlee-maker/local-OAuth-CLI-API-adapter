@@ -3063,3 +3063,48 @@ test('a claude child that did not exit gets no successor either: the same rule o
     reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
   }
 });
+
+// ---------------------------------------------------------------------------
+// Codex native completion parity (docs/design-task-codex-native-completion-parity.md):
+// three pre-existing defects where CodexNativeCliChatSession disagrees with the
+// CodexAppServerBackend on the same completion/notification envelope. Fakes only.
+
+test('an ordinary completing codex native turn returns its own usage, delivered after turn/completed (t1 parity G1 usage)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(3_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // The fake's emitTurn models the live envelope: deltas, turn/completed, then
+  // thread/tokenUsage/updated one macrotask later (the live probe row confirms
+  // usage arrives after completion). The native session closed the queue on
+  // turn/completed and dropped the trailing usage; the app-server sibling holds
+  // a bounded grace for exactly it (USAGE_NOTIFICATION_GRACE_MS).
+  const res = await manager.runTurn(session.id, { input: 'hello' }, { timeoutMs: 5_000 });
+  assert.equal(res.status, 'completed', JSON.stringify(res.final));
+  assert.equal(res.final.text, 'MEDIUM_OK'); // the fake's default-effort narration
+  assert.ok(res.usage, `an ordinary turn dropped its own usage: ${JSON.stringify(res.usage)}`);
+  assert.equal(res.usage.tokenUsage?.last?.totalTokens, 9, `usage not delivered whole: ${JSON.stringify(res.usage)}`);
+});
+
+test('a child-reported FAILED turn surfaces as status error with the child error as authority, not a synthetic completion (t1 parity G2 failed)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(3_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // turn/completed carries params.turn.status:'failed' with an error payload. The
+  // native session closed the queue on the METHOD alone and never read the
+  // status, so the manager synthesized cli.completed and even replaced the
+  // child's failed raw in final.raw; the app-server sibling rejects it.
+  const res = await manager.runTurn(session.id, { input: 'FAIL_TURN' }, { timeoutMs: 5_000 });
+  assert.equal(res.status, 'error', `a failed turn was projected as a completion: ${JSON.stringify(res.final)}`);
+  assert.match(JSON.stringify(res.events.at(-1)?.raw ?? res.final.raw ?? {}), /refus/i, `the child's error is not the terminal authority: ${JSON.stringify(res.final)}`);
+});
+
+test('a codex native turn whose early burst exceeds the pre-ack buffer is delivered whole, not truncated to a shorter success (t1 parity G3 preack)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(5_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // 105 id-bearing deltas + completion arrive BEFORE the turn/start ack, so the
+  // client buffers them while the turn is unnamed. The old slice(-100) dropped
+  // the earliest, returning the last 99 deltas as a successful, shorter turn
+  // (first delta '006|', 396/420 chars).
+  const res = await manager.runTurn(session.id, { input: 'PREACK_BURST' }, { timeoutMs: 8_000 });
+  assert.equal(res.status, 'completed', JSON.stringify(res.final));
+  assert.equal(res.final.text.length, 105 * 4, `pre-ack burst truncated: ${res.final.text.length} chars, starts ${JSON.stringify(res.final.text.slice(0, 8))}`);
+  assert.ok(res.final.text.startsWith('000|'), `earliest deltas dropped: starts ${JSON.stringify(res.final.text.slice(0, 8))}`);
+});
