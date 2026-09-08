@@ -10,6 +10,33 @@ This file was reconstructed on 2026-09-07 from the git history, the merged PRs, 
 `dist` in each artifact. Where a fact could be read straight from a tgz it is stated exactly;
 where only the PR theme was available the entry stays at that level rather than guessing.
 
+## [0.5.2] — 2026-09-08
+
+Codex native/app-server completion parity (PR #21): the three pre-existing native-session defects
+the F2 review surfaced, now fixed. Behavior changes are confined to the native session API
+(`/local/cli/sessions`); the OpenAI Chat/Responses and Anthropic Messages provider surfaces are
+unchanged.
+
+### Fixed
+- **A plain turn's usage is no longer discarded.** A `turn/completed` closed the turn's stream at
+  once, so a `thread/tokenUsage/updated` that trailed the completion (the common ordering) was lost
+  and the turn reported no usage. Completion now holds the stream open a bounded grace
+  (`USAGE_GRACE_MS`, mirroring the app-server sibling's `USAGE_NOTIFICATION_GRACE_MS`): the trailing
+  usage closes it early, or the timer closes it at expiry if none ever arrives. A usage line seen
+  before completion still closes immediately.
+- **A failed turn is reported as failed, not `completed`.** A `turn/completed` carrying
+  `params.turn.status === "failed"` was projected as a normal success; it now retires the turn with
+  the child's own error (the shape the app-server sibling rejects with), on both the live path and
+  the buffered pre-ack replay.
+- **A pre-ack notification burst is no longer truncated.** The pre-ack buffer capped retention at the
+  last 100 notifications, so a turn whose first 100+ deltas arrived before its id was acknowledged
+  lost its head. The whole burst is now replayed; and because the cap is gone, the buffer of a turn
+  stopped while parked on the interrupt barrier — neither flushed nor replaced — is released with the
+  turn on retirement, so an unnamed-window burst cannot be retained for the session's life.
+
+### Known follow-ups
+- Refresh-lease atomicity (`docs/design-task-refresh-lease-atomicity.md`).
+
 ## [0.5.1] — 2026-09-08
 
 The codex interrupt write barrier (F2; PR #19), a correctness fix to the 0.5.0 native session.
