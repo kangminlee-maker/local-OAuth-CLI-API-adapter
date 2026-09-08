@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -1718,7 +1718,12 @@ test('a re-read that parses but carries no usable token is retried like a parse 
       // The writer finishes inside the 50 ms re-read retry, but comfortably after
       // the refresh's first re-read (which runs on the tick after this returns), so
       // the first read sees `{}` and only the retry sees the completed file.
-      setTimeout(() => { void writeFile(authPath, JSON.stringify(completed), { mode: 0o600 }); }, 25);
+      // Atomic (temp + rename) so the retry re-read never observes a partial write.
+      setTimeout(async () => {
+        const writerTmp = `${authPath}.writer-tmp`;
+        await writeFile(writerTmp, JSON.stringify(completed), { mode: 0o600 });
+        await rename(writerTmp, authPath);
+      }, 25);
       return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
     }
     bearers.push(init.headers.authorization);
@@ -1763,7 +1768,12 @@ test('a same-generation re-read whose identity is present but empty is retried, 
   globalThis.fetch = async (url, init) => {
     if (String(url) === 'https://auth.openai.com/oauth/token') {
       await writeFile(authPath, JSON.stringify(torn), { mode: 0o600 });
-      setTimeout(() => { void writeFile(authPath, JSON.stringify(completed), { mode: 0o600 }); }, 25);
+      // Atomic (temp + rename) so the retry re-read never observes a partial write.
+      setTimeout(async () => {
+        const writerTmp = `${authPath}.writer-tmp`;
+        await writeFile(writerTmp, JSON.stringify(completed), { mode: 0o600 });
+        await rename(writerTmp, authPath);
+      }, 25);
       return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
     }
     bearers.push(init.headers.authorization);
@@ -1782,6 +1792,7 @@ test('a same-generation re-read whose identity is present but empty is retried, 
   assert.equal(persisted.tokens.refresh_token, 'proxy-new', 'the rotation is persisted onto the completed same-generation file');
   assert.equal(persisted.tokens.account_id, 'account-1', 'with a usable identity');
   assert.equal(persisted.writer_note, 'slow', "and the writer's own field survives the merge");
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false, 'the lock is released');
 });
 
 test('a same-generation re-read that stays unusable (identity present but empty) is not written over and does not throw the rotation away (r59-track-a)', async () => {

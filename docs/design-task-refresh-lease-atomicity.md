@@ -89,11 +89,22 @@ Three rules are check-then-act on a pathname, not atomic:
   this review). It can also open the gap-1/gap-2 windows downstream once a fresh
   lock has been wrongly removed.
 
-**Worst case on any hit** is the class the r52/r53 floor already blesses and
-bounds: two refreshes consume the same single-use token, exactly one persists (the
-holder's, guarded by `stillHeld()` before the save), and the other's fetch earns a
-401 — one caller sees a single re-login, recoverable. No token is written over a
-good one and no unguarded double-persist occurs.
+**Worst case on any hit.** Two refreshes consume the same single-use token. The
+`stillHeld()` guard before the save allows **at most one** to persist — never an
+unguarded double-persist, and this path never overwrites a concurrently-valid
+generation (the only lost-update overwrite is gap 2's separate final-read→rename
+CLI arm). But "at most one" includes **zero**: a waiter that took over can find
+`stillHeld()` false (a later waiter displaced it) and return its fetched rotation
+*unsaved*, while the other waiter's fetch — racing for the same single-use token —
+earns a **401 and fails its request outright** (not merely a re-login). The disk is
+then left carrying the consumed old token, so subsequent refreshes 401 until the
+operator re-logs in. So the harm is bounded to "a rare stale-orphan / suspend /
+clock-step race costs one failed request and a forced re-login, recoverable" — not
+the stronger "exactly one persists, one re-login" this document previously claimed
+(codex fold review). It is worse than a single re-login, but still rare (a crash
+orphan or a >60 s stall, plus two contenders interleaving in a microsecond window)
+and recoverable, and closing it needs the `flock` route below; revisit that route
+if the failed-request/re-login harm shows up in the field.
 
 **Gap 2 has a second arm that is NOT suspend-class but is adapter-irreducible.**
 The codex CLI writes `auth.json` by the same path and honors no lease; a CLI write
