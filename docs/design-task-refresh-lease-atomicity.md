@@ -1,10 +1,12 @@
 # Design task: the refresh lease's remaining check-then-act gaps
 
-**Status:** closed 2026-09-08 (Track A). Gap 4 — the ordinary-concurrency-reachable
-one — is fixed; gaps 1–3 are a documented suspend-class residual (below), left
-open by decision, not oversight. Filed 2026-09-06 from rounds 52–54 of the PR #15
-review campaign; resolved after a two-provider design (Fable frontier + codex
-gpt-5.6-sol) whose artifacts are in `review-artifacts/track-a/`.
+**Status:** closed 2026-09-08 (Track A). Gap 4 — a re-read stranding the single-use
+rotation, reachable in ordinary concurrency — is fixed; gaps 1–3 are a documented
+lock-atomicity residual (below), left open by decision, not oversight, with the
+worst case bounded to the r52/r53 class (one recoverable re-login). Filed 2026-09-06
+from rounds 52–54 of the PR #15 review campaign; resolved after a two-provider
+design (Fable frontier + codex gpt-5.6-sol) and a two-provider code review, whose
+artifacts are in `review-artifacts/track-a/` and `review-artifacts/track-a-review/`.
 **Scope:** `withRefreshLock`, `unlinkOwnLock`, `lockOwner`, `removeStaleLock` and
 `refreshAuth`'s re-read/save in `src/proxy/codex-backend-transport.ts`.
 
@@ -32,18 +34,28 @@ generation, the next refresh read that stale token, earned a 401, and forced a
 re-login. This is the one gap reachable in **ordinary concurrency** (any logout /
 torn write during a refresh — no suspend needed).
 
-The fix separates "parses as JSON" from "a usable generation": a re-read that
-parses but is neither this refresh's own generation (ours to save, even if it lost
-its identity members — restored by `withIdentityFrom`) nor a usable moved
-generation is retried once, the same 50 ms a parse failure already is. The
-completed write the retry then reads is saved onto, so the rotation lands on the
-writer's completed generation instead of nowhere. A still-token-less file after the
-retry (a completed logout) keeps the fetched auth unsaved and is not written over
-(r56 preserved). Pinned by `r57-track-a` and four mutants
-(`review-artifacts/stage2/track-a-mutants.py`, all killed); r54-codex (usable moved
-generation) and r55-codex (lost-identity save, unreadable-file decline) unchanged.
+The fix separates "parses as JSON" from "a usable generation": a re-read is
+*settled* only when it is a usable moved generation, or this refresh's own
+generation that can actually be persisted (`saveCandidate` = the response merged
+onto the re-read with the identity restored, validated). Anything else —
+unreadable, token-less, or a torn same-generation write whose identity is missing
+AND unrestorable (present-but-empty, not just absent) — is retried once, the same
+50 ms a parse failure already is. The completed write the retry then reads is saved
+onto, so the rotation lands on the writer's completed generation instead of nowhere.
+Two ways a re-read could otherwise strand the single-use rotation are closed
+together: the token-less moved-generation misclassification (the rotation persisted
+nowhere), and a same-generation file that could not be validated for the save
+(`authFromFile` threw the rotation to the caller). Both now keep the fetched auth
+unsaved rather than stranding it — nothing is written over a file that cannot be
+read or turned into a usable auth, and nothing is thrown away (the r55/r56
+principle, extended to the save side). Pinned by `r57-track-a` (token-less torn
+write), `r58-track-a` (present-but-empty identity, retried then saved), and
+`r59-track-a` (a stable unusable same-generation file kept unsaved, not thrown) plus
+six mutants (`review-artifacts/stage2/track-a-mutants.py`, all killed, over a passing
+unmutated baseline); r54-codex (usable moved generation) and r55-codex
+(lost-identity save with *absent* members, unreadable-file decline) unchanged.
 
-## Gaps 1–3 — suspend-class residual (open by decision)
+## Gaps 1–3 — lock-atomicity residual (open by decision)
 
 Three rules are check-then-act on a pathname, not atomic:
 
@@ -56,17 +68,32 @@ Three rules are check-then-act on a pathname, not atomic:
    that replaced the pathname between the two is removed, and the waiter takes a lease over
    a refresh already in flight (codex round 55).
 
-**Reachability — a continuity break, not ordinary contention.** Each needs a
-takeover — a lease older than 60 s — to land inside the microsecond window of an
-owner whose fetch is bounded to 30 s. On the live path that requires the owner's
-process to be *stalled longer than its own lease mid-refresh*: a machine/VM
-suspend, a `SIGSTOP`/cgroup freeze, or a **forward wall-clock step > 60 s** (an NTP
-correction or VM-resume clock jump makes a live fresh lease read "stale" —
-`removeStaleLock` compares `Date.now() - mtimeMs`, and there is no portable
-cross-process monotonic clock to fix it with). codex round 53 reproduced 1–2 by
-widening the window with a FIFO; Fable round 54 measured the ordinary interleavings
-and found them serialized. Worst case on a hit: an older-but-valid rotation lands,
-the next refresh 401s once, one re-login.
+**Reachability.** Two distinct triggers, only one of which is a continuity break:
+
+- *Displacing a LIVE owner* (gaps 1 and 2, and gap 3 against a live lease) needs a
+  takeover — a lease older than 60 s — to land inside the microsecond window of an
+  owner whose fetch is bounded to 30 s, which requires that owner's process to be
+  *stalled longer than its own lease mid-refresh*: a machine/VM suspend, a
+  `SIGSTOP`/cgroup freeze, or a **forward wall-clock step > 60 s** (an NTP
+  correction or VM-resume clock jump makes a live fresh lease read "stale" —
+  `removeStaleLock` compares `Date.now() - mtimeMs`, and there is no portable
+  cross-process monotonic clock to fix it with). Fable round 54 measured the
+  ordinary interleavings against a live lease and found them serialized.
+- *A stale ORPHAN plus two waiters* (gap 3, ordinary concurrency — no suspend). A
+  process killed mid-refresh (`SIGKILL`, an OOM kill, a crash) leaves its lock; it
+  ages past 60 s on its own. Two later refreshes both `open(..., 'wx')`-fail, both
+  `stat` the orphan and judge it stale, and race in `removeStaleLock`'s
+  `stat`→`unlink` window: the second `unlink(lockPath)` can remove the *fresh* lock
+  the first waiter created after taking over, so both proceed to refresh. This needs
+  no stalled live owner — only an expected crash orphan and two contenders (codex,
+  this review). It can also open the gap-1/gap-2 windows downstream once a fresh
+  lock has been wrongly removed.
+
+**Worst case on any hit** is the class the r52/r53 floor already blesses and
+bounds: two refreshes consume the same single-use token, exactly one persists (the
+holder's, guarded by `stillHeld()` before the save), and the other's fetch earns a
+401 — one caller sees a single re-login, recoverable. No token is written over a
+good one and no unguarded double-persist occurs.
 
 **Gap 2 has a second arm that is NOT suspend-class but is adapter-irreducible.**
 The codex CLI writes `auth.json` by the same path and honors no lease; a CLI write
@@ -99,12 +126,15 @@ Two independent frontier designs converged (`review-artifacts/track-a/SYNTHESIS.
   divergence and a non-toggleable all-participant protocol on a credential path — and
   it still does **not** close gap 2's uncooperative-CLI arm, and it would re-semanticise
   the r52/r53 takeover floor (a suspended owner keeps its `flock`, so staleness
-  takeover could no longer displace it). Paying a native dependency to close only the
-  suspend-class arms, while the ordinary-reachable CLI arm stays open, is not
-  justified now.
+  takeover could no longer displace it). Paying a native dependency — plus that floor
+  rewrite — to close gaps whose worst case is already the r52/r53 class (one
+  recoverable re-login), while gap 2's uncooperative-CLI arm stays open regardless,
+  is not justified now.
 
-**Decision:** ship the gap-4 fix; leave 1–3 as the residual above. Revisit the
-`flock` route (with the deliberate floor rewrite it entails) only if suspend-class
-incidents appear in the field. A fencing token was rejected as inert — nothing
-checks it at `rename` time, so it is a produced value with no consumer that changes
-the outcome.
+**Decision:** ship the gap-4 fix; leave 1–3 as the residual above, bounded by the
+`stillHeld()` persist guard (exactly one persists; no unguarded double-persist, no
+token written over a good one). Revisit the `flock` route (with the deliberate floor
+rewrite it entails) if the bounded harm — a spurious re-login under a stale orphan
+plus two contenders, or a suspend/clock-step — shows up often enough in the field to
+warrant it. A fencing token was rejected as inert — nothing checks it at `rename`
+time, so it is a produced value with no consumer that changes the outcome.

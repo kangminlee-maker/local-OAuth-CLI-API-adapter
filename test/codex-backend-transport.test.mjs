@@ -1715,8 +1715,10 @@ test('a re-read that parses but carries no usable token is retried like a parse 
       // carries the same generation, so the next refresh would read the stale token,
       // 401, and force a re-login.
       await writeFile(authPath, '{}', { mode: 0o600 });
-      // The writer finishes well inside the 50 ms re-read retry.
-      setTimeout(() => { void writeFile(authPath, JSON.stringify(completed), { mode: 0o600 }); }, 15);
+      // The writer finishes inside the 50 ms re-read retry, but comfortably after
+      // the refresh's first re-read (which runs on the tick after this returns), so
+      // the first read sees `{}` and only the retry sees the completed file.
+      setTimeout(() => { void writeFile(authPath, JSON.stringify(completed), { mode: 0o600 }); }, 25);
       return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
     }
     bearers.push(init.headers.authorization);
@@ -1732,10 +1734,91 @@ test('a re-read that parses but carries no usable token is retried like a parse 
   assert.deepEqual(bearers, [`Bearer ${proxyAccess}`], 'the request went on with the rotation it fetched');
   // Let the writer's completed file land even on the path that does not retry, so
   // the disk read below is a clean comparison rather than reading the torn `{}`.
-  await new Promise((resolve) => setTimeout(resolve, 60));
+  await new Promise((resolve) => setTimeout(resolve, 80));
   const persisted = JSON.parse(await readFile(authPath, 'utf8'));
   assert.equal(persisted.tokens.refresh_token, 'proxy-new', 'the rotation is persisted onto the completed same-generation file, not stranded');
   assert.equal(persisted.writer_note, 'slow', "and the writer's own field survives the merge");
+  assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false, 'the lock is released');
+});
+
+test('a same-generation re-read whose identity is present but empty is retried, and the rotation is saved onto the completed file, not thrown away (r58-track-a)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+  // The completed file the writer lands: a valid same-generation file (its identity
+  // members present and usable), plus a field of its own.
+  const completed = JSON.parse(await readFile(authPath, 'utf8'));
+  completed.writer_note = 'slow';
+  // The torn intermediate: the SAME generation, but with identity members present
+  // yet empty ("" — not absent) so withIdentityFrom cannot restore them and the
+  // save candidate is not usable. The token endpoint returns no id_token either.
+  const torn = JSON.parse(await readFile(authPath, 'utf8'));
+  torn.tokens.id_token = '';
+  torn.tokens.account_id = '';
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      await writeFile(authPath, JSON.stringify(torn), { mode: 0o600 });
+      setTimeout(() => { void writeFile(authPath, JSON.stringify(completed), { mode: 0o600 }); }, 25);
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1);
+  assert.deepEqual(bearers, [`Bearer ${proxyAccess}`], 'the request went on with the rotation it fetched');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const persisted = JSON.parse(await readFile(authPath, 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'proxy-new', 'the rotation is persisted onto the completed same-generation file');
+  assert.equal(persisted.tokens.account_id, 'account-1', 'with a usable identity');
+  assert.equal(persisted.writer_note, 'slow', "and the writer's own field survives the merge");
+});
+
+test('a same-generation re-read that stays unusable (identity present but empty) is not written over and does not throw the rotation away (r59-track-a)', async () => {
+  const codexHome = await createCodexHome({
+    accessToken: jwt({ exp: Math.floor(Date.now() / 1000) - 60 }),
+    refreshToken: 'old-refresh-token',
+    lastRefresh: new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString(),
+  });
+  const authPath = join(codexHome, 'auth.json');
+  const proxyAccess = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+  // A STABLE same-generation file whose identity is present but empty — no completed
+  // file ever lands. The save cannot be validated; the caller must keep the token it
+  // fetched (unsaved) and the file must not be written over — not receive an error.
+  const stable = JSON.parse(await readFile(authPath, 'utf8'));
+  stable.tokens.id_token = '';
+  stable.tokens.account_id = '';
+  stable.writer_note = 'mine';
+  const bearers = [];
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://auth.openai.com/oauth/token') {
+      await writeFile(authPath, JSON.stringify(stable), { mode: 0o600 });
+      return Response.json({ access_token: proxyAccess, refresh_token: 'proxy-new' });
+    }
+    bearers.push(init.headers.authorization);
+    return new Response(sse([
+      { type: 'response.created', response: { id: 'resp_image', model: 'gpt-5.5' } },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'image_generation_call', id: 'ig_1', status: 'completed', result: tinyPngBase64() } },
+      { type: 'response.completed', response: { id: 'resp_image', model: 'gpt-5.5' } },
+    ]));
+  };
+  const backend = new CodexBackendTransport({ codexHome, timeoutMs: 30_000 });
+  const result = await backend.generate(imageRequest());
+  assert.equal(result.images.length, 1, 'the request completes with the rotation it fetched — not an error');
+  assert.deepEqual(bearers, [`Bearer ${proxyAccess}`], 'on the token the refresh fetched');
+  const persisted = JSON.parse(await readFile(authPath, 'utf8'));
+  assert.equal(persisted.tokens.refresh_token, 'old-refresh-token', 'the unusable same-generation file is not written over');
+  assert.equal(persisted.writer_note, 'mine', "and what the writer left stays");
   assert.equal(existsSync(join(codexHome, 'auth.json.refresh.lock')), false, 'the lock is released');
 });
 

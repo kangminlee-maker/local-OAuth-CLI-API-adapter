@@ -2103,26 +2103,32 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       // unsaved refresh when only the lease moved, since the file is still
       // the stale generation the holder is about to replace.
       const refreshed = mergeRefreshedAuth(parsed, refreshResponse);
-      // A re-read is retried once — not only when it fails to read or parse
-      // (another writer mid-write), but when it PARSES to a file that is neither
-      // this refresh's own generation (ours to save, even if it lost its identity
-      // members — restored below) nor a usable moved generation: a torn write or a
-      // logout caught mid-write. "Parses as JSON" is not "a usable generation"
-      // (track A): treating a parseable-but-token-less re-read as a moved
-      // generation stranded the single-use rotation (persisted nowhere), so if the
-      // writer's completed file carried the same generation the next refresh read
-      // the stale token, earned a 401, and forced a re-login. Retrying it the same
-      // 50 ms a parse failure is retried lets the completed write be saved onto.
-      // What still fails after the retry leaves the caller its refreshed auth,
-      // unsaved — nothing is written over a file that cannot be read or used, and
-      // nothing is thrown away either (r55-codex: the rotation was lost to the
-      // read's error before any backend call; r56-fable: a completed logout is a
-      // file with no token to use and not one to write over).
-      const usableOrOurs = (file: CodexAuthFile | null): boolean =>
+      // What this refresh would persist for its OWN generation: the response merged
+      // onto the re-read, with the identity the re-read may have lost taken from the
+      // generation consumed, and validated before it is written — null when that is
+      // not a usable auth (a re-read whose identity is missing AND not restorable:
+      // present-but-empty, not just absent — a torn/partial same-generation write).
+      const saveCandidate = (file: CodexAuthFile): CodexAuthFile | null => {
+        const updated = mergeRefreshedAuth(withIdentityFrom(file, parsed), refreshResponse);
+        return tryAuthFromFile(updated) ? updated : null;
+      };
+      // A re-read is settled when it is a usable moved generation, or our own
+      // generation that we can actually persist. Anything else — unreadable,
+      // token-less, or a torn same-generation write — is retried once, the same
+      // 50 ms a parse failure is. "Parses as JSON" is not "a usable generation"
+      // (track A): a parseable-but-unusable re-read used to strand the single-use
+      // rotation — persisted nowhere on the moved-generation branch, or thrown to
+      // the caller when a same-generation file could not be validated for the save —
+      // so if the writer's completed file carried the same generation the next
+      // refresh read the stale token, 401'd, and forced a re-login. The completed
+      // write the retry then reads is saved onto instead.
+      const settled = (file: CodexAuthFile | null): boolean =>
         file !== null
-        && (file.tokens?.refresh_token === current.refreshToken || tryAuthFromFile(file) !== null);
+        && (file.tokens?.refresh_token === current.refreshToken
+              ? saveCandidate(file) !== null
+              : tryAuthFromFile(file) !== null);
       let latest = await this.loadAuthFile().catch(() => null);
-      if (!usableOrOurs(latest)) {
+      if (!settled(latest)) {
         await sleep(50);
         latest = await this.loadAuthFile().catch(() => null);
       }
@@ -2136,11 +2142,12 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
         return moved ?? authFromFile(refreshed);
       }
       if (!(await stillHeld())) return authFromFile(refreshed);
-      // Merged onto the re-read, with the identity the re-read may have lost
-      // taken from the generation this refresh consumed, and validated before
-      // it is saved — a file this transport cannot read back is not saved
-      // (r55-codex: a re-read without `account_id` was saved and then refused).
-      const updated = mergeRefreshedAuth(withIdentityFrom(latest, parsed), refreshResponse);
+      // Our generation. A same-generation re-read we still cannot turn into a usable
+      // auth after the retry (a stable torn/partial write, its identity present but
+      // empty) is not written over and does not throw the rotation away — the caller
+      // keeps what it fetched, unsaved (the r55/r56 principle, now on the save side).
+      const updated = saveCandidate(latest);
+      if (updated === null) return authFromFile(refreshed);
       const auth = authFromFile(updated);
       await saveAuthFile(this.codexHome, updated);
       return auth;
