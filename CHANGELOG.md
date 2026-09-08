@@ -10,6 +10,38 @@ This file was reconstructed on 2026-09-07 from the git history, the merged PRs, 
 `dist` in each artifact. Where a fact could be read straight from a tgz it is stated exactly;
 where only the PR theme was available the entry stays at that level rather than guessing.
 
+## [0.5.3] — 2026-09-08
+
+Codex OAuth refresh-lease atomicity (Track A). The change is confined to the Codex
+OAuth token refresh (`auth.json` handling on the `codex-backend` transport); the
+OpenAI Chat/Responses and Anthropic Messages request/response surfaces are unchanged.
+
+### Fixed
+- **A concurrent-writer re-read no longer strands the freshly-fetched rotation.**
+  After a refresh fetches a new token, it re-reads `auth.json` to merge onto the
+  current file. A re-read that *parsed* but was not a usable generation — a codex
+  CLI logout, a torn write showing `{}`, or a same-generation file whose identity
+  members were present but empty — used to be misclassified: the token-less case was
+  treated as a moved generation and the single-use rotation persisted nowhere, and
+  the same-generation-unusable case threw the rotation to the caller as an error. If
+  the writer's completed file then carried the same generation, the next refresh read
+  the stale token, earned a 401, and forced a re-login. The re-read is now classified
+  by whether it can actually be used or saved (`settled`/`saveCandidate`): an
+  unusable re-read is retried once (the same grace a parse failure already gets) and
+  the completed write is saved onto; a re-read still unusable after the retry keeps
+  the fetched auth unsaved rather than stranding or throwing it.
+
+### Known follow-ups
+- The refresh lease's remaining check-then-act gaps (`unlinkOwnLock`,
+  `removeStaleLock`, the save's rename) are a documented lock-atomicity residual
+  (`docs/design-task-refresh-lease-atomicity.md`, closed): reachable only under a
+  stale orphan plus two contenders, a process suspend, or a > 60 s clock step, with
+  the worst case a rare failed request and a forced re-login, bounded by the
+  `stillHeld()` persist guard (no unguarded double-persist). A two-provider design
+  established that no zero-dependency construction closes them while keeping the
+  concurrency floor, and that a native `flock` lock is not justified for that bounded
+  harm. Revisit if it shows up in the field.
+
 ## [0.5.2] — 2026-09-08
 
 Codex native/app-server completion parity (PR #21): the three pre-existing native-session defects
