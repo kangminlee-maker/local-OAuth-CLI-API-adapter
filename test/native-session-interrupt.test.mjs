@@ -3108,3 +3108,18 @@ test('a codex native turn whose early burst exceeds the pre-ack buffer is delive
   assert.equal(res.final.text.length, 105 * 4, `pre-ack burst truncated: ${res.final.text.length} chars, starts ${JSON.stringify(res.final.text.slice(0, 8))}`);
   assert.ok(res.final.text.startsWith('000|'), `earliest deltas dropped: starts ${JSON.stringify(res.final.text.slice(0, 8))}`);
 });
+
+test('a child-reported FAILED turn that arrives before the turn/start ack still surfaces as status error through the buffered replay, not a synthetic completion (t1 parity G2 preack-failed)', { timeout: 20_000 }, async () => {
+  const { manager } = await startCodexManager(3_000);
+  const session = await manager.create({ runtime: 'codex' });
+  // The failed completion is buffered pre-ack and reaches the turn only through
+  // flushBufferedNotifications — the REPLAY half of the completion routing. The
+  // ack-first G2 fixture exercises only the immediate path; a flush-side revert
+  // to the old inline close-on-method body (both halves must agree — commit msg)
+  // passes the whole suite yet regresses this input to a false success.
+  const res = await manager.runTurn(session.id, { input: 'PREACK_FAIL' }, { timeoutMs: 5_000 });
+  assert.equal(res.status, 'error', `a buffered failed completion was projected as a completion: ${JSON.stringify(res.final)}`);
+  assert.equal(res.events.filter((e) => e.event === 'cli.error').length, 1, `expected exactly one cli.error: ${JSON.stringify(res.events.map((e) => e.event))}`);
+  assert.equal(res.events.filter((e) => e.event === 'cli.completed').length, 0, `a failed turn must not also complete: ${JSON.stringify(res.events.map((e) => e.event))}`);
+  assert.match(JSON.stringify(res.events.at(-1)?.raw ?? {}), /refus/i, `the child's error is not the terminal authority: ${JSON.stringify(res.final)}`);
+});

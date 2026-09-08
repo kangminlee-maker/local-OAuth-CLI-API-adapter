@@ -258,6 +258,16 @@ rl.on('line', (line) => {
       result(payload.id, { turn: { id: turnId } });
       return;
     }
+    if (input.includes('PREACK_FAIL')) {
+      // A child-reported FAILURE that arrives BEFORE the turn/start ack, so it is
+      // buffered while the turn is unnamed and reaches the turn only through
+      // flushBufferedNotifications — the replay half of the completion routing
+      // (parity G2 on the buffered path, which the ack-first FAIL_TURN knob does
+      // not exercise). Ack written LAST.
+      write({ method: 'turn/completed', params: { threadId, turn: { id: turnId, status: 'failed', error: { message: 'model refused', code: 'refusal' } } } });
+      result(payload.id, { turn: { id: turnId } });
+      return;
+    }
     if (input.includes('PADDED_NARRATION')) {
       // A completed turn whose text carries leading and trailing whitespace.
       // Every other narration here is whitespace-free, so a `.trim()` on the

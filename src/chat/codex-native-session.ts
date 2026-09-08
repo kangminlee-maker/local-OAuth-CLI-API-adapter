@@ -835,10 +835,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // sends before the `turn/start` ack) is held and sorted at flush once the id
     // is known.
     if (!turn.turnId) {
-      // Held whole until the `turn/start` ack sorts it. A fixed `slice(-100)`
-      // here silently dropped the earliest events of a large pre-ack burst and
-      // returned a truncated success; the `turn/start` RPC timeout bounds how
-      // long this can grow before the turn is named or fails (G3).
+      // Held whole until the turn is named (the `turn/start` ack) sorts it. A
+      // fixed `slice(-100)` here silently dropped the earliest events of a large
+      // pre-ack burst and returned a truncated success. A time bound caps how
+      // long this can grow before the turn is named or fails — the interrupt-gate
+      // wait, a child replacement's handshake (which also clears this buffer), or
+      // the `turn/start` RPC; foreign-id contents are discarded at flush by id (G3).
       this.bufferedNotifications.push(event);
       return;
     }
