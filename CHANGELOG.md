@@ -10,6 +10,34 @@ This file was reconstructed on 2026-09-07 from the git history, the merged PRs, 
 `dist` in each artifact. Where a fact could be read straight from a tgz it is stated exactly;
 where only the PR theme was available the entry stays at that level rather than guessing.
 
+## [0.5.1] — 2026-09-08
+
+The codex interrupt write barrier (F2; PR #19), a correctness fix to the 0.5.0 native session.
+Behavior changes are confined to the native session API (`/local/cli/sessions`); the OpenAI
+Chat/Responses and Anthropic Messages provider surfaces are unchanged.
+
+### Fixed
+- **Nothing starts ahead of an interrupt the child never received.** An interrupt answered `ready`
+  as soon as the write call returned; a write to a dead pipe returns `false` and fails a tick later,
+  and in that window a turn submitted next could reach the dying child ahead of an interrupt it never
+  received. A session-level write barrier, installed synchronously at the interrupt write, now holds
+  the next turn until the OS accepts the interrupt bytes — or, on a failed write, until the
+  replacement child is installed, so the next turn runs on the successor. The barrier waits on OS
+  acceptance, never the RPC ack: an unresponsive child does not hold the next turn, and a
+  wedged-but-alive child is capped at one request budget (`timeoutMs`) then falls through to prior
+  behavior. A healthy child is never replaced by an interrupt.
+- **An interrupted turn's tail is never delivered as the next turn's own.** A `turn/completed` names
+  its turn at `params.turn.id` and a delta/usage at `params.turnId`; a notification naming a prior
+  turn — or carrying no id at all while a turn is running — is now dropped, so a post-interrupt tail
+  can no longer close the next turn's queue (making work that never ran return `completed`) or leak
+  its usage into the next turn.
+
+### Known follow-ups
+- Codex native/app-server completion parity (`docs/design-task-codex-native-completion-parity.md`):
+  three pre-existing native-session defects the F2 review surfaced (a plain turn's usage discarded, a
+  failed turn reported `completed`, a >100-notification pre-ack truncation). Filed, not yet fixed.
+- Refresh-lease atomicity (`docs/design-task-refresh-lease-atomicity.md`).
+
 ## [0.5.0] — 2026-09-07
 
 The native chat session lifecycle, designed as one change (track 1; PR #16, released by PR #17).
