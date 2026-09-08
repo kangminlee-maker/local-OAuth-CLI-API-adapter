@@ -3123,3 +3123,55 @@ test('a child-reported FAILED turn that arrives before the turn/start ack still 
   assert.equal(res.events.filter((e) => e.event === 'cli.completed').length, 0, `a failed turn must not also complete: ${JSON.stringify(res.events.map((e) => e.event))}`);
   assert.match(JSON.stringify(res.events.at(-1)?.raw ?? {}), /refus/i, `the child's error is not the terminal authority: ${JSON.stringify(res.final)}`);
 });
+
+test("a codex turn stopped while PARKED on the write barrier releases its pre-ack notification buffer, it is not retained for the session's life (t1 parity G3 stopped-preack-buffer)", { timeout: 20_000 }, async () => {
+  const pidDir = await mkdtemp(join(tmpdir(), 'interrupt-pid-'));
+  tempDirs.push(pidDir);
+  const pidFile = join(pidDir, 'pid');
+  process.env.FAKE_CODEX_PID_FILE = pidFile;
+  process.env.FAKE_CODEX_NO_INTERRUPT_ACK = '1'; // only the write barrier holds turn 2
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION = '1';
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_TOPLEVEL_ID = '1'; // id-BEARING, so it is BUFFERED (not dropped) under the parked, unnamed turn
+  process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS = '200';
+  const { manager } = await startCodexManager(8_000);
+  const session = await manager.create({ runtime: 'codex' });
+  const ns = manager.sessions.get(session.id).nativeSession;
+  const oldPid = await publishedPid(pidFile);
+  try {
+    const events = [];
+    const drain = (async () => {
+      for await (const event of manager.streamTurn(session.id, { input: 'HANG_NO_COMPLETION' })) events.push(event.event);
+    })();
+    await waitFor(async () => Boolean(ns.turn && ns.turn.turnId), 3_000, 'the first turn to be named');
+    const turn1 = ns.turn;
+    // Forward the interrupt bytes but HOLD the acceptance callback, so the barrier
+    // parks turn 2 (unnamed) while turn 1's id-bearing tail arrives and is buffered.
+    const handle = ns.child;
+    const realWrite = handle.stdin.write.bind(handle.stdin);
+    handle.stdin.write = (chunk, ...rest) => {
+      if (String(chunk).includes('"turn/interrupt"')) {
+        handle.stdin.write = realWrite;
+        realWrite(chunk); // no acceptance callback: the barrier holds turn 2 parked
+        return true;
+      }
+      return realWrite(chunk, ...rest);
+    };
+    await manager.interrupt(session.id);
+    const second = manager.runTurn(session.id, { input: 'again' }, { timeoutMs: 8_000 });
+    second.catch(() => undefined);
+    await waitFor(() => Boolean(ns.turn && ns.turn !== turn1 && !ns.turn.turnId), 4_000, 'the next turn to park on the held gate');
+    // The id-bearing tail (200ms) lands and is buffered under the parked, unnamed turn.
+    await waitFor(() => ns.bufferedNotifications.length > 0, 3_000, 'the id-bearing tail to be buffered pre-ack');
+    // Stop the parked turn: it retires via the generator finally — neither flushed
+    // nor replaced — so the buffer must be released here, not kept for the session's
+    // life (bounded before by slice(-100); unbounded once that truncation is gone).
+    await manager.interrupt(session.id);
+    const result = await second;
+    await drain;
+    assert.equal(result.status, 'error', JSON.stringify(result.final));
+    assert.equal(ns.bufferedNotifications.length, 0, `the stopped parked turn retained ${ns.bufferedNotifications.length} pre-ack notifications past its retirement`);
+  } finally {
+    reapFixtureChild(oldPid);
+    reapFixtureChild(Number(await readFile(pidFile, 'utf8').catch(() => '0')));
+  }
+});

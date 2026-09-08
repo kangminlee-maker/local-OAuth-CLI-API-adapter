@@ -404,7 +404,16 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       clearTimeout(turn.usageGraceTimer);
       turn.usageGraceTimer = null;
     }
-    if (this.turn === turn) this.turn = null;
+    if (this.turn === turn) {
+      // The pre-ack buffer holds only the current turn's unnamed-window
+      // notifications. A turn retired before it was named — stopped while parked
+      // on the interrupt gate — is neither flushed (`flushBufferedNotifications`)
+      // nor replaced (`replaceChild` clears it), so without this the buffer is
+      // retained for the session's life: bounded before by `slice(-100)`, now
+      // unbounded (G3). Release it with the turn that owns it.
+      this.bufferedNotifications = [];
+      this.turn = null;
+    }
     turn.markRetired();
     const cleanup = turn.cleanup;
     turn.cleanup = null;
