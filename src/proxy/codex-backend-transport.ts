@@ -2103,28 +2103,37 @@ export class CodexBackendTransport implements LocalCliBackend, OpenAiImageGenera
       // unsaved refresh when only the lease moved, since the file is still
       // the stale generation the holder is about to replace.
       const refreshed = mergeRefreshedAuth(parsed, refreshResponse);
-      // A re-read that fails — another writer mid-write — is tried once more;
-      // one that still fails leaves the caller its refreshed auth, unsaved:
-      // nothing is written over a file that cannot be read, and nothing is
-      // thrown away either (r55-codex: the rotation was lost to the read's
-      // error before any backend call).
-      const latest = await this.loadAuthFile().catch(async () => {
+      // A re-read is retried once — not only when it fails to read or parse
+      // (another writer mid-write), but when it PARSES to a file that is neither
+      // this refresh's own generation (ours to save, even if it lost its identity
+      // members — restored below) nor a usable moved generation: a torn write or a
+      // logout caught mid-write. "Parses as JSON" is not "a usable generation"
+      // (track A): treating a parseable-but-token-less re-read as a moved
+      // generation stranded the single-use rotation (persisted nowhere), so if the
+      // writer's completed file carried the same generation the next refresh read
+      // the stale token, earned a 401, and forced a re-login. Retrying it the same
+      // 50 ms a parse failure is retried lets the completed write be saved onto.
+      // What still fails after the retry leaves the caller its refreshed auth,
+      // unsaved — nothing is written over a file that cannot be read or used, and
+      // nothing is thrown away either (r55-codex: the rotation was lost to the
+      // read's error before any backend call; r56-fable: a completed logout is a
+      // file with no token to use and not one to write over).
+      const usableOrOurs = (file: CodexAuthFile | null): boolean =>
+        file !== null
+        && (file.tokens?.refresh_token === current.refreshToken || tryAuthFromFile(file) !== null);
+      let latest = await this.loadAuthFile().catch(() => null);
+      if (!usableOrOurs(latest)) {
         await sleep(50);
-        return this.loadAuthFile().catch(() => null);
-      });
+        latest = await this.loadAuthFile().catch(() => null);
+      }
       if (latest === null) return authFromFile(refreshed);
       if (latest.tokens?.refresh_token !== current.refreshToken) {
-        // Another generation — or none. A logout under the refresh leaves a
-        // file with no tokens: not a generation to use, and not one to write
-        // over. The caller of that refresh keeps what it fetched, unsaved
-        // (r56-fable: the logout's file went to `authFromFile` and the fetched
-        // token was thrown away with its error — the one not-saved cell whose
-        // caller got no token).
-        try {
-          return authFromFile(latest);
-        } catch {
-          return authFromFile(refreshed);
-        }
+        // Another generation — or none after the retry. A usable moved generation
+        // is what the caller uses (r54-codex); a still-token-less file (a completed
+        // logout) is not a generation to use and not one to write over, so the
+        // caller keeps what it fetched, unsaved (r56-fable).
+        const moved = tryAuthFromFile(latest);
+        return moved ?? authFromFile(refreshed);
       }
       if (!(await stillHeld())) return authFromFile(refreshed);
       // Merged onto the re-read, with the identity the re-read may have lost
@@ -2264,6 +2273,15 @@ function authFromFile(parsed: CodexAuthFile): CodexBackendAuth {
     refreshToken: parsed.tokens?.refresh_token,
     accountId,
   };
+}
+
+/** `authFromFile`, or null when the file is not a usable generation (no access token or account id). */
+function tryAuthFromFile(parsed: CodexAuthFile): CodexBackendAuth | null {
+  try {
+    return authFromFile(parsed);
+  } catch {
+    return null;
+  }
 }
 
 function shouldRefreshAuth(parsed: CodexAuthFile): boolean {
