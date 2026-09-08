@@ -651,7 +651,10 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 이미 있었고 `/v1/messages`는 그것을 `cache_creation_input_tokens`로 내보내고 있었다. OpenAI 표면만 그 값을 `cached_tokens`에 **접어 넣어**
 캐시를 채우기만 한 턴이 읽은 턴처럼 보였다. 두 필드를 분리해 채웠다(읽기=`cached_tokens`, 쓰기=`cache_write_tokens`).
 이 표면들에서 `0`을 쓰는 것은 위 트레이드오프와 무관하다 — direct 자신이 최소 요청에 `cached_tokens: 0`·`cache_write_tokens: 0`을 보내므로
-항상 채우는 쪽이 미러다. `/v1/messages` 행은 그대로 결정으로 남는다. Images는 §5.3의 미측정 모양이라 새 필드를 물려받지 않는다(P-16).
+항상 채우는 쪽이 미러다.
+**캡처가 증명하는 범위**: P-1/P-3은 캐시를 쓰지 않은 최소 요청 2건이므로 이 바이트가 세우는 사실은 **두 필드의 존재와 그때의 값 `0`**뿐이다.
+direct가 캐시 적중/기록 턴에서 두 값을 어떻게 나누는지는 **미측정**이며, 우리 쪽 분리(읽기=`cacheReadInputTokens`, 쓰기=`cacheCreationInputTokens`)는
+**우리 백엔드가 보고하는 두 값**을 그대로 옮긴 것이지 direct의 분할 의미를 관측한 결과가 아니다. 그 확인은 캐시가 실제로 적중하는 캡처가 필요하다. `/v1/messages` 행은 그대로 결정으로 남는다. Images는 §5.3의 미측정 모양이라 새 필드를 물려받지 않는다(P-16).
 남은 `tool_usage`·`reasoning.mode`는 `spec/declared-divergences.json`에 선언됐고, `conformance-echoed-defaults.test`가
 **선언이 낡아도 실패**하도록 양방향으로 고정한다.
 

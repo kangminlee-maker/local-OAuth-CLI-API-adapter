@@ -1964,8 +1964,13 @@ function mergedChatUsage(results: readonly LocalCompletionResult[]): LocalUsage 
     ...first.usage,
     outputTokens,
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    // The fan-out shares one prompt and adds output, so the merged total is the
+    // first turn's own total plus what the others produced. Recomputing it from
+    // `inputTokens` dropped every cache counter that sits beside it and could
+    // report a total BELOW the prompt it reported — 50 + 40 against a prompt of
+    // 1050 on a runtime that separates cache reads and writes.
     ...(first.usage.totalTokens !== undefined
-      ? { totalTokens: first.usage.inputTokens + outputTokens }
+      ? { totalTokens: first.usage.totalTokens + (outputTokens - first.usage.outputTokens) }
       : {}),
   };
 }

@@ -83,7 +83,7 @@
         ".tool_usage.web_search",
         ".tool_usage.web_search.num_requests"
       ],
-      "behavior": "The direct API reports per-hosted-tool token accounting on every response under `tool_usage` — `image_gen` with its own input/output token details, and `web_search.num_requests` — whether or not the turn used either. This proxy reports no `tool_usage` at all.",
+      "behavior": "The direct API's response carries per-hosted-tool token accounting under `tool_usage` — `image_gen` with its own input/output token details, and `web_search.num_requests` — on the one minimal turn captured (P-1), which used neither tool and reported every counter as 0. Whether it appears on every response is not something these bytes show. This proxy reports no `tool_usage` at all.",
       "why": "Measured 2026-08-29 (P-1, `spec/captures/direct-responses-minimal.json`). These are reporting fields for hosted tools this surface does not run: the proxy's Responses surface has no web search and no image generation of the vendor's kind, so every counter would be a zero asserting that work did not happen rather than a measurement that it did. Matrix §5.5.9 fixed the rule that such a field is not filled by guessing, and the alternative — inventing the counter's semantics for a feature we do not implement — is the failure that rule exists to prevent. A client reading `tool_usage` gets `undefined` instead of a zero; that is the cost, and it is stated here rather than hidden.",
       "measuredAt": "2026-08-29",
       "evidence": "docs/conformance-matrix.md §5.5.9"

@@ -3,10 +3,11 @@
   "originRoot": "artifacts/direct-api-captures",
   "originRun": "a5eee9af-fcf4-450c-a0b0-4b16cdfcefbf",
   "originFile": "0001-P-1.json",
-  "promotedAt": "2026-09-08T22:37:15.106Z",
+  "promotedAt": "2026-09-08T23:47:38.237Z",
   "requiredContent": {
     "mustContain": null,
-    "mustNotContain": null
+    "mustNotContain": null,
+    "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"input\":\"ping\",\"max_output_tokens\":16}"
   },
   "url": "https://api.openai.com/v1/responses",
   "status": 200,

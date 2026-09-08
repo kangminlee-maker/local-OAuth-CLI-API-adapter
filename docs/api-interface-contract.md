@@ -96,6 +96,7 @@ Non-streaming response uses OpenAI Chat Completions shape:
     "total_tokens": 0,
     "prompt_tokens_details": {
       "cached_tokens": 0,
+      "cache_write_tokens": 0,
       "audio_tokens": 0
     },
     "completion_tokens_details": {
@@ -190,7 +191,7 @@ Non-streaming response uses Responses object shape:
     "input_tokens": 0,
     "output_tokens": 0,
     "total_tokens": 0,
-    "input_tokens_details": { "cached_tokens": 0 },
+    "input_tokens_details": { "cached_tokens": 0, "cache_write_tokens": 0 },
     "output_tokens_details": { "reasoning_tokens": 0 }
   }
 }
@@ -399,9 +400,9 @@ Usage fields prefer provider-reported CLI usage when available. Estimated usage 
 
 | Surface | Usage shape |
 | --- | --- |
-| OpenAI Chat | `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens`, `completion_tokens_details.reasoning_tokens` |
-| OpenAI Responses | `input_tokens`, `output_tokens`, `total_tokens`, `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens` |
-| OpenAI Images | Same as OpenAI Responses when local usage is available; otherwise provider/raw image usage is passed through; the usage of attempts that produced no image is merged into the result the retry produced (round 49). |
+| OpenAI Chat | `prompt_tokens`, `completion_tokens`, `total_tokens`, `prompt_tokens_details.cached_tokens` (reads) + `.cache_write_tokens` (writes), `completion_tokens_details.reasoning_tokens` |
+| OpenAI Responses | `input_tokens`, `output_tokens`, `total_tokens`, `input_tokens_details.cached_tokens` (reads) + `.cache_write_tokens` (writes), `output_tokens_details.reasoning_tokens` |
+| OpenAI Images | The Responses shape MINUS `cache_write_tokens` when local usage is available — the provider's own image usage is not the Responses shape at all (`docs/conformance-matrix.md` §5.3) and no capture has measured it, so this surface does not inherit a member measured on another one (P-16 settles it); otherwise provider/raw image usage is passed through; the usage of attempts that produced no image is merged into the result the retry produced (round 49). |
 | Anthropic Messages | `input_tokens`, `output_tokens`, optional `cache_creation_input_tokens`, optional `cache_read_input_tokens` |
 
 Anthropic cache creation/read tokens are folded into OpenAI `input_tokens` when an Anthropic-style backend usage object is rendered through an OpenAI-compatible surface.

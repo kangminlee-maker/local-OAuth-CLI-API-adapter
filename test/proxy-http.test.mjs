@@ -471,6 +471,55 @@ test('a cache WRITE is not counted as a cache read on the OpenAI surfaces', asyn
   }
 });
 
+test('a fan-out totals the shared prompt once, not the bare input tokens', async () => {
+  // `n: 2` runs the turn twice and merges the usages. The merge recomputed the
+  // total from `inputTokens` alone, which on a runtime that reports cache
+  // counters beside it dropped every one of them: a prompt of 1050 came back
+  // with a TOTAL of 90 — arithmetic no client can reconcile, on both the
+  // buffered body and the streamed terminal.
+  const split = await startProxyWithBackend({
+    name: 'split-cache-fanout',
+    model: 'fake-local-model',
+    async generate(request) {
+      return {
+        id: 'fanout_test',
+        model: request.model,
+        text: 'OK',
+        toolCalls: [],
+        usage: {
+          inputTokens: 50,
+          outputTokens: 20,
+          totalTokens: 1_070,
+          cacheCreationInputTokens: 100,
+          cacheReadInputTokens: 900,
+          cachedInputTokens: 1_000,
+          source: 'provider',
+        },
+        latencyMs: 1,
+      };
+    },
+    async close() {},
+  });
+  try {
+    const chat = await (await postJsonTo(split.url, '/v1/chat/completions', {
+      model: 'fake-local-model',
+      messages: [{ role: 'user', content: 'hi' }],
+      n: 2,
+    })).json();
+    assert.equal(chat.choices.length, 2);
+    assert.equal(chat.usage.prompt_tokens, 1_050);
+    assert.equal(chat.usage.completion_tokens, 40);
+    // One prompt, two answers: 1070 for the first turn, plus the second's 20.
+    assert.equal(chat.usage.total_tokens, 1_090);
+    assert.ok(
+      chat.usage.total_tokens >= chat.usage.prompt_tokens,
+      'a total below the prompt it reports is not arithmetic a client can use',
+    );
+  } finally {
+    await split.close();
+  }
+});
+
 test('POST /v1/chat/completions preserves OpenAI image_url input parts', async () => {
   const res = await postJson('/v1/chat/completions', {
     model: 'fake-local-model',
