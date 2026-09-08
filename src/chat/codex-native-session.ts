@@ -117,6 +117,18 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private threadId = '';
   /** The in-flight child replacement, so a turn waits for it instead of racing it. */
   private restarting: Promise<void> | null = null;
+  /**
+   * The interrupt write's fate, so the next turn does not overtake an interrupt
+   * whose write the child never received. Installed synchronously at the write,
+   * before the interrupted turn is retired (so it exists before the endpoint
+   * answers), and awaited by the next turn's admission. `promise` never rejects;
+   * `done` runs once — on a write FAILURE it starts the replacement (setting
+   * `restarting` synchronously) BEFORE it resolves, so the woken waiter joins the
+   * successor rather than the dead child (F2, the interrupt write barrier).
+   */
+  private interruptGate:
+    | { readonly child: ChildProcessWithoutNullStreams; readonly promise: Promise<void>; readonly done: (err?: Error) => void }
+    | null = null;
   /** Set by `close()`: a replacement in flight must not start a child the session will never close. */
   private closed = false;
   /** Isolation directories a replacement could not remove — the close's to remove, or to report. */
@@ -211,6 +223,17 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // (t1 B-child gap 3); now `ready` means a turn will be attempted, and a
       // turn that could not get a child reports why — the replacement's own
       // failure, whether the turn waited for that attempt or made it.
+      // A prior turn's interrupt write may not have been accepted yet: wait for
+      // its fate before this turn is admitted, so nothing starts ahead of an
+      // interrupt the child never received. On a failed write the gate resolves
+      // only after the replacement is installed, so the checks below see it; on
+      // an accepted write ordering already holds (a later `turn/start` is behind
+      // the interrupt bytes on the one stream) (F2).
+      const gate = this.interruptGate;
+      if (gate) {
+        await Promise.race([gate.promise, turn.stopped$]);
+        if (turn.stopped) throw new Error('local CLI chat turn aborted');
+      }
       const replacement = this.restarting ?? (this.child ? null : this.replaceChild());
       if (replacement) await Promise.race([replacement, turn.stopped$]);
       if (turn.stopped) throw new Error('local CLI chat turn aborted');
@@ -382,12 +405,52 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
   private async sendTurnInterrupt(turn: Turn): Promise<void> {
     if (!turn.turnId || turn.interrupted) return;
     turn.interrupted = true;
-    await this.send('turn/interrupt', { threadId: this.threadId, turnId: turn.turnId })
+    const child = this.child;
+    // No child to tell, or already closing: no write is attempted, so no gate is
+    // installed — the next turn's admission handles a missing child (a null child
+    // becomes a replacement) on its own.
+    if (!child || this.closed) return;
+    let settle!: () => void;
+    const promise = new Promise<void>((resolve_) => { settle = resolve_; });
+    let settled = false;
+    let bound: ReturnType<typeof setTimeout>;
+    const gate = {
+      child,
+      promise,
+      done: (err?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(bound);
+        if (this.interruptGate === gate) this.interruptGate = null;
+        // A write that failed replaces the child, thread and all — `restarting`
+        // set synchronously here, BEFORE the gate resolves, so the woken next
+        // turn joins the successor instead of the pipe that could not be told.
+        if (err && this.child === child && !this.closed) {
+          void this.replaceChild().catch(() => undefined);
+        }
+        settle();
+      },
+    };
+    // A wedged-but-alive child that accepts nothing and never errors would hold
+    // the next turn forever; the bound settles the gate as accepted and falls
+    // through to today's behavior (the `turn/start` queues behind the interrupt
+    // and dies by its own RPC timeout). One request budget, worst case.
+    bound = setTimeout(() => gate.done(), this.timeoutMs);
+    bound.unref?.();
+    this.interruptGate = gate;
+    // Written with a settlement callback — OS acceptance of the bytes, not the
+    // child's RPC acknowledgement (t1-r3-codex: the endpoint must not wait on an
+    // unresponsive child). The pending RPC entry and wire bytes are unchanged.
+    await this.send('turn/interrupt', { threadId: this.threadId, turnId: turn.turnId }, gate.done)
       .catch(() => undefined);
   }
 
   async close(): Promise<void> {
     this.closed = true;
+    // A next turn parked on the interrupt gate is released by the turn-stop
+    // below; the gate itself is settled here (no replacement — closed) so a late
+    // write callback or stdin error cannot revive it (F2).
+    this.interruptGate?.done();
     const restarting = this.restarting;
     if (restarting) {
       // A replacement in flight is not waited out: the child it is starting,
@@ -553,7 +616,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       if (this.child === child) this.stderr = `${this.stderr}${chunk}`.slice(-12_000);
     });
     child.on('error', (err) => {
-      if (this.child === child) this.failActive(err);
+      if (this.child !== child) return;
+      if (this.interruptGate && this.interruptGate.child === child) {
+        this.interruptGate.done(err);
+        return;
+      }
+      this.failActive(err);
     });
     // An `error` event with no listener is an uncaught exception: one racing
     // write to a child that has just died would take the whole proxy down
@@ -562,19 +630,32 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     // failure arrived a tick later — the shape `send()`'s synchronous catch
     // cannot see. A child that cannot be written to cannot be told anything: it
     // is replaced, thread and all, the same as one whose write threw (t1-r5-codex
-    // F2). This closes the pipe, but not the ORDER: the replacement lands when
-    // this handler runs, a tick after the interrupt already answered, so a turn
-    // in that window can still reach the dying child before the successor. That
-    // ordering is the open follow-up — a write barrier — filed as
-    // docs/design-task-codex-interrupt-write-barrier.md, not enforced here.
+    // F2). A pending interrupt gate for THIS child OWNS the failure: settle it
+    // (which installs the replacement) and stop — the next turn may already be
+    // parked on the gate as `this.turn`, and failing the active turn here would
+    // retire that innocent turn and reproduce the race in a new shape (F2). An
+    // accepted gate has already cleared itself, so a genuinely later error falls
+    // through to the generic replacement.
     child.stdin.on('error', (err) => {
       if (this.child !== child) return;
+      if (this.interruptGate && this.interruptGate.child === child) {
+        this.interruptGate.done(err);
+        return;
+      }
       this.failActive(err);
       if (!this.closed) void this.replaceChild().catch(() => undefined);
     });
     child.on('close', (code, signal) => {
       if (this.child !== child) return;
       const exit = new Error(`codex app-server exited: code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+      // A pending interrupt gate for this child is settled, not failed onto the
+      // parked next turn: the child is gone, so that turn starts a fresh one
+      // through the null-child replacement below (F2).
+      if (this.interruptGate && this.interruptGate.child === child) {
+        this.interruptGate.done();
+        this.forgetChild(exit);
+        return;
+      }
       this.failActive(exit);
       // Gone on its own: forgotten, thread and all, and the next turn starts a
       // child for itself (t1 B-child gap 3). Its credentials copy is the next
@@ -631,12 +712,17 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.native.thread_id = this.threadId;
   }
 
-  private send(method: string, params: unknown): Promise<JsonRpcMessage> {
+  private send(method: string, params: unknown, onWriteSettled?: (err?: Error) => void): Promise<JsonRpcMessage> {
     if (!this.child) return Promise.reject(new Error('codex app-server is not running'));
     const id = this.nextId;
     this.nextId += 1;
     try {
-      this.child.stdin.write(`${JSON.stringify({ method, id, params })}\n`);
+      // `onWriteSettled` is the interrupt's write barrier and nothing else: with
+      // it undefined this is byte-for-byte the write the four other callers make.
+      this.child.stdin.write(
+        `${JSON.stringify({ method, id, params })}\n`,
+        onWriteSettled ? (err) => onWriteSettled(err ?? undefined) : undefined,
+      );
     } catch (err) {
       // A pipe that died under the write throws from here, and this function
       // returns a promise: a synchronous throw escapes the caller's `.catch`
@@ -646,8 +732,12 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
       // that stopped answering is (r52) — an interrupt whose write failed was
       // reported delivered while the next turn reached the same child ahead
       // of it (t1-r4-codex).
+      const error = err instanceof Error ? err : new Error(String(err));
       if (!this.closed) void this.replaceChild().catch(() => undefined);
-      return Promise.reject(err instanceof Error ? err : new Error(String(err)));
+      // The interrupt's barrier settles on the synchronous throw too, so it is
+      // not left to its timeout while the returned rejection is swallowed.
+      onWriteSettled?.(error);
+      return Promise.reject(error);
     }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -698,21 +788,32 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
         : {}),
       ...(method === 'thread/tokenUsage/updated' ? { usage: params } : {}),
     };
-    const turnId = typeof data?.turnId === 'string' ? data.turnId : undefined;
+    const turnId = notificationTurnId(data);
     const turn = this.turn;
     // Nothing is running, so this belongs to a turn that is over. Holding it
     // would deliver an interrupted turn's tail — its usage above all — to
     // whoever asked next, as that turn's own.
     if (!turn) return;
-    // Still being named: what arrives now belongs to the turn being started,
-    // and nothing else can be running, so hold it until there is an id to
-    // route by.
+    // An id-LESS notification is never the current turn's own output: a running
+    // turn's output carries its id (a delta and usage at `params.turnId`, a
+    // completion at `params.turn.id`). So an id-less notification is a prior
+    // turn's tail after an interrupt — dropped, never attributed to whatever turn
+    // is current, whether or not it has been named yet (F2-1; the barrier holds
+    // the next turn parked and id-less for up to a request budget while the
+    // interrupted child keeps talking, but the leak reaches the named turn too).
+    if (turnId === undefined) return;
+    // Named by an id other than the running turn's: a prior turn's late output —
+    // above all a `turn/completed`, whose id the child carries at `params.turn.id`,
+    // which would otherwise CLOSE this turn's queue as if it were its own (F2-1).
+    if (turn.turnId && turnId !== turn.turnId) return;
+    // Not yet named: this turn's own id-bearing early output (a delta the child
+    // sends before the `turn/start` ack) is held and sorted at flush once the id
+    // is known.
     if (!turn.turnId) {
       this.bufferedNotifications.push(event);
       this.bufferedNotifications = this.bufferedNotifications.slice(-100);
       return;
     }
-    if (turnId && turnId !== turn.turnId) return;
     turn.queue.push(event);
     if (method === 'turn/completed') turn.queue.close();
   }
@@ -722,7 +823,7 @@ export class CodexNativeCliChatSession implements LocalCliChatRuntimeSession {
     this.bufferedNotifications = [];
     for (const event of buffered) {
       const params = asRecord(asRecord(event.raw)?.params);
-      const eventTurnId = typeof params?.turnId === 'string' ? params.turnId : undefined;
+      const eventTurnId = notificationTurnId(params);
       if (eventTurnId && eventTurnId !== turn.turnId) continue;
       turn.queue.push(event);
       if (asRecord(event.raw)?.method === 'turn/completed') turn.queue.close();
@@ -749,6 +850,19 @@ function parseJson(line: string): JsonRpcMessage | null {
 function asRecord(value: unknown): JsonRpcMessage | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   return value as JsonRpcMessage;
+}
+
+/**
+ * The turn a notification names, read the one way for both immediate routing and
+ * buffered replay so the two never disagree: the running turn's deltas and usage
+ * carry `params.turnId`; a `turn/completed` names the turn at `params.turn.id`.
+ * Neither present means unscoped — an interrupted turn's tail, never the current
+ * turn's own output (F2-1).
+ */
+function notificationTurnId(data: JsonRpcMessage | null): string | undefined {
+  if (typeof data?.turnId === 'string') return data.turnId;
+  const nested = asRecord(data?.turn);
+  return typeof nested?.id === 'string' ? nested.id : undefined;
 }
 
 function readPath<T>(value: unknown, path: readonly string[]): T | undefined {

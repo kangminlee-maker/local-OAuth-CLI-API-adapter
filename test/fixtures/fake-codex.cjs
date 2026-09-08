@@ -225,6 +225,12 @@ rl.on('line', (line) => {
       result(payload.id, { turn: { id: turnId } });
       return;
     }
+    if (input.includes('HANG_NO_COMPLETION')) {
+      // A single turn that opens and never closes — per input, not per child, so
+      // a later turn on the same child still completes normally.
+      result(payload.id, { turn: { id: turnId } });
+      return;
+    }
     if (input.includes('PADDED_NARRATION')) {
       // A completed turn whose text carries leading and trailing whitespace.
       // Every other narration here is whitespace-free, so a `.trim()` on the
@@ -277,18 +283,26 @@ rl.on('line', (line) => {
     setTimeout(() => result(payload.id), Number(process.env.FAKE_CODEX_ARCHIVE_DELAY_MS));
     return;
   }
+  // A real child keeps talking for a moment after being told to stop, and some
+  // of what it says carries no turn id at all — which is why where those
+  // notifications land matters. It happens whether or not the interrupt is
+  // acknowledged, so it is emitted before the no-ack early return below.
+  if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_TRAILING_NOTIFICATION === '1') {
+    // Default 10ms; a test that must land this tail in a specific window (e.g.
+    // while the next turn is parked on the write barrier) sets the delay. By
+    // default the tail carries no id (the shape that made routing matter); a test
+    // pinning stale-id rejection tags it with the interrupted turn's top-level id.
+    const params = process.env.FAKE_CODEX_TRAILING_NOTIFICATION_TOPLEVEL_ID === '1'
+      ? { turnId: payload.params?.turnId, totalTokens: 999 }
+      : { totalTokens: 999 };
+    setTimeout(() => {
+      write({ method: 'thread/tokenUsage/updated', params });
+    }, Number(process.env.FAKE_CODEX_TRAILING_NOTIFICATION_DELAY_MS ?? 10));
+  }
   // An interrupt the child never acknowledges: the endpoint must not wait for it.
   if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_NO_INTERRUPT_ACK === '1') return;
   if (payload.method === 'turn/interrupt' || payload.method === 'thread/archive') {
     result(payload.id);
-    // A real child keeps talking for a moment after being told to stop, and
-    // some of what it says carries no turn id at all — which is why where
-    // those notifications land matters.
-    if (payload.method === 'turn/interrupt' && process.env.FAKE_CODEX_TRAILING_NOTIFICATION === '1') {
-      setTimeout(() => {
-        write({ method: 'thread/tokenUsage/updated', params: { totalTokens: 999 } });
-      }, 10);
-    }
     return;
   }
 

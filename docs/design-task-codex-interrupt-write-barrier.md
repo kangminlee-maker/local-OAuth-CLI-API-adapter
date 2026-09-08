@@ -1,6 +1,9 @@
 # Design task — the codex interrupt's write barrier
 
-Status: open. Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2).
+Status: closed 2026-09-07. Implemented, review rounds 1–2 folded, round 3 (both seats) clean on the
+fold. Filed 2026-09-06 from round 6 of the native-session-lifecycle review (codex seat F2). Three
+pre-existing defects the round-3 review surfaced (orthogonal to F2) are filed separately as
+`docs/design-task-codex-native-completion-parity.md`.
 Independent of track 1 (whose seven gaps are closed) and of track A
 (`docs/design-task-refresh-lease-atomicity.md`). Not a defect patch: the fix is a new ordering
 primitive, so it is a design task, not a fold.
@@ -48,6 +51,51 @@ that it wants a design, red fixtures first, and its own two-seat review.
   `stdin.write` return `false` and emit `error` a tick later (the shape Node produces for a dead
   reader), as the round-5/6 fixtures do.
 
+## Design (synthesized from two blind drafts, 2026-09-07)
+
+Two independent drafts (`review-artifacts/f2-design-{fable,codex}/DESIGN_DRAFT.md`) converged on one
+session-level gate installed synchronously at the interrupt write; each caught a flaw the other
+missed, both folded in here.
+
+**One field.** `private interruptGate: { child; promise: Promise<void>; done: (err?: Error) => void } | null`.
+The `promise` never rejects. `done` is idempotent (first signal wins): it clears the field (if still
+this gate), on error starts `replaceChild()` (which sets `this.restarting` synchronously) BEFORE it
+resolves, then resolves. So a woken waiter always sees the truth.
+
+**Install (in `sendTurnInterrupt`, synchronously, before the write).** Only when a write is actually
+attempted (a captured live child, not closed). The gate exists before `stopTurn` retires the turn
+and before `interrupt()` answers, so no next turn can be admitted into the window.
+
+**The write.** Still through `send()`, which gains an optional `onWriteSettled?: (err?) => void`:
+the four other callers pass nothing and are byte-identical by diff. The callback is the OS-acceptance
+signal (contract 3 allows waiting on acceptance, never on the RPC ack). `send()`'s synchronous-throw
+catch also calls `onWriteSettled(err)`. The interrupt keeps its pending RPC entry (unchanged wire).
+
+**Settle** on the first of: write callback (ok → resolve; err → replace then resolve),
+`send()` sync-catch (err), the child's teardown/exit (via the handlers below), or a `timeoutMs`
+bound (a wedged-but-alive child that never flushes and never errors settles as accepted and falls
+through to today's behavior — the bound caps the worst-case hold at one request budget). The bound
+is Fable's; without it a full-buffer child blocks the next turn forever.
+
+**The next turn waits** — inserted immediately before the current admission (`const replacement = …`
+at line 214): `const gate = this.interruptGate; if (gate) { await Promise.race([gate.promise, turn.stopped$]); if (turn.stopped) throw 'local CLI chat turn aborted'; }`.
+On resolve it re-reads `this.restarting`/`this.child` at the existing 214–217 and the r6 ownership
+guard at 230 — reusing the replacement-wait machinery, and surfacing the successor's own start
+failure through the existing `await` at 215.
+
+**The stdin `error` / `close` / child-`error` handlers route a matching pending gate FIRST and
+early-return** — this is codex's catch, essential: once the next turn is parked on the gate it is
+`this.turn`, so the old child's async `error` reaching `failActive(err)` would retire that innocent
+turn and reproduce the defect. So: `if (this.child !== child) return; if (this.interruptGate && this.interruptGate.child === child) { this.interruptGate.done(err); return; } this.failActive(err); if (!this.closed) void this.replaceChild()…`.
+An accepted gate is already cleared, so a genuinely later error takes the generic path.
+
+**`close()`** settles/clears the gate (no replacement while closed) after `closed = true`.
+
+**Rejected** (from both drafts): awaiting the RPC ack (round-3 bar); moving `retire` into the
+callback (turns the race into a client-visible 409, changes `isBusy`); a liveness probe at admission
+(the flags are still healthy in the window — racy); pessimistic replace on every interrupt (burns
+the warm child); treating `write() === false` as failure (that is backpressure).
+
 ## Done when
 
 A turn submitted in the window between a failed-write interrupt returning and its stream error
@@ -55,3 +103,104 @@ never reaches the old child: the child method log shows no `turn/start` on the d
 interrupt, the submitting turn runs on the successor (or reports the replacement's own start
 failure), and the caller gets one terminal event per turn. Red fixtures first; a mutant per new
 guard; both review seats clean on the fold.
+
+## Verification (2026-09-07)
+
+Red-first fixtures in `test/native-session-interrupt.test.mjs`; every guard pinned by a mutant that
+turns its fixture red (`review-artifacts/stage2/f2-mutants-full.py`, ten mutants, all KILLED).
+
+- The barrier's write-fate paths: `t1 F2` (a failed-write interrupt's next turn reaches the
+  successor, no `turn/start` on the dying child) and `t1 F2 accepted` (the barrier holds the next
+  turn only until OS write acceptance — not the RPC ack, `FAKE_CODEX_NO_INTERRUPT_ACK=1` — with the
+  bound pushed far out so only acceptance can release within the test, and never replaces a healthy
+  child). Mutants M1–M4, F10.
+- The barrier's non-write-path guards (F2 review round 1, Fable Finding 2 — pinned by nothing
+  before): `t1 F2 child-exit` (a child that exits while the next turn is parked settles the gate;
+  the next turn starts a fresh child), `t1 F2 child-error` (a child `error` routes to the gate, not
+  onto the innocent parked turn), `t1 F2 bound` (a write neither accepted nor errored releases the
+  next turn at the bound, not forever). Mutants M5, M6, M7.
+
+## Review round 1 fold (2026-09-07)
+
+Two independent seats (Fable frontier agent, codex CLI at ultra) reviewed the barrier commit behind
+a blind packet. Both converged on **one** substantive defect and Fable added a coverage finding;
+both folded here.
+
+- **F2-1 — post-interrupt notification contamination (codex HIGH, Fable medium; pre-existing,
+  reproduced on `a/`; the barrier widened it).** An interrupted turn's tail was replayed into the
+  next turn as its own: a `turn/completed` the child names at `params.turn.id` (which
+  `handleNotification` read only at the top-level `params.turnId`) CLOSED the next turn's queue, so
+  work that never ran on the child returned `completed`; an id-less usage tail became the next
+  turn's usage. The barrier holds the next turn parked and id-less for up to a request budget while
+  the interrupted child keeps talking, widening the window from one RPC round-trip. Fixed at the
+  notification-routing authority, not the gate: one canonical turn-id extractor (`notificationTurnId`,
+  both `params.turnId` and `params.turn.id`) used by immediate routing and buffered replay so a
+  prior turn's completion is dropped, not routed; and while a turn is unnamed, an id-less
+  notification (never the current turn's own output — a running turn's output carries its id) is
+  dropped rather than buffered. Red-first fixtures `t1 F2-1 idless`, `t1 F2-1 nested` (parked), and
+  `t1 F2-1 nested-named` (the named/immediate-routing path — the parked case is backstopped by the
+  id-less drop, so it does not pin the extractor; the named case does). Mutants notifA (extractor
+  top-level only) and notifB (id-less not dropped).
+- **Fable Finding 2 — the barrier's non-write-path guards were pinned by nothing (medium,
+  coverage).** Folded as the three fixtures above (child-exit, child-error, bound) plus a
+  strengthened `t1 F2 accepted` that now distinguishes acceptance-release from bound-release (F10).
+- **Not folded (verified, not defects):** the gate's timer-clear and `close()` settlement are
+  resource hygiene, not behavioral — a leaked bound is `unref`'d and its `done()` idempotent; a gate
+  the close did not clear has its late callback guarded by `!this.closed`. The codex seat killed
+  both with instrumentation probes; a committed behavioral fixture would assert an implementation
+  detail, so none is added.
+
+- Full offline suite **2054/0**; `verify:runtime-boundary` passed.
+
+## Review round 2 fold (2026-09-07)
+
+The codex seat reviewed the round-1 fold (the Fable seat hit a session limit mid-review and was
+retried in round 3, not round 2). One behavioral finding and three coverage findings, all folded.
+
+- **F2-R2-2 — the fold was incomplete: an id-less tail arriving AFTER the next turn is named still
+  leaked (medium, behavioral; pre-existing on `a/`).** Round 1 dropped id-less notifications only
+  while the next turn was unnamed (parked). Now an id-less notification is dropped **unconditionally**
+  once there is a running turn — a running turn's own output always carries its id, so an id-less
+  notification is never the current turn's, whether it is named or not. This also removes the
+  named/unnamed asymmetry. Red-first fixture `t1 F2-1 idless-named`.
+- **F2-R2-1 — the `nested-named` fixture was race-dependent (medium, coverage; introduced by the
+  round-1 fold).** It waited for `turn/start` in the fake's method log, which the fake records on
+  receipt but acknowledges (installing `turn.turnId`) a macrotask later; an interrupt landing in
+  between left turn 1 unnamed and busy, so the second admission got a 409 before the routing ran.
+  All eight interrupt-then-admit fixtures now wait on `ns.turn.turnId` (turn 1 actually named)
+  instead. Verified deflaked under the deterministic trigger `FAKE_CODEX_TURN_START_DELAY_MS=100`.
+- **F2-R2-3 — the native pre-ack replay path was pinned by the wrong component (medium, coverage).**
+  The cited `EARLY_DELTA` test exercises `CodexAppServerBackend`'s own buffer, not the native
+  session's `handleNotification`/`flushBufferedNotifications`. New fixture `t1 F2-1 early-delta`
+  drives the fake's `EARLY_DELTA` through the manager and asserts the buffered id-bearing delta and
+  usage are replayed; a mutant dropping id-bearing deltas while unnamed (R2-M1) now turns it red.
+- **F2-R2-4 — a prior top-level-id tail after naming was unpinned on the round-1 code (medium,
+  coverage).** The round-2 restructure resolves the gap itself: with the id-less drop now
+  unconditional, ignoring the extractor's top-level read strips the CURRENT turn's own deltas, which
+  ordinary completing-turn tests catch. Regression fixture `t1 F2-1 toplevel-named` documents the
+  prior-tail-dropped behaviour end to end.
+
+Thirteen mutants, all KILLED (`review-artifacts/stage2/f2-mutants-full.py`). Note the extractor
+reads (top-level and nested) are no longer pinned by the `nested-named`/`toplevel-named` fixtures:
+once an id-less notification is dropped for any running turn, ignoring a read makes that turn's own
+output look id-less and be dropped — so a mutant on either read hangs or empties an ordinary
+completing turn, which the new `t1 F2-1 plain-complete` fixture catches fast. The full set: M1–M7,
+F10 (barrier); extractor-nested and extractor-toplevel (→ `plain-complete`); mismatch-check-removed
+(→ `nested-named`); notifB id-less-drop (→ `idless`/`idless-named`); R2-M1 early-delta-dropped
+(→ `early-delta`). Full offline suite **2058/0**; `verify:runtime-boundary` passed.
+
+## Review round 3 (2026-09-07) — the fold is clean
+
+Both seats reviewed the round-2 fold; the Fable seat completed this time. Verdict: **no defect in the
+change.** The unconditional id-less drop closes the residual (red-first on `a/`); the naming wait is
+the right fix for a real 409 race (deflake verified under `FAKE_CODEX_TURN_START_DELAY_MS=100`, 88/88,
+control fails 3/3); the four new fixtures are non-vacuous (each red under an independent mutant). The
+Fable seat validated the id-less-drop premise against the live-run sibling `CodexAppServerBackend`,
+which requires those ids — one informational method-family (`account/*` raw events during a turn)
+is `unmeasured`, but it was already dropped when no turn ran, so the fold makes the surface uniform
+rather than newly lossy.
+
+Both seats surfaced the same pre-existing defects **orthogonal to F2** (reproduce on `a/`, native
+vs app-server-backend parity): a plain turn's usage discarded, and a failed turn reported as
+completed; the codex seat additionally found a >100-notification pre-ack buffer truncation. Filed as
+`docs/design-task-codex-native-completion-parity.md`, not folded here.
