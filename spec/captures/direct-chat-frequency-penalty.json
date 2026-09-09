@@ -1,0 +1,33 @@
+{
+  "claimEvidence": "direct-chat-frequency-penalty",
+  "originRoot": "artifacts/direct-api-captures",
+  "originRun": "e179ed00-2bb6-4901-a641-a4b73ebfc379",
+  "originFile": "0001-echo-frequency_penalty-0.5-effort-none-.json",
+  "promotedAt": "2026-09-09T22:01:06.221Z",
+  "requiredContent": {
+    "mustContain": null,
+    "mustNotContain": null,
+    "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_completion_tokens\":32,\"reasoning_effort\":\"none\",\"frequency_penalty\":0.5}"
+  },
+  "promotedFrom": {
+    "revision": "74f07fdfe0f63b1863891268a9b0db57e3c224f7",
+    "sources": [
+      {
+        "path": "scripts/lib/capture-provenance.mjs",
+        "blob": "cdfaf9f32fef52eac3b97e7f43602c036153f7d6"
+      },
+      {
+        "path": "scripts/promote-capture.mjs",
+        "blob": "ed5a0dbc6f07ca6440c9a4d2bcef11051b65f8b2"
+      }
+    ]
+  },
+  "url": "https://api.openai.com/v1/chat/completions",
+  "status": 200,
+  "kind": "json",
+  "requestSha256": "392133bc18782d2ea346b54fc1f9c875c41f208381e40503e8e5690df7e6d377",
+  "request": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_completion_tokens\":32,\"reasoning_effort\":\"none\",\"frequency_penalty\":0.5}",
+  "bodySha256": "5b7c5a8bba4a7e1147ac782756f6fe8eead93686e8dc68d6cb5ba9382d018f7d",
+  "bodyBytes": 796,
+  "body": "{\n  \"id\": \"chatcmpl-EIVmRkBhWFHVfXqWMNPmqPPw2eq5A\",\n  \"object\": \"chat.completion\",\n  \"created\": 1788080775,\n  \"model\": \"gpt-5.6-terra\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"pong\",\n        \"refusal\": null,\n        \"annotations\": []\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 7,\n    \"completion_tokens\": 4,\n    \"total_tokens\": 11,\n    \"prompt_tokens_details\": {\n      \"cached_tokens\": 0,\n      \"cache_write_tokens\": 0,\n      \"audio_tokens\": 0\n    },\n    \"completion_tokens_details\": {\n      \"reasoning_tokens\": 0,\n      \"audio_tokens\": 0,\n      \"accepted_prediction_tokens\": 0,\n      \"rejected_prediction_tokens\": 0\n    }\n  },\n  \"service_tier\": \"default\",\n  \"system_fingerprint\": null\n}\n"
+}

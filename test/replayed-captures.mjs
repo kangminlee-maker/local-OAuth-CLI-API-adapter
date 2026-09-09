@@ -100,6 +100,65 @@ export const SUPPLIED_ECHO_CAPTURES = [
     vendorPaths: 28,
   },
   { fixture: 'direct-chat-logprobs-effort-none', surface: '/v1/chat/completions', supplied: ['logprobs', 'reasoning_effort'], echoed: false, vendorPaths: 37 },
+
+  // The rest of the direct store's 200/json exchanges that a gate can replay.
+  // Each was read against the live proxy before it was promoted, so a status
+  // divergence or an undeclared shape gap would have been a finding rather than
+  // a red row: `review-artifacts/stage3/recon-unpromoted.mjs` is that reading.
+  //
+  // `reasoning_effort` appears in `supplied` only where it is what makes the
+  // vendor accept the option at all — the penalties, tools and functions, which
+  // this model family refuses while it reasons. Elsewhere it is request
+  // preamble, like the output cap, and naming it would make every row claim the
+  // same thing twice.
+
+  // /v1/responses — this surface echoes its configuration back.
+  { fixture: 'direct-responses-instructions', surface: '/v1/responses', supplied: ['instructions'], echoed: true, vendorPaths: 76 },
+  { fixture: 'direct-responses-max-tool-calls', surface: '/v1/responses', supplied: ['max_tool_calls'], echoed: true, vendorPaths: 76 },
+  { fixture: 'direct-responses-text-verbosity', surface: '/v1/responses', supplied: ['text'], echoed: true, vendorPaths: 76 },
+  { fixture: 'direct-responses-truncation-auto', surface: '/v1/responses', supplied: ['truncation'], echoed: true, vendorPaths: 76 },
+  { fixture: 'direct-responses-user', surface: '/v1/responses', supplied: ['user'], echoed: true, vendorPaths: 76 },
+  { fixture: 'direct-responses-safety-identifier', surface: '/v1/responses', supplied: ['safety_identifier'], echoed: true, vendorPaths: 76 },
+  { fixture: 'direct-responses-prompt-cache-key', surface: '/v1/responses', supplied: ['prompt_cache_key'], echoed: true, vendorPaths: 76 },
+  // Its echo carries members the other Responses answers do not, which is why
+  // this row's shape count is not 76.
+  { fixture: 'direct-responses-prompt-cache-options', surface: '/v1/responses', supplied: ['prompt_cache_options'], echoed: true, vendorPaths: 79 },
+  // `flex` is already replayed; these two hold the other branches of the
+  // resolver R-37 describes — `default` here, and everything that is not a
+  // named tier collapsing to it.
+  { fixture: 'direct-responses-service-tier-default', surface: '/v1/responses', supplied: ['service_tier'], echoed: true, vendorPaths: 76 },
+  // Accepted and NOT echoed, both of them: the vendor takes the option and its
+  // answer says nothing about it, so a client cannot read back what it asked.
+  { fixture: 'direct-responses-include-encrypted-content', surface: '/v1/responses', supplied: ['include'], echoed: false, vendorPaths: 76 },
+  { fixture: 'direct-responses-context-management', surface: '/v1/responses', supplied: ['context_management'], echoed: false, vendorPaths: 76 },
+  // Two options at once, and only one of them comes back — which is the claim.
+  { fixture: 'direct-responses-store-false-include-encrypted', surface: '/v1/responses', supplied: ['include', 'store'], echoed: true, vendorPaths: 76 },
+
+  // /v1/chat/completions — this surface echoes almost nothing, and each row
+  // below says so about one more option. `service_tier` is the exception.
+  { fixture: 'direct-chat-service-tier-default', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
+  { fixture: 'direct-chat-service-tier-priority', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
+  { fixture: 'direct-chat-reasoning-effort-none', surface: '/v1/chat/completions', supplied: ['reasoning_effort'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-seed', surface: '/v1/chat/completions', supplied: ['seed'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-store-true', surface: '/v1/chat/completions', supplied: ['store'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-metadata-user-safety-identifier', surface: '/v1/chat/completions', supplied: ['metadata', 'user', 'safety_identifier'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-prompt-cache-key-options', surface: '/v1/chat/completions', supplied: ['prompt_cache_key', 'prompt_cache_options'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-prompt-cache-retention', surface: '/v1/chat/completions', supplied: ['prompt_cache_retention'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-verbosity', surface: '/v1/chat/completions', supplied: ['verbosity'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-tools', surface: '/v1/chat/completions', supplied: ['tools', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-parallel-tool-calls-false', surface: '/v1/chat/completions', supplied: ['tools', 'parallel_tool_calls', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-functions-function-call', surface: '/v1/chat/completions', supplied: ['functions', 'function_call', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-frequency-penalty', surface: '/v1/chat/completions', supplied: ['frequency_penalty', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-presence-penalty', surface: '/v1/chat/completions', supplied: ['presence_penalty', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
+  // These three name `messages` because that is the option the request varies:
+  // a user turn carrying `name`, a user turn carrying a member the schema does
+  // not define, and an assistant turn carrying `refusal` and no content. The
+  // claim they carry is the STATUS — the vendor answers 200 to each, and so
+  // must this proxy — with the echo half saying that neither side reports the
+  // messages back.
+  { fixture: 'direct-chat-message-name', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-message-unknown-member', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-message-refusal', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
 ];
 
 // The two denominators, pinned rather than bounded. `echoedDefaults` counts the

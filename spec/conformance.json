@@ -3,12 +3,12 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "ecb5f4f55a2f369d50dfce898ff948e5798f01cb6b35daa703c8574d1337a2bc",
+    "matrixDigest": "9dca31e6452f3599ee95e8e472a1450710e29df389a7cfd16c863a446977dadc",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
     "claims": 148,
-    "claimsOutsideLegendVocabulary": 100,
+    "claimsOutsideLegendVocabulary": 102,
     "claimsWithLiveParityRow": 134,
     "routes": 11,
     "surfaces": 6,
@@ -1429,8 +1429,8 @@
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
       "claimedNote": "supported; prepended as a `system` message (`normalizers.ts:48-51`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-instructions.json`)",
       "liveParityRow": true
     },
     {
@@ -1470,11 +1470,11 @@
         "observableEffect": "caps built-in tool calls",
         "invalidValue": "UNKNOWN"
       },
-      "claimedLead": "silently ignored",
-      "claimedLeadInLegend": true,
-      "claimedNote": "**silently ignored**; echoed as hard `null` (`http-server.ts:2007`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedLead": "ignored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "ignored, but **mirrored**: the supplied integer comes back (`numberOrNull`, `http-server.ts:2382`), which is what the direct API does with it too. This cell read \"echoed as hard `null`\" against a stale line citation until 2026-09-10, when the capture below was replayed against the code",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-max-tool-calls.json`)",
       "liveParityRow": true
     },
     {
@@ -1648,9 +1648,9 @@
       },
       "claimedLead": "supported",
       "claimedLeadInLegend": true,
-      "claimedNote": "supported",
-      "evidenceGrade": "DOC?",
-      "evidenceNote": "DOC?",
+      "claimedNote": "supported; the whole `text` object comes back with the vendor's own `format: {type: \"text\"}` beside the supplied verbosity, which the capture below shows both sides doing",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-text-verbosity.json`)",
       "liveParityRow": true
     },
     {
@@ -1824,9 +1824,9 @@
       },
       "claimedLead": "message.output_text.logprobs",
       "claimedLeadInLegend": false,
-      "claimedNote": "`message.output_text.logprobs` is **refused at every effort** — 400 / `unsupported_parameter` / `include`, the door the direct API names when logprobs and reasoning are sent together (`normalizers.ts:1110`). Whether the direct API accepts the member at `reasoning.effort: none` is unmeasured on this surface, so no parity is claimed there and the refusal stands. Every other member is **silently ignored**, notably `reasoning.encrypted_content`, which stateless multi-turn clients depend on",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "`message.output_text.logprobs` is **refused at every effort** — 400 / `unsupported_parameter` / `include`, the door the direct API names when logprobs and reasoning are sent together (`normalizers.ts:1110`). Whether the direct API accepts the member at `reasoning.effort: none` is unmeasured on this surface, so no parity is claimed there and the refusal stands. Every other member is **silently ignored**: the answer carries no `include` key at all, measured for `reasoning.encrypted_content` — the one stateless multi-turn clients depend on — alone and alongside `store: false`",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-include-encrypted-content.json`)",
       "liveParityRow": true
     },
     {
@@ -1935,8 +1935,8 @@
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
       "claimedNote": "echoed, not acted on (`http-server.ts:2026`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-truncation-auto.json`)",
       "liveParityRow": true
     },
     {
@@ -1979,8 +1979,8 @@
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
       "claimedNote": "echoed (`http-server.ts:2032`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-user.json`)",
       "liveParityRow": true
     },
     {
@@ -2001,8 +2001,8 @@
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
       "claimedNote": "echoed (`http-server.ts:2017`)",
-      "evidenceGrade": "DOC?",
-      "evidenceNote": "DOC?",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-safety-identifier.json`)",
       "liveParityRow": true
     },
     {
@@ -2023,8 +2023,8 @@
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
       "claimedNote": "echoed (`http-server.ts:2014`)",
-      "evidenceGrade": "DOC?",
-      "evidenceNote": "DOC?",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-prompt-cache-key.json`)",
       "liveParityRow": true
     },
     {
@@ -2064,11 +2064,11 @@
         "observableEffect": "explicit breakpoints",
         "invalidValue": "UNKNOWN"
       },
-      "claimedLead": "silently ignored",
-      "claimedLeadInLegend": true,
-      "claimedNote": "silently ignored",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedLead": "ignored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "ignored, but **mirrored and canonicalised**: the vendor's own `mode: \"implicit\"` and `ttl: \"30m\"` are filled in under what the request sent (`http-server.ts:2393`), and the capture shows both sides answering the same object. Unlike the tool echo (declared, not canonicalised) this fills a cache hint rather than a guarantee about how the turn is run",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-prompt-cache-options.json`)",
       "liveParityRow": true
     },
     {
@@ -2088,9 +2088,9 @@
       },
       "claimedLead": "ignored",
       "claimedLeadInLegend": false,
-      "claimedNote": "ignored, but **resolved and echoed**: `flex` comes back as `flex`, `fast` and `priority` both as `priority`, everything else as `default` (`resolvedOpenAiServiceTier`, reached from `http-server.ts:2400`). This cell read \"hard `\\\"default\\\"`\" until 2026-09-10; the capture it now cites shows the direct API answering `flex` to `flex`, and `conformance-supplied-echo.test` compares the two. A review found the false text still standing under the new grade",
+      "claimedNote": "ignored, but **resolved and echoed**: `flex` comes back as `flex`, `fast` and `priority` both as `priority`, everything else as `default` (`resolvedOpenAiServiceTier`, reached from `http-server.ts:2400`). This cell read \"hard `\\\"default\\\"`\" until 2026-09-10; the capture it now cites shows the direct API answering `flex` to `flex`, and `conformance-supplied-echo.test` compares the two. A review found the false text still standing under the new grade. Two more branches are replayed since 2026-09-10 — `default` here, and `priority` on Chat",
       "evidenceGrade": "WIRE",
-      "evidenceNote": "WIRE (`spec/captures/direct-responses-service-tier-flex.json`)",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-service-tier-flex.json`, `spec/captures/direct-responses-service-tier-default.json`)",
       "liveParityRow": true
     },
     {
@@ -2132,9 +2132,9 @@
       },
       "claimedLead": "silently ignored",
       "claimedLeadInLegend": true,
-      "claimedNote": "silently ignored",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "silently ignored, and the answer carries no `context_management` key on either side",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-context-management.json`)",
       "liveParityRow": true
     },
     {
