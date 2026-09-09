@@ -50,7 +50,9 @@ const SECTIONS = [
  * inventing a meaning the document never wrote down.
  */
 const LEGEND_DISPOSITIONS = ['supported', 'validated-rejected', 'silently ignored', 'not applicable', 'divergent'];
-const EVIDENCE_GRADES = ['VERIFIED', 'DOC?', 'DOC', 'CODE'];
+// Order matters: `readGrade` takes the first that matches, so a longer name
+// must not be a prefix of a shorter one below it.
+const EVIDENCE_GRADES = ['VERIFIED', 'WIRE', 'DOC?', 'DOC', 'CODE'];
 
 /**
  * Every route this server answers, with the method it answers on. Written here
