@@ -64,6 +64,8 @@ const IMPORT_FROM = /(?:^|[\s;}])(?:import|export)\b[^;'"]*?\bfrom\s*(['"])([^'"
 const IMPORT_BARE = /(?:^|[\s;}])import\s*(['"])([^'"]+)\1/g;
 const IMPORT_CALL_LITERAL = /\bimport\s*\(\s*(['"])([^'"]+)\1\s*\)/g;
 const IMPORT_CALL_ANY = /\bimport\s*\(/g;
+// The one door from ESM into CommonJS, whose loads this walk cannot follow.
+const CJS_BRIDGE = new Set(['module', 'node:module']);
 
 function specifiers(text, where) {
   const found = [];
@@ -74,6 +76,14 @@ function specifiers(text, where) {
   const literals = [...text.matchAll(IMPORT_CALL_LITERAL)].length;
   if (calls !== literals) {
     throw new Error(`${where} loads a module by a specifier that is not a literal, so the set of sources that run cannot be derived`);
+  }
+  // The other door out of an ESM graph. Nothing here uses it, and a file that
+  // starts to would otherwise execute code no stamp names. Recognised by the
+  // specifier it must import rather than by scanning for a function name: a
+  // marker matched against raw text matches THIS file's own source.
+  const bridge = found.find((specifier) => CJS_BRIDGE.has(specifier));
+  if (bridge !== undefined) {
+    throw new Error(`${where} imports ${bridge}, a bridge to CommonJS whose loads this walk cannot follow, so the set of sources that run cannot be derived`);
   }
   return found;
 }
@@ -92,7 +102,13 @@ function sourceGraph(entry, root) {
     seen.add(file);
     order.push(file);
     const where = relative(root, file);
-    for (const specifier of specifiers(readFileSync(file, 'utf8'), where)) {
+    let text;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch {
+      throw new Error(`${where} is imported but cannot be read, so its bytes cannot be bound to a revision`);
+    }
+    for (const specifier of specifiers(text, where)) {
       if (specifier.startsWith('.')) queue.push(resolve(dirname(file), specifier));
     }
   }

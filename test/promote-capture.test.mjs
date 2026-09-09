@@ -271,6 +271,25 @@ test('a revision no branch reaches is refused: evidence has to be reviewable', (
   assert.match(whyUnbound(promotedFrom, { root: dir }) ?? '', /is not in this checkout's history/);
 });
 
+test('a source the walk cannot follow refuses rather than binding what it can see', () => {
+  // Two doors out of a derivable graph: a specifier computed at run time, and a
+  // bridge to CommonJS. Either one executes code no stamp would name, which is
+  // the failure the whole binding exists to prevent — so neither promotes.
+  for (const [what, line] of [
+    ['a computed specifier', "const extra = './lib/capture-provenance.mjs';\nawait import(extra);\n"],
+    ['a CommonJS bridge', "import { createRequire } from 'node:module';\nconst need = createRequire(import.meta.url);\nvoid need;\n"],
+  ]) {
+    const dir = checkout();
+    write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+    appendFileSync(join(dir, PROMOTER), `\n${line}`);
+    git(dir, 'commit', '-qam', `the promoter, with ${what}`);
+    const run = promoteIn(dir, { extra: SELECT });
+    assert.equal(run.status, 2, `${what}: expected a refusal, got ${run.status}: ${run.stdout}`);
+    assert.match(run.stderr, /the set of sources that run cannot be derived/, what);
+    assert.throws(() => readFileSync(join(dir, 'out', 'fixture.json')), /ENOENT/);
+  }
+});
+
 test('a poisoned GIT_DIR does not move the binding to another repository', () => {
   // `GIT_DIR`/`GIT_WORK_TREE` override discovery, so an inherited pair would
   // have both the promoter and the gates asking a repository that the `-C` they
