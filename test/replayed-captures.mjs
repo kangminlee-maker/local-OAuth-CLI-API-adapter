@@ -1,3 +1,9 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 // The captures the conformance gates replay, and what each row claims.
 //
 // The rosters live here, outside both gate files, because a third check needs
@@ -146,3 +152,50 @@ export const REPLAYED_FIXTURES = new Set([
   ...MINIMAL_SURFACES.map((row) => row.fixture),
   ...STREAM_SURFACES.flatMap((row) => [row.vendor, row.proxy]),
 ]);
+
+const captureDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec', 'captures');
+
+const GROUPS = {
+  supplied: { rows: SUPPLIED_ECHO_CAPTURES, keyOf: (row) => row.fixture },
+  minimal: { rows: MINIMAL_SURFACES, keyOf: (row) => row.surface },
+};
+
+/**
+ * What a gate actually put on the wire, against what THIS module says it
+ * replays.
+ *
+ * The comparison has to be made here and not in the gate. A review rewrote a
+ * gate's own roster to replay a different capture and adjusted the gate's
+ * expectations to match: every check the gate made was then about the capture
+ * it had substituted, while the registry — which is what the matrix's `WIRE`
+ * rule and the store sweep read — went on certifying the one nobody replayed.
+ * A gate that compares against its own array cannot see that; this reads the
+ * rows and the capture bytes itself.
+ *
+ * `dispatched` maps the group's key to the sha256 of the request body sent.
+ * What this cannot see is a gate that stops calling it, which is what the
+ * mutation table and the runner's subject gate are for.
+ */
+export function assertRosterReplayed(group, dispatched) {
+  const { rows, keyOf } = GROUPS[group];
+  assert.ok(rows, `no such replay group: ${group}`);
+  assert.deepEqual(
+    [...dispatched.keys()].sort(),
+    rows.map(keyOf).sort(),
+    `${group}: what was replayed is not what the registry names`,
+  );
+  for (const row of rows) {
+    const capture = JSON.parse(readFileSync(join(captureDir, `${row.fixture}.json`), 'utf8'));
+    const sent = dispatched.get(keyOf(row));
+    assert.equal(
+      sent,
+      createHash('sha256').update(capture.request).digest('hex'),
+      `${keyOf(row)}: the bytes replayed are not ${row.fixture}'s request`,
+    );
+    assert.equal(
+      capture.requestSha256,
+      createHash('sha256').update(capture.request).digest('hex'),
+      `${row.fixture}: the capture's own request digest does not match its bytes`,
+    );
+  }
+}

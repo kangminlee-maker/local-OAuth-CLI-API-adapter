@@ -32,7 +32,7 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, valueDivergencesFor } from '../scripts/lib/response-comparison.mjs';
-import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES } from './replayed-captures.mjs';
+import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 // A capture this gate's roster does not name cannot be read here. A review
@@ -48,6 +48,7 @@ const load = (name) => {
 
 let started;
 const answers = new Map();
+const dispatched = new Map();
 // A declared value divergence is identified by the WHOLE tuple. Keying it by
 // path let a second declaration on the same path — with values neither side
 // sends — count as exhibited because the true one was: a review planted a false
@@ -95,8 +96,16 @@ before(async () => {
     const text = await res.text();
     let body = null;
     try { body = JSON.parse(text); } catch { body = null; }
+    // What was actually put on the wire, not what the roster says was. A review
+    // repointed a gate's loop at another capture and every check went on
+    // certifying the one the roster advertised.
+    dispatched.set(fixture, createHash('sha256').update(capture.request).digest('hex'));
     answers.set(fixture, { status: res.status, body, text });
   }
+});
+
+test('what this gate replayed is what the registry names', () => {
+  assertRosterReplayed('supplied', dispatched);
 });
 
 after(async () => {
@@ -211,12 +220,12 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harne
       `${fixture}: the vendor answered ${capture.status}, the proxy ${ours.status}: ${ours.text.slice(0, 200)}`,
     );
 
-    const theirs = keyPaths(vendor, '', new Set());
-    const mine = keyPaths(ours.body, '', new Set());
+    const theirs = keyPaths(vendor);
+    const mine = keyPaths(ours.body);
     assert.equal(theirs.size, vendorPaths, `${fixture}: the frozen capture's shape changed`);
 
-    const onlyOurs = [...mine].filter((path) => !theirs.has(path)).sort();
-    const onlyVendor = [...theirs].filter((path) => !mine.has(path)).sort();
+    const onlyOurs = [...mine.keys()].filter((path) => !theirs.has(path)).sort();
+    const onlyVendor = new Map([...theirs].filter(([path]) => !mine.has(path)).sort());
 
     assert.deepEqual(onlyOurs, [], `${fixture}: the proxy reports fields the vendor does not`);
 
@@ -281,8 +290,7 @@ test('every declaration is exercised by a capture this gate replays', () => {
 
   const replayed = new Map();
   for (const { fixture, surface } of CAPTURES) {
-    const paths = new Set([...keyPaths(JSON.parse(load(fixture).body), '', new Set())]
-      .map((path) => path.replace(/:[a-z]+$/, '')));
+    const paths = new Set(keyPaths(JSON.parse(load(fixture).body)).values());
     for (const path of paths) replayed.set(`${surface} ${path}`, true);
   }
 

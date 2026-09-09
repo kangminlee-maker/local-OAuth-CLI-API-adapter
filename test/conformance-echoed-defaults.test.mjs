@@ -31,7 +31,7 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
-import { MINIMAL_SURFACES as SURFACES } from './replayed-captures.mjs';
+import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
@@ -59,6 +59,7 @@ test('the gate covers the surfaces it claims to, once each', () => {
 
 let started;
 const bodies = new Map();
+const dispatched = new Map();
 
 before(async () => {
   started = await startLocalApiProxy({
@@ -101,8 +102,16 @@ before(async () => {
       headers: { 'content-type': 'application/json' },
       body: capture.request,
     });
+    // What was actually put on the wire, not what the roster says was. A review
+    // repointed this loop at another capture and every check went on
+    // certifying the one the roster advertised.
+    dispatched.set(surface, createHash('sha256').update(capture.request).digest('hex'));
     bodies.set(surface, { status: res.status, body: await res.json() });
   }
+});
+
+test('what this gate replayed is what the registry names', () => {
+  assertRosterReplayed('minimal', dispatched);
 });
 
 after(async () => {
@@ -164,7 +173,7 @@ test('the captures this check reads are present and intact', () => {
 
 test('the readers distinguish a shape and a value that differ', () => {
   // Proven against known-opposite inputs before they are used on real bytes.
-  const paths = (value) => [...keyPaths(value, '', new Set())].sort();
+  const paths = (value) => [...keyPaths(value).keys()].sort();
   assert.deepEqual(paths({ a: { b: 1 } }), ['.a.b:number', '.a:object']);
   assert.deepEqual(paths({ a: [{ b: 1 }] }), ['.a:array', '.a[].b:number', '.a[]:object']);
   // An array's LENGTH is not shape, but something only one member carries is,
@@ -220,14 +229,43 @@ test('the readers distinguish a shape and a value that differ', () => {
   assert.equal(rootOf('.output[0].content[0].text'), 'output');
 });
 
+test('a key that looks like the reader\'s own syntax is read as a key', () => {
+  // The reader used to write structure into a string and parse it back out. A
+  // key literally spelled like a member signature was then read as one, and
+  // credited to a field it has nothing to do with; a key with a newline in it
+  // was not read at all, because the pattern's `.` does not span one. Both are
+  // constructions a review built. Quoting a key that is not a plain identifier
+  // is what makes the two unmistakable.
+  const odd = keyPaths({ 'a[]{-.b': 1, 'x\ny': 2, 'plain_1': 3 });
+  assert.deepEqual([...odd.keys()].sort(), ['.plain_1:number', '["a[]{-.b"]:number', '["x\\ny"]:number']);
+  // …and each still names the field it is about, which is itself.
+  assert.deepEqual([...odd.values()].sort(), ['.plain_1', '["a[]{-.b"]', '["x\\ny"]']);
+  // The real payloads carry none of these: an ordinary key is written plainly,
+  // so no declaration in `spec/declared-divergences.json` has to change.
+  assert.deepEqual([...keyPaths({ a: { b: 1 } }).keys()].sort(), ['.a.b:number', '.a:object']);
+});
+
+test('the reader stays cheap on a deeply nested body', () => {
+  // Each member's subtree used to be walked once for its own signature and
+  // again for the aggregate, which is exponential in depth. A review measured
+  // 3.5 seconds on a 191-byte body; the bound below is two orders of magnitude
+  // above what a single walk costs and an order below what the double walk did.
+  let deep = { leaf: 1 };
+  for (let level = 0; level < 23; level += 1) deep = { nested: [deep] };
+  const started = performance.now();
+  const paths = keyPaths(deep);
+  assert.ok(paths.size > 0, 'the probe read nothing, so it timed nothing');
+  assert.ok(performance.now() - started < 300, 'the reader is walking each subtree more than once');
+});
+
 test('a declared absence is credited only where our answer carries no such field', () => {
   // Known-opposite inputs for the credit rule, all three of them constructions
   // a review built and this reader used to accept.
   const declared = ['.a.x'];
   const credit = (vendor, ours, declaredPaths = declared, exempt = []) => {
-    const theirs = keyPaths(vendor, '', new Set());
-    const mine = keyPaths(ours, '', new Set());
-    const onlyVendor = [...theirs].filter((path) => !mine.has(path)).sort();
+    const theirs = keyPaths(vendor);
+    const mine = keyPaths(ours);
+    const onlyVendor = new Map([...theirs].filter(([path]) => !mine.has(path)).sort());
     return creditedAbsences(declaredPaths, exempt, onlyVendor, mine);
   };
   // The field really is gone: credited.
@@ -280,10 +318,10 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
     const answered = bodies.get(surface);
     assert.equal(answered.status, 200, `the proxy did not answer 200: ${JSON.stringify(answered.body).slice(0, 300)}`);
 
-    const vendorPaths = keyPaths(direct, '', new Set());
-    const ourPaths = keyPaths(answered.body, '', new Set());
-    const onlyVendor = [...vendorPaths].filter((path) => !ourPaths.has(path)).sort();
-    const onlyOurs = [...ourPaths].filter((path) => !vendorPaths.has(path)).sort();
+    const vendorPaths = keyPaths(direct);
+    const ourPaths = keyPaths(answered.body);
+    const onlyVendor = new Map([...vendorPaths].filter(([path]) => !ourPaths.has(path)).sort());
+    const onlyOurs = [...ourPaths.keys()].filter((path) => !vendorPaths.has(path)).sort();
     // Declarations name paths, not types: a path we do not report at all has no
     // type to declare. The tag stays in the messages, where it is what tells a
     // reader whether a difference is a missing field or a changed type.

@@ -102,23 +102,15 @@ export function valueDivergencesFor(surface) {
 }
 
 /**
- * The form a declaration is written in: no type tag, no trailing `[]`, and no
- * member-signature suffix.
+ * A key as it appears in a path.
  *
- * A declaration names a field. The reader emits paths a declaration would never
- * write — `…:type` for the type at a path, `…[]` for the types an array's
- * members take, and `…[]{-<relative path>}` for something some members carry
- * and others do not — and each belongs to a field: if we do not report
- * `choices[].logprobs.content` at all, we report nothing beneath it either, so
- * its member types are absent for the same declared reason, and a signature
- * saying one member goes without `.message.role` is about
- * `…[].message.role`. Signatures nest, so this unwraps until none is left.
+ * Ordinary keys — every key these two APIs actually send — are written plainly.
+ * Anything else is quoted, because a path is a string and the reader used to
+ * re-parse it: a key literally containing `[]{-` was read as the member
+ * signature it resembles, and a key containing a newline was not read at all.
+ * Quoting makes a key that looks like syntax unmistakably a key.
  */
-export function declarablePath(path) {
-  const signature = /^(.*?\[\])\{-(.+)\}$/.exec(path);
-  if (signature) return declarablePath(`${signature[1]}${signature[2]}`);
-  return path.replace(/:[a-z]+$/, '').replace(/\[\]$/, '');
-}
+const segmentFor = (key) => (/^[A-Za-z0-9_]+$/.test(key) ? `.${key}` : `[${JSON.stringify(key)}]`);
 
 /**
  * What answers for each path the vendor sent and we did not, and what nothing
@@ -149,8 +141,7 @@ export function declarablePath(path) {
  * before passing it.
  */
 export function creditedAbsences(declared, exempt, onlyVendorPaths, ourPaths) {
-  const ourFields = new Set();
-  for (const path of ourPaths) ourFields.add(declarablePath(path));
+  const ourFields = new Set(ourPaths.values());
   const ancestors = (field) => {
     const out = [field];
     let rest = field;
@@ -163,8 +154,8 @@ export function creditedAbsences(declared, exempt, onlyVendorPaths, ourPaths) {
       out.push(rest);
     }
   };
-  const owner = (path) => {
-    for (const candidate of ancestors(declarablePath(path))) {
+  const owner = (field) => {
+    for (const candidate of ancestors(field)) {
       if (declared.includes(candidate) && !ourFields.has(candidate)) return candidate;
     }
     return null;
@@ -172,12 +163,12 @@ export function creditedAbsences(declared, exempt, onlyVendorPaths, ourPaths) {
 
   const credited = new Set();
   const uncredited = [];
-  for (const path of onlyVendorPaths) {
+  for (const [path, field] of onlyVendorPaths) {
     if (exempt.includes(path)) {
       credited.add(path);
       continue;
     }
-    const found = owner(path);
+    const found = owner(field);
     if (found !== null) credited.add(found);
     else uncredited.push(path);
   }
@@ -197,8 +188,8 @@ export function creditedAbsences(declared, exempt, onlyVendorPaths, ourPaths) {
  * by this one.
  */
 export function expectedAbsentPaths(surface, vendorPaths) {
-  const untagged = new Set([...vendorPaths].map(declarablePath));
-  return absentPathsFor(surface).filter((path) => untagged.has(path));
+  const fields = new Set(vendorPaths.values());
+  return absentPathsFor(surface).filter((path) => fields.has(path));
 }
 
 // Values that differ on every call by construction — identifiers, clocks, the
@@ -217,57 +208,70 @@ export const PER_CALL = new Set([
 export const jsonType = (value) => (value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value);
 
 /**
- * Every key path in a value, TAGGED with the JSON type at that path, arrays
- * collapsed to `[]` so item count is not shape.
+ * Every path in a value, TAGGED with the JSON type there, arrays collapsed to
+ * `[]` so item count is not shape — mapped to the FIELD each path is about.
  *
  * The type tag is load-bearing. Without it an empty container and a `null`
  * occupy the same path and contribute no children, so a default that changed
  * from `metadata: {}` to `metadata: null` — a difference every client sees —
  * left both key sets identical and no value to compare.
+ *
+ * Two things the union of an array's member paths cannot say are recorded as
+ * paths of their own: the TYPES the members take, and anything a member goes
+ * WITHOUT that a sibling carries. Three reviews built the constructions that
+ * forced each: a second choice answered as `null`, then as `{}`, then keeping
+ * its own keys with its `message` emptied. So a member's signature is its whole
+ * path set, at any depth. Uniform absence is deliberately not recorded — it is
+ * already missing from the union, which is where a declaration answers for it.
+ *
+ * Member ORDER is not shape: which items a turn contains varies by
+ * construction, so a signature records that a member went without something,
+ * not which member it was. That is a known limit, not an oversight: moving a
+ * field from one member to another leaves both sides' signatures equal. It is
+ * written up as a design task rather than patched here, because telling members
+ * apart needs an identity rule this reader does not have.
+ *
+ * The map's VALUE is the field the path is about, computed here where the
+ * structure is known rather than parsed back out of the string later. A key
+ * that looks like the reader's own syntax used to be read as syntax.
  */
-export function keyPaths(value, prefix, out) {
+function pathsWithin(value) {
+  const out = new Map();
   if (Array.isArray(value)) {
-    // What the union of member paths cannot say is whether the members AGREE.
-    // A review answered the second choice as `{}` — an object like the first,
-    // contributing no paths of its own — and the union was unchanged: a choice
-    // with no message and no index, invisible to both gates. The next review
-    // did it one level down, leaving the choice's own keys and emptying its
-    // `message`, which a signature of immediate keys could not see. So each
-    // member's WHOLE path set is compared against its siblings', and anything a
-    // member goes without becomes a path.
-    //
-    // Uniform absence is deliberately not recorded: something no member has is
-    // already missing from the union, which is where a declaration answers for
-    // it, and recording it twice would make every declared absence look like a
-    // disagreement between our own members.
-    const within = value.map((item) => (
-      item !== null && typeof item === 'object' && !Array.isArray(item) ? keyPaths(item, '', new Set()) : null
-    ));
-    const shared = new Set();
-    for (const paths of within) if (paths) for (const path of paths) shared.add(path);
+    // Each member's subtree is walked ONCE and used twice — for the signature
+    // and for the aggregate. Walking it again per use made a 191-byte body of
+    // nested singleton arrays take three and a half seconds.
+    const within = value.map((item) => pathsWithin(item));
+    const isMember = value.map((item) => item !== null && typeof item === 'object' && !Array.isArray(item));
+    const shared = new Map();
+    for (const [index, paths] of within.entries()) {
+      if (isMember[index]) for (const [path, field] of paths) shared.set(path, field);
+    }
     value.forEach((item, index) => {
-      // The TYPES an array's members take are shape, even though their count is
-      // not. Without this line the union of member paths is all a reader sees,
-      // so a second choice answered as `null` — which every SDK reads as a
-      // missing message — contributed nothing and hid behind the first choice's
-      // paths. A review planted exactly that and both gates passed.
-      out.add(`${prefix}[]:${jsonType(item)}`);
-      const paths = within[index];
-      // Member ORDER is deliberately not shape: which items a turn contains
-      // varies by construction, so this records that a member went without the
-      // path, not which member it was.
-      if (paths) for (const path of shared) if (!paths.has(path)) out.add(`${prefix}[]{-${path}}`);
-      keyPaths(item, `${prefix}[]`, out);
+      out.set(`[]:${jsonType(item)}`, '');
+      if (isMember[index]) {
+        for (const [path, field] of shared) {
+          if (!within[index].has(path)) out.set(`[]{-${path}}`, `[]${field}`);
+        }
+      }
+      for (const [path, field] of within[index]) out.set(`[]${path}`, `[]${field}`);
     });
     return out;
   }
   if (value !== null && typeof value === 'object') {
     for (const [key, member] of Object.entries(value)) {
-      out.add(`${prefix}.${key}:${jsonType(member)}`);
-      keyPaths(member, `${prefix}.${key}`, out);
+      const segment = segmentFor(key);
+      out.set(`${segment}:${jsonType(member)}`, segment);
+      for (const [path, field] of pathsWithin(member)) out.set(`${segment}${path}`, `${segment}${field}`);
     }
-    return out;
   }
+  return out;
+}
+
+/** The paths in a value, each mapped to the field it is about. */
+export function keyPaths(value, prefix = '') {
+  const out = new Map();
+  for (const [path, field] of pathsWithin(value)) out.set(`${prefix}${path}`, `${prefix}${field}`);
   return out;
 }
 
