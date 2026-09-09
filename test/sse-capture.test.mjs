@@ -65,6 +65,10 @@ test('a refused stream is recorded with its body, not thrown away in a message',
   await assert.rejects(() => read(url), (error) => {
     assert.ok(error instanceof SseTransportError, `threw ${error?.name}`);
     assert.equal(error.status, 400);
+    // Whole, not the truncation the message carries: a prober treats a refusal
+    // as the answer it asked for, and reading it back off disk is the thing
+    // this field exists to avoid.
+    assert.equal(error.body, '{"error":{"message":"nope","code":"probe_refused"}}');
     return true;
   });
 
@@ -141,6 +145,29 @@ test('a whole stream is recorded once, with the terminator', async () => {
   assert.match(record.stream.text, /^data: \[DONE\]$/m);
 });
 
+test('a good stream ending mid-character records what the callback saw', async () => {
+  // The other half of the flush, and the half no case reached: case #3 asserts
+  // `record.stream.text === rawStream` but its stream ends on a blank line, so
+  // the tail is empty and the assertion holds with the flush removed. This one
+  // ends INSIDE a character, where the frame callback is handed a replacement
+  // character that the record used to go without.
+  const url = await serving((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"n":1}\n\n');
+    res.end(Buffer.from([0xed]));
+  });
+  const run = capturing();
+  const frames = [];
+
+  const { rawStream } = await read(url, (frame) => frames.push(frame));
+  assert.deepEqual(frames, ['data: {"n":1}', '\uFFFD']);
+
+  const record = soleRecord(run);
+  assert.equal(record.stream.text, rawStream);
+  assert.equal(record.stream.text, 'data: {"n":1}\n\n\uFFFD',
+    'the callback was handed a character the record does not hold');
+});
+
 test('a request that never reached a response is recorded too', async () => {
   // The connection is reset before the head is written, so `fetch` itself
   // throws and there is no response to describe. Recording nothing here reads
@@ -210,10 +237,31 @@ test('a long refusal is truncated in the message and kept whole in the record', 
   await assert.rejects(() => read(url), (error) => {
     const shown = error.message.slice(`${url} 400: `.length);
     assert.equal(shown, `${body.slice(0, 2000)}...`, 'the message is not cut where the runner cuts');
+    assert.equal(error.body, body, 'the error carries the cut body rather than the whole one');
     return true;
   });
 
   assert.equal(soleRecord(run).stream.text, body, 'the record lost bytes the message had to drop');
+});
+
+test('a whole refusal ending mid-character says the same thing twice', async () => {
+  // The message is built from `rawStream` BEFORE the exit flush runs, so the
+  // refusal branch has to flush its own decoder. Without that the thrown
+  // message is a character shorter than the record — one body, described two
+  // ways, which is the shape this file exists to remove.
+  const url = await serving((req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(Buffer.from([0x7b, 0x22, 0x65, 0x22, 0x3a, 0x22, 0xed]));
+  });
+  const run = capturing();
+
+  let thrown;
+  await assert.rejects(() => read(url), (error) => { thrown = error; return true; });
+
+  const record = soleRecord(run);
+  assert.equal(record.stream.text, '{"e":"\uFFFD');
+  assert.equal(thrown.body, record.stream.text, 'the caller and the record disagree about one body');
+  assert.equal(thrown.message, `${url} 400: ${record.stream.text}`);
 });
 
 test('a refusal cut off mid-body keeps the bytes that arrived', async () => {

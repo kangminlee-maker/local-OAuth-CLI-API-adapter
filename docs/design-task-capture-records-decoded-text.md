@@ -1,9 +1,12 @@
 # Design task: a capture record holds decoded text, not the bytes that arrived
 
 **Status:** open, filed 2026-09-10. **Scope:** `encodeBody` in
-`scripts/lib/capture-recorder.mjs`, every record it writes, and the two things
-that read those records back — `spec/captures/*.json` and its provenance
-binding, and `scripts/lib/sse-capture.mjs`.
+`scripts/lib/capture-recorder.mjs` and every record it writes; the two other
+places a byte count is derived from decoded text — `scripts/promote-capture.mjs`
+(`streamBytes`/`bodyBytes`, re-derived onto a fixture) and
+`scripts/probe-direct-api.mjs` (the buffered branch, passing `res.text()` output
+in as a body); and `scripts/lib/sse-capture.mjs`, which is where the question
+first became visible.
 
 Filed from the second seat of the first confirmation round on PR #28
 (`review-artifacts/batch2-review-codex2/dist/batch2/REPORT.md`, the MED
@@ -15,8 +18,21 @@ asked afterwards.
 
 `recordExchange` takes `streamBytes` as a STRING. `encodeBody` then derives the
 record's `bytes` and `sha256` from the UTF-8 encoding of that string. Every
-capture in `spec/captures/` has that shape, and the provenance binding hashes
-it.
+capture in `spec/captures/` has that shape: `promote-capture.mjs` re-derives the
+count and digest onto the fixture, and the three gates re-derive the digest again
+on every run.
+
+The provenance binding does NOT hash it. `scripts/lib/capture-provenance.mjs`
+binds the promoter's own source blobs to a committed revision — `git cat-file`,
+`merge-base --is-ancestor`, `rev-parse <rev>:<path>` — and the string `sha256`
+does not appear in it. That distinction is the point of the binding: a fixture's
+own digest proves it has not drifted and says nothing about what wrote it.
+Getting it wrong here would overstate the migration below.
+
+And the count has no reader. Nothing in this repository reads `streamBytes` or
+`bodyBytes` back: 45 fixtures carry them, and the gates check only the digests.
+So the cost of changing the shape is the writers and the migration, not a set of
+consumers that would have to be taught a second representation.
 
 The transport therefore has to decode before it records. `TextDecoder` with
 `{stream: true}` holds back the first byte of a multi-byte character until the
@@ -48,8 +64,9 @@ Two directions, neither chosen:
   reads today's records changes; the cost is two representations of one thing,
   which is a thing that can disagree with itself.
 - **Bytes as the record, text as a view.** `encodeBody` takes bytes, and `text`
-  becomes a decoding computed on read. Honest, and it touches every fixture and
-  the provenance digests that bind them.
+  becomes a decoding computed on read. Honest, and it touches every fixture,
+  `promote-capture.mjs`, and the three gates' digest re-derivation — 45 fixtures,
+  one promoter, three gates, and no consumer of the count itself.
 
 ## What would close it
 

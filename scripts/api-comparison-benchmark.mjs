@@ -3745,8 +3745,11 @@ function stripUndefined(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function truncate(value) {
-  return value.length > 2000 ? `${value.slice(0, 2000)}...` : value;
+// The limit is a parameter because one call site already passes one. It was
+// declared without it and the argument was discarded in silence, so a payload
+// asked for at 500 characters was cut at 2000.
+function truncate(value, limit = 2000) {
+  return value.length > limit ? `${value.slice(0, limit)}...` : value;
 }
 
 function elapsed(startedAt) {

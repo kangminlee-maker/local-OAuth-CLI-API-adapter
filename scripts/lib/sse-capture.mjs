@@ -23,12 +23,21 @@ import { recordExchange } from './capture-recorder.mjs';
  */
 const truncate = (text, limit = 2000) => (text.length > limit ? `${text.slice(0, limit)}...` : text);
 
-/** A transport failure that already carries its status, so a caller need not re-read the response. */
+/**
+ * A transport failure that already carries its status and its whole body, so a
+ * caller need not re-read a response that has been consumed.
+ *
+ * `body` is the untruncated bytes; `message` carries only as much of them as a
+ * diagnostic should. A caller that treats a refusal as an OBSERVATION rather
+ * than a failure — a prober asking what the vendor says to a bad request — needs
+ * the whole thing, and the alternative is reading the record back off disk.
+ */
 export class SseTransportError extends Error {
-  constructor(message, status) {
+  constructor(message, status, body = '') {
     super(message);
     this.name = 'SseTransportError';
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -113,11 +122,11 @@ export async function readRecordedSse({ url, request, timeoutMs, label, startedA
           throw error;
         }
       }
-      throw new SseTransportError(`${url} ${res.status}: ${truncate(rawStream)}`, res.status);
+      throw new SseTransportError(`${url} ${res.status}: ${truncate(rawStream)}`, res.status, rawStream);
     }
     if (!res.body) {
       failure = `${url} did not return a readable stream`;
-      throw new SseTransportError(failure, res.status);
+      throw new SseTransportError(failure, res.status, '');
     }
 
     const reader = res.body.getReader();
