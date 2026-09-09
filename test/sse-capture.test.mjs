@@ -36,6 +36,20 @@ function capturing() {
   };
 }
 
+/**
+ * The one record this call must have left — and proof that it left exactly one.
+ *
+ * `const [record] = run.records()` reads the first of however many there are, so
+ * every assertion built on it passes a helper that records twice. The count is
+ * the guarantee under test on EVERY exit, not only the good one: a second
+ * recording makes a run's exchange count a lie.
+ */
+function soleRecord(run) {
+  const records = run.records();
+  assert.equal(records.length, 1, `recorded ${records.length} exchanges for one call`);
+  return records[0];
+}
+
 const request = { headers: { 'content-type': 'application/json' }, body: '{"probe":1}' };
 const read = (url, onFrame = () => {}) => readRecordedSse({
   url, request, timeoutMs: 5000, label: 'probe', startedAt: performance.now(), onFrame,
@@ -54,8 +68,7 @@ test('a refused stream is recorded with its body, not thrown away in a message',
     return true;
   });
 
-  const [record] = run.records();
-  assert.ok(record, 'the refusal recorded nothing at all');
+  const record = soleRecord(run);
   assert.equal(record.status, 400);
   // The body is the evidence for an error-parity row, and it is here whole
   // rather than truncated into the error message.
@@ -78,8 +91,7 @@ test('a stream that dies halfway is recorded with the bytes that arrived', async
 
   await assert.rejects(() => read(url, (frame) => frames.push(frame)));
 
-  const [record] = run.records();
-  assert.ok(record, 'the broken stream recorded nothing at all');
+  const record = soleRecord(run);
   assert.equal(record.status, 200);
   // What arrived is what a reader needs to see why it stopped: the completed
   // frame, and the partial one that never finished.
@@ -87,6 +99,24 @@ test('a stream that dies halfway is recorded with the bytes that arrived', async
   assert.match(record.stream.text, /"n":2/);
   assert.ok(record.error, 'a broken stream recorded no error');
   assert.deepEqual(frames, ['data: {"n":1}'], 'a partial frame was handed on as if complete');
+});
+
+test('a stream cut inside a character records that something arrived', async () => {
+  // The first byte of a multi-byte character, then nothing. A streaming decoder
+  // holds that byte back waiting for the rest, so the exit path that skips the
+  // flush recorded the empty string — a turn that reads afterwards as one where
+  // nothing arrived at all, which is the opposite of what happened.
+  const url = await serving((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(Buffer.from([0xed]), () => setTimeout(() => res.socket.destroy(), 10));
+  });
+  const run = capturing();
+
+  await assert.rejects(() => read(url));
+
+  const record = soleRecord(run);
+  assert.equal(record.status, 200);
+  assert.equal(record.stream.text, '\uFFFD', 'a byte arrived and the record says none did');
 });
 
 test('a whole stream is recorded once, with the terminator', async () => {
@@ -103,15 +133,12 @@ test('a whole stream is recorded once, with the terminator', async () => {
   assert.equal(status, 200);
   assert.deepEqual(frames, ['data: {"n":1}', 'data: {"n":2}', 'data: [DONE]']);
 
-  const records = run.records();
-  // Exactly one: the `finally` records every exit, so a success path that also
-  // recorded at the end would leave two and make a run's exchange count a lie.
-  assert.equal(records.length, 1, `recorded ${records.length} exchanges for one call`);
-  assert.equal(records[0].error, null);
+  const record = soleRecord(run);
+  assert.equal(record.error, null);
   // The terminator lives in the wire text and nowhere else — it is the matrix's
   // highest-risk cell, and a parsed event list cannot say whether it was sent.
-  assert.equal(records[0].stream.text, rawStream);
-  assert.match(records[0].stream.text, /^data: \[DONE\]$/m);
+  assert.equal(record.stream.text, rawStream);
+  assert.match(record.stream.text, /^data: \[DONE\]$/m);
 });
 
 test('a request that never reached a response is recorded too', async () => {
@@ -124,14 +151,16 @@ test('a request that never reached a response is recorded too', async () => {
 
   await assert.rejects(() => read(url));
 
-  const [record] = run.records();
-  assert.ok(record, 'a reset connection recorded nothing at all');
+  const record = soleRecord(run);
   assert.equal(record.status, null);
   assert.equal(record.request.text, request.body);
   assert.ok(record.error, 'a reset connection recorded no error');
 });
 
-test('a 200 with no readable body is recorded rather than thrown past', async () => {
+test('a 200 whose stream carries nothing is recorded as the empty turn it was', async () => {
+  // A body that is present and empty, which is what `res.end()` on a 200 sends.
+  // It is NOT the missing-body case below: naming it that made the guard for
+  // that case look tested when nothing reached it.
   const url = await serving((req, res) => {
     res.writeHead(200, { 'content-type': 'text/event-stream' });
     res.end();
@@ -139,7 +168,69 @@ test('a 200 with no readable body is recorded rather than thrown past', async ()
   const run = capturing();
   const { rawStream } = await read(url);
   assert.equal(rawStream, '');
-  const records = run.records();
-  assert.equal(records.length, 1);
-  assert.equal(records[0].status, 200);
+  const record = soleRecord(run);
+  assert.equal(record.status, 200);
+  assert.equal(record.stream.text, '');
+});
+
+test('a success with no body at all is refused, and recorded', async () => {
+  // 204 is `res.ok`, so it walks past the refusal branch and reaches the guard
+  // that has no stream to read. Reaching it is the point: read as an empty
+  // stream instead, it would look like a turn the vendor answered with nothing.
+  const url = await serving((req, res) => {
+    res.writeHead(204);
+    res.end();
+  });
+  const run = capturing();
+
+  await assert.rejects(() => read(url), (error) => {
+    assert.ok(error instanceof SseTransportError, `threw ${error?.name}`);
+    assert.equal(error.status, 204);
+    assert.match(error.message, /did not return a readable stream/);
+    return true;
+  });
+
+  const record = soleRecord(run);
+  assert.equal(record.status, 204);
+  assert.match(record.error, /did not return a readable stream/);
+});
+
+test('a long refusal is truncated in the message and kept whole in the record', async () => {
+  // The two halves of the same rule. The message is a diagnostic and is cut to
+  // the length the runner's buffered path cuts to — the extraction shortened it
+  // to a fifth of that, which drops the end of a body where the vendor's code
+  // often is. The record is evidence and is never cut at all.
+  const body = `{"error":{"message":"${'x'.repeat(2400)}","code":"probe_long"}}`;
+  const url = await serving((req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(body);
+  });
+  const run = capturing();
+
+  await assert.rejects(() => read(url), (error) => {
+    const shown = error.message.slice(`${url} 400: `.length);
+    assert.equal(shown, `${body.slice(0, 2000)}...`, 'the message is not cut where the runner cuts');
+    return true;
+  });
+
+  assert.equal(soleRecord(run).stream.text, body, 'the record lost bytes the message had to drop');
+});
+
+test('a refusal cut off mid-body keeps the bytes that arrived', async () => {
+  // The mirror of the broken stream above. `res.text()` resolves only on a
+  // whole body, so this exit used to record the empty string — a refusal that
+  // reads afterwards as one the vendor sent no reason for.
+  const url = await serving((req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.write('{"error":{"message":"cut', () => setTimeout(() => res.socket.destroy(), 10));
+  });
+  const run = capturing();
+
+  await assert.rejects(() => read(url));
+
+  const record = soleRecord(run);
+  assert.equal(record.status, 400);
+  assert.equal(record.stream.text, '{"error":{"message":"cut');
+  assert.match(record.error, /400/);
+  assert.match(record.error, /body interrupted/);
 });

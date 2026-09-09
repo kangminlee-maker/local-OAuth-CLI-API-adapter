@@ -15,8 +15,13 @@
 // does not: the capture path is what the conformance suite consumes.
 import { recordExchange } from './capture-recorder.mjs';
 
-/** Enough of a body to read in an error message, without carrying the whole turn. */
-const truncate = (text, limit = 400) => (text.length > limit ? `${text.slice(0, limit)}…` : text);
+/**
+ * Enough of a body to read in an error message, without carrying the whole turn.
+ * The limit and the ellipsis are the runner's own, so a message this throws reads
+ * the same as one from the buffered path beside it — an extraction that quietly
+ * shortened a diagnostic would be a behaviour change wearing a refactor's name.
+ */
+const truncate = (text, limit = 2000) => (text.length > limit ? `${text.slice(0, limit)}...` : text);
 
 /** A transport failure that already carries its status, so a caller need not re-read the response. */
 export class SseTransportError extends Error {
@@ -44,9 +49,21 @@ export async function readRecordedSse({ url, request, timeoutMs, label, startedA
   let rawStream = '';
   let failure = null;
   let recorded = false;
+  // One decoder for whichever branch reads a body, so the flush below can reach
+  // what it is still holding. `decode(chunk, {stream: true})` returns nothing
+  // for the first byte of a multi-byte character and waits for the rest; a
+  // stream cut there used to record the empty string, which reads afterwards as
+  // a turn where nothing arrived rather than one cut mid-character.
+  const decoder = new TextDecoder();
   const record = () => {
     if (recorded) return;
     recorded = true;
+    // Whatever the decoder is still holding, as the replacement character it is.
+    // A second call returns '' , so the good path — which has already flushed —
+    // is unaffected. The exact bytes would need a record that can carry binary,
+    // which every promoted fixture's shape depends on: see
+    // docs/design-task-capture-records-decoded-text.md.
+    rawStream += decoder.decode();
     recordExchange({
       kind: 'sse',
       label,
@@ -76,8 +93,26 @@ export async function readRecordedSse({ url, request, timeoutMs, label, startedA
     });
 
     if (!res.ok) {
-      rawStream = await res.text();
       failure = `${url} ${res.status}`;
+      // Read the refusal the way a good stream is read, chunk by chunk into
+      // `rawStream`. `res.text()` resolves only when the whole body has arrived,
+      // so a refusal whose connection drops mid-body recorded an empty string —
+      // the same evidence loss this file exists to remove, surviving on the
+      // other side of the branch.
+      if (res.body) {
+        const reader = res.body.getReader();
+        try {
+          while (true) {
+            const read = await reader.read();
+            if (read.done) break;
+            rawStream += decoder.decode(read.value, { stream: true });
+          }
+          rawStream += decoder.decode();
+        } catch (error) {
+          failure = `${failure}, body interrupted: ${String(error?.message ?? error)}`;
+          throw error;
+        }
+      }
       throw new SseTransportError(`${url} ${res.status}: ${truncate(rawStream)}`, res.status);
     }
     if (!res.body) {
@@ -86,7 +121,6 @@ export async function readRecordedSse({ url, request, timeoutMs, label, startedA
     }
 
     const reader = res.body.getReader();
-    const decoder = new TextDecoder();
     let buffer = '';
     while (true) {
       const read = await reader.read();
@@ -100,7 +134,13 @@ export async function readRecordedSse({ url, request, timeoutMs, label, startedA
         buffer = buffer.slice(index + 2);
       }
     }
-    buffer += decoder.decode();
+    // The flush goes to both: `buffer` so a final frame is handed on, and
+    // `rawStream` because that is what the record and the terminator gate read.
+    // It used to reach only `buffer`, so a good stream ending mid-character was
+    // recorded a byte short of what the frame callback had already seen.
+    const tail = decoder.decode();
+    rawStream += tail;
+    buffer += tail;
     const finalFrame = buffer.trim();
     if (finalFrame) onFrame(finalFrame);
   } catch (error) {
