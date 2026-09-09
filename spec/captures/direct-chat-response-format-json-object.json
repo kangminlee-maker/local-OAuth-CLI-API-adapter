@@ -1,0 +1,33 @@
+{
+  "claimEvidence": "direct-chat-response-format-json-object",
+  "originRoot": "artifacts/direct-api-captures",
+  "originRun": "a77a5779-c2dd-451c-92a9-ce5daed42779",
+  "originFile": "0022-echo-response_format-json_object.json",
+  "promotedAt": "2026-09-09T14:37:52.071Z",
+  "requiredContent": {
+    "mustContain": null,
+    "mustNotContain": null,
+    "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with a JSON object {\\\"ok\\\":true}\"}],\"max_completion_tokens\":32,\"reasoning_effort\":\"none\",\"response_format\":{\"type\":\"json_object\"}}"
+  },
+  "promotedFrom": {
+    "revision": "dd92b386cf75df7d07ce1a9f958d8ffaf70a1d3a",
+    "sources": [
+      {
+        "path": "scripts/lib/capture-provenance.mjs",
+        "blob": "cdfaf9f32fef52eac3b97e7f43602c036153f7d6"
+      },
+      {
+        "path": "scripts/promote-capture.mjs",
+        "blob": "ed5a0dbc6f07ca6440c9a4d2bcef11051b65f8b2"
+      }
+    ]
+  },
+  "url": "https://api.openai.com/v1/chat/completions",
+  "status": 200,
+  "kind": "json",
+  "requestSha256": "e77f1bdd9c59fe0701728fde400478f1efb511bb4938d91dcd5902475670ddc9",
+  "request": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with a JSON object {\\\"ok\\\":true}\"}],\"max_completion_tokens\":32,\"reasoning_effort\":\"none\",\"response_format\":{\"type\":\"json_object\"}}",
+  "bodySha256": "fe69d02d34295509afa7b73819116894a1c56f28169c50ed0c6aab5d5f1ad17d",
+  "bodyBytes": 807,
+  "body": "{\n  \"id\": \"chatcmpl-EIViwlIPyG6kGsHf5KRZxlQMRwhSR\",\n  \"object\": \"chat.completion\",\n  \"created\": 1788080558,\n  \"model\": \"gpt-5.6-terra\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"{\\\"ok\\\":true}\",\n        \"refusal\": null,\n        \"annotations\": []\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 16,\n    \"completion_tokens\": 11,\n    \"total_tokens\": 27,\n    \"prompt_tokens_details\": {\n      \"cached_tokens\": 0,\n      \"cache_write_tokens\": 0,\n      \"audio_tokens\": 0\n    },\n    \"completion_tokens_details\": {\n      \"reasoning_tokens\": 0,\n      \"audio_tokens\": 0,\n      \"accepted_prediction_tokens\": 0,\n      \"rejected_prediction_tokens\": 0\n    }\n  },\n  \"service_tier\": \"default\",\n  \"system_fingerprint\": null\n}\n"
+}

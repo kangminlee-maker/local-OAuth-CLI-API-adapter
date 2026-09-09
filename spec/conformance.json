@@ -3,12 +3,12 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "ee3684d7ee6408741df1fad8b749a817bb4048e2855fe46ec11f607bc7eb2bbc",
+    "matrixDigest": "969b2c3add1e0e51e10bfc5231b661d9cf7da2e5abeba5904c663ce32ba9cdbe",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
     "claims": 148,
-    "claimsOutsideLegendVocabulary": 98,
+    "claimsOutsideLegendVocabulary": 99,
     "claimsWithLiveParityRow": 134,
     "routes": 11,
     "surfaces": 6,
@@ -158,6 +158,24 @@
       "surface": "/v1/responses",
       "evidence": "docs/conformance-matrix.md §5.5.9",
       "measuredAt": "2026-08-29"
+    },
+    {
+      "id": "chat-logprobs-are-not-produced",
+      "surface": "/v1/chat/completions",
+      "evidence": "spec/captures/direct-chat-logprobs-effort-none.json; docs/conformance-matrix.md row 22",
+      "measuredAt": "2026-09-09"
+    },
+    {
+      "id": "responses-tool-echo-is-not-canonicalised",
+      "surface": "/v1/responses",
+      "evidence": "spec/captures/direct-responses-tools-parallel-false.json",
+      "measuredAt": "2026-09-09"
+    },
+    {
+      "id": "responses-reasoning-summary-alias-is-not-resolved",
+      "surface": "/v1/responses",
+      "evidence": "spec/captures/direct-responses-reasoning-summary-auto.json; docs/conformance-matrix.md R-22",
+      "measuredAt": "2026-09-09"
     }
   ],
   "claims": [
@@ -635,12 +653,12 @@
       "vendor": {
         "valueSpace": "boolean",
         "defaultWhenOmitted": "`false` (caveat)",
-        "observableEffect": "populates `choices[].logprobs`",
+        "observableEffect": "populates `choices[].logprobs` — one entry per token with its `logprob`, its UTF-8 `bytes` and an empty `top_logprobs`, measured 2026-09-09 (`spec/captures/direct-chat-logprobs-effort-none.json`)",
         "invalidValue": "400 / `invalid_request_error` / `logprobs` / —"
       },
       "claimedLead": "refused",
       "claimedLeadInLegend": false,
-      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`); at `reasoning_effort: none` it is accepted and not applied — the response carries no `logprobs`, which the contract states",
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`); at `reasoning_effort: none` it is accepted and not applied — the choice carries no `logprobs` key at all, declared in `spec/declared-divergences.json` and compared against the capture by `conformance-supplied-echo.test`",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (§5.5.5)",
       "liveParityRow": true
@@ -1514,13 +1532,13 @@
       "field": "`top_logprobs`",
       "vendor": {
         "valueSpace": "integer 0-20",
-        "defaultWhenOmitted": "`null` (doc)",
-        "observableEffect": "logprobs on output text",
+        "defaultWhenOmitted": "**`0`** on the wire (P-1), not the doc's `null`",
+        "observableEffect": "logprobs on output text; the output-text content carries a `logprobs` member either way",
         "invalidValue": "400 / `invalid_request_error` / `top_logprobs` / —"
       },
-      "claimedLead": "ignored",
+      "claimedLead": "refused",
       "claimedLeadInLegend": false,
-      "claimedNote": "ignored; echoed as **`0`** (`http-server.ts:2024`) where the provider echoes `null`",
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`, same sentence as `include`); at `reasoning.effort: none` accepted and echoed as supplied, and not applied — measured 2026-09-09 (`spec/captures/direct-responses-top-logprobs-effort-none.json`, replayed by `conformance-supplied-echo.test`). Until that capture this surface refused it at every effort while Chat accepted it at `none`: one proxy, two answers to one request",
       "evidenceGrade": "DOC",
       "evidenceNote": "DOC",
       "liveParityRow": true
@@ -1694,9 +1712,9 @@
         "observableEffect": ">1 call per turn",
         "invalidValue": "400 / `invalid_request_error` / `parallel_tool_calls` / —"
       },
-      "claimedLead": "divergent",
-      "claimedLeadInLegend": true,
-      "claimedNote": "**divergent**: ignored **and** echoed as a hard `true` (`http-server.ts:2011`) even when the client sent `false`",
+      "claimedLead": "ignored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "ignored, but **mirrored**: `false` comes back as `false` (`http-server.ts:2386`), which `conformance-supplied-echo.test` compares against the direct API's own echo. This cell read \"echoed as a hard `true` even when the client sent `false`\" until 2026-09-09, when the replay showed both sides sending `false` — the note had outlived the code",
       "evidenceGrade": "DOC",
       "evidenceNote": "DOC",
       "liveParityRow": true
@@ -1734,13 +1752,13 @@
       "field": "`reasoning.summary`",
       "vendor": {
         "valueSpace": "`auto`|`concise`|`detailed`",
-        "defaultWhenOmitted": "`null`",
+        "defaultWhenOmitted": "`null`; **`auto` is echoed back as `detailed`** — the direct API resolves the alias (measured once, at `effort: low`, 2026-09-09, `spec/captures/direct-responses-reasoning-summary-auto.json`; that turn carried no summary either)",
         "observableEffect": "adds `summary` parts to the `reasoning` output item",
         "invalidValue": "400 / `invalid_request_error` / `reasoning.summary` / —"
       },
       "claimedLead": "silently ignored",
       "claimedLeadInLegend": true,
-      "claimedNote": "**silently ignored** — the proxy never emits reasoning summaries; a client that asked for `detailed` gets an empty/absent summary with no error",
+      "claimedNote": "**silently ignored** — the proxy never emits reasoning summaries; a client that asked for `detailed` gets an empty/absent summary with no error. The echo is not resolved either: `auto` comes back as `auto`, declared in `spec/declared-divergences.json` rather than mirrored, because one sample of one alias at one effort is not an alias table",
       "evidenceGrade": "DOC",
       "evidenceNote": "DOC",
       "liveParityRow": true

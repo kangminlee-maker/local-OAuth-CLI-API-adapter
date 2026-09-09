@@ -1077,23 +1077,36 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
   // the model can do and not about the shape of the body. Both doors to them
   // are refused; the proxy used to accept the `include` member and run the
   // turn, answering with no logprobs in it at all.
+  //
+  // These refusals are about what the model can do WHILE IT REASONS, and at
+  // `effort: none` it does not. Chat has always read it that way; this surface
+  // refused unconditionally until a promoted capture showed the direct API
+  // answering 200 to `top_logprobs` at `effort: none`
+  // (`spec/captures/direct-responses-top-logprobs-effort-none.json`), which
+  // made the two surfaces of one proxy disagree about one request.
+  //
+  // A plain read, not the validated one: `reasoning` reports its own fault at
+  // its own position above, and this pass runs after it.
+  const reasons = asRecord(input.reasoning)?.effort !== 'none';
   rejectUnsupportedOpenAiSampling(input, 'openai-responses', 'temperature');
   rejectUnsupportedOpenAiSampling(input, 'openai-responses', 'top_p');
-  // `include` first: sent together, the direct API names that door (measured).
-  if (Array.isArray(input.include) && input.include.includes('message.output_text.logprobs')) {
-    throw unsupportedParameter('include', 'logprobs are not supported with reasoning models.');
-  }
-  if (present('top_logprobs')) {
-    throw unsupportedParameter('top_logprobs', 'logprobs are not supported with reasoning models.');
-  }
-  for (const key of ['presence_penalty', 'frequency_penalty'] as const) {
-    // Chat carries `unsupported_parameter` here; Responses carries no code at
-    // all for the same sentence (measured on both).
-    if (present(key)) {
-      throw new ProxyRequestError(
-        `Unsupported parameter: '${key}' is not supported with this model.`,
-        400, 'openai', 'invalid_request_error', key,
-      );
+  if (reasons) {
+    // `include` first: sent together, the direct API names that door (measured).
+    if (Array.isArray(input.include) && input.include.includes('message.output_text.logprobs')) {
+      throw unsupportedParameter('include', 'logprobs are not supported with reasoning models.');
+    }
+    if (present('top_logprobs')) {
+      throw unsupportedParameter('top_logprobs', 'logprobs are not supported with reasoning models.');
+    }
+    for (const key of ['presence_penalty', 'frequency_penalty'] as const) {
+      // Chat carries `unsupported_parameter` here; Responses carries no code at
+      // all for the same sentence (measured on both).
+      if (present(key)) {
+        throw new ProxyRequestError(
+          `Unsupported parameter: '${key}' is not supported with this model.`,
+          400, 'openai', 'invalid_request_error', key,
+        );
+      }
     }
   }
 }

@@ -99,6 +99,56 @@
       "why": "Measured 2026-08-29 (P-1, `spec/captures/direct-responses-minimal.json`). One observed value is not a value space: nothing here has measured what other modes exist, what selects them, or whether the member is even accepted on the request, and no matrix row describes it (`reasoning.context` is R-23, `summary` R-22, `generate_summary` R-24 — `mode` has none). Echoing a constant `standard` would publish a claim about a mode system this proxy has never measured and does not implement. `reasoning.context` went the other way in the same measurement and IS mirrored, because it is a member the request may carry and the echo is mechanical.",
       "measuredAt": "2026-08-29",
       "evidence": "docs/conformance-matrix.md §5.5.9"
+    },
+    {
+      "id": "chat-logprobs-are-not-produced",
+      "surface": "/v1/chat/completions",
+      "claim": "supplied-echo",
+      "absentPaths": [
+        ".choices[].logprobs",
+        ".choices[].logprobs.content",
+        ".choices[].logprobs.content[].token",
+        ".choices[].logprobs.content[].logprob",
+        ".choices[].logprobs.content[].bytes",
+        ".choices[].logprobs.content[].top_logprobs",
+        ".choices[].logprobs.refusal"
+      ],
+      "behavior": "With `logprobs: true` at `reasoning_effort: none` the direct API answers 200 and fills `choices[].logprobs.content` with one entry per token — the token, its log probability, its UTF-8 bytes, and an empty `top_logprobs` list. This proxy answers 200 and sends no `logprobs` key on the choice at all. A minimal request is not affected: the direct API omits the key there too, which is why the shape comparison for the minimal capture does not read this declaration.",
+      "why": "A token's log probability is a property of the decoder that produced it. The local runtimes this proxy drives return finished text over a CLI protocol that carries no per-token probabilities, so there is nothing to report and nothing to derive one from: any number here would be invented. Matrix row 22 already states the acceptance envelope this measures — accepted while the model does not reason, and not applied.",
+      "measuredAt": "2026-09-09",
+      "evidence": "spec/captures/direct-chat-logprobs-effort-none.json; docs/conformance-matrix.md row 22"
+    },
+    {
+      "id": "responses-tool-echo-is-not-canonicalised",
+      "surface": "/v1/responses",
+      "claim": "supplied-echo",
+      "absentPaths": [
+        ".tools[].description",
+        ".tools[].output_schema",
+        ".tools[].strict",
+        ".tools[].parameters.additionalProperties",
+        ".tools[].parameters.required"
+      ],
+      "behavior": "The direct API echoes a function tool in a canonical form, filling what the request left out: `description: null`, `output_schema: null`, `strict: true`, and inside `parameters` an `additionalProperties: false` and an empty `required`. This proxy echoes the tool as the request wrote it.",
+      "why": "The filled members are not cosmetic — `strict: true` and `additionalProperties: false` say the surface will hold the model's arguments to that schema. This proxy passes tools to a local runtime that enforces neither, so echoing the canonical form would report a guarantee the turn does not carry, and a client that reads its own tool back to learn how it was interpreted would be told the opposite of the truth. Echoing the request's own form is the honest answer available. Filling only the two inert members (`description`, `output_schema`) while omitting the two that mean something would be worse: a partial canonical form reads as the whole one.",
+      "measuredAt": "2026-09-09",
+      "evidence": "spec/captures/direct-responses-tools-parallel-false.json"
+    },
+    {
+      "id": "responses-reasoning-summary-alias-is-not-resolved",
+      "surface": "/v1/responses",
+      "claim": "supplied-echo",
+      "valueDivergences": [
+        {
+          "path": ".reasoning.summary",
+          "vendor": "\"detailed\"",
+          "proxy": "\"auto\""
+        }
+      ],
+      "behavior": "A request asking for `reasoning.summary: \"auto\"` is echoed by the direct API as the value it resolved that alias to — `\"detailed\"` on the one turn measured, at `effort: low`, and that turn carried no reasoning summary in its output either. This proxy echoes `\"auto\"`, the value the request supplied.",
+      "why": "One sample of one alias at one effort is not an alias table. Mirroring it would encode `auto -> detailed` for every effort and every model on the strength of a single turn, and the value is precisely the one a client reads to learn what it will get. Matrix R-22 records the larger fact: this proxy emits no reasoning summaries at all, so resolving the alias would name a summary style for a summary that never arrives. Measuring `auto` at the other efforts is three cheap calls and is listed in the probe plan.",
+      "measuredAt": "2026-09-09",
+      "evidence": "spec/captures/direct-responses-reasoning-summary-auto.json; docs/conformance-matrix.md R-22"
     }
   ]
 }

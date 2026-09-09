@@ -1,0 +1,303 @@
+// A client supplies ONE option. What comes back?
+//
+// `conformance-echoed-defaults` answers that for a request that configures
+// nothing, which is the first call an SDK makes. This answers it for the second
+// one: the call that asks for something. The matrix's largest column is about
+// exactly this — whether an option is honoured, mirrored, silently ignored, or
+// refused — and until now that column was prose.
+//
+// The asymmetry is the same and for the same reason: the vendor side is a
+// FROZEN promoted capture (its request bytes and its response bytes, with
+// digests), and our side is LIVE — the real server, started here, answering
+// those same request bytes. Two frozen fixtures would only ever detect fixture
+// drift.
+//
+// Three things are compared, in the order a client meets them:
+//
+//   1. the STATUS. A surface that refuses what the vendor accepts is a
+//      divergence a client cannot work around, and it is the one this gate
+//      found on its first run.
+//   2. the SHAPE, as typed key paths, with what we structurally do not report
+//      declared in `spec/declared-divergences.json` and required to still be true.
+//   3. the ECHO of the option the request supplied. This is the claim: a client
+//      reads its own option back to learn what the surface did with it, and an
+//      option echoed as something the vendor would not echo tells it a lie
+//      about the turn it is about to receive.
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { after, before, test } from 'node:test';
+import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
+import { PER_CALL, absentPathsFor, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, valueDivergencesFor } from '../scripts/lib/response-comparison.mjs';
+
+const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
+const load = (name) => JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
+
+// Each row is a claim about one option.
+//
+//   supplied     the options the request carries. Asserted present in the
+//                request bytes, so a row cannot claim something the capture is
+//                not evidence about.
+//   echoed       whether the surface echoes them back AT ALL. Chat echoes
+//                almost nothing — `n`, `logprobs` and `response_format` never
+//                appear in its answer — and that is a fact worth failing on if
+//                it changes, so `false` is a claim here and not a skip.
+//   alsoCompare  leaf paths this row claims that are not echoes. `n` is not
+//                echoed; the number of choices it produces is what a client
+//                actually receives.
+//   harnessGaps  paths the vendor's turn has and ours cannot: our side runs on
+//                a fake backend whose turn contains no reasoning item. That is
+//                a property of this test, not of the proxy, and it is written
+//                per row so it cannot quietly cover a real gap.
+//   vendorPaths  how much shape the comparison actually reads. The vendor side
+//                is frozen, so this number only moves when the fixture does.
+const CAPTURES = [
+  { fixture: 'direct-responses-service-tier-flex', surface: '/v1/responses', supplied: ['service_tier'], echoed: true, vendorPaths: 74 },
+  { fixture: 'direct-responses-store-false', surface: '/v1/responses', supplied: ['store'], echoed: true, vendorPaths: 74 },
+  { fixture: 'direct-responses-metadata', surface: '/v1/responses', supplied: ['metadata'], echoed: true, vendorPaths: 75 },
+  { fixture: 'direct-responses-reasoning-summary-auto', surface: '/v1/responses', supplied: ['reasoning'], echoed: true, vendorPaths: 74 },
+  {
+    fixture: 'direct-responses-tools-parallel-false',
+    surface: '/v1/responses',
+    supplied: ['tools', 'parallel_tool_calls'],
+    echoed: true,
+    // The vendor's turn reasoned and ours does not: a reasoning item carries
+    // these two members, and the fake backend emits no reasoning item at all.
+    // What a real backend's reasoning item would carry is matrix R-25's claim,
+    // not this row's.
+    harnessGaps: ['.output[].encrypted_content', '.output[].summary'],
+    vendorPaths: 86,
+  },
+  { fixture: 'direct-responses-top-logprobs-effort-none', surface: '/v1/responses', supplied: ['top_logprobs', 'reasoning'], echoed: true, vendorPaths: 74 },
+  { fixture: 'direct-chat-service-tier-flex', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 27 },
+  { fixture: 'direct-chat-response-format-json-object', surface: '/v1/chat/completions', supplied: ['response_format'], echoed: false, vendorPaths: 27 },
+  {
+    fixture: 'direct-chat-n-2',
+    surface: '/v1/chat/completions',
+    supplied: ['n'],
+    echoed: false,
+    // Not echoed, but not invisible either: two choices are what the client
+    // gets, and the fan-out that produces them is where this proxy has had a
+    // real defect before (the shared prompt counted twice).
+    alsoCompare: ['.choices[]#'],
+    vendorPaths: 27,
+  },
+  { fixture: 'direct-chat-logprobs-effort-none', surface: '/v1/chat/completions', supplied: ['logprobs', 'reasoning_effort'], echoed: false, vendorPaths: 34 },
+];
+
+let started;
+const answers = new Map();
+// Which declared value divergences a row actually met. Read by the last test:
+// a declaration no capture exhibits is a claim about nothing.
+const exhibited = new Set();
+
+before(async () => {
+  started = await startLocalApiProxy({
+    host: '127.0.0.1',
+    port: 0,
+    requestTimeoutMs: 10_000,
+    backend: {
+      name: 'fake-backend',
+      model: 'fake-local-model',
+      async generate(request) {
+        return {
+          id: 'local_test',
+          model: request.model,
+          text: 'OK',
+          toolCalls: [],
+          usage: {
+            inputTokens: 7, outputTokens: 1, totalTokens: 8,
+            cachedInputTokens: 0, reasoningOutputTokens: 0, source: 'provider',
+          },
+          latencyMs: 1,
+        };
+      },
+      async close() {},
+    },
+  });
+
+  // The capture's own request bytes, forwarded verbatim: re-typing them would
+  // ask a different question than the one the vendor answered.
+  for (const { fixture, surface } of CAPTURES) {
+    const capture = load(fixture);
+    const res = await fetch(`${started.url}${surface}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: capture.request,
+    });
+    const text = await res.text();
+    let body = null;
+    try { body = JSON.parse(text); } catch { body = null; }
+    answers.set(fixture, { status: res.status, body, text });
+  }
+});
+
+after(async () => {
+  await started?.close();
+});
+
+test('the gate covers each capture once, on a surface it names', () => {
+  assert.equal(new Set(CAPTURES.map((row) => row.fixture)).size, CAPTURES.length);
+  assert.deepEqual(
+    [...new Set(CAPTURES.map((row) => row.surface))].sort(),
+    ['/v1/chat/completions', '/v1/responses'],
+  );
+});
+
+test('the captures this check reads are present, intact, and about the option they name', () => {
+  const { checked, unbound } = verifyCaptureStore();
+  assert.deepEqual(unbound, [], 'promoted captures whose provenance git cannot confirm');
+
+  for (const { fixture, supplied } of CAPTURES) {
+    assert.ok(checked.includes(fixture), `${fixture} is not among the ${checked.length} verified captures`);
+    const capture = load(fixture);
+    assert.equal(capture.kind, 'json', `${fixture} is not a buffered capture`);
+    assert.equal(capture.status, 200, `${fixture} did not record a 200`);
+    for (const [field, digest] of [['body', 'bodySha256'], ['request', 'requestSha256']]) {
+      assert.equal(
+        createHash('sha256').update(capture[field]).digest('hex'),
+        capture[digest],
+        `${fixture} ${field} no longer matches the capture it was promoted from`,
+      );
+    }
+    // The row's claim has to be about this capture: an option named here but
+    // absent from the request would make the echo check below vacuous, and it
+    // would pass.
+    const request = JSON.parse(capture.request);
+    for (const option of supplied) {
+      assert.ok(option in request, `${fixture} does not supply ${option}, so this row claims nothing`);
+    }
+  }
+});
+
+for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, vendorPaths } of CAPTURES) {
+  test(`${fixture}: the proxy answers in the vendor's shape`, () => {
+    const capture = load(fixture);
+    const vendor = JSON.parse(capture.body);
+    const ours = answers.get(fixture);
+
+    // Status first: everything below reads a body that a refusal does not have,
+    // and "we refuse what the vendor accepts" is the difference a client feels
+    // hardest.
+    assert.equal(
+      ours.status,
+      capture.status,
+      `${fixture}: the vendor answered ${capture.status}, the proxy ${ours.status}: ${ours.text.slice(0, 200)}`,
+    );
+
+    const theirs = keyPaths(vendor, '', new Set());
+    const mine = keyPaths(ours.body, '', new Set());
+    assert.equal(theirs.size, vendorPaths, `${fixture}: the frozen capture's shape changed`);
+
+    const untagged = (path) => path.replace(/:[a-z]+$/, '');
+    const onlyOurs = [...mine].filter((path) => !theirs.has(path)).sort();
+    const onlyVendor = [...theirs].filter((path) => !mine.has(path)).sort();
+
+    assert.deepEqual(onlyOurs, [], `${fixture}: the proxy reports fields the vendor does not`);
+    assert.deepEqual(
+      onlyVendor.map(untagged).sort(),
+      [...expectedAbsentPaths(surface, theirs), ...(harnessGaps ?? [])].sort(),
+      `${fixture}: the fields missing from the proxy's answer are not the declared ones`,
+    );
+  });
+
+  test(`${fixture}: the option the request supplied comes back as the vendor sends it`, () => {
+    const capture = load(fixture);
+    const vendor = JSON.parse(capture.body);
+    const ours = answers.get(fixture);
+    assert.equal(ours.status, capture.status, `${fixture}: refused, so there is no echo to read`);
+
+    const absent = new Set(absentPathsFor(surface));
+    const divergences = new Map(valueDivergencesFor(surface).map((entry) => [entry.path, entry]));
+    const vendorLeaves = leafValues(vendor, '', new Map());
+    const ourLeaves = leafValues(ours.body, '', new Map());
+
+    const differences = [];
+    let compared = 0;
+    for (const [path, value] of vendorLeaves) {
+      // Only what this row claims. The rest of the body is the sibling gate's
+      // claim, and reading it here would make every fixture a second copy of
+      // that comparison.
+      const claimed = supplied.includes(rootOf(path)) || (alsoCompare ?? []).includes(path);
+      if (!claimed) continue;
+      if (PER_CALL.has(rootOf(path)) && !path.endsWith('[]#')) continue;
+      if (isDeclaredAbsent(absent, path)) continue;
+      compared += 1;
+      const ourValue = ourLeaves.get(path);
+
+      if (ourValue === value) continue;
+
+      // The two sides differ. A declaration may say so — and if it does, it has
+      // to name both sides exactly: an exemption that only says "this path may
+      // differ" would wave through any future value on either side. A
+      // declaration is also not surface-wide the way an absence is, because
+      // whether the values differ depends on what the request asked for.
+      const divergence = divergences.get(path);
+      if (divergence && value === divergence.vendor && ourValue === divergence.proxy) {
+        exhibited.add(path);
+        continue;
+      }
+      differences.push(divergence
+        ? `${path}: declared vendor ${divergence.vendor} / proxy ${divergence.proxy}, measured vendor ${value} / proxy ${ourValue ?? '(absent)'}`
+        : `${path}: vendor ${value}, proxy ${ourValue ?? '(absent)'}`);
+    }
+
+    if (echoed) {
+      // An option that contributes no leaf is an option this row cannot speak
+      // for: the check would pass by comparing nothing.
+      assert.ok(compared > 0, `${fixture}: none of ${supplied.join(', ')} reached the comparison`);
+    } else {
+      // The other direction is a claim too. Chat's answer carries no `n`, no
+      // `logprobs` and no `response_format`, so a client cannot read back what
+      // it asked for — and if that ever changes, this row should fail rather
+      // than quietly start comparing something new.
+      const echoedPaths = [...vendorLeaves.keys()].filter((path) => supplied.includes(rootOf(path)));
+      assert.deepEqual(echoedPaths, [], `${fixture}: the vendor now echoes ${supplied.join(', ')}, so this row's claim is stale`);
+      assert.equal(compared, (alsoCompare ?? []).length, `${fixture}: the paths this row claims did not all reach the comparison`);
+    }
+    assert.deepEqual(differences, [], `${fixture}: the proxy answers ${supplied.join(', ')} differently`);
+  });
+}
+
+// A declaration nothing exercises is a claim nobody checks. The shape check
+// above compares against the declarations THIS capture can speak to, which is
+// what keeps a minimal request from failing for a field it never asked for —
+// and it means a declared path that no capture carries would be asserted
+// nowhere at all. This is where that is caught.
+test('every declared absence is carried by a capture that can show it', () => {
+  const captures = readdirSync(join(specDir, 'captures'))
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => JSON.parse(readFileSync(join(specDir, 'captures', name), 'utf8')))
+    .filter((capture) => capture.kind === 'json');
+  assert.ok(captures.length >= CAPTURES.length, 'the buffered captures went missing');
+
+  const seen = new Map();
+  for (const capture of captures) {
+    const surface = new URL(capture.url).pathname;
+    const paths = new Set([...keyPaths(JSON.parse(capture.body), '', new Set())].map((path) => path.replace(/:[a-z]+$/, '')));
+    for (const path of paths) seen.set(`${surface} ${path}`, true);
+  }
+
+  const dead = [];
+  for (const surface of new Set(CAPTURES.map((row) => row.surface))) {
+    for (const path of absentPathsFor(surface)) {
+      if (!seen.has(`${surface} ${path}`)) dead.push(`${surface} ${path}`);
+    }
+    for (const { path } of valueDivergencesFor(surface)) {
+      if (!seen.has(`${surface} ${path}`)) dead.push(`${surface} ${path}`);
+    }
+  }
+  assert.deepEqual(dead, [], 'declared divergences that no promoted capture carries: nothing checks these');
+
+  // Carrying the path is not the same as showing the difference. A value
+  // divergence claims the two sides answer a field differently, and the only
+  // proof of that is a row where they did — otherwise the declaration is a
+  // note, and the check above would pass on a path where both sides agree.
+  const unexhibited = [...new Set(CAPTURES.map((row) => row.surface))]
+    .flatMap((surface) => valueDivergencesFor(surface).map((entry) => entry.path))
+    .filter((path) => !exhibited.has(path));
+  assert.deepEqual(unexhibited, [], 'declared value divergences that no capture actually exhibits');
+});

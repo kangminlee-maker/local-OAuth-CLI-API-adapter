@@ -1,0 +1,33 @@
+{
+  "claimEvidence": "direct-responses-metadata",
+  "originRoot": "artifacts/direct-api-captures",
+  "originRun": "3e0b8b03-d858-441c-a895-c57deac20f83",
+  "originFile": "0049-value-metadata-a-b-.json",
+  "promotedAt": "2026-09-09T14:37:51.434Z",
+  "requiredContent": {
+    "mustContain": null,
+    "mustNotContain": null,
+    "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"input\":\"ping\",\"max_output_tokens\":16,\"metadata\":{\"a\":\"b\"}}"
+  },
+  "promotedFrom": {
+    "revision": "dd92b386cf75df7d07ce1a9f958d8ffaf70a1d3a",
+    "sources": [
+      {
+        "path": "scripts/lib/capture-provenance.mjs",
+        "blob": "cdfaf9f32fef52eac3b97e7f43602c036153f7d6"
+      },
+      {
+        "path": "scripts/promote-capture.mjs",
+        "blob": "ed5a0dbc6f07ca6440c9a4d2bcef11051b65f8b2"
+      }
+    ]
+  },
+  "url": "https://api.openai.com/v1/responses",
+  "status": 200,
+  "kind": "json",
+  "requestSha256": "859fdcaf4d711497745851a042935da32a44c66cfba3ce53fc4492fab1e88a23",
+  "request": "{\"model\":\"gpt-5.6-terra\",\"input\":\"ping\",\"max_output_tokens\":16,\"metadata\":{\"a\":\"b\"}}",
+  "bodySha256": "1c9b1d0fa71f9aaa7f81b986cdccf88875b15bbf1b3adc5874677e729ce9e670",
+  "bodyBytes": 2038,
+  "body": "{\n  \"id\": \"resp_02384c95de9b0a1f006a93f11cc01c87d0b9052d4cc9deb213\",\n  \"object\": \"response\",\n  \"created_at\": 1788080412,\n  \"status\": \"completed\",\n  \"background\": false,\n  \"billing\": {\n    \"payer\": \"developer\"\n  },\n  \"completed_at\": 1788080413,\n  \"error\": null,\n  \"frequency_penalty\": 0.0,\n  \"incomplete_details\": null,\n  \"instructions\": null,\n  \"max_output_tokens\": 16,\n  \"max_tool_calls\": null,\n  \"model\": \"gpt-5.6-terra\",\n  \"moderation\": null,\n  \"output\": [\n    {\n      \"id\": \"msg_02384c95de9b0a1f006a93f11d5be487d0b88c3ba0dd1092fc\",\n      \"type\": \"message\",\n      \"status\": \"completed\",\n      \"content\": [\n        {\n          \"type\": \"output_text\",\n          \"annotations\": [],\n          \"logprobs\": [],\n          \"text\": \"pong\"\n        }\n      ],\n      \"phase\": \"final_answer\",\n      \"role\": \"assistant\"\n    }\n  ],\n  \"parallel_tool_calls\": true,\n  \"presence_penalty\": 0.0,\n  \"previous_response_id\": null,\n  \"prompt_cache_key\": null,\n  \"prompt_cache_retention\": \"24h\",\n  \"reasoning\": {\n    \"context\": \"all_turns\",\n    \"effort\": \"medium\",\n    \"mode\": \"standard\",\n    \"summary\": null\n  },\n  \"safety_identifier\": null,\n  \"service_tier\": \"default\",\n  \"store\": true,\n  \"temperature\": 1.0,\n  \"text\": {\n    \"format\": {\n      \"type\": \"text\"\n    },\n    \"verbosity\": \"medium\"\n  },\n  \"tool_choice\": \"auto\",\n  \"tool_usage\": {\n    \"image_gen\": {\n      \"input_tokens\": 0,\n      \"input_tokens_details\": {\n        \"image_tokens\": 0,\n        \"text_tokens\": 0\n      },\n      \"output_tokens\": 0,\n      \"output_tokens_details\": {\n        \"image_tokens\": 0,\n        \"text_tokens\": 0\n      },\n      \"total_tokens\": 0\n    },\n    \"web_search\": {\n      \"num_requests\": 0\n    }\n  },\n  \"tools\": [],\n  \"top_logprobs\": 0,\n  \"top_p\": 0.98,\n  \"truncation\": \"disabled\",\n  \"usage\": {\n    \"input_tokens\": 7,\n    \"input_tokens_details\": {\n      \"cache_write_tokens\": 0,\n      \"cached_tokens\": 0\n    },\n    \"output_tokens\": 5,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 0\n    },\n    \"total_tokens\": 12\n  },\n  \"user\": null,\n  \"metadata\": {\n    \"a\": \"b\"\n  }\n}"
+}
