@@ -29,6 +29,13 @@ for (const claim of manifest.claims) {
 // else is a candidate: DOC is the vendor's prose, CODE is our own reading, and
 // neither is evidence about the vendor's behaviour.
 const verified = manifest.claims.filter((claim) => claim.evidenceGrade === 'VERIFIED');
+// WIRE is the vendor's own VALUE for a cell, read from a promoted capture that
+// a gate replays. It is counted apart from VERIFIED because it answers a
+// different question — what came back, rather than that the field was accepted
+// — and because it was invisible here until the grade existed: the rows now
+// carrying it had their measurements written into the cell body while this
+// report counted them as prose.
+const wire = manifest.claims.filter((claim) => claim.evidenceGrade === 'WIRE');
 // The derived half. `Ev` is a label someone wrote; `liveParityRow` is whether
 // the field is sent to BOTH the vendor and this proxy on every instrument run
 // and the two envelopes compared. Where the two disagree, the label is the
@@ -40,10 +47,15 @@ const report = {
   claims: manifest.claims.length,
   verified: verified.length,
   verifiedShare: Number((verified.length / manifest.claims.length).toFixed(3)),
+  wire: wire.length,
+  wireCaptures: wire.map((claim) => `${claim.id} ${claim.field}`),
   byEvidenceGrade: tally(manifest.claims, 'evidenceGrade'),
   liveParityRows: live.length,
+  // Neither a grade that names vendor evidence nor a row the instrument sends
+  // live. WIRE counts as the first kind: it names a capture, and a gate reads
+  // that capture on every run.
   claimsWithNeitherLabelNorRow: manifest.claims
-    .filter((claim) => claim.evidenceGrade !== 'VERIFIED' && !claim.liveParityRow)
+    .filter((claim) => !['VERIFIED', 'WIRE'].includes(claim.evidenceGrade) && !claim.liveParityRow)
     .map((claim) => `${claim.id} ${claim.field}`),
   byClaimedLead: tally(manifest.claims, 'claimedLead'),
   // The matrix's column 6 declares a five-word vocabulary in its legend and the
@@ -87,6 +99,8 @@ process.stdout.write(`declared divergences: ${report.declaredDivergences}\n`);
 process.stdout.write(`\nsurfaces this server answers on with NO claim row: ${report.surfacesWithoutClaims.join(', ') || 'none'}\n`);
 process.stdout.write(`routes with NO claim row: ${report.routesWithoutClaims.join(', ') || 'none'}\n`);
 process.stdout.write(`\nEv column says VERIFIED: ${report.verified}/${report.claims} (${(report.verifiedShare * 100).toFixed(1)}%)\n`);
+process.stdout.write(`Ev column says WIRE (a value read from a capture a gate replays): ${report.wire}/${report.claims}\n`);
+for (const row of report.wireCaptures) process.stdout.write(`  ${row}\n`);
 process.stdout.write(`live parity row on every run: ${report.liveParityRows}/${report.claims} (${((report.liveParityRows / report.claims) * 100).toFixed(1)}%)\n`);
 process.stdout.write(`neither: ${report.claimsWithNeitherLabelNorRow.length}\n`);
 for (const claim of report.claimsWithNeitherLabelNorRow) process.stdout.write(`  ${claim}\n`);

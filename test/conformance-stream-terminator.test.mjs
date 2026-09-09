@@ -16,11 +16,16 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
+import { STREAM_SURFACES as SURFACES } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 const captureDir = join(specDir, 'captures');
 
+// A capture this gate's roster does not name cannot be read here, so what the
+// registry advertises and what this gate reads cannot come apart.
+const ROSTER = new Set(SURFACES.flatMap((row) => [row.vendor, row.proxy]));
 function loadCapture(name) {
+  assert.ok(ROSTER.has(name), `${name} is not one of this gate's roster captures`);
   return JSON.parse(readFileSync(join(captureDir, `${name}.json`), 'utf8'));
 }
 
@@ -28,15 +33,6 @@ function hasDoneTerminator(wire) {
   return /^data:\s*\[DONE\]\s*$/m.test(wire);
 }
 
-// Surfaces to compare, and which capture is which side.
-// `surface` is the vocabulary `spec/declared-divergences.json` uses, so the
-// lookup below can actually find one. It used to read `openai.responses.stream`,
-// a spelling no declaration has ever carried, which left the stale-declaration
-// branch unreachable — the check could only ever take the equality path.
-const SURFACES = [
-  { surface: '/v1/responses', vendor: 'direct-responses-stream', proxy: 'proxy-responses-stream' },
-  { surface: '/v1/chat/completions', vendor: 'direct-chat-stream', proxy: 'proxy-chat-stream' },
-];
 
 test('the capture set this check reads is present and intact', () => {
   // A check whose evidence is missing has not passed, it has not run. Saying so

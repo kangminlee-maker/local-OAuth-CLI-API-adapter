@@ -3,12 +3,12 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "ee3684d7ee6408741df1fad8b749a817bb4048e2855fe46ec11f607bc7eb2bbc",
+    "matrixDigest": "ecb5f4f55a2f369d50dfce898ff948e5798f01cb6b35daa703c8574d1337a2bc",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
     "claims": 148,
-    "claimsOutsideLegendVocabulary": 98,
+    "claimsOutsideLegendVocabulary": 100,
     "claimsWithLiveParityRow": 134,
     "routes": 11,
     "surfaces": 6,
@@ -158,6 +158,24 @@
       "surface": "/v1/responses",
       "evidence": "docs/conformance-matrix.md §5.5.9",
       "measuredAt": "2026-08-29"
+    },
+    {
+      "id": "chat-logprobs-are-not-produced",
+      "surface": "/v1/chat/completions",
+      "evidence": "spec/captures/direct-chat-logprobs-effort-none.json; docs/conformance-matrix.md row 22",
+      "measuredAt": "2026-09-09"
+    },
+    {
+      "id": "responses-tool-echo-is-not-canonicalised",
+      "surface": "/v1/responses",
+      "evidence": "spec/captures/direct-responses-tools-parallel-false.json",
+      "measuredAt": "2026-09-09"
+    },
+    {
+      "id": "responses-reasoning-summary-alias-is-not-resolved",
+      "surface": "/v1/responses",
+      "evidence": "spec/captures/direct-responses-reasoning-summary-auto.json; docs/conformance-matrix.md R-22",
+      "measuredAt": "2026-09-09"
     }
   ],
   "claims": [
@@ -168,7 +186,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "1",
-      "matrixLine": 86,
+      "matrixLine": 89,
       "field": "`model`",
       "vendor": {
         "valueSpace": "string, required",
@@ -190,7 +208,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "2",
-      "matrixLine": 87,
+      "matrixLine": 90,
       "field": "`messages`",
       "vendor": {
         "valueSpace": "array, `minItems: 1`, required",
@@ -212,7 +230,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "3",
-      "matrixLine": 88,
+      "matrixLine": 91,
       "field": "`messages[].role`",
       "vendor": {
         "valueSpace": "`developer`|`system`|`user`|`assistant`|`tool`|`function`(dep.)",
@@ -234,7 +252,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "4",
-      "matrixLine": 89,
+      "matrixLine": 92,
       "field": "`messages[].content`",
       "vendor": {
         "valueSpace": "string | content-part array (`text`, `image_url`, `input_audio`, `file`); nullable on assistant-with-tool_calls and on `function`",
@@ -256,7 +274,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "5",
-      "matrixLine": 90,
+      "matrixLine": 93,
       "field": "`messages[].name`",
       "vendor": {
         "valueSpace": "string",
@@ -278,7 +296,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "6",
-      "matrixLine": 91,
+      "matrixLine": 94,
       "field": "`messages[].tool_calls`",
       "vendor": {
         "valueSpace": "array of `{id, type:\"function\", function:{name, arguments}}`",
@@ -300,7 +318,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "7",
-      "matrixLine": 92,
+      "matrixLine": 95,
       "field": "`messages[].tool_call_id`",
       "vendor": {
         "valueSpace": "string, required on `role:\"tool\"`",
@@ -322,7 +340,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "8",
-      "matrixLine": 93,
+      "matrixLine": 96,
       "field": "`messages[].function_call`",
       "vendor": {
         "valueSpace": "`{name, arguments}` (deprecated)",
@@ -344,7 +362,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "9",
-      "matrixLine": 94,
+      "matrixLine": 97,
       "field": "`messages[].refusal`",
       "vendor": {
         "valueSpace": "string, assistant input",
@@ -366,7 +384,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "10",
-      "matrixLine": 95,
+      "matrixLine": 98,
       "field": "`messages[].audio`",
       "vendor": {
         "valueSpace": "`{id}`, assistant input",
@@ -388,7 +406,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "11",
-      "matrixLine": 96,
+      "matrixLine": 99,
       "field": "`modalities`",
       "vendor": {
         "valueSpace": "array of `text`|`audio`",
@@ -410,7 +428,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "12",
-      "matrixLine": 97,
+      "matrixLine": 100,
       "field": "`audio`",
       "vendor": {
         "valueSpace": "`{voice, format}`; required when `modalities` includes `audio`",
@@ -432,7 +450,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "13",
-      "matrixLine": 98,
+      "matrixLine": 101,
       "field": "`temperature`",
       "vendor": {
         "valueSpace": "number 0-2",
@@ -454,7 +472,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "14",
-      "matrixLine": 99,
+      "matrixLine": 102,
       "field": "`top_p`",
       "vendor": {
         "valueSpace": "number 0-1",
@@ -476,7 +494,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "15",
-      "matrixLine": 100,
+      "matrixLine": 103,
       "field": "`n`",
       "vendor": {
         "valueSpace": "integer ≥1",
@@ -498,7 +516,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "16",
-      "matrixLine": 101,
+      "matrixLine": 104,
       "field": "`stop`",
       "vendor": {
         "valueSpace": "string | array (≤4) | null",
@@ -520,7 +538,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "17",
-      "matrixLine": 102,
+      "matrixLine": 105,
       "field": "`max_tokens`",
       "vendor": {
         "valueSpace": "integer (deprecated)",
@@ -542,7 +560,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "18",
-      "matrixLine": 103,
+      "matrixLine": 106,
       "field": "`max_completion_tokens`",
       "vendor": {
         "valueSpace": "integer",
@@ -564,7 +582,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "19",
-      "matrixLine": 104,
+      "matrixLine": 107,
       "field": "`presence_penalty`",
       "vendor": {
         "valueSpace": "number -2..2",
@@ -586,7 +604,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "20",
-      "matrixLine": 105,
+      "matrixLine": 108,
       "field": "`frequency_penalty`",
       "vendor": {
         "valueSpace": "number -2..2",
@@ -608,7 +626,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "21",
-      "matrixLine": 106,
+      "matrixLine": 109,
       "field": "`logit_bias`",
       "vendor": {
         "valueSpace": "map token-id → -100..100",
@@ -630,17 +648,17 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "22",
-      "matrixLine": 107,
+      "matrixLine": 110,
       "field": "`logprobs`",
       "vendor": {
         "valueSpace": "boolean",
         "defaultWhenOmitted": "`false` (caveat)",
-        "observableEffect": "populates `choices[].logprobs`",
+        "observableEffect": "populates `choices[].logprobs` — one entry per token with its `logprob`, its UTF-8 `bytes` and an empty `top_logprobs`, measured 2026-09-09 (`spec/captures/direct-chat-logprobs-effort-none.json`)",
         "invalidValue": "400 / `invalid_request_error` / `logprobs` / —"
       },
       "claimedLead": "refused",
       "claimedLeadInLegend": false,
-      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`); at `reasoning_effort: none` it is accepted and not applied — the response carries no `logprobs`, which the contract states",
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`); at `reasoning_effort: none` it is accepted and not applied — the choice carries no `logprobs` key at all, declared in `spec/declared-divergences.json` and compared against the capture by `conformance-supplied-echo.test`",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (§5.5.5)",
       "liveParityRow": true
@@ -652,7 +670,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "23",
-      "matrixLine": 108,
+      "matrixLine": 111,
       "field": "`top_logprobs`",
       "vendor": {
         "valueSpace": "integer 0-20; requires `logprobs:true`",
@@ -674,7 +692,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "24",
-      "matrixLine": 109,
+      "matrixLine": 112,
       "field": "`seed`",
       "vendor": {
         "valueSpace": "integer (Beta)",
@@ -696,7 +714,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "25",
-      "matrixLine": 110,
+      "matrixLine": 113,
       "field": "`stream`",
       "vendor": {
         "valueSpace": "boolean",
@@ -718,7 +736,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "26",
-      "matrixLine": 111,
+      "matrixLine": 114,
       "field": "`stream_options.include_usage`",
       "vendor": {
         "valueSpace": "boolean",
@@ -740,7 +758,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "27",
-      "matrixLine": 112,
+      "matrixLine": 115,
       "field": "`stream_options.include_obfuscation`",
       "vendor": {
         "valueSpace": "boolean",
@@ -762,7 +780,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "28",
-      "matrixLine": 113,
+      "matrixLine": 116,
       "field": "`response_format`",
       "vendor": {
         "valueSpace": "`{type:\"text\"|\"json_object\"|\"json_schema\"}`",
@@ -784,7 +802,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "29",
-      "matrixLine": 114,
+      "matrixLine": 117,
       "field": "`tools`",
       "vendor": {
         "valueSpace": "array of `{type:\"function\", function:{name, description, parameters, strict}}`",
@@ -806,7 +824,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "30",
-      "matrixLine": 115,
+      "matrixLine": 118,
       "field": "`tools[].function.strict`",
       "vendor": {
         "valueSpace": "boolean",
@@ -828,7 +846,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "31",
-      "matrixLine": 116,
+      "matrixLine": 119,
       "field": "`tool_choice`",
       "vendor": {
         "valueSpace": "`\"none\"`|`\"auto\"`|`\"required\"`|`{type:\"function\", function:{name}}`",
@@ -850,7 +868,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "32",
-      "matrixLine": 117,
+      "matrixLine": 120,
       "field": "`parallel_tool_calls`",
       "vendor": {
         "valueSpace": "boolean",
@@ -872,7 +890,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "33",
-      "matrixLine": 118,
+      "matrixLine": 121,
       "field": "`functions`",
       "vendor": {
         "valueSpace": "array (deprecated)",
@@ -894,7 +912,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "34",
-      "matrixLine": 119,
+      "matrixLine": 122,
       "field": "`function_call`",
       "vendor": {
         "valueSpace": "`\"none\"`|`\"auto\"`|`{name}` (deprecated)",
@@ -916,7 +934,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "35",
-      "matrixLine": 120,
+      "matrixLine": 123,
       "field": "`user`",
       "vendor": {
         "valueSpace": "string (superseded)",
@@ -938,7 +956,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "36",
-      "matrixLine": 121,
+      "matrixLine": 124,
       "field": "`safety_identifier`",
       "vendor": {
         "valueSpace": "string ≤64",
@@ -960,7 +978,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "37",
-      "matrixLine": 122,
+      "matrixLine": 125,
       "field": "`prompt_cache_key`",
       "vendor": {
         "valueSpace": "string",
@@ -982,7 +1000,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "38",
-      "matrixLine": 123,
+      "matrixLine": 126,
       "field": "`prompt_cache_retention`",
       "vendor": {
         "valueSpace": "`\"in_memory\"`|`\"24h\"` (deprecated)",
@@ -1004,7 +1022,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "39",
-      "matrixLine": 124,
+      "matrixLine": 127,
       "field": "`prompt_cache_options`",
       "vendor": {
         "valueSpace": "`{ttl:\"30m\", mode:\"implicit\"|\"explicit\"}`",
@@ -1026,7 +1044,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "40",
-      "matrixLine": 125,
+      "matrixLine": 128,
       "field": "`service_tier`",
       "vendor": {
         "valueSpace": "`auto`|`default`|`fast`|`flex`|`priority` (the direct API's own list, measured — `scale` is not in it)",
@@ -1048,7 +1066,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "41",
-      "matrixLine": 126,
+      "matrixLine": 129,
       "field": "`store`",
       "vendor": {
         "valueSpace": "boolean",
@@ -1070,7 +1088,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "42",
-      "matrixLine": 127,
+      "matrixLine": 130,
       "field": "`metadata`",
       "vendor": {
         "valueSpace": "map, ≤16 pairs, key ≤64 / value ≤512",
@@ -1092,7 +1110,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "43",
-      "matrixLine": 128,
+      "matrixLine": 131,
       "field": "`reasoning_effort`",
       "vendor": {
         "valueSpace": "`none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`",
@@ -1114,7 +1132,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "44",
-      "matrixLine": 129,
+      "matrixLine": 132,
       "field": "`reasoning.effort` (on chat)",
       "vendor": {
         "valueSpace": "same enum",
@@ -1136,7 +1154,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "45",
-      "matrixLine": 130,
+      "matrixLine": 133,
       "field": "`verbosity`",
       "vendor": {
         "valueSpace": "`low`|`medium`|`high`",
@@ -1158,7 +1176,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "46",
-      "matrixLine": 131,
+      "matrixLine": 134,
       "field": "`text.verbosity` (on chat)",
       "vendor": {
         "valueSpace": "same enum",
@@ -1180,7 +1198,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "47",
-      "matrixLine": 132,
+      "matrixLine": 135,
       "field": "`prediction`",
       "vendor": {
         "valueSpace": "`{type:\"content\", content}`",
@@ -1202,7 +1220,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "48",
-      "matrixLine": 133,
+      "matrixLine": 136,
       "field": "`web_search_options`",
       "vendor": {
         "valueSpace": "`{user_location, search_context_size}`",
@@ -1224,7 +1242,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "49",
-      "matrixLine": 134,
+      "matrixLine": 137,
       "field": "`moderation`",
       "vendor": {
         "valueSpace": "`{model, policy:{input:{mode}, output}}`",
@@ -1246,7 +1264,7 @@
         "POST /v1/chat/completions"
       ],
       "matrixRow": "50",
-      "matrixLine": 135,
+      "matrixLine": 138,
       "field": "*(behavioral)* unknown top-level field, e.g. `{\"foo\":1}`",
       "vendor": {
         "valueSpace": "—",
@@ -1268,7 +1286,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-1",
-      "matrixLine": 145,
+      "matrixLine": 148,
       "field": "`model`",
       "vendor": {
         "valueSpace": "string",
@@ -1290,7 +1308,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-2",
-      "matrixLine": 146,
+      "matrixLine": 149,
       "field": "`input` (string form)",
       "vendor": {
         "valueSpace": "string",
@@ -1312,7 +1330,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-3",
-      "matrixLine": 147,
+      "matrixLine": 150,
       "field": "`input` (array form)",
       "vendor": {
         "valueSpace": "array of typed items",
@@ -1334,7 +1352,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-4",
-      "matrixLine": 148,
+      "matrixLine": 151,
       "field": "`input[].role`",
       "vendor": {
         "valueSpace": "`system`|`developer`|`user`|`assistant`",
@@ -1356,7 +1374,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-5",
-      "matrixLine": 149,
+      "matrixLine": 152,
       "field": "`input[].content`",
       "vendor": {
         "valueSpace": "string | object | parts (`input_text`, `input_image`, `input_file`)",
@@ -1378,7 +1396,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-6",
-      "matrixLine": 150,
+      "matrixLine": 153,
       "field": "`input[].type`",
       "vendor": {
         "valueSpace": "`message`, `function_call`, `function_call_output`, `reasoning`, `item_reference`, … (open union)",
@@ -1400,7 +1418,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-7",
-      "matrixLine": 151,
+      "matrixLine": 154,
       "field": "`instructions`",
       "vendor": {
         "valueSpace": "string",
@@ -1422,7 +1440,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-8",
-      "matrixLine": 152,
+      "matrixLine": 155,
       "field": "`max_output_tokens`",
       "vendor": {
         "valueSpace": "integer",
@@ -1444,7 +1462,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-9",
-      "matrixLine": 153,
+      "matrixLine": 156,
       "field": "`max_tool_calls`",
       "vendor": {
         "valueSpace": "integer",
@@ -1466,7 +1484,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-10",
-      "matrixLine": 154,
+      "matrixLine": 157,
       "field": "`temperature`",
       "vendor": {
         "valueSpace": "number 0-2",
@@ -1488,7 +1506,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-11",
-      "matrixLine": 155,
+      "matrixLine": 158,
       "field": "`top_p`",
       "vendor": {
         "valueSpace": "number 0-1",
@@ -1510,19 +1528,19 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-12",
-      "matrixLine": 156,
+      "matrixLine": 159,
       "field": "`top_logprobs`",
       "vendor": {
         "valueSpace": "integer 0-20",
-        "defaultWhenOmitted": "`null` (doc)",
-        "observableEffect": "logprobs on output text",
+        "defaultWhenOmitted": "**`0`** on the wire (P-1), not the doc's `null`",
+        "observableEffect": "logprobs on output text; the output-text content carries a `logprobs` member either way",
         "invalidValue": "400 / `invalid_request_error` / `top_logprobs` / —"
       },
-      "claimedLead": "ignored",
+      "claimedLead": "refused",
       "claimedLeadInLegend": false,
-      "claimedNote": "ignored; echoed as **`0`** (`http-server.ts:2024`) where the provider echoes `null`",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`, same sentence as `include`); at `reasoning.effort: none` accepted and echoed as supplied, and not applied — measured 2026-09-09 (`spec/captures/direct-responses-top-logprobs-effort-none.json`, replayed by `conformance-supplied-echo.test`). Until that capture this surface refused it at every effort while Chat accepted it at `none`: one proxy, two answers to one request. Where it is accepted it is held to the documented `0..20`; Chat's measured ceiling is 5 and which one the direct Responses API enforces is **unmeasured**, so the wider documented range is the one a request is held to. The first version of this change also opened `include`'s logprobs door and the two penalties at that effort, and a review shut them again: their acceptance here is unmeasured, and the refusal turned out to be the only validation in front of them — `presence_penalty: 99` was accepted and echoed back",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-top-logprobs-effort-none.json`)",
       "liveParityRow": true
     },
     {
@@ -1532,7 +1550,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-13",
-      "matrixLine": 157,
+      "matrixLine": 160,
       "field": "`stream`",
       "vendor": {
         "valueSpace": "boolean",
@@ -1554,7 +1572,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-14",
-      "matrixLine": 158,
+      "matrixLine": 161,
       "field": "`stream_options.include_obfuscation`",
       "vendor": {
         "valueSpace": "boolean",
@@ -1576,7 +1594,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-15",
-      "matrixLine": 159,
+      "matrixLine": 162,
       "field": "`stream_options.include_usage`",
       "vendor": {
         "valueSpace": "—",
@@ -1598,7 +1616,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-16",
-      "matrixLine": 160,
+      "matrixLine": 163,
       "field": "`text.format`",
       "vendor": {
         "valueSpace": "`{type:\"text\"|\"json_object\"|\"json_schema\", name, schema, strict}`",
@@ -1620,7 +1638,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-17",
-      "matrixLine": 161,
+      "matrixLine": 164,
       "field": "`text.verbosity`",
       "vendor": {
         "valueSpace": "`low`|`medium`|`high`",
@@ -1642,7 +1660,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-18",
-      "matrixLine": 162,
+      "matrixLine": 165,
       "field": "`tools`",
       "vendor": {
         "valueSpace": "array; `function` tools plus **built-ins** (`web_search`, `file_search`, `code_interpreter`, `image_generation`, `computer_use`, `mcp`)",
@@ -1664,7 +1682,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-19",
-      "matrixLine": 163,
+      "matrixLine": 166,
       "field": "`tool_choice`",
       "vendor": {
         "valueSpace": "`\"none\"`|`\"auto\"`|`\"required\"`|`{type:\"function\", name}`|`{type:\"<builtin>\"}`",
@@ -1686,7 +1704,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-20",
-      "matrixLine": 164,
+      "matrixLine": 167,
       "field": "`parallel_tool_calls`",
       "vendor": {
         "valueSpace": "boolean",
@@ -1694,11 +1712,11 @@
         "observableEffect": ">1 call per turn",
         "invalidValue": "400 / `invalid_request_error` / `parallel_tool_calls` / —"
       },
-      "claimedLead": "divergent",
-      "claimedLeadInLegend": true,
-      "claimedNote": "**divergent**: ignored **and** echoed as a hard `true` (`http-server.ts:2011`) even when the client sent `false`",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedLead": "ignored",
+      "claimedLeadInLegend": false,
+      "claimedNote": "ignored, but **mirrored**: `false` comes back as `false` (`http-server.ts:2386`), which `conformance-supplied-echo.test` compares against the direct API's own echo. This cell read \"echoed as a hard `true` even when the client sent `false`\" until 2026-09-09, when the replay showed both sides sending `false` — the note had outlived the code",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-tools-parallel-false.json`)",
       "liveParityRow": true
     },
     {
@@ -1708,7 +1726,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-21",
-      "matrixLine": 165,
+      "matrixLine": 168,
       "field": "`reasoning.effort`",
       "vendor": {
         "valueSpace": "`none`…`max`",
@@ -1730,19 +1748,19 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-22",
-      "matrixLine": 166,
+      "matrixLine": 169,
       "field": "`reasoning.summary`",
       "vendor": {
         "valueSpace": "`auto`|`concise`|`detailed`",
-        "defaultWhenOmitted": "`null`",
+        "defaultWhenOmitted": "`null`; **`auto` is echoed back as `detailed`** — the direct API resolves the alias (measured once, at `effort: low`, 2026-09-09, `spec/captures/direct-responses-reasoning-summary-auto.json`; that turn carried no summary either)",
         "observableEffect": "adds `summary` parts to the `reasoning` output item",
         "invalidValue": "400 / `invalid_request_error` / `reasoning.summary` / —"
       },
       "claimedLead": "silently ignored",
       "claimedLeadInLegend": true,
-      "claimedNote": "**silently ignored** — the proxy never emits reasoning summaries; a client that asked for `detailed` gets an empty/absent summary with no error",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "**silently ignored** — the proxy never emits reasoning summaries; a client that asked for `detailed` gets an empty/absent summary with no error. The echo is not resolved either: `auto` comes back as `auto`, declared in `spec/declared-divergences.json` rather than mirrored, because one sample of one alias at one effort is not an alias table",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-reasoning-summary-auto.json`)",
       "liveParityRow": true
     },
     {
@@ -1752,19 +1770,19 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-23",
-      "matrixLine": 167,
+      "matrixLine": 170,
       "field": "`reasoning.context`",
       "vendor": {
         "valueSpace": "`auto`|`current_turn`|`all_turns`",
-        "defaultWhenOmitted": "**`all_turns`** — observed on the wire 2026-08-29 (P-1, `spec/captures/direct-responses-minimal.json`, whose request proves `reasoning` was omitted). The contract's own sample body showed `\"context\":\"current_turn\"`, which is where our echo's default came from until 2026-09-09; the sample is not the wire. The row's Ev stays `DOC?`: this legend scopes `VERIFIED` to \"the field was accepted and the asserted response shape came back\", explicitly **never** to \"the omitted default was X\", and nothing here has measured the accepted values, the invalid-value error, or the effect",
+        "defaultWhenOmitted": "**`all_turns`** — observed on the wire 2026-08-29 (P-1, `spec/captures/direct-responses-minimal.json`, whose request proves `reasoning` was omitted). The contract's own sample body showed `\"context\":\"current_turn\"`, which is where our echo's default came from until 2026-09-09; the sample is not the wire. The row's Ev is `WIRE`, the grade this row's own history produced: `VERIFIED` was tried here on 2026-09-09 and reverted, because this legend scopes it to \"the field was accepted and the asserted response shape came back\" and explicitly **never** to \"the omitted default was X\". Nothing here has measured the accepted values, the invalid-value error, or the effect — `WIRE` claims the capture's bytes and no more",
         "observableEffect": "which reasoning items replay",
         "invalidValue": "400 / `invalid_request_error` / `reasoning.context` / —"
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
       "claimedNote": "echoed via `responseReasoning` at the vendor's measured default `all_turns`; not acted on (`conformance-echoed-defaults.test` compares the echo against `spec/captures/direct-responses-minimal.json`)",
-      "evidenceGrade": "DOC?",
-      "evidenceNote": "DOC?",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-minimal.json`)",
       "liveParityRow": true
     },
     {
@@ -1774,7 +1792,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-24",
-      "matrixLine": 168,
+      "matrixLine": 171,
       "field": "`reasoning.generate_summary`",
       "vendor": {
         "valueSpace": "deprecated alias of `summary`",
@@ -1796,7 +1814,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-25",
-      "matrixLine": 169,
+      "matrixLine": 172,
       "field": "`include`",
       "vendor": {
         "valueSpace": "array: `reasoning.encrypted_content`, `message.output_text.logprobs`, `web_search_call.action.sources`, `file_search_call.results`, `code_interpreter_call.outputs`, `computer_call_output.output.image_url`, `message.input_image.image_url`",
@@ -1804,9 +1822,9 @@
         "observableEffect": "adds the named payloads to `output`",
         "invalidValue": "400 / `invalid_request_error` / `include` / —"
       },
-      "claimedLead": "silently ignored",
-      "claimedLeadInLegend": true,
-      "claimedNote": "**silently ignored** — notably `reasoning.encrypted_content`, which stateless multi-turn clients depend on",
+      "claimedLead": "message.output_text.logprobs",
+      "claimedLeadInLegend": false,
+      "claimedNote": "`message.output_text.logprobs` is **refused at every effort** — 400 / `unsupported_parameter` / `include`, the door the direct API names when logprobs and reasoning are sent together (`normalizers.ts:1110`). Whether the direct API accepts the member at `reasoning.effort: none` is unmeasured on this surface, so no parity is claimed there and the refusal stands. Every other member is **silently ignored**, notably `reasoning.encrypted_content`, which stateless multi-turn clients depend on",
       "evidenceGrade": "DOC",
       "evidenceNote": "DOC",
       "liveParityRow": true
@@ -1818,7 +1836,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-26",
-      "matrixLine": 170,
+      "matrixLine": 173,
       "field": "`store`",
       "vendor": {
         "valueSpace": "boolean",
@@ -1828,9 +1846,9 @@
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
-      "claimedNote": "echoed (`raw.store === false ? false : true`, `http-server.ts:2019`) but **nothing is stored** — the proxy has no `GET /v1/responses/{id}`, so an echoed `store:true` is a false promise",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "echoed (`raw.store === false ? false : true`, `http-server.ts:2401`) but **nothing is stored** — the proxy has no `GET /v1/responses/{id}`, so an echoed `store:true` is a false promise",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-store-false.json`)",
       "liveParityRow": true
     },
     {
@@ -1840,7 +1858,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-27",
-      "matrixLine": 171,
+      "matrixLine": 174,
       "field": "`background`",
       "vendor": {
         "valueSpace": "boolean",
@@ -1862,7 +1880,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-28",
-      "matrixLine": 172,
+      "matrixLine": 175,
       "field": "`previous_response_id`",
       "vendor": {
         "valueSpace": "string",
@@ -1884,7 +1902,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-29",
-      "matrixLine": 173,
+      "matrixLine": 176,
       "field": "`conversation`",
       "vendor": {
         "valueSpace": "string (conversation id); mutually exclusive with `previous_response_id`",
@@ -1906,7 +1924,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-30",
-      "matrixLine": 174,
+      "matrixLine": 177,
       "field": "`truncation`",
       "vendor": {
         "valueSpace": "`auto`|`disabled`",
@@ -1928,7 +1946,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-31",
-      "matrixLine": 175,
+      "matrixLine": 178,
       "field": "`metadata`",
       "vendor": {
         "valueSpace": "≤16 pairs",
@@ -1938,9 +1956,9 @@
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
-      "claimedNote": "echoed via `asRecordPayload` (`http-server.ts:2033`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "echoed via `asRecordPayload` (`http-server.ts:2418`)",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-metadata.json`)",
       "liveParityRow": true
     },
     {
@@ -1950,7 +1968,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-32",
-      "matrixLine": 176,
+      "matrixLine": 179,
       "field": "`user`",
       "vendor": {
         "valueSpace": "string (superseded)",
@@ -1972,7 +1990,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-33",
-      "matrixLine": 177,
+      "matrixLine": 180,
       "field": "`safety_identifier`",
       "vendor": {
         "valueSpace": "string ≤64",
@@ -1994,7 +2012,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-34",
-      "matrixLine": 178,
+      "matrixLine": 181,
       "field": "`prompt_cache_key`",
       "vendor": {
         "valueSpace": "string",
@@ -2016,7 +2034,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-35",
-      "matrixLine": 179,
+      "matrixLine": 182,
       "field": "`prompt_cache_retention`",
       "vendor": {
         "valueSpace": "`in_memory`|`24h`",
@@ -2038,7 +2056,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-36",
-      "matrixLine": 180,
+      "matrixLine": 183,
       "field": "`prompt_cache_options`",
       "vendor": {
         "valueSpace": "`{ttl, mode}`",
@@ -2060,7 +2078,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-37",
-      "matrixLine": 181,
+      "matrixLine": 184,
       "field": "`service_tier`",
       "vendor": {
         "valueSpace": "`auto`|`default`|`flex`|`scale`|`priority`",
@@ -2070,9 +2088,9 @@
       },
       "claimedLead": "ignored",
       "claimedLeadInLegend": false,
-      "claimedNote": "ignored; hard `\"default\"` (`http-server.ts:2018`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "ignored, but **resolved and echoed**: `flex` comes back as `flex`, `fast` and `priority` both as `priority`, everything else as `default` (`resolvedOpenAiServiceTier`, reached from `http-server.ts:2400`). This cell read \"hard `\\\"default\\\"`\" until 2026-09-10; the capture it now cites shows the direct API answering `flex` to `flex`, and `conformance-supplied-echo.test` compares the two. A review found the false text still standing under the new grade",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-service-tier-flex.json`)",
       "liveParityRow": true
     },
     {
@@ -2082,7 +2100,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-38",
-      "matrixLine": 182,
+      "matrixLine": 185,
       "field": "`prompt`",
       "vendor": {
         "valueSpace": "`{id, version, variables}`",
@@ -2104,7 +2122,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-39",
-      "matrixLine": 183,
+      "matrixLine": 186,
       "field": "`context_management`",
       "vendor": {
         "valueSpace": "array of `{type:\"compaction\", compact_threshold}`",
@@ -2126,7 +2144,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-40",
-      "matrixLine": 184,
+      "matrixLine": 187,
       "field": "`moderation`",
       "vendor": {
         "valueSpace": "`{model, policy}`",
@@ -2148,7 +2166,7 @@
         "POST /v1/responses"
       ],
       "matrixRow": "R-41",
-      "matrixLine": 185,
+      "matrixLine": 188,
       "field": "*(behavioral)* unknown top-level field",
       "vendor": {
         "valueSpace": "—",
@@ -2171,7 +2189,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-1",
-      "matrixLine": 195,
+      "matrixLine": 198,
       "field": "`model`",
       "applicability": "G E V",
       "vendor": {
@@ -2195,7 +2213,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-2",
-      "matrixLine": 196,
+      "matrixLine": 199,
       "field": "`prompt`",
       "applicability": "G E",
       "vendor": {
@@ -2218,7 +2236,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-3",
-      "matrixLine": 197,
+      "matrixLine": 200,
       "field": "`images` (JSON) / `image`, `image[]` (multipart)",
       "applicability": "— E —",
       "vendor": {
@@ -2241,7 +2259,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-4",
-      "matrixLine": 198,
+      "matrixLine": 201,
       "field": "`mask`",
       "applicability": "— E —",
       "vendor": {
@@ -2265,7 +2283,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-5",
-      "matrixLine": 199,
+      "matrixLine": 202,
       "field": "`n`",
       "applicability": "G E",
       "vendor": {
@@ -2289,7 +2307,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-6",
-      "matrixLine": 200,
+      "matrixLine": 203,
       "field": "`size`",
       "applicability": "G E",
       "vendor": {
@@ -2313,7 +2331,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-7",
-      "matrixLine": 201,
+      "matrixLine": 204,
       "field": "`quality`",
       "applicability": "G E",
       "vendor": {
@@ -2336,7 +2354,7 @@
         "POST /v1/images/generations"
       ],
       "matrixRow": "I-8",
-      "matrixLine": 202,
+      "matrixLine": 205,
       "field": "`style`",
       "applicability": "G — —",
       "vendor": {
@@ -2360,7 +2378,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-9",
-      "matrixLine": 203,
+      "matrixLine": 206,
       "field": "`background`",
       "applicability": "G E V",
       "vendor": {
@@ -2384,7 +2402,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-10",
-      "matrixLine": 204,
+      "matrixLine": 207,
       "field": "`output_format`",
       "applicability": "G E",
       "vendor": {
@@ -2408,7 +2426,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-11",
-      "matrixLine": 205,
+      "matrixLine": 208,
       "field": "`output_compression`",
       "applicability": "G E",
       "vendor": {
@@ -2432,7 +2450,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-12",
-      "matrixLine": 206,
+      "matrixLine": 209,
       "field": "`moderation`",
       "applicability": "G E",
       "vendor": {
@@ -2455,7 +2473,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-13",
-      "matrixLine": 207,
+      "matrixLine": 210,
       "field": "`input_fidelity`",
       "applicability": "— E —",
       "vendor": {
@@ -2479,7 +2497,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-14",
-      "matrixLine": 208,
+      "matrixLine": 211,
       "field": "`response_format`",
       "applicability": "G E V",
       "vendor": {
@@ -2503,7 +2521,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-15",
-      "matrixLine": 209,
+      "matrixLine": 212,
       "field": "`stream`",
       "applicability": "G E",
       "vendor": {
@@ -2527,7 +2545,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-16",
-      "matrixLine": 210,
+      "matrixLine": 213,
       "field": "`partial_images`",
       "applicability": "G E",
       "vendor": {
@@ -2551,7 +2569,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-17",
-      "matrixLine": 211,
+      "matrixLine": 214,
       "field": "`user`",
       "applicability": "G E V",
       "vendor": {
@@ -2575,7 +2593,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-18",
-      "matrixLine": 212,
+      "matrixLine": 215,
       "field": "`x_proxy_image_route`",
       "applicability": "G E",
       "vendor": {
@@ -2599,7 +2617,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-19",
-      "matrixLine": 213,
+      "matrixLine": 216,
       "field": "*(behavioral)* body encoding",
       "applicability": "G E —",
       "vendor": {
@@ -2623,7 +2641,7 @@
         "POST /v1/images/edits"
       ],
       "matrixRow": "I-20",
-      "matrixLine": 214,
+      "matrixLine": 217,
       "field": "*(behavioral)* unknown top-level field",
       "applicability": "G E",
       "vendor": {
@@ -2646,7 +2664,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-1",
-      "matrixLine": 224,
+      "matrixLine": 227,
       "field": "`model`",
       "vendor": {
         "valueSpace": "string, required",
@@ -2668,7 +2686,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-2",
-      "matrixLine": 225,
+      "matrixLine": 228,
       "field": "`max_tokens`",
       "vendor": {
         "valueSpace": "integer, **required**",
@@ -2690,7 +2708,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-3",
-      "matrixLine": 226,
+      "matrixLine": 229,
       "field": "`messages`",
       "vendor": {
         "valueSpace": "array, `minItems: 1`, required",
@@ -2712,7 +2730,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-4",
-      "matrixLine": 227,
+      "matrixLine": 230,
       "field": "`messages[].role`",
       "vendor": {
         "valueSpace": "`user`|`assistant`, plus `system` in the positions §5.5.7 measures",
@@ -2734,7 +2752,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-5",
-      "matrixLine": 228,
+      "matrixLine": 231,
       "field": "`messages[].content`",
       "vendor": {
         "valueSpace": "string | block array",
@@ -2756,7 +2774,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-6",
-      "matrixLine": 229,
+      "matrixLine": 232,
       "field": "`content[].type:\"text\"`",
       "vendor": {
         "valueSpace": "`{text, cache_control?, citations?}`",
@@ -2778,7 +2796,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-7",
-      "matrixLine": 230,
+      "matrixLine": 233,
       "field": "`content[].type:\"image\"`",
       "vendor": {
         "valueSpace": "`source`: `{type:\"base64\", media_type, data}` | `{type:\"url\", url}` | `{type:\"file\", file_id}`",
@@ -2800,7 +2818,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-8",
-      "matrixLine": 231,
+      "matrixLine": 234,
       "field": "`content[].type:\"document\"`",
       "vendor": {
         "valueSpace": "PDF / text / custom-content sources",
@@ -2822,7 +2840,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-9",
-      "matrixLine": 232,
+      "matrixLine": 235,
       "field": "`content[].type:\"tool_use\"`",
       "vendor": {
         "valueSpace": "`{id, name, input}`",
@@ -2844,7 +2862,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-10",
-      "matrixLine": 233,
+      "matrixLine": 236,
       "field": "`content[].type:\"tool_result\"`",
       "vendor": {
         "valueSpace": "`{tool_use_id, content, is_error?}`",
@@ -2866,7 +2884,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-11",
-      "matrixLine": 234,
+      "matrixLine": 237,
       "field": "`content[].type:\"thinking\"` / `\"redacted_thinking\"`",
       "vendor": {
         "valueSpace": "`{thinking, signature}`",
@@ -2888,7 +2906,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-12",
-      "matrixLine": 235,
+      "matrixLine": 238,
       "field": "`cache_control` (on any block)",
       "vendor": {
         "valueSpace": "`{type:\"ephemeral\", ttl?}`",
@@ -2910,7 +2928,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-13",
-      "matrixLine": 236,
+      "matrixLine": 239,
       "field": "`system`",
       "vendor": {
         "valueSpace": "string | block array",
@@ -2932,7 +2950,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-14",
-      "matrixLine": 237,
+      "matrixLine": 240,
       "field": "`temperature`",
       "vendor": {
         "valueSpace": "number **0..1**",
@@ -2954,7 +2972,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-15",
-      "matrixLine": 238,
+      "matrixLine": 241,
       "field": "`top_p`",
       "vendor": {
         "valueSpace": "number 0..1",
@@ -2976,7 +2994,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-16",
-      "matrixLine": 239,
+      "matrixLine": 242,
       "field": "`top_k`",
       "vendor": {
         "valueSpace": "integer (negatives accepted by the direct API)",
@@ -2998,7 +3016,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-17",
-      "matrixLine": 240,
+      "matrixLine": 243,
       "field": "`stop_sequences`",
       "vendor": {
         "valueSpace": "array of strings",
@@ -3020,7 +3038,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-18",
-      "matrixLine": 241,
+      "matrixLine": 244,
       "field": "`stream`",
       "vendor": {
         "valueSpace": "boolean",
@@ -3042,7 +3060,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-19",
-      "matrixLine": 242,
+      "matrixLine": 245,
       "field": "`tools`",
       "vendor": {
         "valueSpace": "array of `{name, description, input_schema}` + server tools (`web_search`, `bash`, `text_editor`, `computer`, …)",
@@ -3064,7 +3082,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-20",
-      "matrixLine": 243,
+      "matrixLine": 246,
       "field": "`tools[].input_schema`",
       "vendor": {
         "valueSpace": "JSON Schema object, required",
@@ -3086,7 +3104,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-21",
-      "matrixLine": 244,
+      "matrixLine": 247,
       "field": "`tool_choice`",
       "vendor": {
         "valueSpace": "`{type:\"auto\"|\"any\"|\"tool\"|\"none\", name?, disable_parallel_tool_use?}`",
@@ -3108,7 +3126,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-22",
-      "matrixLine": 245,
+      "matrixLine": 248,
       "field": "`thinking`",
       "vendor": {
         "valueSpace": "`{type:\"adaptive\"|\"enabled\"|\"disabled\", budget_tokens?, display?}`",
@@ -3130,7 +3148,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-23",
-      "matrixLine": 246,
+      "matrixLine": 249,
       "field": "`output_config.effort`",
       "vendor": {
         "valueSpace": "`low`|`medium`|`high`|`xhigh`|`max`",
@@ -3152,7 +3170,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-24",
-      "matrixLine": 247,
+      "matrixLine": 250,
       "field": "`output_config.format`",
       "vendor": {
         "valueSpace": "`{type:\"json_schema\", schema}`",
@@ -3174,7 +3192,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-25",
-      "matrixLine": 248,
+      "matrixLine": 251,
       "field": "`output_config.task_budget`",
       "vendor": {
         "valueSpace": "`{type:\"tokens\", total ≥ 20000}`",
@@ -3196,7 +3214,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-26",
-      "matrixLine": 249,
+      "matrixLine": 252,
       "field": "`output_format` (top level, deprecated)",
       "vendor": {
         "valueSpace": "object",
@@ -3218,7 +3236,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-27",
-      "matrixLine": 250,
+      "matrixLine": 253,
       "field": "`metadata.user_id`",
       "vendor": {
         "valueSpace": "opaque string",
@@ -3240,7 +3258,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-28",
-      "matrixLine": 251,
+      "matrixLine": 254,
       "field": "`service_tier`",
       "vendor": {
         "valueSpace": "`auto`|`standard_only`",
@@ -3262,7 +3280,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-29",
-      "matrixLine": 252,
+      "matrixLine": 255,
       "field": "`speed`",
       "vendor": {
         "valueSpace": "`standard`|`fast`",
@@ -3284,7 +3302,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-30",
-      "matrixLine": 253,
+      "matrixLine": 256,
       "field": "`inference_geo`",
       "vendor": {
         "valueSpace": "string (beta)",
@@ -3306,7 +3324,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-31",
-      "matrixLine": 254,
+      "matrixLine": 257,
       "field": "`mcp_servers`",
       "vendor": {
         "valueSpace": "array of MCP server defs (beta)",
@@ -3328,7 +3346,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-32",
-      "matrixLine": 255,
+      "matrixLine": 258,
       "field": "`container`",
       "vendor": {
         "valueSpace": "string (code-execution container id)",
@@ -3350,7 +3368,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-33",
-      "matrixLine": 256,
+      "matrixLine": 259,
       "field": "`context_management`",
       "vendor": {
         "valueSpace": "object (beta)",
@@ -3372,7 +3390,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-34",
-      "matrixLine": 257,
+      "matrixLine": 260,
       "field": "`anthropic-version` header",
       "vendor": {
         "valueSpace": "e.g. `2023-06-01`; **required**",
@@ -3394,7 +3412,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-35",
-      "matrixLine": 258,
+      "matrixLine": 261,
       "field": "`anthropic-beta` header",
       "vendor": {
         "valueSpace": "array/CSV of beta ids",
@@ -3416,7 +3434,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-36",
-      "matrixLine": 259,
+      "matrixLine": 262,
       "field": "`x-api-key` / `Authorization`",
       "vendor": {
         "valueSpace": "credential header",
@@ -3438,7 +3456,7 @@
         "POST /v1/messages"
       ],
       "matrixRow": "A-37",
-      "matrixLine": 260,
+      "matrixLine": 263,
       "field": "*(behavioral)* unknown top-level field",
       "vendor": {
         "valueSpace": "—",

@@ -85,6 +85,10 @@ const OPENAI_METADATA_MAX_VALUE_LENGTH = 512;
 // Measured, not assumed: `n: 64` answers "Expected a value <= 8".
 const OPENAI_CHAT_MAX_CHOICES = 8;
 const OPENAI_CHAT_MAX_TOP_LOGPROBS = 5;
+// Responses documents `0..20` where Chat measures a ceiling of 5. Which one the
+// direct Responses API enforces is unmeasured; the documented range is the one
+// this surface publishes, so it is the one a request is held to.
+const OPENAI_RESPONSES_MAX_TOP_LOGPROBS = 20;
 
 export function normalizeOpenAiChatRequest(body: unknown): NormalizedRequest {
   const input = objectBody(body);
@@ -1077,6 +1081,29 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
   // the model can do and not about the shape of the body. Both doors to them
   // are refused; the proxy used to accept the `include` member and run the
   // turn, answering with no logprobs in it at all.
+  //
+  // `top_logprobs` is refused about what the model can do WHILE IT REASONS, and
+  // at `effort: none` it does not: a promoted capture shows the direct API
+  // answering 200 there, echoing the value, and filling the output text's
+  // `logprobs` member with `[]`
+  // (`spec/captures/direct-responses-top-logprobs-effort-none.json`). This
+  // surface refused at every effort while Chat accepted at `none`, so one proxy
+  // gave two answers to one request.
+  //
+  // ONLY that door moves. The `include` member and the two penalties were
+  // opened the same way in the first version of this change and had to be shut
+  // again: their acceptance at `effort: none` on THIS surface is unmeasured,
+  // and the unconditional refusal turned out to be the only validation standing
+  // in front of them — behind it, `presence_penalty: 99` and
+  // `frequency_penalty: 1e308` were accepted and echoed back, where Chat, at the
+  // same effort, answers `decimal_above_max_value`. Inferring the acceptance
+  // published three unvalidated fields.
+  //
+  // A plain read, not the validated one: `reasoning` reports its own fault at
+  // its own position above, and this pass runs after it. `asRecord` answers
+  // `null` for a null or an array, so anything that is not the exact string
+  // keeps the refusal.
+  const reasons = asRecord(input.reasoning)?.effort !== 'none';
   rejectUnsupportedOpenAiSampling(input, 'openai-responses', 'temperature');
   rejectUnsupportedOpenAiSampling(input, 'openai-responses', 'top_p');
   // `include` first: sent together, the direct API names that door (measured).
@@ -1084,7 +1111,24 @@ function validateOpenAiResponsesFields(input: Record<string, unknown>, model: st
     throw unsupportedParameter('include', 'logprobs are not supported with reasoning models.');
   }
   if (present('top_logprobs')) {
-    throw unsupportedParameter('top_logprobs', 'logprobs are not supported with reasoning models.');
+    if (reasons) {
+      throw unsupportedParameter('top_logprobs', 'logprobs are not supported with reasoning models.');
+    }
+    // Accepted — so it has to be a value this surface's own documentation calls
+    // valid. The bound is checked HERE rather than at the field's position
+    // above so that a reasoning turn still answers with the refusal that was
+    // measured, and it is `0..20` because that is the range the matrix records
+    // for this surface (R-12, doc-sourced); Chat's measured ceiling is 5, and
+    // which one the direct Responses API enforces is unmeasured. Without a
+    // bound the surface accepted `999` and `-5` and echoed them back.
+    const top = input.top_logprobs as number;
+    if (top < 0) throw integerBelowMin('top_logprobs', top, 0);
+    if (top > OPENAI_RESPONSES_MAX_TOP_LOGPROBS) {
+      throw new ProxyRequestError(
+        `Invalid value for 'top_logprobs': must be less than or equal to ${OPENAI_RESPONSES_MAX_TOP_LOGPROBS}.`,
+        400, 'openai', 'invalid_request_error', 'top_logprobs',
+      );
+    }
   }
   for (const key of ['presence_penalty', 'frequency_penalty'] as const) {
     // Chat carries `unsupported_parameter` here; Responses carries no code at

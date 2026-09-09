@@ -264,6 +264,20 @@ const REJECTIONS = [
   ["top_logprobs refusal vs temperature", { ...OUT, top_logprobs: 1, temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
   ["include logprobs vs temperature", { ...OUT, include: ['message.output_text.logprobs'], temperature: 0.5 }, { param: "temperature", code: null, message: "Unsupported parameter: 'temperature' is not supported with this model." }],
   ["include logprobs vs top_logprobs", { ...OUT, include: ['message.output_text.logprobs'], top_logprobs: 1 }, { param: "include", code: "unsupported_parameter", message: "logprobs are not supported with reasoning models." }],
+
+  // At `reasoning.effort: none` the model does not reason, and a promoted
+  // capture shows the direct API answering 200 to `top_logprobs` there. The
+  // acceptance is a conformance gate's claim; these rows hold the EDGES of it,
+  // which is where the first version of the change went wrong — it opened three
+  // more doors on inference, and behind them stood no value checks at all.
+  ["top_logprobs above the documented range at effort none", { ...OUT, reasoning: { effort: 'none' }, top_logprobs: 21 }, { param: "top_logprobs", code: null, message: "Invalid value for 'top_logprobs': must be less than or equal to 20." }],
+  ["top_logprobs below zero at effort none", { ...OUT, reasoning: { effort: 'none' }, top_logprobs: -1 }, { param: "top_logprobs", code: "integer_below_min_value", message: "Invalid 'top_logprobs': integer below minimum value. Expected a value >= 0, but got -1 instead." }],
+  ["include logprobs is still refused at effort none", { ...OUT, reasoning: { effort: 'none' }, include: ['message.output_text.logprobs'] }, { param: "include", code: "unsupported_parameter", message: "logprobs are not supported with reasoning models." }],
+  ["presence_penalty is still refused at effort none", { ...OUT, reasoning: { effort: 'none' }, presence_penalty: 0.5 }, { param: "presence_penalty", code: null, message: "Unsupported parameter: 'presence_penalty' is not supported with this model." }],
+  ["frequency_penalty is still refused at effort none", { ...OUT, reasoning: { effort: 'none' }, frequency_penalty: 0.5 }, { param: "frequency_penalty", code: null, message: "Unsupported parameter: 'frequency_penalty' is not supported with this model." }],
+  ["top_logprobs is refused when reasoning is not an object", { ...OUT, reasoning: null, top_logprobs: 1 }, { param: "top_logprobs", code: "unsupported_parameter", message: "logprobs are not supported with reasoning models." }],
+  ["top_logprobs is refused at an effort that is not none", { ...OUT, reasoning: { effort: 'low' }, top_logprobs: 1 }, { param: "top_logprobs", code: "unsupported_parameter", message: "logprobs are not supported with reasoning models." }],
+  ["a type fault still beats the accepted top_logprobs", { ...OUT, reasoning: { effort: 'none' }, top_logprobs: 1, context_management: 'x' }, { param: "context_management", code: "invalid_type", message: "Invalid type for 'context_management': expected an array of objects, but got a string instead." }],
 ];
 
 for (const [name, fragment, expected] of REJECTIONS) {
