@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "e78cfb9fb147ed87e2325741cf973b0e2f801fee1d20fb3996272b4a3993dff5",
+    "matrixDigest": "ee3684d7ee6408741df1fad8b749a817bb4048e2855fe46ec11f607bc7eb2bbc",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -146,6 +146,18 @@
       "surface": "/v1/chat/completions",
       "evidence": "docs/conformance-matrix.md §5.5.5",
       "measuredAt": "2026-09-01"
+    },
+    {
+      "id": "responses-hosted-tool-usage-is-not-reported",
+      "surface": "/v1/responses",
+      "evidence": "docs/conformance-matrix.md §5.5.9",
+      "measuredAt": "2026-08-29"
+    },
+    {
+      "id": "responses-reasoning-mode-is-not-reported",
+      "surface": "/v1/responses",
+      "evidence": "docs/conformance-matrix.md §5.5.9",
+      "measuredAt": "2026-08-29"
     }
   ],
   "claims": [
@@ -1744,13 +1756,13 @@
       "field": "`reasoning.context`",
       "vendor": {
         "valueSpace": "`auto`|`current_turn`|`all_turns`",
-        "defaultWhenOmitted": "UNKNOWN (contract's own sample body shows `\"context\":\"current_turn\"`)",
+        "defaultWhenOmitted": "**`all_turns`** — observed on the wire 2026-08-29 (P-1, `spec/captures/direct-responses-minimal.json`, whose request proves `reasoning` was omitted). The contract's own sample body showed `\"context\":\"current_turn\"`, which is where our echo's default came from until 2026-09-09; the sample is not the wire. The row's Ev stays `DOC?`: this legend scopes `VERIFIED` to \"the field was accepted and the asserted response shape came back\", explicitly **never** to \"the omitted default was X\", and nothing here has measured the accepted values, the invalid-value error, or the effect",
         "observableEffect": "which reasoning items replay",
         "invalidValue": "400 / `invalid_request_error` / `reasoning.context` / —"
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
-      "claimedNote": "echoed via `responseReasoning`; not acted on",
+      "claimedNote": "echoed via `responseReasoning` at the vendor's measured default `all_turns`; not acted on (`conformance-echoed-defaults.test` compares the echo against `spec/captures/direct-responses-minimal.json`)",
       "evidenceGrade": "DOC?",
       "evidenceNote": "DOC?",
       "liveParityRow": true

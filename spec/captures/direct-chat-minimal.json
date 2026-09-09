@@ -1,0 +1,33 @@
+{
+  "claimEvidence": "direct-chat-minimal",
+  "originRoot": "artifacts/direct-api-captures",
+  "originRun": "a5eee9af-fcf4-450c-a0b0-4b16cdfcefbf",
+  "originFile": "0003-P-3.json",
+  "promotedAt": "2026-09-09T13:26:31.054Z",
+  "requiredContent": {
+    "mustContain": null,
+    "mustNotContain": null,
+    "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_completion_tokens\":16}"
+  },
+  "promotedFrom": {
+    "revision": "172ffce2a615405f946c1ddbde808af8bee1298f",
+    "sources": [
+      {
+        "path": "scripts/lib/capture-provenance.mjs",
+        "blob": "4bf38fcc8a768d5b3289bebe5cdb6221caad58d7"
+      },
+      {
+        "path": "scripts/promote-capture.mjs",
+        "blob": "ed5a0dbc6f07ca6440c9a4d2bcef11051b65f8b2"
+      }
+    ]
+  },
+  "url": "https://api.openai.com/v1/chat/completions",
+  "status": 200,
+  "kind": "json",
+  "requestSha256": "d6906e54f891f94f0a93d06fc4283cd19f518c66f9de2ae6b7cdec41aec8b34e",
+  "request": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_completion_tokens\":16}",
+  "bodySha256": "1c8e7252c899e005000e01c7d592dca4b7bde3e866153342d4df101331e21470",
+  "bodyBytes": 796,
+  "body": "{\n  \"id\": \"chatcmpl-EHwd5u013WnWJu4Vglv0c8CWg1K3A\",\n  \"object\": \"chat.completion\",\n  \"created\": 1787945655,\n  \"model\": \"gpt-5.6-terra\",\n  \"choices\": [\n    {\n      \"index\": 0,\n      \"message\": {\n        \"role\": \"assistant\",\n        \"content\": \"pong\",\n        \"refusal\": null,\n        \"annotations\": []\n      },\n      \"finish_reason\": \"stop\"\n    }\n  ],\n  \"usage\": {\n    \"prompt_tokens\": 7,\n    \"completion_tokens\": 4,\n    \"total_tokens\": 11,\n    \"prompt_tokens_details\": {\n      \"cached_tokens\": 0,\n      \"cache_write_tokens\": 0,\n      \"audio_tokens\": 0\n    },\n    \"completion_tokens_details\": {\n      \"reasoning_tokens\": 0,\n      \"audio_tokens\": 0,\n      \"accepted_prediction_tokens\": 0,\n      \"rejected_prediction_tokens\": 0\n    }\n  },\n  \"service_tier\": \"default\",\n  \"system_fingerprint\": null\n}\n"
+}

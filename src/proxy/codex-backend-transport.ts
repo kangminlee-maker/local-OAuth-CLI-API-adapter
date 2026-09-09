@@ -3182,6 +3182,15 @@ function usageFromResponses(value: unknown): LocalUsage | undefined {
     inputTokens,
     outputTokens,
     totalTokens,
+    // `input_tokens_details.cache_write_tokens` is NOT read here, and adding it
+    // as `cacheCreationInputTokens` would be wrong rather than incomplete:
+    // `openAiInputTokens` treats that member being set as the marker for the
+    // Anthropic convention, where `inputTokens` EXCLUDES cache tokens and the
+    // halves are added back. This protocol is the other convention — its
+    // `input_tokens` already contains them — so writing the write count into
+    // that field would inflate every `prompt_tokens` on this backend by it.
+    // Reporting a write count from here needs `LocalUsage` to say which
+    // convention a usage follows; that is a design change, not a line.
     cachedInputTokens: readNumber(inputDetails?.cached_tokens),
     reasoningOutputTokens: readNumber(outputDetails?.reasoning_tokens),
     source: 'provider',
