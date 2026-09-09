@@ -3,13 +3,16 @@
   "originRoot": "artifacts/direct-api-captures",
   "originRun": "a5eee9af-fcf4-450c-a0b0-4b16cdfcefbf",
   "originFile": "0003-P-3.json",
-  "promotedAt": "2026-09-09T00:10:22.007Z",
+  "promotedAt": "2026-09-09T11:51:00.823Z",
   "requiredContent": {
     "mustContain": null,
     "mustNotContain": null,
     "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_completion_tokens\":16}"
   },
-  "promotedFromRevision": "391d25cd51176385d2e13217d1c1c3f7746c9db7",
+  "promotedFrom": {
+    "revision": "1978f3c41362435ffef40fee2b372447d1256464",
+    "promoterUncommitted": false
+  },
   "url": "https://api.openai.com/v1/chat/completions",
   "status": 200,
   "kind": "json",

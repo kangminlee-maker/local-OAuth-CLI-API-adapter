@@ -209,6 +209,18 @@ test('the captures this check reads are present and intact', () => {
         `${fixture} ${field} no longer matches the capture it was promoted from`,
       );
     }
+    // A fixture whose stamp names a revision that could not have produced it is
+    // worse than one with no stamp, because a reader treats the stamp as
+    // evidence. The promoter refuses to write an unbound one; this gates the
+    // committed artifact, so a fixture promoted from a modified promoter (or
+    // with the refusal overridden) cannot land here.
+    assert.equal(
+      capture.promotedFrom?.promoterUncommitted,
+      false,
+      `${fixture} was promoted by a promoter that differed from its recorded revision`,
+    );
+    assert.match(capture.promotedFrom?.revision ?? '', /^[0-9a-f]{40}$/, `${fixture} records no promoting revision`);
+
     // The claim is "every optional field omitted EXCEPT the output cap", which
     // the probe sets to bound what the measurement costs. That cap is not a
     // default — it is an echo of a value the request supplied, and it is
