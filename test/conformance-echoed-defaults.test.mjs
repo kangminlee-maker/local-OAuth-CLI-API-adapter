@@ -246,6 +246,23 @@ test('a key that looks like the reader\'s own syntax is read as a key', () => {
   assert.deepEqual([...keyPaths({ a: { b: 1 } }).keys()].sort(), ['.a.b:number', '.a:object']);
 });
 
+test('a quoted key is spelled the same way everywhere', () => {
+  // Quoting was added to the shape reader alone, so a field needing it could be
+  // compared under one spelling and looked up under another: a declaration for
+  // `.metadata["a.b"]` matched the shape and found `undefined` among the leaves.
+  const body = { metadata: { 'a.b': 1 }, plain: 2 };
+  const shape = [...keyPaths(body).values()];
+  const leaves = [...leafValues(body, '', new Map()).keys()];
+  assert.ok(shape.includes('.metadata["a.b"]'), `shape reader: ${shape.join(', ')}`);
+  assert.ok(leaves.includes('.metadata["a.b"]'), `leaf reader: ${leaves.join(', ')}`);
+  // …and a declaration may be written in that spelling.
+  assert.doesNotThrow(() => validateDeclarations([{
+    id: 'q', surface: '/v1/responses', claim: 'supplied-echo',
+    behavior: 'b', why: 'w', measuredAt: '2026-09-10', evidence: 'e',
+    absentPaths: ['["a-b"]', '.metadata["a.b"]'],
+  }]));
+});
+
 test('the reader stays cheap on a deeply nested body', () => {
   // Each member's subtree used to be walked once for its own signature and
   // again for the aggregate, which is exponential in depth. A review measured

@@ -170,6 +170,11 @@ const GROUPS = {
  * server is what the proxy received, and the gate contributes no label to it —
  * the surface and the bytes are read off the request itself.
  */
+// Headers that describe the hop rather than the message. `fetch` decodes and
+// re-frames on its own, so passing these through would describe a transfer that
+// is no longer happening.
+const HOP_BY_HOP = new Set(['host', 'connection', 'keep-alive', 'transfer-encoding', 'content-length', 'content-encoding']);
+
 export async function startReplayRecorder(targetUrl) {
   const seen = [];
   const server = createServer((req, res) => {
@@ -178,16 +183,19 @@ export async function startReplayRecorder(targetUrl) {
     req.on('end', async () => {
       const body = Buffer.concat(chunks);
       seen.push({ surface: req.url, request: createHash('sha256').update(body).digest('hex') });
-      const upstream = await fetch(`${targetUrl}${req.url}`, {
-        method: req.method,
-        headers: { 'content-type': req.headers['content-type'] ?? 'application/json' },
-        body,
-      });
-      const text = await upstream.text();
-      res.writeHead(upstream.status, {
-        'content-type': upstream.headers.get('content-type') ?? 'application/json',
-      });
-      res.end(text);
+      const forwarded = Object.fromEntries(
+        Object.entries(req.headers).filter(([name]) => !HOP_BY_HOP.has(name)),
+      );
+      const upstream = await fetch(`${targetUrl}${req.url}`, { method: req.method, headers: forwarded, body });
+      // BYTES, not text. Decoding and re-encoding is not observation: reading
+      // the answer as a string collapsed a run of byte-order marks the proxy had
+      // actually sent, so a body the gate could not have parsed arrived parsed.
+      // A review put three of them in front of a turn and the gate passed 37/37.
+      const answer = Buffer.from(await upstream.arrayBuffer());
+      const back = {};
+      for (const [name, value] of upstream.headers) if (!HOP_BY_HOP.has(name)) back[name] = value;
+      res.writeHead(upstream.status, { ...back, 'content-length': answer.length });
+      res.end(answer);
     });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

@@ -26,6 +26,11 @@ const declared = JSON.parse(
 // satisfied by someone else's evidence. Refusing here means a malformed
 // declaration cannot be loaded by either gate rather than being caught by
 // whichever test happens to read it.
+// A path starts at a key, and a key that needs quoting is written `["…"]`.
+// Requiring a leading dot rejected every quoted first segment, so a field that
+// needs quotes could be compared but never declared.
+const isKeyPath = (path) => path.startsWith('.') || path.startsWith('[');
+
 const canonicalJsonText = (text) => {
   if (typeof text !== 'string') return false;
   try { return JSON.stringify(JSON.parse(text)) === text; } catch { return false; }
@@ -48,12 +53,12 @@ export function validateDeclarations(divergences) {
       if (key in entry && !Array.isArray(entry[key])) throw new Error(`${where}: ${key} must be a list`);
     }
     for (const path of entry.absentPaths ?? []) {
-      if (typeof path !== 'string' || !path.startsWith('.')) {
+      if (typeof path !== 'string' || !isKeyPath(path)) {
         throw new Error(`${where}: absentPaths must be key paths written as the reader emits them`);
       }
     }
     for (const divergence of entry.valueDivergences ?? []) {
-      if (typeof divergence?.path !== 'string' || !divergence.path.startsWith('.')) {
+      if (typeof divergence?.path !== 'string' || !isKeyPath(divergence.path)) {
         throw new Error(`${where}: a valueDivergences path must be a key path`);
       }
       for (const side of ['vendor', 'proxy']) {
@@ -287,7 +292,10 @@ export function leafValues(value, prefix, out) {
     return out;
   }
   if (value !== null && typeof value === 'object') {
-    for (const [key, member] of Object.entries(value)) leafValues(member, `${prefix}.${key}`, out);
+    // The same spelling the shape reader uses. They were written apart, and a
+    // key needing quotes could then be declared for one and not found by the
+    // other: `.metadata["a.b"]` matched the shape and looked up `undefined`.
+    for (const [key, member] of Object.entries(value)) leafValues(member, `${prefix}${segmentFor(key)}`, out);
     return out;
   }
   out.set(prefix, JSON.stringify(value));
