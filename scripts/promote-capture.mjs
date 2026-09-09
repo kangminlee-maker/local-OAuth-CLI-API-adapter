@@ -10,13 +10,11 @@
 // test. So a promotion states what the capture must contain, and refuses rather
 // than promoting something that does not.
 import { createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
+import { bindingOfExecutingSource, repoRoot } from './lib/capture-provenance.mjs';
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const name = readArg('--name');
 const root = readArg('--from');
@@ -35,7 +33,7 @@ const requestMustBe = readArg('--request-must-be');
 const outDir = readArg('--out-dir') ?? join('spec', 'captures');
 
 if (!name || !root || !urlPart) {
-  console.error('usage: promote-capture.mjs --name <fixture> --from <capture root> --url <url substring> [--kind sse|json] [--must-contain <text>] [--must-not-contain <text>] [--request-must-be <exact request body>] [--out-dir <dir>]');
+  console.error('usage: promote-capture.mjs --name <fixture> --from <capture root> --url <url substring> [--kind sse|json] [--must-contain <text>] [--must-not-contain <text>] [--request-must-be <exact request body>] [--out-dir <dir>] [--allow-unbound-provenance]');
   process.exit(2);
 }
 if (kind !== 'sse' && kind !== 'json') {
@@ -51,36 +49,24 @@ if (kind === 'json' && !requestMustBe) {
   process.exit(2);
 }
 
-/**
- * The tree that produced this fixture — and whether that claim binds.
- *
- * Stamping ambient `HEAD` alone is a false identity: fixtures promoted while
- * this script was still uncommitted named a revision that contains no code able
- * to write the field. What decides the claim is not the whole worktree (which
- * carries unrelated edits and would never be clean) but THIS script: if its own
- * source differs from `HEAD`, `HEAD` does not name the code that ran.
- */
-function provenance() {
-  try {
-    const revision = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
-    const self = relative(repoRoot, fileURLToPath(import.meta.url));
-    const status = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain', '--', self], { encoding: 'utf8' });
-    return { revision, promoterUncommitted: status.trim() !== '' };
-  } catch {
-    return { revision: null, promoterUncommitted: null };
+// What wrote this fixture, as a claim git can re-check: the revision, the path,
+// and the sha1 of the executing bytes. A fixture that names a revision which
+// cannot have produced it is worse than one that names none, because a reader
+// treats the stamp as evidence — so a promotion that cannot state the binding
+// refuses instead of degrading to `null` or to an unchecked boolean.
+let promotedFrom;
+try {
+  promotedFrom = bindingOfExecutingSource(import.meta.url);
+} catch (error) {
+  if (!args.includes('--allow-unbound-provenance')) {
+    console.error(
+      `refusing to promote: ${error.message}. Commit the promoter and run it from its tracked path, `
+      + 'or pass --allow-unbound-provenance to write a fixture marked unbound — which no conformance '
+      + 'check accepts as evidence.',
+    );
+    process.exit(2);
   }
-}
-
-const promotedFrom = provenance();
-// A fixture that names a revision which cannot have produced it is worse than
-// one that names none: a reader treats the stamp as evidence.
-if (promotedFrom.promoterUncommitted && !args.includes('--allow-unbound-provenance')) {
-  console.error(
-    `${relative(repoRoot, fileURLToPath(import.meta.url))} has uncommitted changes, so HEAD (${promotedFrom.revision?.slice(0, 12) ?? 'unknown'}) `
-    + 'does not name the code that would write this fixture. Commit the promoter first, or pass '
-    + '--allow-unbound-provenance to record the stamp as unbound.',
-  );
-  process.exit(2);
+  promotedFrom = { unbound: error.message };
 }
 
 const rootDir = resolve(repoRoot, root);

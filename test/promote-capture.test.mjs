@@ -7,15 +7,23 @@
 // authenticated request, pairing a response for ever with a request that did
 // not produce it. Everything downstream — "this field was omitted, and this is
 // what came back" — rests on that pairing.
+//
+// The second thing it owes a gate is the binding: which code wrote the fixture,
+// stated so git can re-check it. The cases below run a committed COPY of the
+// promoter inside a throwaway repository, because the three ways the first
+// attempt broke — edited source, ignored source, git missing — are properties of
+// a checkout, and asserting them against this one would make the promoter's own
+// tests fail whenever someone edits the promoter.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, test } from 'node:test';
+import { whyUnbound } from '../scripts/lib/capture-provenance.mjs';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const script = join(repoRoot, 'scripts', 'promote-capture.mjs');
@@ -64,8 +72,57 @@ function promote(dir, extra = []) {
     '--url', '/v1/responses',
     '--kind', 'json',
     '--out-dir', join(dir, 'out'),
+    // These cases are about digests and selection, not about provenance, and
+    // they run the WORKING copy of the promoter — which is uncommitted whenever
+    // someone is editing it. The override keeps that from turning every
+    // selection test red; the binding cases below use committed copies.
+    '--allow-unbound-provenance',
     ...extra,
   ], { cwd: repoRoot, encoding: 'utf8' });
+}
+
+/** Git in a throwaway checkout, with an identity so `commit` works anywhere. */
+function git(dir, ...argv) {
+  const run = spawnSync('git', ['-C', dir, ...argv], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'promote-capture test',
+      GIT_AUTHOR_EMAIL: 'test@example.invalid',
+      GIT_COMMITTER_NAME: 'promote-capture test',
+      GIT_COMMITTER_EMAIL: 'test@example.invalid',
+    },
+  });
+  assert.equal(run.status, 0, `git ${argv.join(' ')}: ${run.stderr}`);
+  return run.stdout.trim();
+}
+
+const PROMOTER = join('scripts', 'promote-capture.mjs');
+
+/** A repository whose only content is a committed copy of the promoter. */
+function checkout() {
+  const dir = workspace();
+  mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
+  for (const rel of [PROMOTER, join('scripts', 'lib', 'capture-provenance.mjs')]) {
+    copyFileSync(join(repoRoot, rel), join(dir, rel));
+  }
+  writeFileSync(join(dir, '.gitignore'), 'dist/\n');
+  git(dir, 'init', '-q');
+  git(dir, 'add', '-A');
+  git(dir, 'commit', '-qm', 'the promoter, committed');
+  return dir;
+}
+
+function promoteIn(dir, { from = join(dir, PROMOTER), extra = [], env = process.env } = {}) {
+  return spawnSync(process.execPath, [
+    from,
+    '--name', 'fixture',
+    '--from', join(dir, 'runs'),
+    '--url', '/v1/responses',
+    '--kind', 'json',
+    '--out-dir', join(dir, 'out'),
+    ...extra,
+  ], { cwd: dir, encoding: 'utf8', env });
 }
 
 const REQUEST = '{"model":"m","input":"ping"}';
@@ -144,4 +201,75 @@ test('two IDENTICAL requests with different responses are refused as ambiguous',
   const run = promote(dir, SELECT);
   assert.equal(run.status, 1, `expected a refusal, got ${run.status}: ${run.stdout}`);
   assert.match(run.stderr, /match and they are not the same exchange/);
+});
+
+test('CONTROL: a committed promoter binds its fixture to the blob git holds', () => {
+  const dir = checkout();
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  const run = promoteIn(dir, { extra: SELECT });
+  assert.equal(run.status, 0, run.stderr);
+
+  const { promotedFrom } = JSON.parse(readFileSync(join(dir, 'out', 'fixture.json'), 'utf8'));
+  assert.equal(promotedFrom.path, PROMOTER);
+  assert.equal(promotedFrom.revision, git(dir, 'rev-parse', 'HEAD'));
+  assert.equal(promotedFrom.blob, git(dir, 'hash-object', '--', join(dir, PROMOTER)));
+  assert.equal(whyUnbound(promotedFrom, { root: dir }), null);
+
+  // The verifier is not vacuous: the same record read against a repository that
+  // does not have that revision is rejected, naming what is missing.
+  assert.match(whyUnbound(promotedFrom, { root: repoRoot }) ?? '', /this clone does not have/);
+});
+
+test('a promoter edited since its commit refuses: HEAD no longer names the code that runs', () => {
+  const dir = checkout();
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  appendFileSync(join(dir, PROMOTER), '\n// an edit that is not in HEAD\n');
+  const run = promoteIn(dir, { extra: SELECT });
+  assert.equal(run.status, 2, `expected a refusal, got ${run.status}: ${run.stdout}`);
+  assert.match(run.stderr, /does not name the code that is running/);
+  assert.throws(() => readFileSync(join(dir, 'out', 'fixture.json')), /ENOENT/);
+});
+
+test('a promoter run from an IGNORED path refuses, instead of inheriting the tracked blob', () => {
+  // The construction a review used to defeat the first attempt: `dist/` is
+  // ignored, so a copy there is untracked, but `git -C` walks up to the same
+  // repository — and a check that asked about `scripts/promote-capture.mjs`
+  // rather than about the file that is executing found the tracked blob and
+  // called the copy clean.
+  const dir = checkout();
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  const hidden = join(dir, 'dist', 'probe');
+  mkdirSync(join(hidden, 'scripts', 'lib'), { recursive: true });
+  for (const rel of [PROMOTER, join('scripts', 'lib', 'capture-provenance.mjs')]) {
+    copyFileSync(join(dir, rel), join(hidden, rel));
+  }
+  assert.equal(
+    spawnSync('git', ['-C', dir, 'check-ignore', join(hidden, PROMOTER)], { encoding: 'utf8' }).status,
+    0,
+    'the copy is supposed to be ignored; this case proves nothing otherwise',
+  );
+
+  const run = promoteIn(dir, { from: join(hidden, PROMOTER), extra: SELECT });
+  assert.equal(run.status, 2, `expected a refusal, got ${run.status}: ${run.stdout}`);
+  assert.match(run.stderr, /dist\/probe\/scripts\/promote-capture\.mjs does not exist at/);
+  assert.throws(() => readFileSync(join(dir, 'out', 'fixture.json')), /ENOENT/);
+});
+
+test('with git unavailable it refuses, and the override writes something no gate accepts', () => {
+  const dir = checkout();
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  // Node is invoked by absolute path, so only git goes missing.
+  const blind = { ...process.env, PATH: join(dir, 'no-such-bin') };
+
+  const refused = promoteIn(dir, { extra: SELECT, env: blind });
+  assert.equal(refused.status, 2, `expected a refusal, got ${refused.status}: ${refused.stdout}`);
+  assert.match(refused.stderr, /refusing to promote/);
+  assert.throws(() => readFileSync(join(dir, 'out', 'fixture.json')), /ENOENT/);
+
+  // An override may still produce local output — it may not produce evidence.
+  const overridden = promoteIn(dir, { extra: [...SELECT, '--allow-unbound-provenance'], env: blind });
+  assert.equal(overridden.status, 0, overridden.stderr);
+  const { promotedFrom } = JSON.parse(readFileSync(join(dir, 'out', 'fixture.json'), 'utf8'));
+  assert.equal(typeof promotedFrom.unbound, 'string');
+  assert.match(whyUnbound(promotedFrom, { root: dir }) ?? '', /was promoted unbound/);
 });
