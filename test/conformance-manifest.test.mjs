@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { REPLAYED_FIXTURES } from './replayed-captures.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(`${root}/spec/conformance.json`, 'utf8'));
@@ -120,11 +121,11 @@ test('a WIRE row names a capture that exists and that a gate replays', () => {
   // `WIRE` that named no capture at all: the builder took the word, the
   // coverage report counted it under "a value read from a capture a gate
   // replays", and the manifest test passed 6/6. The word was the whole check.
-  const gates = readdirSync(`${root}/test`)
-    .filter((name) => name.startsWith('conformance-') && name.endsWith('.test.mjs'))
-    .map((name) => readFileSync(`${root}/test/${name}`, 'utf8'))
-    .join('\n');
-
+  //
+  // Replay is read from the roster the gates iterate, not from their source
+  // text. The first version searched the gate files for the fixture's name,
+  // which a mention in a comment satisfies — including the comment left behind
+  // when the row that replayed the capture is deleted.
   const wire = manifest.claims.filter((claim) => claim.evidenceGrade === 'WIRE');
   assert.ok(wire.length > 0, 'no row carries the grade, so this check proves nothing');
 
@@ -139,7 +140,7 @@ test('a WIRE row names a capture that exists and that a gate replays', () => {
       if (!existsSync(`${root}/spec/captures/${fixture}.json`)) faults.push(`${claim.id}: ${fixture} is not in spec/captures`);
       // The fixture has to be one a gate actually loads, not merely a file on
       // disk: an unreplayed capture proves nothing on any run.
-      else if (!gates.includes(`'${fixture}'`)) faults.push(`${claim.id}: no conformance gate replays ${fixture}`);
+      else if (!REPLAYED_FIXTURES.has(fixture)) faults.push(`${claim.id}: no conformance gate replays ${fixture}`);
     }
   }
   assert.deepEqual(faults, [], 'WIRE rows whose evidence is not what the legend requires');

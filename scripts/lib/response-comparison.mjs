@@ -18,6 +18,59 @@ const declared = JSON.parse(
   readFileSync(join(repoRoot, 'spec', 'declared-divergences.json'), 'utf8'),
 ).divergences;
 
+// A declaration that cannot be compared is worse than a missing one: it looks
+// like a checked claim and matches nothing. The gates compare a divergence's
+// two sides against `JSON.stringify` of a leaf, so `"detailed"` is the written
+// form and `detailed` is a value no answer can ever equal — which would leave
+// the declaration permanently unexhibited or, keyed loosely, permanently
+// satisfied by someone else's evidence. Refusing here means a malformed
+// declaration cannot be loaded by either gate rather than being caught by
+// whichever test happens to read it.
+const canonicalJsonText = (text) => {
+  if (typeof text !== 'string') return false;
+  try { return JSON.stringify(JSON.parse(text)) === text; } catch { return false; }
+};
+
+/** Throws on a declaration the gates could not compare. Exported so it can be shown to refuse. */
+export function validateDeclarations(divergences) {
+  if (!Array.isArray(divergences)) throw new Error('declared-divergences: divergences must be a list');
+  const seenIds = new Set();
+  for (const entry of divergences) {
+    const where = `declared-divergences entry ${typeof entry?.id === 'string' ? entry.id : '(unnamed)'}`;
+    for (const field of ['id', 'surface', 'claim', 'behavior', 'why', 'measuredAt', 'evidence']) {
+      if (typeof entry?.[field] !== 'string' || entry[field] === '') {
+        throw new Error(`${where}: ${field} must be a non-empty string`);
+      }
+    }
+    if (seenIds.has(entry.id)) throw new Error(`${where}: declared twice`);
+    seenIds.add(entry.id);
+    for (const key of ['absentPaths', 'valueDivergences']) {
+      if (key in entry && !Array.isArray(entry[key])) throw new Error(`${where}: ${key} must be a list`);
+    }
+    for (const path of entry.absentPaths ?? []) {
+      if (typeof path !== 'string' || !path.startsWith('.')) {
+        throw new Error(`${where}: absentPaths must be key paths written as the reader emits them`);
+      }
+    }
+    for (const divergence of entry.valueDivergences ?? []) {
+      if (typeof divergence?.path !== 'string' || !divergence.path.startsWith('.')) {
+        throw new Error(`${where}: a valueDivergences path must be a key path`);
+      }
+      for (const side of ['vendor', 'proxy']) {
+        if (!canonicalJsonText(divergence[side])) {
+          throw new Error(`${where}: ${divergence.path} ${side} must be the JSON text of a value`);
+        }
+      }
+      if (divergence.vendor === divergence.proxy) {
+        throw new Error(`${where}: ${divergence.path} declares a divergence between two equal values`);
+      }
+    }
+  }
+  return divergences;
+}
+
+validateDeclarations(declared);
+
 /**
  * The response paths a surface is declared NOT to emit.
  *
@@ -49,15 +102,68 @@ export function valueDivergencesFor(surface) {
 }
 
 /**
- * The form a declaration is written in: no type tag, and no trailing `[]`.
+ * The form a declaration is written in: no type tag, no trailing `[]`, and no
+ * member-signature suffix.
  *
- * A declaration names a field. The reader emits two paths a declaration would
- * never write — `…:type` for the type at a path, and `…[]` for the types an
- * array's members take — and both belong to the field above them: if we do not
- * report `choices[].logprobs.content` at all, we report nothing beneath it
- * either, so its member types are absent for the same declared reason.
+ * A declaration names a field. The reader emits paths a declaration would never
+ * write — `…:type` for the type at a path, `…[]` for the types an array's
+ * members take, and `…[]{-key}` for a key some members carry and others do not
+ * — and each belongs to a field: if we do not report
+ * `choices[].logprobs.content` at all, we report nothing beneath it either, so
+ * its member types are absent for the same declared reason, and a signature
+ * that says one member is missing `key` is about `…[].key`.
  */
-export const declarablePath = (path) => path.replace(/:[a-z]+$/, '').replace(/\[\]$/, '');
+export const declarablePath = (path) => path
+  .replace(/:[a-z]+$/, '')
+  .replace(/\[\]\{-([^}]+)\}$/, '[].$1')
+  .replace(/\{[^}]*\}$/, '')
+  .replace(/\[\]$/, '');
+
+/**
+ * The declared absences a capture's own missing paths can satisfy, and nothing
+ * else.
+ *
+ * A declaration says a FIELD is not reported. The paths beneath that field are
+ * absent for the same reason and must not need declarations of their own — but
+ * the reverse is not true, and a review used it: with `logprobs: {content: []}`
+ * answered where the vendor sends entries, the only missing path is the array's
+ * member type, whose declarable form is the CONTENT field — so a declaration
+ * that the content field is absent was satisfied by a content field that is
+ * present and empty. An absence is credited here only when the field's own path
+ * is missing, and a descendant only under a field that is itself missing.
+ */
+export function creditedAbsences(declared, onlyVendorPaths) {
+  const absentFields = new Set();
+  for (const path of onlyVendorPaths) {
+    // The field's own path is the one that carries a type tag and no array
+    // suffix; `.a[]:object` and `.a[]{x}` are statements about members.
+    if (/:[a-z]+$/.test(path) && !/\[\](?::[a-z]+)?$/.test(path)) absentFields.add(declarablePath(path));
+  }
+  const under = (path) => {
+    const field = declarablePath(path);
+    if (absentFields.has(field)) return field;
+    for (const candidate of absentFields) {
+      if (field.startsWith(`${candidate}.`) || field.startsWith(`${candidate}[`)) return candidate;
+    }
+    return null;
+  };
+  const credited = new Set();
+  const uncredited = [];
+  for (const path of onlyVendorPaths) {
+    // An entry written exactly as the reader emits it — a member type, say —
+    // covers itself and nothing else. Those are statements about what an
+    // array's members look like, not about a field being absent, so they are
+    // not credited to the field above them.
+    if (declared.includes(path)) {
+      credited.add(path);
+      continue;
+    }
+    const owner = under(path);
+    if (owner !== null && declared.includes(owner)) credited.add(owner);
+    else uncredited.push(path);
+  }
+  return { credited: [...credited].sort(), uncredited: uncredited.sort() };
+}
 
 /**
  * The declared absences that THIS capture can speak to.
@@ -102,15 +208,34 @@ export const jsonType = (value) => (value === null ? 'null' : Array.isArray(valu
  */
 export function keyPaths(value, prefix, out) {
   if (Array.isArray(value)) {
-    for (const item of value) {
+    const objectKeys = value.map((item) => (
+      item !== null && typeof item === 'object' && !Array.isArray(item) ? new Set(Object.keys(item)) : null
+    ));
+    // What the union of member paths cannot say is whether the members AGREE.
+    // A review answered the second choice as `{}` — an object like the first,
+    // contributing no paths of its own — and the union was unchanged: a choice
+    // with no message and no index, invisible to both gates. So each key that
+    // some member carries and another does not becomes a path of its own.
+    // Uniform absence is deliberately not recorded here: a key no member has is
+    // already missing from the union, which is where a declaration answers for
+    // it, and recording it twice would make every declared absence look like a
+    // disagreement between our own members.
+    const shared = new Set();
+    for (const keys of objectKeys) if (keys) for (const key of keys) shared.add(key);
+    value.forEach((item, index) => {
       // The TYPES an array's members take are shape, even though their count is
       // not. Without this line the union of member paths is all a reader sees,
       // so a second choice answered as `null` — which every SDK reads as a
       // missing message — contributed nothing and hid behind the first choice's
       // paths. A review planted exactly that and both gates passed.
       out.add(`${prefix}[]:${jsonType(item)}`);
+      const keys = objectKeys[index];
+      // Member ORDER is deliberately not shape: which items a turn contains
+      // varies by construction, so this records that a member went without the
+      // key, not which member it was.
+      if (keys) for (const key of shared) if (!keys.has(key)) out.add(`${prefix}[]{-${key}}`);
       keyPaths(item, `${prefix}[]`, out);
-    }
+    });
     return out;
   }
   if (value !== null && typeof value === 'object') {

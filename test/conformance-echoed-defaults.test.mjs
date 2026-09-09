@@ -30,7 +30,8 @@ import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
-import { PER_CALL, absentPathsFor, declarablePath, expectedAbsentPaths, keyPaths, leafValues, rootOf } from '../scripts/lib/response-comparison.mjs';
+import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
+import { MINIMAL_SURFACES as SURFACES } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
@@ -38,35 +39,9 @@ function load(name) {
   return JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
 }
 
-// The two denominators, pinned rather than bounded. `echoedDefaults` counts the
-// leaf values the vendor CHOSE for a field the request never mentioned;
-// `suppliedEchoes` counts the ones it echoed back from the request. They are
-// counted apart because the probe has to supply an output cap to bound its
-// cost, and counting that cap among the defaults is how the gate came to claim
-// a property it never exercised. A pinned count fails when it silently drops by
-// one, which a `>= 1` would not.
-const SURFACES = [
-  {
-    surface: '/v1/responses',
-    fixture: 'direct-responses-minimal',
-    requestKeys: ['model', 'input', 'max_output_tokens'],
-    echoedDefaults: 34,
-    // `model` and `max_output_tokens` — the two the request named.
-    suppliedEchoes: 2,
-  },
-  {
-    surface: '/v1/chat/completions',
-    fixture: 'direct-chat-minimal',
-    requestKeys: ['model', 'messages', 'max_completion_tokens'],
-    echoedDefaults: 5,
-    // `model` only: Chat does not echo its cap or its messages as configuration.
-    suppliedEchoes: 1,
-  },
-];
-
-// The list above is the gate's whole reach, and it is a mutable array in the
-// file it gates: duplicating one entry over the other leaves six green tests
-// and silently drops a surface. Pinned here so that edit fails.
+// The imported roster is the gate's whole reach, and it is a mutable array:
+// duplicating one entry over the other leaves six green tests and silently
+// drops a surface. Pinned here so that edit fails.
 test('the gate covers the surfaces it claims to, once each', () => {
   assert.deepEqual(
     SURFACES.map((entry) => entry.surface).sort(),
@@ -185,8 +160,18 @@ test('the readers distinguish a shape and a value that differ', () => {
   const paths = (value) => [...keyPaths(value, '', new Set())].sort();
   assert.deepEqual(paths({ a: { b: 1 } }), ['.a.b:number', '.a:object']);
   assert.deepEqual(paths({ a: [{ b: 1 }] }), ['.a:array', '.a[].b:number', '.a[]:object']);
-  // An array's LENGTH is not shape, but a member only one item carries is.
-  assert.deepEqual(paths({ a: [{ b: 1 }, { c: 2 }] }), ['.a:array', '.a[].b:number', '.a[].c:number', '.a[]:object']);
+  // An array's LENGTH is not shape, but a member only one item carries is, and
+  // so is the fact that the other item went without it.
+  assert.deepEqual(
+    paths({ a: [{ b: 1 }, { c: 2 }] }),
+    ['.a:array', '.a[].b:number', '.a[].c:number', '.a[]:object', '.a[]{-b}', '.a[]{-c}'],
+  );
+  // …which is what stops an EMPTY member hiding behind a full sibling: the
+  // union of paths below is identical to the single member's.
+  assert.notDeepEqual(paths({ a: [{ b: 1 }] }), paths({ a: [{ b: 1 }, {}] }));
+  // A key NO member carries is a plain absence from the union, not a
+  // disagreement, so members that agree produce no signature paths at all.
+  assert.deepEqual(paths({ a: [{ b: 1 }, { b: 2 }] }), ['.a:array', '.a[].b:number', '.a[]:object']);
   // …and so is the TYPE a member takes. A second choice answered as `null`
   // contributes no paths of its own, so the union of the others hid it until
   // the member type became a path — a review planted exactly that.
@@ -215,6 +200,30 @@ test('the readers distinguish a shape and a value that differ', () => {
   assert.equal(rootOf('.output[0].content[0].text'), 'output');
 });
 
+test('a declaration the gates could not compare is refused when it is loaded', () => {
+  // Shown refusing, against declarations whose defect is known, because a
+  // validator that never rejects anything reads exactly like one that works.
+  const sound = {
+    id: 'x', surface: '/v1/responses', claim: 'supplied-echo',
+    behavior: 'b', why: 'w', measuredAt: '2026-09-10', evidence: 'e',
+    absentPaths: ['.a.b'],
+    valueDivergences: [{ path: '.a.c', vendor: '"one"', proxy: '"two"' }],
+  };
+  assert.doesNotThrow(() => validateDeclarations([sound]));
+
+  const withDivergence = (divergence) => [{ ...sound, valueDivergences: [divergence] }];
+  // The written form of a value, not the value: the gates compare these against
+  // `JSON.stringify` of a leaf, so a bare word matches nothing forever.
+  assert.throws(() => validateDeclarations(withDivergence({ path: '.a.c', vendor: 'detailed', proxy: '"auto"' })), /vendor must be the JSON text/);
+  assert.throws(() => validateDeclarations(withDivergence({ path: '.a.c', vendor: '"a"', proxy: 5 })), /proxy must be the JSON text/);
+  assert.throws(() => validateDeclarations(withDivergence({ path: '.a.c', vendor: '"a"', proxy: '"a"' })), /between two equal values/);
+  assert.throws(() => validateDeclarations(withDivergence({ path: 'a.c', vendor: '"a"', proxy: '"b"' })), /must be a key path/);
+  assert.throws(() => validateDeclarations([{ ...sound, absentPaths: ['choices[].logprobs'] }]), /absentPaths must be key paths/);
+  assert.throws(() => validateDeclarations([{ ...sound, why: '' }]), /why must be a non-empty string/);
+  assert.throws(() => validateDeclarations([sound, sound]), /declared twice/);
+  assert.throws(() => validateDeclarations([{ ...sound, absentPaths: '.a.b' }]), /absentPaths must be a list/);
+});
+
 for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
   test(`${surface}: the proxy answers a minimal request in the vendor's shape`, () => {
     const direct = JSON.parse(load(fixture).body);
@@ -236,11 +245,10 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
     // still be true. A field we quietly started reporting makes its
     // declaration stale, and a stale exemption hides the fix and waves the
     // next regression through — so both directions fail here.
-    assert.deepEqual(
-      [...new Set(onlyVendor.map(declarablePath))].sort(),
-      [...new Set(expectedAbsentPaths(surface, vendorPaths))].sort(),
-      `${surface}: the fields missing from the proxy's answer are not the declared ones`,
-    );
+    const declared = [...new Set(expectedAbsentPaths(surface, vendorPaths))].sort();
+    const { credited, uncredited } = creditedAbsences(declared, onlyVendor);
+    assert.deepEqual(uncredited, [], `${surface}: fields missing from the proxy's answer that no declaration covers`);
+    assert.deepEqual(credited, declared, `${surface}: a declared absence this capture no longer shows`);
   });
 
   test(`${surface}: the proxy fills omitted fields with the vendor's defaults`, () => {
