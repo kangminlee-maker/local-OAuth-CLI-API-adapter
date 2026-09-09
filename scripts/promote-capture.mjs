@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -51,13 +51,36 @@ if (kind === 'json' && !requestMustBe) {
   process.exit(2);
 }
 
-/** The revision the fixture was promoted at, so a receipt names a tree. */
-function revision() {
+/**
+ * The tree that produced this fixture — and whether that claim binds.
+ *
+ * Stamping ambient `HEAD` alone is a false identity: fixtures promoted while
+ * this script was still uncommitted named a revision that contains no code able
+ * to write the field. What decides the claim is not the whole worktree (which
+ * carries unrelated edits and would never be clean) but THIS script: if its own
+ * source differs from `HEAD`, `HEAD` does not name the code that ran.
+ */
+function provenance() {
   try {
-    return execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const revision = execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const self = relative(repoRoot, fileURLToPath(import.meta.url));
+    const status = execFileSync('git', ['-C', repoRoot, 'status', '--porcelain', '--', self], { encoding: 'utf8' });
+    return { revision, promoterUncommitted: status.trim() !== '' };
   } catch {
-    return null;
+    return { revision: null, promoterUncommitted: null };
   }
+}
+
+const promotedFrom = provenance();
+// A fixture that names a revision which cannot have produced it is worse than
+// one that names none: a reader treats the stamp as evidence.
+if (promotedFrom.promoterUncommitted && !args.includes('--allow-unbound-provenance')) {
+  console.error(
+    `${relative(repoRoot, fileURLToPath(import.meta.url))} has uncommitted changes, so HEAD (${promotedFrom.revision?.slice(0, 12) ?? 'unknown'}) `
+    + 'does not name the code that would write this fixture. Commit the promoter first, or pass '
+    + '--allow-unbound-provenance to record the stamp as unbound.',
+  );
+  process.exit(2);
 }
 
 const rootDir = resolve(repoRoot, root);
@@ -139,7 +162,7 @@ if (matches.length > 0) {
       mustNotContain: mustNotContain ?? null,
       requestMustBe: requestMustBe ?? null,
     },
-    promotedFromRevision: revision(),
+    promotedFrom,
     url: record.url,
     status: record.status,
     kind: record.kind,
