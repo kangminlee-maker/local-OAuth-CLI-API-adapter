@@ -31,7 +31,7 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
-import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed } from './replayed-captures.mjs';
+import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed, startReplayRecorder } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
@@ -58,8 +58,8 @@ test('the gate covers the surfaces it claims to, once each', () => {
 });
 
 let started;
+let recorder;
 const bodies = new Map();
-const dispatched = new Map();
 
 before(async () => {
   started = await startLocalApiProxy({
@@ -89,6 +89,7 @@ before(async () => {
       async close() {},
     },
   });
+  recorder = await startReplayRecorder(started.url);
 
   // The capture's own request bytes, forwarded verbatim. Re-typing them here
   // would ask a different question than the one the vendor answered — and the
@@ -97,24 +98,24 @@ before(async () => {
   // supplied echoes apart from defaults.
   for (const { surface, fixture } of SURFACES) {
     const capture = load(fixture);
-    const res = await fetch(`${started.url}${surface}`, {
+    const res = await fetch(`${recorder.url}${surface}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: capture.request,
     });
-    // What was actually put on the wire, not what the roster says was. A review
-    // repointed this loop at another capture and every check went on
-    // certifying the one the roster advertised.
-    dispatched.set(surface, createHash('sha256').update(capture.request).digest('hex'));
     bodies.set(surface, { status: res.status, body: await res.json() });
   }
 });
 
-test('what this gate replayed is what the registry names', () => {
-  assertRosterReplayed('minimal', dispatched);
+// Measured on the wire, by a recorder in front of the proxy, and compared by
+// the registry against its own rows. A gate that records what it MEANT to send
+// records nothing.
+test('what crossed the wire is what the registry names', () => {
+  assertRosterReplayed('minimal', recorder.seen);
 });
 
 after(async () => {
+  await recorder?.close();
   await started?.close();
 });
 

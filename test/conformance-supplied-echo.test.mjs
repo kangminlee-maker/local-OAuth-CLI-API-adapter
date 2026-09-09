@@ -32,7 +32,7 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, valueDivergencesFor } from '../scripts/lib/response-comparison.mjs';
-import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed } from './replayed-captures.mjs';
+import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 // A capture this gate's roster does not name cannot be read here. A review
@@ -47,8 +47,8 @@ const load = (name) => {
 };
 
 let started;
+let recorder;
 const answers = new Map();
-const dispatched = new Map();
 // A declared value divergence is identified by the WHOLE tuple. Keying it by
 // path let a second declaration on the same path — with values neither side
 // sends — count as exhibited because the true one was: a review planted a false
@@ -83,12 +83,13 @@ before(async () => {
       async close() {},
     },
   });
+  recorder = await startReplayRecorder(started.url);
 
   // The capture's own request bytes, forwarded verbatim: re-typing them would
   // ask a different question than the one the vendor answered.
   for (const { fixture, surface } of CAPTURES) {
     const capture = load(fixture);
-    const res = await fetch(`${started.url}${surface}`, {
+    const res = await fetch(`${recorder.url}${surface}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: capture.request,
@@ -96,19 +97,21 @@ before(async () => {
     const text = await res.text();
     let body = null;
     try { body = JSON.parse(text); } catch { body = null; }
-    // What was actually put on the wire, not what the roster says was. A review
-    // repointed a gate's loop at another capture and every check went on
-    // certifying the one the roster advertised.
-    dispatched.set(fixture, createHash('sha256').update(capture.request).digest('hex'));
     answers.set(fixture, { status: res.status, body, text });
   }
 });
 
-test('what this gate replayed is what the registry names', () => {
-  assertRosterReplayed('supplied', dispatched);
+// Measured on the wire, by a recorder in front of the proxy, and compared by
+// the registry against its own rows. A gate that records what it MEANT to send
+// records nothing: the first version of this hashed the capture the row names
+// while the driver posted a different one, and the mutant written for exactly
+// that survived.
+test('what crossed the wire is what the registry names', () => {
+  assertRosterReplayed('supplied', recorder.seen);
 });
 
 after(async () => {
+  await recorder?.close();
   await started?.close();
 });
 

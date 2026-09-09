@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -156,46 +157,75 @@ export const REPLAYED_FIXTURES = new Set([
 const captureDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec', 'captures');
 
 const GROUPS = {
-  supplied: { rows: SUPPLIED_ECHO_CAPTURES, keyOf: (row) => row.fixture },
-  minimal: { rows: MINIMAL_SURFACES, keyOf: (row) => row.surface },
+  supplied: { rows: SUPPLIED_ECHO_CAPTURES },
+  minimal: { rows: MINIMAL_SURFACES },
 };
 
 /**
- * What a gate actually put on the wire, against what THIS module says it
- * replays.
+ * A recorder in front of the proxy, so what a gate replayed is MEASURED.
  *
- * The comparison has to be made here and not in the gate. A review rewrote a
- * gate's own roster to replay a different capture and adjusted the gate's
- * expectations to match: every check the gate made was then about the capture
- * it had substituted, while the registry — which is what the matrix's `WIRE`
- * rule and the store sweep read — went on certifying the one nobody replayed.
- * A gate that compares against its own array cannot see that; this reads the
- * rows and the capture bytes itself.
+ * A gate that records what it meant to send records nothing: the first version
+ * of this hashed the capture the row names while the driver posted a different
+ * one, and the mutant written for exactly that survived. What crosses this
+ * server is what the proxy received, and the gate contributes no label to it —
+ * the surface and the bytes are read off the request itself.
+ */
+export async function startReplayRecorder(targetUrl) {
+  const seen = [];
+  const server = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', async () => {
+      const body = Buffer.concat(chunks);
+      seen.push({ surface: req.url, request: createHash('sha256').update(body).digest('hex') });
+      const upstream = await fetch(`${targetUrl}${req.url}`, {
+        method: req.method,
+        headers: { 'content-type': req.headers['content-type'] ?? 'application/json' },
+        body,
+      });
+      const text = await upstream.text();
+      res.writeHead(upstream.status, {
+        'content-type': upstream.headers.get('content-type') ?? 'application/json',
+      });
+      res.end(text);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    seen,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+/**
+ * What crossed the recorder, against what THIS module says the group replays.
  *
- * `dispatched` maps the group's key to the sha256 of the request body sent.
+ * The comparison is made here and not in the gate. A review rewrote a gate's
+ * own roster to replay a different capture and adjusted the gate's expectations
+ * to match: every check the gate made was then about the capture it had
+ * substituted, while the registry — which is what the matrix's `WIRE` rule and
+ * the store sweep read — went on certifying the one nobody replayed. A gate
+ * comparing against its own array cannot see that.
+ *
  * What this cannot see is a gate that stops calling it, which is what the
  * mutation table and the runner's subject gate are for.
  */
-export function assertRosterReplayed(group, dispatched) {
-  const { rows, keyOf } = GROUPS[group];
+export function assertRosterReplayed(group, seen) {
+  const { rows } = GROUPS[group];
   assert.ok(rows, `no such replay group: ${group}`);
-  assert.deepEqual(
-    [...dispatched.keys()].sort(),
-    rows.map(keyOf).sort(),
-    `${group}: what was replayed is not what the registry names`,
-  );
-  for (const row of rows) {
+  const expected = rows.map((row) => {
     const capture = JSON.parse(readFileSync(join(captureDir, `${row.fixture}.json`), 'utf8'));
-    const sent = dispatched.get(keyOf(row));
-    assert.equal(
-      sent,
-      createHash('sha256').update(capture.request).digest('hex'),
-      `${keyOf(row)}: the bytes replayed are not ${row.fixture}'s request`,
-    );
-    assert.equal(
-      capture.requestSha256,
-      createHash('sha256').update(capture.request).digest('hex'),
-      `${row.fixture}: the capture's own request digest does not match its bytes`,
-    );
-  }
+    const request = createHash('sha256').update(capture.request).digest('hex');
+    assert.equal(capture.requestSha256, request, `${row.fixture}: its own request digest does not match its bytes`);
+    return `${row.surface} ${request} (${row.fixture})`;
+  });
+  const measured = seen.map((call) => {
+    const named = rows.find((row) => {
+      const capture = JSON.parse(readFileSync(join(captureDir, `${row.fixture}.json`), 'utf8'));
+      return row.surface === call.surface && capture.requestSha256 === call.request;
+    });
+    return `${call.surface} ${call.request} (${named?.fixture ?? 'no row in the registry sends these bytes here'})`;
+  });
+  assert.deepEqual(measured.sort(), expected.sort(), `${group}: what crossed the wire is not what the registry names`);
 }
