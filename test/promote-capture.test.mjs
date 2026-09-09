@@ -271,6 +271,29 @@ test('a revision no branch reaches is refused: evidence has to be reviewable', (
   assert.match(whyUnbound(promotedFrom, { root: dir }) ?? '', /is not in this checkout's history/);
 });
 
+test('a poisoned GIT_DIR does not move the binding to another repository', () => {
+  // `GIT_DIR`/`GIT_WORK_TREE` override discovery, so an inherited pair would
+  // have both the promoter and the gates asking a repository that the `-C` they
+  // pass does not name — and every answer would be correct about the wrong tree.
+  const dir = checkout();
+  const decoy = checkout();
+  // Two throwaway repositories built the same way commit to the same hash, so
+  // the decoy gets a second commit: without it the check below cannot tell
+  // which repository answered.
+  git(decoy, 'commit', '--allow-empty', '-qm', 'a commit the other repository does not have');
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  const run = promoteIn(dir, {
+    extra: SELECT,
+    env: { ...process.env, GIT_DIR: join(decoy, '.git'), GIT_WORK_TREE: decoy },
+  });
+  assert.equal(run.status, 0, run.stderr);
+
+  const { promotedFrom } = JSON.parse(readFileSync(join(dir, 'out', 'fixture.json'), 'utf8'));
+  assert.equal(promotedFrom.revision, git(dir, 'rev-parse', 'HEAD'));
+  assert.notEqual(promotedFrom.revision, git(decoy, 'rev-parse', 'HEAD'));
+  assert.equal(whyUnbound(promotedFrom, { root: dir }), null);
+});
+
 test('a promoter edited since its commit refuses: HEAD no longer names the code that runs', () => {
   const dir = checkout();
   write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));

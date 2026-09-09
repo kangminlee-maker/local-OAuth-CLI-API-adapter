@@ -30,10 +30,18 @@ import { fileURLToPath } from 'node:url';
 export const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const captureDir = join(repoRoot, 'spec', 'captures');
 
+// Every `GIT_*` variable is dropped from the child's environment. `GIT_DIR` and
+// `GIT_WORK_TREE` override discovery outright, so an inherited one would point
+// both the promoter and the gates at a different repository than the `-C` here
+// names — and the object they then found would answer every question correctly
+// about the wrong tree.
+const CLEAN_ENV = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
+
 function git(root, ...argv) {
   return execFileSync('git', ['-C', root, ...argv], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: CLEAN_ENV,
   }).trim();
 }
 
