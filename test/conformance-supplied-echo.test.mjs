@@ -35,7 +35,16 @@ import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDecl
 import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
-const load = (name) => JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
+// A capture this gate's roster does not name cannot be read here. A review
+// repointed a gate's own driver at a different fixture while leaving the roster
+// and the manifest alone: every check still certified the capture the roster
+// advertised, and nothing replayed it. Advertising and reading are the same act
+// now.
+const ROSTER = new Set(CAPTURES.map((row) => row.fixture));
+const load = (name) => {
+  assert.ok(ROSTER.has(name), `${name} is not one of this gate's roster captures`);
+  return JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
+};
 
 let started;
 const answers = new Map();
@@ -187,7 +196,7 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
   return { compared, differences, exhibited, echoedPaths };
 }
 
-for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, vendorPaths } of CAPTURES) {
+for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harnessPremise, vendorPaths } of CAPTURES) {
   test(`${fixture}: the proxy answers in the vendor's shape`, () => {
     const capture = load(fixture);
     const vendor = JSON.parse(capture.body);
@@ -216,10 +225,23 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, vendo
     // only missing path was the array member's, whose field is the content
     // itself; crediting that satisfied a declaration that the field is not
     // reported at all.
-    const declared = [...new Set([...expectedAbsentPaths(surface, theirs), ...(harnessGaps ?? [])])].sort();
-    const { credited, uncredited } = creditedAbsences(declared, onlyVendor);
+    // An exemption only counts once its premise is shown to hold. The gaps
+    // below are consequences of our turn lacking an output item the vendor's
+    // turn has, and a review built the case that breaks that reasoning: give
+    // our side a reasoning item of its own and the exemptions keep covering
+    // disagreements that are no longer about a missing member.
+    const gaps = harnessGaps ?? [];
+    if (gaps.length > 0) {
+      assert.ok(harnessPremise, `${fixture}: harness gaps without the premise that explains them`);
+      const typesOf = (body) => (body?.output ?? body?.choices ?? []).map((item) => item?.type ?? null);
+      assert.deepEqual(typesOf(vendor), harnessPremise.vendor, `${fixture}: the vendor's turn is not the one these gaps describe`);
+      assert.deepEqual(typesOf(ours.body), harnessPremise.ours, `${fixture}: our turn is not the one these gaps describe`);
+    }
+
+    const declared = [...new Set(expectedAbsentPaths(surface, theirs))].sort();
+    const { credited, uncredited } = creditedAbsences(declared, gaps, onlyVendor, mine);
     assert.deepEqual(uncredited, [], `${fixture}: fields missing from the proxy's answer that no declaration covers`);
-    assert.deepEqual(credited, declared, `${fixture}: a declared absence this capture no longer shows`);
+    assert.deepEqual(credited, [...new Set([...declared, ...gaps])].sort(), `${fixture}: a declared absence this capture no longer shows`);
   });
 
   test(`${fixture}: the option the request supplied comes back as the vendor sends it`, () => {
@@ -289,13 +311,14 @@ test('every declaration is exercised by a capture this gate replays', () => {
 // No promoted capture goes unread. The store is the repository's evidence, and
 // a fixture nothing replays is a file that can drift, be tampered with, or
 // quietly justify a declaration on its own.
-test('every buffered capture in the store is replayed by a gate', () => {
-  const buffered = readdirSync(join(specDir, 'captures'))
+test('every capture in the store is replayed by a gate', () => {
+  const stored = readdirSync(join(specDir, 'captures'))
     .filter((name) => name.endsWith('.json'))
-    .filter((name) => JSON.parse(readFileSync(join(specDir, 'captures', name), 'utf8')).kind === 'json')
     .map((name) => name.slice(0, -'.json'.length));
-  // Against the shared roster, so the minimal pair this gate does not replay is
-  // covered by the gate that does rather than by a second list written here.
-  const unread = buffered.filter((name) => !REPLAYED_FIXTURES.has(name));
-  assert.deepEqual(unread, [], 'promoted buffered captures that no gate replays');
+  // Against the shared registry, so the captures this gate does not replay are
+  // covered by the gates that do rather than by a second list written here.
+  // The streamed captures used to be carved out of this check; they are not,
+  // and the carve-out is what let the registry lose the stream gate unnoticed.
+  const unread = stored.filter((name) => !REPLAYED_FIXTURES.has(name));
+  assert.deepEqual(unread, [], 'promoted captures that no gate replays');
 });

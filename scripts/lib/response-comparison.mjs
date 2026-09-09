@@ -107,59 +107,78 @@ export function valueDivergencesFor(surface) {
  *
  * A declaration names a field. The reader emits paths a declaration would never
  * write — `…:type` for the type at a path, `…[]` for the types an array's
- * members take, and `…[]{-key}` for a key some members carry and others do not
- * — and each belongs to a field: if we do not report
+ * members take, and `…[]{-<relative path>}` for something some members carry
+ * and others do not — and each belongs to a field: if we do not report
  * `choices[].logprobs.content` at all, we report nothing beneath it either, so
  * its member types are absent for the same declared reason, and a signature
- * that says one member is missing `key` is about `…[].key`.
+ * saying one member goes without `.message.role` is about
+ * `…[].message.role`. Signatures nest, so this unwraps until none is left.
  */
-export const declarablePath = (path) => path
-  .replace(/:[a-z]+$/, '')
-  .replace(/\[\]\{-([^}]+)\}$/, '[].$1')
-  .replace(/\{[^}]*\}$/, '')
-  .replace(/\[\]$/, '');
+export function declarablePath(path) {
+  const signature = /^(.*?\[\])\{-(.+)\}$/.exec(path);
+  if (signature) return declarablePath(`${signature[1]}${signature[2]}`);
+  return path.replace(/:[a-z]+$/, '').replace(/\[\]$/, '');
+}
 
 /**
- * The declared absences a capture's own missing paths can satisfy, and nothing
- * else.
+ * What answers for each path the vendor sent and we did not, and what nothing
+ * answers for.
  *
- * A declaration says a FIELD is not reported. The paths beneath that field are
- * absent for the same reason and must not need declarations of their own — but
- * the reverse is not true, and a review used it: with `logprobs: {content: []}`
- * answered where the vendor sends entries, the only missing path is the array's
- * member type, whose declarable form is the CONTENT field — so a declaration
- * that the content field is absent was satisfied by a content field that is
- * present and empty. An absence is credited here only when the field's own path
- * is missing, and a descendant only under a field that is itself missing.
+ * Three readings had to be corrected here, each by a review that built the
+ * construction the previous reading let through:
+ *
+ *  - A declaration says a FIELD is not reported. The paths beneath it are
+ *    absent for the same reason and must not need declarations of their own —
+ *    but the reverse is not true, and `logprobs: {content: []}` used it: the
+ *    only missing path was the array's member type, whose declarable form is
+ *    the CONTENT field, so "we do not report the content" was satisfied by a
+ *    content that is present and empty.
+ *  - "Missing" therefore means our answer carries NO path for that field, not
+ *    that one of its typed paths is missing: with the vendor sending `x: 1`
+ *    and `x: null` across two members and us sending only `x: null`, the
+ *    number-typed path was gone and the field read as absent while every
+ *    member still had it.
+ *  - The owner is the nearest DECLARED ancestor, not the nearest missing one.
+ *    Replacing an enumerated list of descendants with the one truthful parent
+ *    used to fail, because each descendant's own path was missing and so
+ *    stopped the walk before the declaration was reached.
+ *
+ * `exempt` is the other kind of answer: a path this TEST cannot produce,
+ * credited literally and only to itself, so an exemption cannot spread the way
+ * a declaration does. The caller is required to prove the exemption's premise
+ * before passing it.
  */
-export function creditedAbsences(declared, onlyVendorPaths) {
-  const absentFields = new Set();
-  for (const path of onlyVendorPaths) {
-    // The field's own path is the one that carries a type tag and no array
-    // suffix; `.a[]:object` and `.a[]{x}` are statements about members.
-    if (/:[a-z]+$/.test(path) && !/\[\](?::[a-z]+)?$/.test(path)) absentFields.add(declarablePath(path));
-  }
-  const under = (path) => {
-    const field = declarablePath(path);
-    if (absentFields.has(field)) return field;
-    for (const candidate of absentFields) {
-      if (field.startsWith(`${candidate}.`) || field.startsWith(`${candidate}[`)) return candidate;
+export function creditedAbsences(declared, exempt, onlyVendorPaths, ourPaths) {
+  const ourFields = new Set();
+  for (const path of ourPaths) ourFields.add(declarablePath(path));
+  const ancestors = (field) => {
+    const out = [field];
+    let rest = field;
+    while (true) {
+      const cut = Math.max(rest.lastIndexOf('.'), rest.lastIndexOf('['));
+      if (cut <= 0) return out;
+      rest = rest.slice(0, cut);
+      if (rest.endsWith('[]')) rest = rest.slice(0, -2);
+      if (rest === '') return out;
+      out.push(rest);
+    }
+  };
+  const owner = (path) => {
+    for (const candidate of ancestors(declarablePath(path))) {
+      if (declared.includes(candidate) && !ourFields.has(candidate)) return candidate;
     }
     return null;
   };
+
   const credited = new Set();
   const uncredited = [];
   for (const path of onlyVendorPaths) {
-    // An entry written exactly as the reader emits it — a member type, say —
-    // covers itself and nothing else. Those are statements about what an
-    // array's members look like, not about a field being absent, so they are
-    // not credited to the field above them.
-    if (declared.includes(path)) {
+    if (exempt.includes(path)) {
       credited.add(path);
       continue;
     }
-    const owner = under(path);
-    if (owner !== null && declared.includes(owner)) credited.add(owner);
+    const found = owner(path);
+    if (found !== null) credited.add(found);
     else uncredited.push(path);
   }
   return { credited: [...credited].sort(), uncredited: uncredited.sort() };
@@ -208,20 +227,24 @@ export const jsonType = (value) => (value === null ? 'null' : Array.isArray(valu
  */
 export function keyPaths(value, prefix, out) {
   if (Array.isArray(value)) {
-    const objectKeys = value.map((item) => (
-      item !== null && typeof item === 'object' && !Array.isArray(item) ? new Set(Object.keys(item)) : null
-    ));
     // What the union of member paths cannot say is whether the members AGREE.
     // A review answered the second choice as `{}` — an object like the first,
     // contributing no paths of its own — and the union was unchanged: a choice
-    // with no message and no index, invisible to both gates. So each key that
-    // some member carries and another does not becomes a path of its own.
-    // Uniform absence is deliberately not recorded here: a key no member has is
+    // with no message and no index, invisible to both gates. The next review
+    // did it one level down, leaving the choice's own keys and emptying its
+    // `message`, which a signature of immediate keys could not see. So each
+    // member's WHOLE path set is compared against its siblings', and anything a
+    // member goes without becomes a path.
+    //
+    // Uniform absence is deliberately not recorded: something no member has is
     // already missing from the union, which is where a declaration answers for
     // it, and recording it twice would make every declared absence look like a
     // disagreement between our own members.
+    const within = value.map((item) => (
+      item !== null && typeof item === 'object' && !Array.isArray(item) ? keyPaths(item, '', new Set()) : null
+    ));
     const shared = new Set();
-    for (const keys of objectKeys) if (keys) for (const key of keys) shared.add(key);
+    for (const paths of within) if (paths) for (const path of paths) shared.add(path);
     value.forEach((item, index) => {
       // The TYPES an array's members take are shape, even though their count is
       // not. Without this line the union of member paths is all a reader sees,
@@ -229,11 +252,11 @@ export function keyPaths(value, prefix, out) {
       // missing message — contributed nothing and hid behind the first choice's
       // paths. A review planted exactly that and both gates passed.
       out.add(`${prefix}[]:${jsonType(item)}`);
-      const keys = objectKeys[index];
+      const paths = within[index];
       // Member ORDER is deliberately not shape: which items a turn contains
       // varies by construction, so this records that a member went without the
-      // key, not which member it was.
-      if (keys) for (const key of shared) if (!keys.has(key)) out.add(`${prefix}[]{-${key}}`);
+      // path, not which member it was.
+      if (paths) for (const path of shared) if (!paths.has(path)) out.add(`${prefix}[]{-${path}}`);
       keyPaths(item, `${prefix}[]`, out);
     });
     return out;

@@ -12,6 +12,31 @@
 // A gate file cannot be imported for this: loading it would register its tests
 // a second time and start a second server.
 
+// Everything the vendor's turn shows that ours cannot, all of it one fact: the
+// fake backend behind this gate emits no reasoning item, so the vendor's output
+// array holds two items where ours holds one. Two of the reasoning item's own
+// members never appear, and every place the vendor's two items disagree is a
+// disagreement an array of one cannot have.
+//
+// They are listed exactly as the reader emits them because an exemption covers
+// itself and nothing else — unlike a declaration, which owns what is beneath
+// it. And they are honoured only after the row's `harnessPremise` is checked
+// against both turns, so they cannot outlive the situation they describe.
+const HARNESS_GAPS_NO_REASONING_ITEM = [
+  '.output[].encrypted_content:string',
+  '.output[].summary:array',
+  '.output[]{-.content[].annotations:array}',
+  '.output[]{-.content[].logprobs:array}',
+  '.output[]{-.content[].text:string}',
+  '.output[]{-.content[].type:string}',
+  '.output[]{-.content[]:object}',
+  '.output[]{-.encrypted_content:string}',
+  '.output[]{-.phase:string}',
+  '.output[]{-.role:string}',
+  '.output[]{-.status:string}',
+  '.output[]{-.summary:array}',
+];
+
 // Each row is a claim about one option.
 //
 //   supplied     the options the request carries. Asserted present in the
@@ -40,23 +65,18 @@ export const SUPPLIED_ECHO_CAPTURES = [
     surface: '/v1/responses',
     supplied: ['tools', 'parallel_tool_calls'],
     echoed: true,
-    // The vendor's turn reasoned and ours does not: a reasoning item carries
-    // the first two members, and the fake backend emits no reasoning item at
-    // all. What a real backend's reasoning item would carry is matrix R-25's
-    // claim, not this row's.
+    // The vendor's turn reasoned and ours does not: the fake backend emits no
+    // reasoning item at all, so two of that item's members never appear and
+    // the vendor's two output items disagree where an array of one message
+    // item cannot. What a real backend's reasoning item would carry is matrix
+    // R-25's claim, not this row's.
     //
-    // The `{-key}` entries are the same fact read from the other side: the
-    // vendor's output array holds two items that disagree about `phase`,
-    // `role` and `status`, and an array of one message item cannot disagree
-    // with itself. Every member the vendor's turn does have, ours matches.
-    harnessGaps: [
-      '.output[].encrypted_content',
-      '.output[].summary',
-      '.output[]{-phase}',
-      '.output[]{-role}',
-      '.output[]{-status}',
-    ],
-    vendorPaths: 94,
+    // The premise is asserted before any of these are honoured. A review gave
+    // our side a reasoning item of its own, which left every exemption below
+    // covering a disagreement that was no longer about a missing member.
+    harnessPremise: { vendor: ['reasoning', 'message'], ours: ['message'] },
+    harnessGaps: HARNESS_GAPS_NO_REASONING_ITEM,
+    vendorPaths: 99,
   },
   { fixture: 'direct-responses-top-logprobs-effort-none', surface: '/v1/responses', supplied: ['top_logprobs', 'reasoning'], echoed: true, vendorPaths: 76 },
   { fixture: 'direct-chat-service-tier-flex', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
@@ -101,8 +121,28 @@ export const MINIMAL_SURFACES = [
   },
 ];
 
-/** Every promoted buffered capture some gate replays. */
+// Surfaces to compare, and which capture is which side.
+// `surface` is the vocabulary `spec/declared-divergences.json` uses, so the
+// lookup below can actually find one. It used to read `openai.responses.stream`,
+// a spelling no declaration has ever carried, which left the stale-declaration
+// branch unreachable — the check could only ever take the equality path.
+export const STREAM_SURFACES = [
+  { surface: '/v1/responses', vendor: 'direct-responses-stream', proxy: 'proxy-responses-stream' },
+  { surface: '/v1/chat/completions', vendor: 'direct-chat-stream', proxy: 'proxy-chat-stream' },
+];
+
+/**
+ * Every promoted capture some gate replays, buffered and streamed alike.
+ *
+ * The streamed pair was missing from the first version of this registry, and
+ * the check that reads it — the matrix's `WIRE` rule — went from searching gate
+ * source text, which found the stream gate, to reading a registry that did not
+ * know about it. A review caught the regression on the mutant written to prove
+ * the rule: it claimed no gate replays `direct-chat-stream` while the stream
+ * gate reads it on every run.
+ */
 export const REPLAYED_FIXTURES = new Set([
   ...SUPPLIED_ECHO_CAPTURES.map((row) => row.fixture),
   ...MINIMAL_SURFACES.map((row) => row.fixture),
+  ...STREAM_SURFACES.flatMap((row) => [row.vendor, row.proxy]),
 ]);

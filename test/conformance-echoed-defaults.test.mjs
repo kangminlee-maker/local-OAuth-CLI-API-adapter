@@ -35,7 +35,14 @@ import { MINIMAL_SURFACES as SURFACES } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
+// A capture this gate's roster does not name cannot be read here. A review
+// repointed the gate's own driver at a different fixture while leaving the
+// roster and the manifest alone: every check still certified the capture the
+// roster advertised, and nothing replayed it. Advertising and reading are the
+// same act now.
+const ROSTER = new Set(SURFACES.map((entry) => entry.fixture));
 function load(name) {
+  assert.ok(ROSTER.has(name), `${name} is not one of this gate's roster captures`);
   return JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
 }
 
@@ -160,18 +167,31 @@ test('the readers distinguish a shape and a value that differ', () => {
   const paths = (value) => [...keyPaths(value, '', new Set())].sort();
   assert.deepEqual(paths({ a: { b: 1 } }), ['.a.b:number', '.a:object']);
   assert.deepEqual(paths({ a: [{ b: 1 }] }), ['.a:array', '.a[].b:number', '.a[]:object']);
-  // An array's LENGTH is not shape, but a member only one item carries is, and
-  // so is the fact that the other item went without it.
+  // An array's LENGTH is not shape, but something only one member carries is,
+  // and so is the fact that the other went without it.
   assert.deepEqual(
     paths({ a: [{ b: 1 }, { c: 2 }] }),
-    ['.a:array', '.a[].b:number', '.a[].c:number', '.a[]:object', '.a[]{-b}', '.a[]{-c}'],
+    ['.a:array', '.a[].b:number', '.a[].c:number', '.a[]:object', '.a[]{-.b:number}', '.a[]{-.c:number}'],
   );
   // …which is what stops an EMPTY member hiding behind a full sibling: the
   // union of paths below is identical to the single member's.
   assert.notDeepEqual(paths({ a: [{ b: 1 }] }), paths({ a: [{ b: 1 }, {}] }));
-  // A key NO member carries is a plain absence from the union, not a
+  // The signature reaches all the way down, because the second construction a
+  // review built left the member's own keys in place and emptied what was
+  // under them.
+  assert.notDeepEqual(
+    paths({ a: [{ i: 0, m: { r: 'x' } }, { i: 1, m: { r: 'y' } }] }),
+    paths({ a: [{ i: 0, m: { r: 'x' } }, { i: 1, m: {} }] }),
+  );
+  // Something NO member carries is a plain absence from the union, not a
   // disagreement, so members that agree produce no signature paths at all.
   assert.deepEqual(paths({ a: [{ b: 1 }, { b: 2 }] }), ['.a:array', '.a[].b:number', '.a[]:object']);
+  // A member that carries the path at a DIFFERENT type has not gone without
+  // the field: losing one typed path is not the field being absent.
+  assert.deepEqual(
+    paths({ a: [{ b: 1 }, { b: null }] }),
+    ['.a:array', '.a[].b:null', '.a[].b:number', '.a[]:object', '.a[]{-.b:null}', '.a[]{-.b:number}'],
+  );
   // …and so is the TYPE a member takes. A second choice answered as `null`
   // contributes no paths of its own, so the union of the others hid it until
   // the member type became a path — a review planted exactly that.
@@ -198,6 +218,36 @@ test('the readers distinguish a shape and a value that differ', () => {
 
   assert.equal(rootOf('.usage.input_tokens_details.cached_tokens'), 'usage');
   assert.equal(rootOf('.output[0].content[0].text'), 'output');
+});
+
+test('a declared absence is credited only where our answer carries no such field', () => {
+  // Known-opposite inputs for the credit rule, all three of them constructions
+  // a review built and this reader used to accept.
+  const declared = ['.a.x'];
+  const credit = (vendor, ours, declaredPaths = declared, exempt = []) => {
+    const theirs = keyPaths(vendor, '', new Set());
+    const mine = keyPaths(ours, '', new Set());
+    const onlyVendor = [...theirs].filter((path) => !mine.has(path)).sort();
+    return creditedAbsences(declaredPaths, exempt, onlyVendor, mine);
+  };
+  // The field really is gone: credited.
+  assert.deepEqual(credit({ a: { x: 1 } }, { a: {} }), { credited: ['.a.x'], uncredited: [] });
+  // Present and empty is not gone. The only missing path is the member's, and
+  // crediting it satisfied "we do not report this field at all".
+  assert.deepEqual(
+    credit({ a: { x: [{ t: 1 }] } }, { a: { x: [] } }).uncredited,
+    ['.a.x[].t:number', '.a.x[]:object'],
+  );
+  // Present at another type is not gone either.
+  assert.deepEqual(
+    credit({ a: [{ x: 1 }, { x: null }] }, { a: [{ x: null }, { x: null }] }, ['.a[].x']).uncredited,
+    ['.a[].x:number', '.a[]{-.x:null}', '.a[]{-.x:number}'],
+  );
+  // The owner is the nearest DECLARED ancestor, not the nearest missing path:
+  // a truthful parent has to cover the descendants it owns.
+  assert.deepEqual(credit({ a: { x: { y: { z: 1 } } } }, { a: {} }), { credited: ['.a.x'], uncredited: [] });
+  // An exemption covers itself and nothing else.
+  assert.deepEqual(credit({ a: { x: 1 } }, { a: {} }, [], ['.a.x:number']), { credited: ['.a.x:number'], uncredited: [] });
 });
 
 test('a declaration the gates could not compare is refused when it is loaded', () => {
@@ -246,7 +296,7 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
     // declaration stale, and a stale exemption hides the fix and waves the
     // next regression through — so both directions fail here.
     const declared = [...new Set(expectedAbsentPaths(surface, vendorPaths))].sort();
-    const { credited, uncredited } = creditedAbsences(declared, onlyVendor);
+    const { credited, uncredited } = creditedAbsences(declared, [], onlyVendor, ourPaths);
     assert.deepEqual(uncredited, [], `${surface}: fields missing from the proxy's answer that no declaration covers`);
     assert.deepEqual(credited, declared, `${surface}: a declared absence this capture no longer shows`);
   });
