@@ -49,6 +49,17 @@ export function valueDivergencesFor(surface) {
 }
 
 /**
+ * The form a declaration is written in: no type tag, and no trailing `[]`.
+ *
+ * A declaration names a field. The reader emits two paths a declaration would
+ * never write — `…:type` for the type at a path, and `…[]` for the types an
+ * array's members take — and both belong to the field above them: if we do not
+ * report `choices[].logprobs.content` at all, we report nothing beneath it
+ * either, so its member types are absent for the same declared reason.
+ */
+export const declarablePath = (path) => path.replace(/:[a-z]+$/, '').replace(/\[\]$/, '');
+
+/**
  * The declared absences that THIS capture can speak to.
  *
  * A declaration is about a surface, but a capture only shows the paths its own
@@ -61,7 +72,7 @@ export function valueDivergencesFor(surface) {
  * by this one.
  */
 export function expectedAbsentPaths(surface, vendorPaths) {
-  const untagged = new Set([...vendorPaths].map((path) => path.replace(/:[a-z]+$/, '')));
+  const untagged = new Set([...vendorPaths].map(declarablePath));
   return absentPathsFor(surface).filter((path) => untagged.has(path));
 }
 
@@ -91,7 +102,15 @@ export const jsonType = (value) => (value === null ? 'null' : Array.isArray(valu
  */
 export function keyPaths(value, prefix, out) {
   if (Array.isArray(value)) {
-    for (const item of value) keyPaths(item, `${prefix}[]`, out);
+    for (const item of value) {
+      // The TYPES an array's members take are shape, even though their count is
+      // not. Without this line the union of member paths is all a reader sees,
+      // so a second choice answered as `null` — which every SDK reads as a
+      // missing message — contributed nothing and hid behind the first choice's
+      // paths. A review planted exactly that and both gates passed.
+      out.add(`${prefix}[]:${jsonType(item)}`);
+      keyPaths(item, `${prefix}[]`, out);
+    }
     return out;
   }
   if (value !== null && typeof value === 'object') {

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -113,4 +113,34 @@ test('derived evidence is derived, not declared', () => {
   assert.ok(derived > labelled, `derived ${derived} must exceed the stale label's ${labelled}`);
   // And it must not simply be true everywhere.
   assert.ok(manifest.claims.some((claim) => !claim.liveParityRow), 'a detector that never says no measures nothing');
+});
+
+test('a WIRE row names a capture that exists and that a gate replays', () => {
+  // The legend's rule for the grade, made executable. A review graded a row
+  // `WIRE` that named no capture at all: the builder took the word, the
+  // coverage report counted it under "a value read from a capture a gate
+  // replays", and the manifest test passed 6/6. The word was the whole check.
+  const gates = readdirSync(`${root}/test`)
+    .filter((name) => name.startsWith('conformance-') && name.endsWith('.test.mjs'))
+    .map((name) => readFileSync(`${root}/test/${name}`, 'utf8'))
+    .join('\n');
+
+  const wire = manifest.claims.filter((claim) => claim.evidenceGrade === 'WIRE');
+  assert.ok(wire.length > 0, 'no row carries the grade, so this check proves nothing');
+
+  const faults = [];
+  for (const claim of wire) {
+    const named = [...claim.evidenceNote.matchAll(/spec\/captures\/([A-Za-z0-9._-]+)\.json/g)].map((hit) => hit[1]);
+    if (named.length === 0) {
+      faults.push(`${claim.id} ${claim.field}: names no capture`);
+      continue;
+    }
+    for (const fixture of named) {
+      if (!existsSync(`${root}/spec/captures/${fixture}.json`)) faults.push(`${claim.id}: ${fixture} is not in spec/captures`);
+      // The fixture has to be one a gate actually loads, not merely a file on
+      // disk: an unreplayed capture proves nothing on any run.
+      else if (!gates.includes(`'${fixture}'`)) faults.push(`${claim.id}: no conformance gate replays ${fixture}`);
+    }
+  }
+  assert.deepEqual(faults, [], 'WIRE rows whose evidence is not what the legend requires');
 });

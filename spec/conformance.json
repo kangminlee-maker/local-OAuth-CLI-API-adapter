@@ -3,12 +3,12 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "c070fc7915bdc0b8da9556510b628c07efd40641f2bb3860fa4017472d6aaee7",
+    "matrixDigest": "6685f7cb8fbce806847b6b3f4b2f5e95c11d07cc73ff6da140002496ee9d3086",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
     "claims": 148,
-    "claimsOutsideLegendVocabulary": 99,
+    "claimsOutsideLegendVocabulary": 100,
     "claimsWithLiveParityRow": 134,
     "routes": 11,
     "surfaces": 6,
@@ -1538,7 +1538,7 @@
       },
       "claimedLead": "refused",
       "claimedLeadInLegend": false,
-      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`, same sentence as `include`); at `reasoning.effort: none` accepted and echoed as supplied, and not applied — measured 2026-09-09 (`spec/captures/direct-responses-top-logprobs-effort-none.json`, replayed by `conformance-supplied-echo.test`). Until that capture this surface refused it at every effort while Chat accepted it at `none`: one proxy, two answers to one request",
+      "claimedNote": "**refused while the model reasons** (`unsupported_parameter`, same sentence as `include`); at `reasoning.effort: none` accepted and echoed as supplied, and not applied — measured 2026-09-09 (`spec/captures/direct-responses-top-logprobs-effort-none.json`, replayed by `conformance-supplied-echo.test`). Until that capture this surface refused it at every effort while Chat accepted it at `none`: one proxy, two answers to one request. Where it is accepted it is held to the documented `0..20`; Chat's measured ceiling is 5 and which one the direct Responses API enforces is **unmeasured**, so the wider documented range is the one a request is held to. The first version of this change also opened `include`'s logprobs door and the two penalties at that effort, and a review shut them again: their acceptance here is unmeasured, and the refusal turned out to be the only validation in front of them — `presence_penalty: 99` was accepted and echoed back",
       "evidenceGrade": "WIRE",
       "evidenceNote": "WIRE (`spec/captures/direct-responses-top-logprobs-effort-none.json`)",
       "liveParityRow": true
@@ -1822,9 +1822,9 @@
         "observableEffect": "adds the named payloads to `output`",
         "invalidValue": "400 / `invalid_request_error` / `include` / —"
       },
-      "claimedLead": "silently ignored",
-      "claimedLeadInLegend": true,
-      "claimedNote": "**silently ignored** — notably `reasoning.encrypted_content`, which stateless multi-turn clients depend on",
+      "claimedLead": "message.output_text.logprobs",
+      "claimedLeadInLegend": false,
+      "claimedNote": "`message.output_text.logprobs` is **refused** while the model reasons (`unsupported_parameter`, the door the direct API names when both are sent) and, at `reasoning.effort: none`, accepted and not applied — unmeasured on this surface at that effort. Every other member is **silently ignored**, notably `reasoning.encrypted_content`, which stateless multi-turn clients depend on. This cell said \"silently ignored\" without qualification until 2026-09-10, when a review read it against the code",
       "evidenceGrade": "DOC",
       "evidenceNote": "DOC",
       "liveParityRow": true
@@ -1846,7 +1846,7 @@
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
-      "claimedNote": "echoed (`raw.store === false ? false : true`, `http-server.ts:2019`) but **nothing is stored** — the proxy has no `GET /v1/responses/{id}`, so an echoed `store:true` is a false promise",
+      "claimedNote": "echoed (`raw.store === false ? false : true`, `http-server.ts:2401`) but **nothing is stored** — the proxy has no `GET /v1/responses/{id}`, so an echoed `store:true` is a false promise",
       "evidenceGrade": "WIRE",
       "evidenceNote": "WIRE (`spec/captures/direct-responses-store-false.json`)",
       "liveParityRow": true
@@ -1956,7 +1956,7 @@
       },
       "claimedLead": "echoed",
       "claimedLeadInLegend": false,
-      "claimedNote": "echoed via `asRecordPayload` (`http-server.ts:2033`)",
+      "claimedNote": "echoed via `asRecordPayload` (`http-server.ts:2418`)",
       "evidenceGrade": "WIRE",
       "evidenceNote": "WIRE (`spec/captures/direct-responses-metadata.json`)",
       "liveParityRow": true
@@ -2088,7 +2088,7 @@
       },
       "claimedLead": "ignored",
       "claimedLeadInLegend": false,
-      "claimedNote": "ignored; hard `\"default\"` (`http-server.ts:2018`)",
+      "claimedNote": "ignored, but **resolved and echoed**: `flex` comes back as `flex`, `fast` and `priority` both as `priority`, everything else as `default` (`resolvedOpenAiServiceTier`, reached from `http-server.ts:2400`). This cell read \"hard `\\\"default\\\"`\" until 2026-09-10; the capture it now cites shows the direct API answering `flex` to `flex`, and `conformance-supplied-echo.test` compares the two. A review found the false text still standing under the new grade",
       "evidenceGrade": "WIRE",
       "evidenceNote": "WIRE (`spec/captures/direct-responses-service-tier-flex.json`)",
       "liveParityRow": true
