@@ -98,12 +98,13 @@ function git(dir, ...argv) {
 }
 
 const PROMOTER = join('scripts', 'promote-capture.mjs');
+const MODULE = join('scripts', 'lib', 'capture-provenance.mjs');
 
 /** A repository whose only content is a committed copy of the promoter. */
 function checkout() {
   const dir = workspace();
   mkdirSync(join(dir, 'scripts', 'lib'), { recursive: true });
-  for (const rel of [PROMOTER, join('scripts', 'lib', 'capture-provenance.mjs')]) {
+  for (const rel of [PROMOTER, MODULE]) {
     copyFileSync(join(repoRoot, rel), join(dir, rel));
   }
   writeFileSync(join(dir, '.gitignore'), 'dist/\n');
@@ -203,21 +204,71 @@ test('two IDENTICAL requests with different responses are refused as ambiguous',
   assert.match(run.stderr, /match and they are not the same exchange/);
 });
 
-test('CONTROL: a committed promoter binds its fixture to the blob git holds', () => {
+test('CONTROL: a committed promoter binds EVERY source it runs to the blob git holds', () => {
   const dir = checkout();
   write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
   const run = promoteIn(dir, { extra: SELECT });
   assert.equal(run.status, 0, run.stderr);
 
   const { promotedFrom } = JSON.parse(readFileSync(join(dir, 'out', 'fixture.json'), 'utf8'));
-  assert.equal(promotedFrom.path, PROMOTER);
   assert.equal(promotedFrom.revision, git(dir, 'rev-parse', 'HEAD'));
-  assert.equal(promotedFrom.blob, git(dir, 'hash-object', '--', join(dir, PROMOTER)));
+  // Both files, derived from the import graph rather than declared: the entry
+  // file alone left an uncommitted edit to the module it imports invisible.
+  assert.deepEqual(promotedFrom.sources.map((source) => source.path).sort(), [MODULE, PROMOTER].sort());
+  for (const { path, blob } of promotedFrom.sources) {
+    assert.equal(blob, git(dir, 'hash-object', '--', join(dir, path)), `${path} is not bound to its own bytes`);
+  }
   assert.equal(whyUnbound(promotedFrom, { root: dir }), null);
 
   // The verifier is not vacuous: the same record read against a repository that
   // does not have that revision is rejected, naming what is missing.
   assert.match(whyUnbound(promotedFrom, { root: repoRoot }) ?? '', /this clone does not have/);
+});
+
+test('an edited MODULE refuses too: the program is not its entry file', () => {
+  // The gap the entry-file-only binding left. The promoter is committed and
+  // unchanged; the code it imports is not, and it is what decides the stamp.
+  const dir = checkout();
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  appendFileSync(join(dir, MODULE), '\n// an edit that is not in HEAD\n');
+  const run = promoteIn(dir, { extra: SELECT });
+  assert.equal(run.status, 2, `expected a refusal, got ${run.status}: ${run.stdout}`);
+  assert.match(run.stderr, /scripts\/lib\/capture-provenance\.mjs on disk is .* does not name the code that is running/);
+  assert.throws(() => readFileSync(join(dir, 'out', 'fixture.json')), /ENOENT/);
+});
+
+test('a record that carries an unbound key is rejected whatever that key holds', () => {
+  // `--allow-unbound-provenance` writes a reason there. A hand-written `true`
+  // beside an otherwise valid triple used to be read as bound, because only a
+  // string was treated as the override's mark.
+  const dir = checkout();
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  assert.equal(promoteIn(dir, { extra: SELECT }).status, 0);
+  const { promotedFrom } = JSON.parse(readFileSync(join(dir, 'out', 'fixture.json'), 'utf8'));
+  assert.equal(whyUnbound(promotedFrom, { root: dir }), null);
+  for (const value of [true, {}, null, 'a reason']) {
+    assert.match(
+      whyUnbound({ ...promotedFrom, unbound: value }, { root: dir }) ?? '',
+      /was promoted unbound/,
+      `unbound: ${JSON.stringify(value)} was read as bound`,
+    );
+  }
+});
+
+test('a revision no branch reaches is refused: evidence has to be reviewable', () => {
+  const dir = checkout();
+  write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
+  assert.equal(promoteIn(dir, { extra: SELECT }).status, 0);
+  const { promotedFrom } = JSON.parse(readFileSync(join(dir, 'out', 'fixture.json'), 'utf8'));
+
+  // Abandon the commit the fixture names: a second commit on a branch that the
+  // first is not part of. The object still exists, and git can still answer
+  // every question about its contents — which is why shape and blob checks
+  // accept it and only reachability does not.
+  git(dir, 'checkout', '-q', '--orphan', 'elsewhere');
+  git(dir, 'commit', '-qm', 'a history the stamped commit is not in');
+  assert.equal(git(dir, 'cat-file', '-t', promotedFrom.revision), 'commit');
+  assert.match(whyUnbound(promotedFrom, { root: dir }) ?? '', /is not in this checkout's history/);
 });
 
 test('a promoter edited since its commit refuses: HEAD no longer names the code that runs', () => {
@@ -240,7 +291,7 @@ test('a promoter run from an IGNORED path refuses, instead of inheriting the tra
   write(dir, '0001.json', exchange({ request: REQUEST, response: RESPONSE }));
   const hidden = join(dir, 'dist', 'probe');
   mkdirSync(join(hidden, 'scripts', 'lib'), { recursive: true });
-  for (const rel of [PROMOTER, join('scripts', 'lib', 'capture-provenance.mjs')]) {
+  for (const rel of [PROMOTER, MODULE]) {
     copyFileSync(join(dir, rel), join(hidden, rel));
   }
   assert.equal(
