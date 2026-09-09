@@ -29,6 +29,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
+import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
@@ -176,9 +177,11 @@ before(async () => {
     },
   });
 
-  // The capture's own request bytes, forwarded verbatim: the claim is about a
-  // body that omits every optional field, so re-typing it here would be a
-  // different request than the one the vendor answered.
+  // The capture's own request bytes, forwarded verbatim. Re-typing them here
+  // would ask a different question than the one the vendor answered — and the
+  // body is not "every optional field omitted" either: it supplies the output
+  // cap to bound what the probe costs, which is why the check below counts
+  // supplied echoes apart from defaults.
   for (const { surface, fixture } of SURFACES) {
     const capture = load(fixture);
     const res = await fetch(`${started.url}${surface}`, {
@@ -196,6 +199,20 @@ after(async () => {
 
 test('the captures this check reads are present and intact', () => {
   // Evidence that is missing has not passed, it has not run.
+
+  // A fixture whose stamp names a revision that could not have produced it is
+  // worse than one with no stamp, because a reader treats the stamp as
+  // evidence. Checking the stamp's SHAPE is not that check: a hand-written
+  // revision of forty zeroes satisfied a hex match. So git re-derives the
+  // claim — revision, path, and the promoter blob committed there — over the
+  // whole capture store, because a gate that verifies only the fixtures it
+  // itself loads leaves every other consumed capture exempt.
+  const { checked, unbound } = verifyCaptureStore();
+  assert.deepEqual(unbound, [], 'promoted captures whose provenance git cannot confirm');
+  for (const { fixture } of SURFACES) {
+    assert.ok(checked.includes(fixture), `${fixture} is not among the ${checked.length} verified captures`);
+  }
+
   for (const { fixture, requestKeys } of SURFACES) {
     const capture = load(fixture);
     assert.equal(capture.kind, 'json', `${fixture} is not a buffered capture`);
@@ -209,18 +226,6 @@ test('the captures this check reads are present and intact', () => {
         `${fixture} ${field} no longer matches the capture it was promoted from`,
       );
     }
-    // A fixture whose stamp names a revision that could not have produced it is
-    // worse than one with no stamp, because a reader treats the stamp as
-    // evidence. The promoter refuses to write an unbound one; this gates the
-    // committed artifact, so a fixture promoted from a modified promoter (or
-    // with the refusal overridden) cannot land here.
-    assert.equal(
-      capture.promotedFrom?.promoterUncommitted,
-      false,
-      `${fixture} was promoted by a promoter that differed from its recorded revision`,
-    );
-    assert.match(capture.promotedFrom?.revision ?? '', /^[0-9a-f]{40}$/, `${fixture} records no promoting revision`);
-
     // The claim is "every optional field omitted EXCEPT the output cap", which
     // the probe sets to bound what the measurement costs. That cap is not a
     // default — it is an echo of a value the request supplied, and it is
