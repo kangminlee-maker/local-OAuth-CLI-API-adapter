@@ -10,6 +10,7 @@
 // test. So a promotion states what the capture must contain, and refuses rather
 // than promoting something that does not.
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { gunzipSync } from 'node:zlib';
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -48,6 +49,15 @@ if (kind !== 'sse' && kind !== 'json') {
 if (kind === 'json' && !requestMustBe) {
   console.error('--request-must-be is required with --kind json: the request body is the evidence for what was omitted, so it is selected by hand, not by URL.');
   process.exit(2);
+}
+
+/** The revision the fixture was promoted at, so a receipt names a tree. */
+function revision() {
+  try {
+    return execFileSync('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  } catch {
+    return null;
+  }
 }
 
 const rootDir = resolve(repoRoot, root);
@@ -129,18 +139,22 @@ if (matches.length > 0) {
       mustNotContain: mustNotContain ?? null,
       requestMustBe: requestMustBe ?? null,
     },
+    promotedFromRevision: revision(),
     url: record.url,
     status: record.status,
     kind: record.kind,
     requestSha256: record.request.sha256,
     request: requestText,
+    // Byte counts are derived from the bytes just verified, not copied from the
+    // record: a count carried over from an unverified field describes whatever
+    // the record claimed rather than what the fixture holds.
     ...(kind === 'sse'
-      ? { streamSha256: source.sha256, streamBytes: source.bytes, stream: payload }
-      : { bodySha256: source.sha256, bodyBytes: source.bytes, body: payload }),
+      ? { streamSha256: source.sha256, streamBytes: Buffer.byteLength(payload), stream: payload }
+      : { bodySha256: source.sha256, bodyBytes: Buffer.byteLength(payload), body: payload }),
   };
   const target = join(resolve(repoRoot, outDir), `${name}.json`);
   writeFileSync(target, `${JSON.stringify(out, null, 2)}\n`);
-  console.log(`promoted ${name} (${kind}) from ${where} (${source.bytes} bytes, sha ${source.sha256.slice(0, 12)})`);
+  console.log(`promoted ${name} (${kind}) from ${where} (${Buffer.byteLength(payload)} bytes, sha ${source.sha256.slice(0, 12)})`);
   process.exit(0);
 }
 

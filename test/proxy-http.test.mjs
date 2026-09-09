@@ -515,6 +515,39 @@ test('a fan-out totals the shared prompt once, not the bare input tokens', async
       chat.usage.total_tokens >= chat.usage.prompt_tokens,
       'a total below the prompt it reports is not arithmetic a client can use',
     );
+
+    // The STREAM has to agree with the body; the merge is shared, and a fix
+    // proved on one path only is the defect class this repo keeps meeting.
+    const streamed = await fetch(`${split.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'fake-local-model',
+        messages: [{ role: 'user', content: 'hi' }],
+        n: 2,
+        stream: true,
+        stream_options: { include_usage: true },
+      }),
+    });
+    const wire = await streamed.text();
+    const withUsage = wire
+      .split('\n')
+      .filter((line) => line.startsWith('data: ') && !line.includes('[DONE]'))
+      .map((line) => JSON.parse(line.slice(6)))
+      .filter((chunk) => chunk.usage);
+    assert.equal(withUsage.length, 1, 'exactly one streamed chunk carries usage');
+    assert.deepEqual(withUsage[0].usage.prompt_tokens, chat.usage.prompt_tokens);
+    assert.deepEqual(withUsage[0].usage.total_tokens, chat.usage.total_tokens);
+
+    // CONTROL at n:1 — the merge returns the single usage untouched, so the
+    // backend's own total stands and this test cannot pass by rewriting totals
+    // everywhere.
+    const single = await (await postJsonTo(split.url, '/v1/chat/completions', {
+      model: 'fake-local-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    })).json();
+    assert.equal(single.usage.total_tokens, 1_070);
+    assert.equal(single.usage.prompt_tokens, 1_050);
   } finally {
     await split.close();
   }

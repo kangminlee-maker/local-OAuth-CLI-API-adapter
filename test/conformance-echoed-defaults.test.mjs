@@ -40,24 +40,29 @@ const declaredDivergences = JSON.parse(
   readFileSync(join(specDir, 'declared-divergences.json'), 'utf8'),
 ).divergences;
 
-// `echoedLeaves` is the denominator, pinned rather than bounded: it is how many
-// leaf values the vendor's minimal answer carries that are configuration rather
-// than per-call output. Chat's three (`object`, `service_tier`,
-// `system_fingerprint`) look thin because that surface's minimal body really is
-// almost all per-call — and a pinned 3 fails if it silently becomes 2, which a
-// `>= 1` would not.
+// The two denominators, pinned rather than bounded. `echoedDefaults` counts the
+// leaf values the vendor CHOSE for a field the request never mentioned;
+// `suppliedEchoes` counts the ones it echoed back from the request. They are
+// counted apart because the probe has to supply an output cap to bound its
+// cost, and counting that cap among the defaults is how the gate came to claim
+// a property it never exercised. A pinned count fails when it silently drops by
+// one, which a `>= 1` would not.
 const SURFACES = [
   {
     surface: '/v1/responses',
     fixture: 'direct-responses-minimal',
     requestKeys: ['model', 'input', 'max_output_tokens'],
-    echoedLeaves: 36,
+    echoedDefaults: 34,
+    // `model` and `max_output_tokens` — the two the request named.
+    suppliedEchoes: 2,
   },
   {
     surface: '/v1/chat/completions',
     fixture: 'direct-chat-minimal',
     requestKeys: ['model', 'messages', 'max_completion_tokens'],
-    echoedLeaves: 6,
+    echoedDefaults: 5,
+    // `model` only: Chat does not echo its cap or its messages as configuration.
+    suppliedEchoes: 1,
   },
 ];
 
@@ -258,7 +263,7 @@ test('the readers distinguish a shape and a value that differ', () => {
   assert.equal(rootOf('.output[0].content[0].text'), 'output');
 });
 
-for (const { surface, fixture, echoedLeaves } of SURFACES) {
+for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
   test(`${surface}: the proxy answers a minimal request in the vendor's shape`, () => {
     const direct = JSON.parse(load(fixture).body);
     const answered = bodies.get(surface);
@@ -289,14 +294,22 @@ for (const { surface, fixture, echoedLeaves } of SURFACES) {
   });
 
   test(`${surface}: the proxy fills omitted fields with the vendor's defaults`, () => {
-    const direct = JSON.parse(load(fixture).body);
+    const capture = load(fixture);
+    const direct = JSON.parse(capture.body);
     const ours = bodies.get(surface).body;
     const absent = new Set(declaredAbsentPaths(surface));
+    // A response field whose name the REQUEST also carries is an echo of what
+    // was supplied, not a default the vendor chose. Counting the probe's own
+    // `max_output_tokens: 16` among the defaults was how "every optional field
+    // omitted" stayed true-sounding while the branch that fills that field when
+    // it is ABSENT went unexercised. The two are separated and counted apart,
+    // so neither can stand in for the other.
+    const supplied = new Set(Object.keys(JSON.parse(capture.request)));
 
     const vendorLeaves = leafValues(direct, '', new Map());
     const ourLeaves = leafValues(ours, '', new Map());
     const differences = [];
-    let compared = 0;
+    const counts = { defaults: 0, echoes: 0 };
     for (const [path, value] of vendorLeaves) {
       // A per-call root's CONTENT varies by construction; its cardinality does
       // not. A duplicated `output` item is a message the client receives twice,
@@ -305,20 +318,19 @@ for (const { surface, fixture, echoedLeaves } of SURFACES) {
       if (PER_CALL.has(rootOf(path)) && !path.endsWith('[]#')) continue;
       // `[]` in a declaration stands for any index; leaves carry real ones.
       if (absent.has(path) || absent.has(path.replace(/\[\d+\]/g, '[]'))) continue;
-      compared += 1;
+      counts[supplied.has(rootOf(path)) ? 'echoes' : 'defaults'] += 1;
       const ourValue = ourLeaves.get(path);
       if (ourValue !== value) differences.push(`${path}: vendor ${value}, proxy ${ourValue ?? '(absent)'}`);
     }
 
-    // The denominator, asserted rather than printed: with every echoed field
-    // excluded this check passes while comparing nothing.
-    // The denominator, asserted rather than printed: with every echoed field
-    // skipped this check passes while comparing nothing, and a defaults check
-    // that compares nothing is the exact failure this suite keeps finding.
-    assert.equal(
-      compared,
-      echoedLeaves,
-      `${surface} compared ${compared} echoed values, not the ${echoedLeaves} this fixture carries`,
+    // Both denominators, asserted rather than printed: with every field skipped
+    // this check passes while comparing nothing, and a defaults check that
+    // compares nothing is the exact failure this suite keeps finding. Splitting
+    // them means a shrinking default count cannot be masked by an echo.
+    assert.deepEqual(
+      counts,
+      { defaults: echoedDefaults, echoes: suppliedEchoes },
+      `${surface} compared ${counts.defaults} defaults and ${counts.echoes} supplied echoes, not ${echoedDefaults} and ${suppliedEchoes}`,
     );
     assert.deepEqual(differences, [], `${surface} echoes different defaults than the vendor:\n  ${differences.join('\n  ')}`);
   });

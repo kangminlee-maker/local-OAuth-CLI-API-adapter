@@ -3,12 +3,13 @@
   "originRoot": "artifacts/direct-api-captures",
   "originRun": "a5eee9af-fcf4-450c-a0b0-4b16cdfcefbf",
   "originFile": "0001-P-1.json",
-  "promotedAt": "2026-09-08T23:47:38.237Z",
+  "promotedAt": "2026-09-09T00:10:21.937Z",
   "requiredContent": {
     "mustContain": null,
     "mustNotContain": null,
     "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"input\":\"ping\",\"max_output_tokens\":16}"
   },
+  "promotedFromRevision": "391d25cd51176385d2e13217d1c1c3f7746c9db7",
   "url": "https://api.openai.com/v1/responses",
   "status": 200,
   "kind": "json",

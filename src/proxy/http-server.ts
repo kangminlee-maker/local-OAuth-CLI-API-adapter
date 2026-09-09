@@ -1965,12 +1965,15 @@ function mergedChatUsage(results: readonly LocalCompletionResult[]): LocalUsage 
     outputTokens,
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
     // The fan-out shares one prompt and adds output, so the merged total is the
-    // first turn's own total plus what the others produced. Recomputing it from
-    // `inputTokens` dropped every cache counter that sits beside it and could
-    // report a total BELOW the prompt it reported — 50 + 40 against a prompt of
-    // 1050 on a runtime that separates cache reads and writes.
+    // prompt AS THIS SURFACE REPORTS IT plus every completion. Recomputing it
+    // from `inputTokens` dropped the cache counters that sit beside it and
+    // could report a total BELOW the prompt on the same response — 50 + 40
+    // against a prompt of 1050 on a runtime that separates reads and writes.
+    // Deriving it from the same projection the body reports keeps the two
+    // numbers reconcilable by construction rather than by the backend's total
+    // happening to agree.
     ...(first.usage.totalTokens !== undefined
-      ? { totalTokens: first.usage.totalTokens + (outputTokens - first.usage.outputTokens) }
+      ? { totalTokens: openAiInputTokens(first.usage) + outputTokens }
       : {}),
   };
 }
