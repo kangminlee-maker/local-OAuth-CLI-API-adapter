@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { captureSummary, recordExchange, startCaptureRun } from './lib/capture-recorder.mjs';
+import { readRecordedSse } from './lib/sse-capture.mjs';
 import fs from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -2351,22 +2352,6 @@ async function postSse(url, body, headers, collectText, collectToolArgument = ()
 async function postSseRequest(url, request, collectText, collectToolArgument = () => '') {
   return await guardedProxyFetch(url, async () => {
     const startedAt = performance.now();
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: request.headers,
-      body: request.body,
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!res.ok) throw new Error(`${url} ${res.status}: ${truncate(await res.text())}`);
-    if (!res.body) throw new Error(`${url} did not return a readable stream`);
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    // The wire as it arrived, before any event parsing. The terminator and the
-    // chunk boundaries exist only here — the parsed event list cannot say
-    // whether `[DONE]` was sent, which is the single highest-risk unverified
-    // cell in the conformance matrix.
-    let rawStream = '';
-    let buffer = '';
     let firstDataMs = null;
     let firstTextMs = null;
     let firstToolArgumentMs = null;
@@ -2407,34 +2392,20 @@ async function postSseRequest(url, request, collectText, collectToolArgument = (
       }
     }
 
-    while (true) {
-      const read = await reader.read();
-      if (read.done) break;
-      const decoded = decoder.decode(read.value, { stream: true });
-      rawStream += decoded;
-      buffer += decoded;
-      let index;
-      while ((index = buffer.indexOf('\n\n')) !== -1) {
-        const frame = buffer.slice(0, index);
-        buffer = buffer.slice(index + 2);
-        processFrame(frame);
-      }
-    }
-    buffer += decoder.decode();
-    const finalFrame = buffer.trim();
-    if (finalFrame) processFrame(finalFrame);
-    recordExchange({
-      kind: 'sse',
-      label: captureLabelFor(url),
+    // The transport and the recording live in `lib/sse-capture.mjs`, which
+    // records on every exit. This function used to throw past its own recording
+    // call on a refusal and on a stream that died halfway — the two exits whose
+    // bytes a reader most needs — while the buffered path beside it recorded
+    // before the status check and said why.
+    await readRecordedSse({
       url,
-      requestHeaders: request.headers,
-      requestBody: request.body,
-      status: res.status,
-      statusText: res.statusText,
-      responseHeaders: res.headers,
-      streamBytes: rawStream,
-      durationMs: elapsed(startedAt),
+      request,
+      timeoutMs,
+      label: captureLabelFor(url),
+      startedAt,
+      onFrame: processFrame,
     });
+
     return { totalMs: elapsed(startedAt), firstDataMs, firstTextMs, firstToolArgumentMs, chunks, text, toolArguments, done, events };
   });
 }
