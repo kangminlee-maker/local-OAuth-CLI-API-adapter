@@ -30,16 +30,13 @@ import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
+import { PER_CALL, absentPathsFor, expectedAbsentPaths, keyPaths, leafValues, rootOf } from '../scripts/lib/response-comparison.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
 function load(name) {
   return JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
 }
-
-const declaredDivergences = JSON.parse(
-  readFileSync(join(specDir, 'declared-divergences.json'), 'utf8'),
-).divergences;
 
 // The two denominators, pinned rather than bounded. `echoedDefaults` counts the
 // leaf values the vendor CHOSE for a field the request never mentioned;
@@ -77,73 +74,6 @@ test('the gate covers the surfaces it claims to, once each', () => {
   );
   assert.equal(new Set(SURFACES.map((entry) => entry.fixture)).size, SURFACES.length);
 });
-
-// Values that differ on every call by construction — identifiers, clocks, the
-// answer itself, and the token counts of two different models. Their SHAPE is
-// still compared; only the leaf values below them are not.
-//
-// `model` is NOT on this list, though it looks like it belongs: the capture's
-// request names a model and both sides echo THAT, so it is comparable, and
-// skipping it would let a proxy that answered with its backend's model — or a
-// constant — pass a conformance check on the field a client uses to know what
-// answered it.
-const PER_CALL = new Set([
-  'id', 'created', 'created_at', 'completed_at', 'output', 'usage', 'choices',
-]);
-
-const jsonType = (value) => (value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value);
-
-/**
- * Every key path in a value, TAGGED with the JSON type at that path, arrays
- * collapsed to `[]` so item count is not shape.
- *
- * The type tag is load-bearing. Without it an empty container and a `null`
- * occupy the same path and contribute no children, so a default that changed
- * from `metadata: {}` to `metadata: null` — a difference every client sees —
- * left both key sets identical and no value to compare.
- */
-function keyPaths(value, prefix, out) {
-  if (Array.isArray(value)) {
-    for (const item of value) keyPaths(item, `${prefix}[]`, out);
-    return out;
-  }
-  if (value !== null && typeof value === 'object') {
-    for (const [key, member] of Object.entries(value)) {
-      out.add(`${prefix}.${key}:${jsonType(member)}`);
-      keyPaths(member, `${prefix}.${key}`, out);
-    }
-    return out;
-  }
-  return out;
-}
-
-/** Leaf values by path, for the fields a client would read as configuration. */
-function leafValues(value, prefix, out) {
-  if (Array.isArray(value)) {
-    // An array of SCALARS contributes no key paths at all, so its contents are
-    // invisible to the shape reading above; its length is the value that makes
-    // them visible. Without this, a vendor `tools: []` answered with
-    // `tools: ["leaked"]` passed both halves of this gate.
-    out.set(`${prefix}[]#`, String(value.length));
-    value.forEach((item, index) => leafValues(item, `${prefix}[${index}]`, out));
-    return out;
-  }
-  if (value !== null && typeof value === 'object') {
-    for (const [key, member] of Object.entries(value)) leafValues(member, `${prefix}.${key}`, out);
-    return out;
-  }
-  out.set(prefix, JSON.stringify(value));
-  return out;
-}
-
-const rootOf = (path) => path.replace(/^\./, '').split(/[.[]/, 1)[0];
-
-/** The paths a surface is declared NOT to report, from the divergence data. */
-function declaredAbsentPaths(surface) {
-  return declaredDivergences
-    .filter((entry) => entry.surface === surface && entry.claim === 'echoed-defaults')
-    .flatMap((entry) => entry.absentPaths ?? []);
-}
 
 let started;
 const bodies = new Map();
@@ -305,7 +235,7 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
     // next regression through — so both directions fail here.
     assert.deepEqual(
       onlyVendor.map(untagged).sort(),
-      declaredAbsentPaths(surface).slice().sort(),
+      expectedAbsentPaths(surface, vendorPaths).slice().sort(),
       `${surface}: the fields missing from the proxy's answer are not the declared ones`,
     );
   });
@@ -314,7 +244,7 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
     const capture = load(fixture);
     const direct = JSON.parse(capture.body);
     const ours = bodies.get(surface).body;
-    const absent = new Set(declaredAbsentPaths(surface));
+    const absent = new Set(absentPathsFor(surface));
     // A response field whose name the REQUEST also carries is an echo of what
     // was supplied, not a default the vendor chose. Counting the probe's own
     // `max_output_tokens: 16` among the defaults was how "every optional field
