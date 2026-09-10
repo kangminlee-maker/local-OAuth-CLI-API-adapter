@@ -143,6 +143,20 @@ export function createReplayBackend() {
   };
 }
 
+/**
+ * Why fourteen Chat rows carry `reasoning_effort` and claim nothing about it.
+ *
+ * The probes set it to `none` so the turn does not reason — a capture costs a
+ * few tokens and comes back the same way twice. It is how the request was
+ * TAKEN, not what any of those rows is about; `direct-chat-reasoning-effort-none`
+ * is the row that is about it. Written out per row rather than excused for the
+ * whole surface, because a surface-level excuse is what let a row stop claiming
+ * an option while another row kept the key alive — dropping a claim has to be a
+ * visible edit, not a deletion.
+ */
+const PROBE_SHAPING_EFFORT = 'set to `none` so the probe turn does not reason; '
+  + '`direct-chat-reasoning-effort-none` is the row that claims this option';
+
 export const SUPPLIED_ECHO_CAPTURES = [
   { fixture: 'direct-responses-service-tier-flex', surface: '/v1/responses', supplied: ['service_tier'], echoed: true, vendorPaths: 76 },
   { fixture: 'direct-responses-store-false', surface: '/v1/responses', supplied: ['store'], echoed: true, vendorPaths: 76 },
@@ -167,10 +181,11 @@ export const SUPPLIED_ECHO_CAPTURES = [
     vendorPaths: 99,
   },
   { fixture: 'direct-responses-top-logprobs-effort-none', surface: '/v1/responses', supplied: ['top_logprobs', 'reasoning'], echoed: true, vendorPaths: 76 },
-  { fixture: 'direct-chat-service-tier-flex', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
-  { fixture: 'direct-chat-response-format-json-object', surface: '/v1/chat/completions', supplied: ['response_format'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-service-tier-flex', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-response-format-json-object', surface: '/v1/chat/completions', supplied: ['response_format'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
   {
     fixture: 'direct-chat-n-2',
+    unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT },
     surface: '/v1/chat/completions',
     supplied: ['n'],
     echoed: false,
@@ -239,15 +254,15 @@ export const SUPPLIED_ECHO_CAPTURES = [
     declaredAbsent: ['moderation'],
     vendorPaths: 155,
   },
-  { fixture: 'direct-chat-service-tier-default', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
-  { fixture: 'direct-chat-service-tier-priority', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
+  { fixture: 'direct-chat-service-tier-default', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-service-tier-priority', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
   { fixture: 'direct-chat-reasoning-effort-none', surface: '/v1/chat/completions', supplied: ['reasoning_effort'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-seed', surface: '/v1/chat/completions', supplied: ['seed'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-store-true', surface: '/v1/chat/completions', supplied: ['store'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-metadata-user-safety-identifier', surface: '/v1/chat/completions', supplied: ['metadata', 'user', 'safety_identifier'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-prompt-cache-key-options', surface: '/v1/chat/completions', supplied: ['prompt_cache_key', 'prompt_cache_options'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-prompt-cache-retention', surface: '/v1/chat/completions', supplied: ['prompt_cache_retention'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-verbosity', surface: '/v1/chat/completions', supplied: ['verbosity'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-seed', surface: '/v1/chat/completions', supplied: ['seed'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-store-true', surface: '/v1/chat/completions', supplied: ['store'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-metadata-user-safety-identifier', surface: '/v1/chat/completions', supplied: ['metadata', 'user', 'safety_identifier'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-prompt-cache-key-options', surface: '/v1/chat/completions', supplied: ['prompt_cache_key', 'prompt_cache_options'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-prompt-cache-retention', surface: '/v1/chat/completions', supplied: ['prompt_cache_retention'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-verbosity', surface: '/v1/chat/completions', supplied: ['verbosity'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
   { fixture: 'direct-chat-tools', surface: '/v1/chat/completions', supplied: ['tools', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
   { fixture: 'direct-chat-parallel-tool-calls-false', surface: '/v1/chat/completions', supplied: ['tools', 'parallel_tool_calls', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
   { fixture: 'direct-chat-functions-function-call', surface: '/v1/chat/completions', supplied: ['functions', 'function_call', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
@@ -259,9 +274,9 @@ export const SUPPLIED_ECHO_CAPTURES = [
   // claim they carry is the STATUS — the vendor answers 200 to each, and so
   // must this proxy — with the echo half saying that neither side reports the
   // messages back.
-  { fixture: 'direct-chat-message-name', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-message-unknown-member', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-message-refusal', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
+  { fixture: 'direct-chat-message-name', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-message-unknown-member', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-message-refusal', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
   // Six turns whose shape is a function of what the VENDOR generated rather than
   // of the option supplied, each answered here the way its own turn went. A
   // backend that says `OK` to everything cannot produce an empty `content`, a
@@ -747,33 +762,63 @@ export const UNCLAIMED_REQUEST_KEYS = {
  * Claiming through `declaredAbsent` counts: that row asserts the option's whole
  * answer is missing, which is a claim about it.
  */
-export function unclaimedRequestOptions(rows, requestKeysOf) {
-  const bySurface = new Map();
+export function unclaimedRequestOptions(rows, requestKeysOf,
+  mandatoryKeys = MANDATORY_REQUEST_KEYS, surfaceExceptions = UNCLAIMED_REQUEST_KEYS) {
+  const claimedOnSurface = new Map();
+  const presentOnSurface = new Map();
   for (const row of rows) {
-    const seen = bySurface.get(row.surface) ?? { claimed: new Set(), present: new Set() };
-    for (const option of [...(row.supplied ?? []), ...(row.declaredAbsent ?? [])]) seen.claimed.add(option);
-    for (const key of requestKeysOf(row.fixture)) seen.present.add(key);
-    bySurface.set(row.surface, seen);
+    const claimed = claimedOnSurface.get(row.surface) ?? new Set();
+    for (const option of [...(row.supplied ?? []), ...(row.declaredAbsent ?? [])]) claimed.add(option);
+    claimedOnSurface.set(row.surface, claimed);
+    const present = presentOnSurface.get(row.surface) ?? new Set();
+    for (const key of requestKeysOf(row.fixture)) present.add(key);
+    presentOnSurface.set(row.surface, present);
   }
+
   const unclaimed = [];
   const staleExceptions = [];
-  for (const [surface, { claimed, present }] of bySurface) {
-    const mandatory = new Set(MANDATORY_REQUEST_KEYS[surface] ?? []);
-    const excused = UNCLAIMED_REQUEST_KEYS[surface] ?? {};
-    for (const key of [...present].sort()) {
-      if (mandatory.has(key) || claimed.has(key)) continue;
-      if (Object.prototype.hasOwnProperty.call(excused, key)) {
-        if (!excused[key]) staleExceptions.push(`${surface} ${key}: excused with no reason`);
+  for (const row of rows) {
+    const mandatory = new Set(mandatoryKeys[row.surface] ?? []);
+    const surfaceExcused = surfaceExceptions[row.surface] ?? {};
+    const rowExcused = row.unclaimed ?? {};
+    const claims = new Set([...(row.supplied ?? []), ...(row.declaredAbsent ?? [])]);
+    const keys = requestKeysOf(row.fixture);
+    // PER ROW. Per surface was not this property: a key stays claimed on a
+    // surface by any row that names it, so the row that is a defect's only
+    // WITNESS can stop claiming it and the rule sees nothing. Being an option's
+    // only claimer and being its only witness are different, and a review made
+    // a client-visible defect — `reasoning.effort: "none"` answered as
+    // `"medium"` — pass all 2283 tests by deleting one word from the row that
+    // witnessed it, while another row on the same surface kept the key claimed.
+    for (const key of keys) {
+      if (mandatory.has(key) || claims.has(key)) continue;
+      if (Object.prototype.hasOwnProperty.call(rowExcused, key)) {
+        if (!rowExcused[key]) staleExceptions.push(`${row.fixture} ${key}: excused with no reason`);
         continue;
       }
-      unclaimed.push(`${surface} ${key}`);
+      if (Object.prototype.hasOwnProperty.call(surfaceExcused, key)) {
+        if (!surfaceExcused[key]) staleExceptions.push(`${row.surface} ${key}: excused with no reason`);
+        continue;
+      }
+      unclaimed.push(`${row.fixture} ${key}`);
     }
-    // An exception for a key no capture sends, or for one a row does claim, has
-    // outlived whatever it was for.
+    for (const key of Object.keys(rowExcused)) {
+      if (!keys.includes(key)) staleExceptions.push(`${row.fixture} ${key}: excused but its request does not carry it`);
+      else if (claims.has(key)) staleExceptions.push(`${row.fixture} ${key}: excused but this row claims it`);
+    }
+  }
+
+  // A surface-level exception is for a key NO row claims — the shape of a knob
+  // every probe sets and no row is about. One that a row does claim, or that no
+  // capture sends, has outlived whatever it was for.
+  for (const [surface, excused] of Object.entries(surfaceExceptions)) {
+    const claimed = claimedOnSurface.get(surface) ?? new Set();
+    const present = presentOnSurface.get(surface) ?? new Set();
+    if (!presentOnSurface.has(surface)) continue;
     for (const key of Object.keys(excused)) {
       if (!present.has(key)) staleExceptions.push(`${surface} ${key}: excused but no capture's request carries it`);
       else if (claimed.has(key)) staleExceptions.push(`${surface} ${key}: excused but a row claims it`);
     }
   }
-  return { unclaimed: unclaimed.sort(), staleExceptions: staleExceptions.sort() };
+  return { unclaimed: [...new Set(unclaimed)].sort(), staleExceptions: [...new Set(staleExceptions)].sort() };
 }

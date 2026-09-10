@@ -526,7 +526,13 @@ test('a root cannot be both supplied and declared absent', () => {
 // HAS. Deleting one word from one row's `supplied` made a real echo defect —
 // `top_logprobs: 1` answered as `0` — invisible to the entire suite, because
 // that row was the defect's only witness.
-test('every option the store sends is claimed by some row', () => {
+//
+// The first fix asked the question PER SURFACE, which is a different property:
+// a key stays claimed by any row that names it, so the witness row could still
+// stop claiming it. A second review used exactly that to make
+// `reasoning.effort: "none"` answered as `"medium"` pass all 2283 tests. It is
+// per row now, with the probe-shaping keys excused per row and by name.
+test('every option the store sends is claimed by the row that replays it', () => {
   const { unclaimed, staleExceptions } = unclaimedRequestOptions(
     CAPTURES,
     (fixture) => Object.keys(JSON.parse(load(fixture).request)),
@@ -585,23 +591,72 @@ test('a free field with no reason given is itself a failure', () => {
   assert.ok(failures.length > 0, 'an entirely unbound surface reported nothing');
 });
 
-test('an option no row claims is named', () => {
+test('an option THIS row does not claim is named, even if a sibling claims it', () => {
+  // Per ROW, not per surface. A key stays claimed on a surface by any row that
+  // names it, so the row that is a defect's only WITNESS could stop claiming it
+  // and the rule saw nothing: a review made `reasoning.effort: "none"` answered
+  // as `"medium"` pass all 2283 tests by deleting one word from the row that
+  // witnessed it, while another row on the same surface kept `reasoning` alive.
   const { unclaimed } = unclaimedRequestOptions(
-    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['store'] }],
-    () => ['model', 'input', 'store', 'top_logprobs'],
+    [
+      { fixture: 'witness', surface: '/v1/responses', supplied: ['top_logprobs'] },
+      { fixture: 'sibling', surface: '/v1/responses', supplied: ['reasoning'] },
+    ],
+    (fixture) => (fixture === 'witness'
+      ? ['model', 'input', 'top_logprobs', 'reasoning']
+      : ['model', 'input', 'reasoning']),
+    { '/v1/responses': ['model', 'input'] },
+    {},
   );
-  assert.deepEqual(unclaimed, ['/v1/responses top_logprobs'],
-    'an option the capture sends and no row asserts went unnamed');
+  assert.deepEqual(unclaimed, ['witness reasoning'],
+    'a row stopped claiming an option its own request carries and nothing said so');
 });
 
-test('an exception no capture sends, or one a row claims, is stale', () => {
-  const rows = [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['max_output_tokens'] }];
-  const { staleExceptions } = unclaimedRequestOptions(rows, () => ['model', 'input', 'max_output_tokens']);
-  assert.match(staleExceptions.join('\n'), /max_output_tokens: excused but a row claims it/);
+test('a per-row exception excuses only the row that names it', () => {
+  const rows = [
+    { fixture: 'excused', surface: '/v1/responses', supplied: ['top_logprobs'], unclaimed: { reasoning: 'why' } },
+    { fixture: 'bare', surface: '/v1/responses', supplied: ['top_logprobs'] },
+  ];
+  const { unclaimed, staleExceptions } = unclaimedRequestOptions(
+    rows,
+    () => ['model', 'input', 'top_logprobs', 'reasoning'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+  );
+  assert.deepEqual(unclaimed, ['bare reasoning']);
+  assert.deepEqual(staleExceptions, []);
+});
+
+test('a per-row exception with no reason, or for a key the row claims, is stale', () => {
+  const { staleExceptions } = unclaimedRequestOptions(
+    [
+      { fixture: 'silent', surface: '/v1/responses', supplied: ['store'], unclaimed: { reasoning: '' } },
+      { fixture: 'both-ways', surface: '/v1/responses', supplied: ['reasoning'], unclaimed: { reasoning: 'why' } },
+      { fixture: 'absent-key', surface: '/v1/responses', supplied: ['store'], unclaimed: { nowhere: 'why' } },
+    ],
+    () => ['model', 'input', 'store', 'reasoning'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+  );
+  const said = staleExceptions.join('\n');
+  assert.match(said, /silent reasoning: excused with no reason/);
+  assert.match(said, /both-ways reasoning: excused but this row claims it/);
+  assert.match(said, /absent-key nowhere: excused but its request does not carry it/);
+});
+
+test('a SURFACE exception no capture sends, or one a row claims, is stale', () => {
+  const tables = [{ '/v1/responses': ['model', 'input'] }, { '/v1/responses': { cap: 'the probe caps the turn' } }];
+  const { staleExceptions } = unclaimedRequestOptions(
+    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['cap'] }],
+    () => ['model', 'input', 'cap'],
+    ...tables,
+  );
+  assert.match(staleExceptions.join('\n'), /cap: excused but a row claims it/);
 
   const { staleExceptions: gone } = unclaimedRequestOptions(
     [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['store'] }],
     () => ['model', 'input', 'store'],
+    ...tables,
   );
-  assert.match(gone.join('\n'), /max_output_tokens: excused but no capture's request carries it/);
+  assert.match(gone.join('\n'), /cap: excused but no capture's request carries it/);
 });
