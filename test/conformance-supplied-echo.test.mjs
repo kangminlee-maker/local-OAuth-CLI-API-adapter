@@ -36,6 +36,7 @@ import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterRepl
   createReplayBackend,
   answerPremiseFailures,
   MINIMAL_SURFACES,
+  bindingsReached,
   echoFailures,
   freeFieldsReached,
   harnessGapsFrom,
@@ -415,6 +416,22 @@ test('the free reasons no roster reaches are the ones held in reserve', () => {
     '/v1/messages stopSequence',
     '/v1/responses stopSequence',
   ], 'the set of never-read reasons changed: read the ones that became live before counting them');
+});
+
+test('every binding is run by some row', () => {
+  // The mirror of the reserve list, and the reason it is not optional: a binding
+  // nothing runs certifies without being able to be wrong. Two of these had
+  // never been read against anything — both were rewritten to return a string no
+  // vendor sends and the suite stayed green — because only the six
+  // `/v1/messages` rows wrote a cache-write number. `DEFAULT_ANSWER` serves one
+  // now, so the two OpenAI surfaces read it too.
+  const { neverRun, runs } = bindingsReached([CAPTURES, MINIMAL_SURFACES]);
+  assert.deepEqual(neverRun, [],
+    'a binding is in the table and absent from every run; serve the value or say why it is held');
+  // ...and the count is per binding, not one number over all of them. The gate's
+  // only coverage assertion used to be `checked > 0`, which nine bindings
+  // satisfied on behalf of the two that never ran.
+  assert.ok(Object.values(runs).every((count) => count > 0));
 });
 
 test('the usage counts are free only while nothing compares a usage path', () => {

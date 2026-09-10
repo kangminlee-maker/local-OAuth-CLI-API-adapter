@@ -117,7 +117,23 @@ export const DEFAULT_ANSWER = {
   // against a finished one and calling the difference the proxy's. Left
   // undefined here because "the turn simply ended" is what most rows replay.
   stopReason: undefined,
-  usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8, cachedInputTokens: 0, reasoningOutputTokens: 0, source: 'provider' },
+  // `cacheCreationInputTokens` is here so the binding that reads it RUNS. A
+  // review measured the eleven bindings against both rosters and found two that
+  // had never been read against anything — the cache-write number on the two
+  // OpenAI surfaces — because only the six `/v1/messages` rows wrote one. Both
+  // were rewritten to return a string no vendor sends and the whole suite stayed
+  // green. Every OpenAI capture in the store reports `cache_write_tokens: 0`, so
+  // the honest fix is to serve the number rather than to write down that nobody
+  // checks it.
+  usage: {
+    inputTokens: 7,
+    outputTokens: 1,
+    totalTokens: 8,
+    cachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0,
+    source: 'provider',
+  },
 };
 
 /**
@@ -822,6 +838,41 @@ export function freeFieldsReached(rosters, bindings = ANSWER_BINDINGS, free = FR
   return {
     reached: [...reached].sort(),
     heldInReserve: [...declared].filter((entry) => !reached.has(entry)).sort(),
+  };
+}
+
+/**
+ * Which BINDINGS the rosters actually run, and which have never been read.
+ *
+ * The mirror of `freeFieldsReached`, and it exists because the argument behind
+ * that one is not about prose. It is about un-run inputs, and the binding table
+ * had two: `usage.cacheCreationInputTokens` on the two OpenAI surfaces, present
+ * in the table and absent from every run, because only the six `/v1/messages`
+ * rows wrote that number. A review rewrote both to return a string no vendor
+ * sends and the whole suite stayed green — "a binding that is wrong in the
+ * proxy's own direction is worse than none, because it certifies", and those two
+ * were the ones nothing could tell right from wrong.
+ *
+ * The gate's only coverage assertion was `checked > 0`, one number over three
+ * surfaces and eleven bindings, which the other nine satisfy on their own.
+ */
+export function bindingsReached(rosters, bindings = ANSWER_BINDINGS) {
+  const runs = new Map();
+  for (const [surface, table] of Object.entries(bindings)) {
+    for (const [field] of table) runs.set(`${surface} ${field}`, 0);
+  }
+  for (const rows of rosters) {
+    for (const { surface, answer } of rows) {
+      const present = new Set(leafPaths(servedAnswer(answer)));
+      for (const [field] of bindings[surface] ?? []) {
+        const key = `${surface} ${field}`;
+        if (present.has(field)) runs.set(key, (runs.get(key) ?? 0) + 1);
+      }
+    }
+  }
+  return {
+    runs: Object.fromEntries([...runs].sort(([a], [b]) => a.localeCompare(b))),
+    neverRun: [...runs].filter(([, count]) => count === 0).map(([key]) => key).sort(),
   };
 }
 
