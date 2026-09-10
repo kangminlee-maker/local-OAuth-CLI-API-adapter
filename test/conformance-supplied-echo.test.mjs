@@ -534,3 +534,63 @@ test('every option the store sends is claimed by some row', () => {
   assert.deepEqual(unclaimed, [], 'options the captures send that no row asserts anything about');
   assert.deepEqual(staleExceptions, [], 'exceptions that have outlived what they were for');
 });
+
+// The rules below are true of this roster, so nothing in it can tell a working
+// rule from a broken one. Three mutants survived on exactly that: the roster is
+// clean, so removing the rule changed nothing. A rule no input distinguishes is
+// an un-run input, not a guard shown to be unnecessary.
+
+test('a row with NO answer is still checked against its capture', () => {
+  // The scope round 3 moved a compensating value into: rows that declare no
+  // answer are served `DEFAULT_ANSWER`, and it was bound to no capture.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages' }],
+    () => ({
+      body: { stop_reason: 'max_tokens', content: [], usage: { cache_creation_input_tokens: 4, cache_read_input_tokens: 0 } },
+      request: {},
+    }),
+  );
+  // `DEFAULT_ANSWER` says nothing was read from cache; this capture says 4 was.
+  assert.match(failures.join('\n'), /cachedInputTokens yields 0, the capture says 4/,
+    'a row with no answer of its own escaped the check entirely');
+});
+
+test('an answer field that is neither bound nor named free is reported', () => {
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: { somethingNew: 1 } }],
+    () => ({ body: { stop_reason: 'max_tokens', content: [], usage: {} }, request: {} }),
+  );
+  assert.match(failures.join('\n'), /somethingNew, which no binding checks/);
+});
+
+test('a free field with no reason given is itself a failure', () => {
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/nowhere-free', answer: {} }],
+    () => ({ body: {}, request: {} }),
+    { '/v1/nowhere-free': [] },
+  );
+  // No binding table entry for this surface in FREE_ANSWER_FIELDS either, so
+  // every leaf is reported rather than silently skipped.
+  assert.ok(failures.length > 0, 'an entirely unbound surface reported nothing');
+});
+
+test('an option no row claims is named', () => {
+  const { unclaimed } = unclaimedRequestOptions(
+    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['store'] }],
+    () => ['model', 'input', 'store', 'top_logprobs'],
+  );
+  assert.deepEqual(unclaimed, ['/v1/responses top_logprobs'],
+    'an option the capture sends and no row asserts went unnamed');
+});
+
+test('an exception no capture sends, or one a row claims, is stale', () => {
+  const rows = [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['max_output_tokens'] }];
+  const { staleExceptions } = unclaimedRequestOptions(rows, () => ['model', 'input', 'max_output_tokens']);
+  assert.match(staleExceptions.join('\n'), /max_output_tokens: excused but a row claims it/);
+
+  const { staleExceptions: gone } = unclaimedRequestOptions(
+    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['store'] }],
+    () => ['model', 'input', 'store'],
+  );
+  assert.match(gone.join('\n'), /max_output_tokens: excused but no capture's request carries it/);
+});

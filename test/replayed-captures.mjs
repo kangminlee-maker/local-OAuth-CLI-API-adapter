@@ -555,6 +555,44 @@ function leafPaths(value, prefix = '') {
   return keys.flatMap((key) => leafPaths(value[key], prefix ? `${prefix}.${key}` : key));
 }
 
+/**
+ * Answer fields a surface deliberately does not check, each with its reason.
+ *
+ * A field that is neither bound nor named here is a failure. The first version
+ * hard-skipped `text` and `stopReason` inside the scan, so renaming a binding
+ * left the field unchecked AND unreported — a mutant that removed the `text`
+ * binding survived. An unchecked input has to be a written decision or it is a
+ * hole.
+ */
+export const FREE_ANSWER_FIELDS = {
+  '/v1/chat/completions': {
+    id: "the proxy mints its own; no capture's id is reproducible",
+    model: 'echoed from the request, and the rows that care compare it',
+    toolCalls: 'always empty here; a row needing tool calls would have to bind them',
+    latencyMs: 'wall-clock, and nothing compares it',
+    text: 'this surface compares echoed request options and shapes, not the answer text; '
+      + 'no row on it reads the content back, so the text cannot carry a compensating value',
+    stopReason: 'not passed through on this surface',
+    stopSequence: 'not passed through on this surface',
+    'usage.source': "a label on where the numbers came from, absent from the vendor's shape",
+    'usage.inputTokens': 'the counts a row compares are the cache ones; these are the turn\'s own size',
+    'usage.outputTokens': 'as above',
+    'usage.totalTokens': 'as above',
+    'usage.reasoningOutputTokens': 'the fake backend does not reason, and the rows whose captures DID '
+      + "declare it in `harnessGaps` with an asserted premise — `direct-responses-tools-parallel-false`'s "
+      + 'vendor turn spent 9. Binding it would require a fixture to claim a reasoning turn it never had',
+  },
+};
+FREE_ANSWER_FIELDS['/v1/responses'] = FREE_ANSWER_FIELDS['/v1/chat/completions'];
+FREE_ANSWER_FIELDS['/v1/messages'] = {
+  ...FREE_ANSWER_FIELDS['/v1/chat/completions'],
+  // Bound on this surface, so not free here.
+  text: null,
+  stopReason: null,
+};
+delete FREE_ANSWER_FIELDS['/v1/messages'].text;
+delete FREE_ANSWER_FIELDS['/v1/messages'].stopReason;
+
 export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) {
   const read = (answer, dotted) => dotted.split('.').reduce(
     (value, key) => (value === undefined || value === null ? undefined : value[key]),
@@ -581,17 +619,13 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
     // These reach the proxy and are compared by the rows that claim them; a
     // fixture cannot use them to contradict a capture without the comparison
     // saying so.
-    const free = new Set(['id', 'model', 'toolCalls', 'latencyMs', 'usage.source',
-      'usage.inputTokens', 'usage.outputTokens', 'usage.totalTokens', 'stopSequence',
-      // Not bound, on purpose. The fake backend does not reason, and the rows
-      // whose captures DID reason say so in `harnessGaps` with an asserted
-      // premise — `direct-responses-tools-parallel-false`'s vendor turn spent 9
-      // reasoning tokens. Binding this would require the fixture to claim a
-      // reasoning turn it never had, which is the opposite of what this check
-      // is for.
-      'usage.reasoningOutputTokens']);
+    const free = FREE_ANSWER_FIELDS[surface] ?? {};
     for (const field of leafPaths(answer)) {
-      if (covered.has(field) || free.has(field) || field === 'text' || field === 'stopReason') continue;
+      if (covered.has(field)) continue;
+      if (Object.prototype.hasOwnProperty.call(free, field)) {
+        if (!free[field]) failures.push(`${fixture}: ${field} is free with no reason given`);
+        continue;
+      }
       failures.push(`${fixture}: the answer sets ${field}, which no binding checks against the capture`);
     }
     for (const [field, ofVendor, ofAnswer] of table) {
