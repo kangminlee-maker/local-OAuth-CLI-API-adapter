@@ -634,6 +634,14 @@ function chatFinishReason(answer) {
 }
 
 function anthropicStopReason(answer) {
+  // Deliberately the RAW answer, not the answer after `applyStopSequences`
+  // (src/proxy/http-server.ts:2139) has had its way with it: that function can
+  // overwrite `result.stopReason` with `'stop_sequence'` before the messages
+  // shaping sees it, and this derivation does not. The disagreement runs in the
+  // failing direction — the binding demands the capture agree with the
+  // UNREWRITTEN answer, so a row whose text runs into a sequence has to declare
+  // `stopReason: 'stop_sequence'` itself, which both hit rows do. It cannot
+  // certify a turn the proxy ended some other way.
   const hasToolCalls = (answer.toolCalls ?? []).length > 0;
   if (hasToolCalls && answer.stopReason !== 'max_tokens') return 'tool_use';
   const reported = answer.stopReason;
@@ -794,8 +802,17 @@ export const REQUIRED_EFFECTS = {
     n: ['.choices[]#'],
   },
   '/v1/messages': {
-    // The sequence is what cuts the text; `stop_reason` and the cut text itself
-    // are the only ways a client sees that it was honoured.
+    // What EVERY row sending this option owes, including the one that sends an
+    // empty list: the reason the turn ended and which sequence ended it.
+    //
+    // Not the cut text, though an earlier version of this comment said "the cut
+    // text itself" was among them — a sentence the table below did not
+    // implement. The row that sends an empty list has no cut text to compare, so
+    // the requirement cannot be unconditional here. The two rows whose text does
+    // run into a sequence compare `.content[0].text` and `.content[0].type` of
+    // their own accord, and the truncation itself is pinned OUTSIDE this gate:
+    // removing it fails six cases in `test/anthropic-stop-sequences.test.mjs`
+    // and the two-surface stop tests, and two more in here.
     stop_sequences: ['.stop_reason', '.stop_sequence'],
   },
 };
