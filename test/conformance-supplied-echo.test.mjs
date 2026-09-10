@@ -36,6 +36,8 @@ import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterRepl
   createReplayBackend,
   answerPremiseFailures,
   echoFailures,
+  harnessGapsFrom,
+  missingRequiredEffects,
   unclaimedRequestOptions,
 } from './replayed-captures.mjs';
 
@@ -257,6 +259,10 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, ha
       const typesOf = (body) => (body?.output ?? body?.choices ?? []).map((item) => item?.type ?? null);
       assert.deepEqual(typesOf(vendor), harnessPremise.vendor, `${fixture}: the vendor's turn is not the one these gaps describe`);
       assert.deepEqual(typesOf(ours.body), harnessPremise.ours, `${fixture}: our turn is not the one these gaps describe`);
+      // ...and the list itself follows from that missing item. A true premise
+      // used to license any path listed beside it.
+      assert.deepEqual([...gaps].sort(), harnessGapsFrom(vendor, harnessPremise),
+        `${fixture}: a declared harness gap does not follow from the item our turn lacks`);
     }
 
     const declared = [...new Set(expectedAbsentPaths(surface, theirs))].sort();
@@ -359,6 +365,66 @@ test('every capture in the store is replayed by a gate', () => {
 // The premise check's own controls, on a synthetic roster. The case above runs
 // it over the real one, where every surface happens to be bound and every answer
 // happens to agree — so nothing there can show what it does when they do not.
+// A free field's REASON is prose, and prose rots. A round found two of these
+// reasons already false: one said `stopReason` is "not passed through on this
+// surface" when all three surfaces pass it through, and one named `harnessGaps`
+// as the mechanism keeping `usage.reasoningOutputTokens` free when every path in
+// that list is under `.output[]` and none is a usage path. The first was not
+// merely mis-worded — two independent reviews walked through it — and is now a
+// binding rather than a reason. What is left free rests on checkable facts, and
+// these are those facts, so the next reason to go false says so.
+
+test('a gap that does not follow from the missing item is not derivable', () => {
+  // The construction: a real premise (`reasoning` gone from our turn) plus an
+  // unrelated top-level field the proxy stopped reporting.
+  const vendor = {
+    billing: { payer: 'developer' },
+    output: [{ type: 'reasoning', summary: [] }, { type: 'message', content: [] }],
+  };
+  const derived = harnessGapsFrom(vendor, { vendor: ['reasoning', 'message'], ours: ['message'] });
+  assert.ok(!derived.includes('.billing:object'), 'the derivation credits a path the missing item cannot explain');
+  assert.ok(derived.includes('.output[].summary:array'), 'the derivation lost the paths the missing item does explain');
+});
+
+test('an option whose only effect is a path is compared by every row that supplies it', () => {
+  assert.deepEqual(missingRequiredEffects(CAPTURES), []);
+});
+
+test('deleting the only effect path fails the row that supplies the option', () => {
+  // The construction that broke the row-local version: `n: 2` answered as one
+  // choice, the row still claiming `n`, and `alsoCompare` simply gone.
+  assert.deepEqual(
+    missingRequiredEffects([{ fixture: 'fanout', surface: '/v1/chat/completions', supplied: ['n'] }]),
+    ['fanout n: nothing compares .choices[]#, which is the only way this option shows'],
+  );
+});
+
+test('the usage counts are free only while nothing compares a usage path', () => {
+  // Every usage count that is not bound BY NAME is free for one reason: the
+  // value half skips the root, and no row reaches into it by hand.
+  assert.ok(PER_CALL.has('usage'), '`usage` left PER_CALL: bind the counts or rewrite their reasons');
+  // A member-signature path is not reaching in; PER_CALL never skipped those.
+  const reaching = CAPTURES.filter(({ alsoCompare }) => (alsoCompare ?? [])
+    .some((path) => rootOf(path) === 'usage' && !path.endsWith('[]#')));
+  assert.deepEqual(reaching.map((row) => row.fixture), [],
+    'a row compares a usage path, so the free reasons no longer describe what happens');
+});
+
+test('every /v1/messages capture that carries a stop sequence has a row comparing it', () => {
+  // `stopSequence` is free on this surface for a different reason than on the
+  // other two: it IS reported here, as `stop_sequence`, and the rows that depend
+  // on it read it off the wire through `alsoCompare` rather than off the answer.
+  const unwatched = [];
+  for (const { fixture, surface, alsoCompare } of CAPTURES) {
+    if (surface !== '/v1/messages') continue;
+    const body = JSON.parse(load(fixture).body);
+    if (body.stop_sequence === null || body.stop_sequence === undefined) continue;
+    if (!(alsoCompare ?? []).includes('.stop_sequence')) unwatched.push(fixture);
+  }
+  assert.deepEqual(unwatched, [],
+    'a capture reports a stop sequence and no row compares it, so a fixture could move it unseen');
+});
+
 test('the premise check refuses an answer on a surface it cannot check', () => {
   const { failures, checked } = answerPremiseFailures(
     [{ fixture: 'made-up', surface: '/v1/nowhere', answer: { stopReason: 'end_turn' } }],
@@ -659,4 +725,19 @@ test('a SURFACE exception no capture sends, or one a row claims, is stale', () =
     ...tables,
   );
   assert.match(gone.join('\n'), /cap: excused but no capture's request carries it/);
+});
+
+test('parking a claim on a mandatory key does not save the row', () => {
+  // `supplied: ['model']` satisfies `option in request`, `supplied.length > 0`
+  // and even `echoed: true` — `.model` really is echoed and really does match —
+  // so a row could park its claim there instead of dropping it and go on
+  // certifying while asserting nothing. Per row, the option it stopped claiming
+  // is the one that fails.
+  const { unclaimed } = unclaimedRequestOptions(
+    [{ fixture: 'parked', surface: '/v1/responses', supplied: ['model'] }],
+    () => ['model', 'input', 'service_tier'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+  );
+  assert.deepEqual(unclaimed, ['parked service_tier']);
 });

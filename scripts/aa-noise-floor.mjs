@@ -21,12 +21,13 @@
 // Usage:
 //   node scripts/aa-noise-floor.mjs                        # plan only, no calls
 //   node scripts/aa-noise-floor.mjs --live [--reps 24] [--resume <state.json>]
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
 import { noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+import { acquireStateLock, canonicalStatePath } from './lib/state-lock.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -56,7 +57,9 @@ const budgetCalls = num('--budget', null);
 const openAiModel = opt('--openai-model', 'gpt-5.6-terra');
 const anthropicModel = opt('--anthropic-model', 'claude-sonnet-5');
 const maxTokens = num('--max-tokens', 1536);
-const statePath = opt('--resume', null);
+// Canonical from here down: the lock, the reads and the writes all have to mean
+// the same inode, and only the reads and writes followed symlinks before.
+const statePath = canonicalStatePath(opt('--resume', null));
 // Re-read a finished run's artifact and print its floor. Makes no vendor call.
 const reportPath = opt('--report', null);
 // A substring filter over `provider/task`, so the wiring can be proved on two
@@ -227,19 +230,14 @@ if (reportPath) {
 // writes the WHOLE state object from its own snapshot, the second writer erases
 // rows the first had paid for. Through `--only`, which exists to partition a
 // batch across processes, that is the ordinary way to run it.
-let lockPath = null;
 if (statePath) {
-  lockPath = `${statePath}.lock`;
-  try {
-    writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
-  } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
-    console.error(`another run holds ${lockPath} (pid ${readFileSync(lockPath, 'utf8').trim()}). `
+  const { lockPath, heldBy, release } = acquireStateLock(statePath);
+  if (!release) {
+    console.error(`another run holds ${lockPath} (pid ${heldBy}). `
       + 'Two runs sharing one state file each spend the whole budget and the second erases the '
       + "first's rows. If that process is gone, delete the lock deliberately.");
     process.exit(1);
   }
-  const release = () => { try { unlinkSync(lockPath); } catch { /* already gone */ } };
   process.on('exit', release);
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, () => { release(); process.exit(130); });

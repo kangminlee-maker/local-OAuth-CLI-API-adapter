@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { keyPaths } from '../scripts/lib/response-comparison.mjs';
 
 // The captures the conformance gates replay, and what each row claims.
 //
@@ -29,6 +30,46 @@ import { fileURLToPath } from 'node:url';
 // itself and nothing else — unlike a declaration, which owns what is beneath
 // it. And they are honoured only after the row's `harnessPremise` is checked
 // against both turns, so they cannot outlive the situation they describe.
+/**
+ * The paths a declared harness gap is ALLOWED to name, derived from the capture
+ * rather than listed.
+ *
+ * `harnessPremise` says which output items our turn lacks. That premise was
+ * checked and the LIST was not, so once the two type arrays matched, any path at
+ * all could ride in the list beside them: a review made the proxy drop `billing`
+ * from a Responses answer — a client-visible field loss, red at 115/116 — and
+ * turned it green by appending `.billing:object` and `.billing.payer:string` to
+ * this row's gaps. The premise was still true. It just never had anything to do
+ * with `billing`.
+ *
+ * So the gap set is now COMPUTED: remove from the vendor's own body exactly the
+ * items the premise says we lack, and the paths that disappear are the gaps.
+ * Nothing else can be one.
+ */
+export function harnessGapsFrom(vendor, premise) {
+  const key = vendor?.output ? 'output' : 'choices';
+  const missing = [...(premise?.vendor ?? [])];
+  for (const type of premise?.ours ?? []) {
+    const at = missing.indexOf(type);
+    if (at !== -1) missing.splice(at, 1);
+  }
+  const kept = [];
+  for (const item of vendor?.[key] ?? []) {
+    const at = missing.indexOf(item?.type ?? null);
+    if (at !== -1) {
+      missing.splice(at, 1);
+      continue;
+    }
+    kept.push(item);
+  }
+  const theirs = keyPaths(vendor);
+  const ours = keyPaths({ ...vendor, [key]: kept });
+  return [...theirs.keys()].filter((path) => !ours.has(path)).sort();
+}
+
+// Written out as well as derived: a reader of the roster should be able to see
+// what the row is exempting without running anything. The gate asserts the two
+// agree, so this list cannot drift or grow.
 const HARNESS_GAPS_NO_REASONING_ITEM = [
   '.output[].encrypted_content:string',
   '.output[].summary:array',
@@ -520,6 +561,38 @@ function afterStopSequences(text, sequences) {
 }
 
 /**
+ * How each surface turns an answer's `stopReason` into what the client reads.
+ *
+ * RE-DERIVED here, not imported, for the same reason `afterStopSequences` is:
+ * a binding that calls the proxy's own function cannot disagree with it, and
+ * disagreeing is the entire job. Both were written off the source and the
+ * captures — `openAiChatFinishReason` (src/proxy/http-server.ts:1939),
+ * `responseCutOff` (:2362), `anthropicStopReason` (:2249) with
+ * `ANTHROPIC_PASSTHROUGH_STOP_REASONS` (:2241).
+ *
+ * These exist because "not passed through on this surface" was written of a
+ * field that is passed through on all three, and two independent reviews walked
+ * straight through the hole it left: `answer: { stopReason: 'max_tokens' }` on a
+ * Chat row answered `finish_reason: "length"` against a capture that says
+ * `"stop"` and passed, and the same one-field answer on a Responses row
+ * compensated for an inverted `responseCutOff` so exactly that a planted,
+ * client-visible defect went green.
+ */
+const ANTHROPIC_PASSTHROUGH_STOP_REASONS = new Set(['end_turn', 'max_tokens', 'stop_sequence', 'refusal', 'pause_turn']);
+
+function chatFinishReason(answer) {
+  if (answer.stopReason === 'max_tokens') return 'length';
+  return (answer.toolCalls ?? []).length > 0 ? 'tool_calls' : 'stop';
+}
+
+function anthropicStopReason(answer) {
+  const hasToolCalls = (answer.toolCalls ?? []).length > 0;
+  if (hasToolCalls && answer.stopReason !== 'max_tokens') return 'tool_use';
+  const reported = answer.stopReason;
+  return reported && ANTHROPIC_PASSTHROUGH_STOP_REASONS.has(reported) ? reported : 'end_turn';
+}
+
+/**
  * The cache numbers, which every surface reports and every fixture can lie
  * about. `cachedInputTokens` is what the OpenAI shapes read; the Anthropic shape
  * reads the two halves separately. A surface missing from this table used to be
@@ -527,15 +600,32 @@ function afterStopSequences(text, sequences) {
  */
 export const ANSWER_BINDINGS = {
   '/v1/chat/completions': [
+    // Per CHOICE, not just the first: a fan-out answers n of them, and a fixture
+    // that could move one finish reason without the others saying so would be
+    // the `n` hole in a second place.
+    ['stopReason', (body) => (body.choices ?? []).map((choice) => choice?.finish_reason ?? null),
+      (answer, request) => Array.from({ length: request.n ?? 1 }, () => chatFinishReason(answer))],
     ['usage.cachedInputTokens', (body) => body.usage?.prompt_tokens_details?.cached_tokens],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.prompt_tokens_details?.cache_write_tokens],
   ],
   '/v1/responses': [
+    // The whole cut-off envelope through the one value that drives it. Binding
+    // `status` alone would leave `completed_at` and `incomplete_details` free to
+    // be moved by a defect the answer then compensated for.
+    ['stopReason', (body) => ({
+      status: body.status,
+      incompleteReason: body.incomplete_details?.reason ?? null,
+      completedAtIsSet: typeof body.completed_at === 'number',
+    }), (answer) => (answer.stopReason === 'max_tokens'
+      ? { status: 'incomplete', incompleteReason: 'max_output_tokens', completedAtIsSet: false }
+      : { status: 'completed', incompleteReason: null, completedAtIsSet: true })],
     ['usage.cachedInputTokens', (body) => body.usage?.input_tokens_details?.cached_tokens],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.input_tokens_details?.cache_write_tokens],
   ],
   '/v1/messages': [
-    ['stopReason', (body) => body.stop_reason],
+    // Through the derivation, not raw. `undefined` is not "no claim" here — it
+    // is a claim that the turn simply ended, and the wire says `end_turn`.
+    ['stopReason', (body) => body.stop_reason, (answer) => anthropicStopReason(answer)],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.cache_creation_input_tokens],
     ['usage.cacheReadInputTokens', (body) => body.usage?.cache_read_input_tokens],
     ['usage.cachedInputTokens', (body) => (body.usage?.cache_creation_input_tokens ?? 0)
@@ -587,26 +677,85 @@ export const FREE_ANSWER_FIELDS = {
     latencyMs: 'wall-clock, and nothing compares it',
     text: 'this surface compares echoed request options and shapes, not the answer text; '
       + 'no row on it reads the content back, so the text cannot carry a compensating value',
-    stopReason: 'not passed through on this surface',
-    stopSequence: 'not passed through on this surface',
+    stopSequence: 'not passed through on this surface: `stop_sequence` is shaped only for /v1/messages '
+      + '(src/proxy/http-server.ts:2233, 3720)',
     'usage.source': "a label on where the numbers came from, absent from the vendor's shape",
     'usage.inputTokens': 'the counts a row compares are the cache ones; these are the turn\'s own size',
     'usage.outputTokens': 'as above',
     'usage.totalTokens': 'as above',
-    'usage.reasoningOutputTokens': 'the fake backend does not reason, and the rows whose captures DID '
-      + "declare it in `harnessGaps` with an asserted premise — `direct-responses-tools-parallel-false`'s "
-      + 'vendor turn spent 9. Binding it would require a fixture to claim a reasoning turn it never had',
+    // An earlier reason here named `harnessGaps` as the mechanism. It is not:
+    // `HARNESS_GAPS_NO_REASONING_ITEM` (:32-45) holds twelve paths, every one of
+    // them under `.output[]`, and none of them a usage path. Nothing declares
+    // this count absent, because it is not absent — we publish it, as a hard
+    // zero. The real mechanism is that no usage count is compared unless it is
+    // bound here by name.
+    'usage.reasoningOutputTokens': 'no usage count reaches a comparison unless it is bound above by '
+      + 'name: `usage` is in `PER_CALL` so the value half skips it, no row supplies or `alsoCompare`s a '
+      + 'usage path, and the shape half sees the same path on both sides whatever the number. The cache '
+      + 'counters are bound for exactly that reason; this one cannot be, because our fake backend never '
+      + 'reasons — claude-code-backend does not populate `reasoningOutputTokens` — while '
+      + "`direct-responses-tools-parallel-false`'s vendor turn spent 9, so binding it would require a "
+      + 'fixture to claim a reasoning turn it never had. What the proxy publishes here is therefore not '
+      + 'evidence about the proxy; docs/design-task-unmeasured-thinking-tokens.md is where that is settled',
   },
 };
-FREE_ANSWER_FIELDS['/v1/responses'] = FREE_ANSWER_FIELDS['/v1/chat/completions'];
+FREE_ANSWER_FIELDS['/v1/responses'] = { ...FREE_ANSWER_FIELDS['/v1/chat/completions'] };
 FREE_ANSWER_FIELDS['/v1/messages'] = {
   ...FREE_ANSWER_FIELDS['/v1/chat/completions'],
-  // Bound on this surface, so not free here.
-  text: null,
-  stopReason: null,
+  // `stop_sequence` IS shaped on this surface (src/proxy/http-server.ts:2233,
+  // 3720), so chat's reason would be false here. Three rows compare it directly
+  // through `alsoCompare: ['.stop_sequence']`, which is what makes it free: the
+  // rows that care read it off the wire, not off the answer.
+  stopSequence: 'reported here as `stop_sequence`, and the three rows that depend on it compare it by '
+    + 'path through `alsoCompare`, so a fixture cannot move it without one of them saying so',
 };
+// Bound on this surface, so not free here.
 delete FREE_ANSWER_FIELDS['/v1/messages'].text;
-delete FREE_ANSWER_FIELDS['/v1/messages'].stopReason;
+
+/**
+ * Options whose only observable effect is a path, and the path each one owes.
+ *
+ * `alsoCompare` is a row-local array, and a row-local array is a thing a defect
+ * can delete. A review deleted this one: with `n: 2` answered as a single
+ * choice, `direct-chat-n-2` failed on `.choices[]#` — and then passed, whole
+ * suite green, once the row no longer listed the path. Nothing was left saying
+ * `n` has an effect, because the only thing that said so was the row that
+ * stopped saying it. Cardinality is not shape: one choice and two carry the same
+ * 28 typed paths, so the shape half cannot notice either.
+ *
+ * So the requirement lives HERE, outside the row. A row that supplies one of
+ * these options and does not compare its effect fails by name — which is the
+ * same move as `unclaimedRequestOptions`, one level in: that one says an option
+ * must be claimed, this one says a claim without its witness is not a claim.
+ */
+export const REQUIRED_EFFECTS = {
+  '/v1/chat/completions': {
+    // Two choices are what the client receives, and the fan-out that produces
+    // them is where this proxy has had a real defect before.
+    n: ['.choices[]#'],
+  },
+  '/v1/messages': {
+    // The sequence is what cuts the text; `stop_reason` and the cut text itself
+    // are the only ways a client sees that it was honoured.
+    stop_sequences: ['.stop_reason', '.stop_sequence'],
+  },
+};
+
+/** Every row that supplies an effect-bearing option without comparing its effect. */
+export function missingRequiredEffects(rows, required = REQUIRED_EFFECTS) {
+  const failures = [];
+  for (const { fixture, surface, supplied, alsoCompare } of rows) {
+    const table = required[surface] ?? {};
+    for (const option of supplied ?? []) {
+      for (const path of table[option] ?? []) {
+        if (!(alsoCompare ?? []).includes(path)) {
+          failures.push(`${fixture} ${option}: nothing compares ${path}, which is the only way this option shows`);
+        }
+      }
+    }
+  }
+  return failures;
+}
 
 export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) {
   const read = (answer, dotted) => dotted.split('.').reduce(
@@ -643,13 +792,20 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
       }
       failures.push(`${fixture}: the answer sets ${field}, which no binding checks against the capture`);
     }
+    const present = new Set(leafPaths(answer));
     for (const [field, ofVendor, ofAnswer] of table) {
-      const supplied = read(answer, field);
-      if (supplied === undefined) continue;
+      // Skipped only when the served answer has no such PATH. `undefined` is not
+      // absence: `DEFAULT_ANSWER.stopReason` is an own key whose value is
+      // undefined, and reading absence off the VALUE let a fixture blank a bound
+      // field back to "no claim" — a review set one messages row's `stopReason`
+      // to an explicit `undefined`, the proxy answered `end_turn` where the
+      // capture says `max_tokens`, and this loop skipped the binding that exists
+      // to catch exactly that.
+      if (!present.has(field)) continue;
       checked += 1;
       const theirs = ofVendor(vendor, request);
       // Some fields are compared through the effect they have, not literally.
-      const ours = ofAnswer ? ofAnswer(answer, request) : supplied;
+      const ours = ofAnswer ? ofAnswer(answer, request) : read(answer, field);
       if (JSON.stringify(ours) !== JSON.stringify(theirs)) {
         failures.push(`${fixture}: the answer's ${field} yields ${JSON.stringify(ours)}, `
           + `the capture says ${JSON.stringify(theirs)}`);
@@ -721,8 +877,21 @@ export function echoFailures({
 }
 
 /**
- * Keys every request on a surface must carry. They are the envelope, not an
- * option, and no row is about them.
+ * Keys every request on a surface must carry.
+ *
+ * A row need not claim them: they are the envelope, and a row that claimed
+ * `model` would be asserting nothing about what it replays. A row MAY claim one
+ * when its subject is a member INSIDE it — `direct-chat-message-name`,
+ * `-message-refusal` and `-message-unknown-member` all claim `messages`, and
+ * each is about one member of it. An earlier version of this comment said "no
+ * row is about them", which those three rows disprove.
+ *
+ * Padding `supplied` with a mandatory key used to be a way to PARK a claim
+ * rather than drop it: `supplied: ['model']` satisfies `option in request`,
+ * `supplied.length > 0`, and even `echoed: true`, because `.model` really is
+ * echoed and really does match — so a row went on certifying while asserting
+ * nothing about its own option. That is closed by the per-row rule below rather
+ * than by a ban here: the row's real option becomes unclaimed and fails by name.
  */
 export const MANDATORY_REQUEST_KEYS = {
   '/v1/chat/completions': ['model', 'messages'],
@@ -806,6 +975,7 @@ export function unclaimedRequestOptions(rows, requestKeysOf,
       if (!keys.includes(key)) staleExceptions.push(`${row.fixture} ${key}: excused but its request does not carry it`);
       else if (claims.has(key)) staleExceptions.push(`${row.fixture} ${key}: excused but this row claims it`);
     }
+
   }
 
   // A surface-level exception is for a key NO row claims — the shape of a knob
