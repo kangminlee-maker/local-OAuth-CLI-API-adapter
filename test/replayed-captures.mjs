@@ -769,6 +769,22 @@ export const FREE_ANSWER_FIELDS = {
 FREE_ANSWER_FIELDS['/v1/responses'] = { ...FREE_ANSWER_FIELDS['/v1/chat/completions'] };
 FREE_ANSWER_FIELDS['/v1/messages'] = {
   ...FREE_ANSWER_FIELDS['/v1/chat/completions'],
+  // The Chat text says the shape half "sees the same path on both sides whatever
+  // the number", and on THIS surface the two sides do not carry the same path at
+  // all: `anthropicUsage` deliberately omits `output_tokens_details`
+  // (src/proxy/http-server.ts:2525) and the absence is declared as
+  // `messages-vendor-routing-usage-is-not-reported`. What the clause is asserting
+  // — that a fixture's number cannot move the shape half — is true here too, for
+  // the stronger reason that the number reaches no path on the wire.
+  //
+  // Inherited-and-false-on-one-surface is the shape round 4 found in the
+  // `stopReason` entry, one clause deep instead of one entry deep, and it gets
+  // the same treatment: its own text.
+  'usage.reasoningOutputTokens': 'this surface does not publish the number at all — `anthropicUsage` '
+    + 'omits `output_tokens_details` and `messages-vendor-routing-usage-is-not-reported` declares the '
+    + 'absence — so a fixture can move it without reaching any path on the wire, let alone a compared '
+    + 'one. Binding it would require a fixture to claim a reasoning turn the fake backend never had; '
+    + 'docs/design-task-unmeasured-thinking-tokens.md is where the three surfaces are settled together',
   // `stop_sequence` IS shaped on this surface (src/proxy/http-server.ts:2233,
   // 3720), so chat's reason would be false here. Three rows compare it directly
   // through `alsoCompare: ['.stop_sequence']`, which is what makes it free: the
