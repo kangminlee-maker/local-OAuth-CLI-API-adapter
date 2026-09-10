@@ -404,13 +404,17 @@ test('deleting the only effect path fails the row that supplies the option', () 
 test('the free reasons no roster reaches are the five that are held in reserve', () => {
   // A reason nothing reads has the authority of a checked one and none of the
   // checking — which is how "not passed through on this surface" survived three
-  // rounds of review while being false on all three. These five are kept because
-  // a row that sets `model` tomorrow needs an answer waiting for it; what must
-  // not happen is a roster starting to lean on one without anybody re-reading it.
+  // rounds of review while being false on all three. Four of the five this
+  // started with turned out to be reachable the moment the scan read what the
+  // proxy is actually handed rather than what the roster wrote; their reasons
+  // were rewritten as part of becoming live. `stopSequence` is what is left:
+  // `servedResult` never returns it, so nothing has ever read this sentence.
   const { heldInReserve } = freeFieldsReached([CAPTURES, MINIMAL_SURFACES]);
-  const perSurface = ['id', 'latencyMs', 'model', 'stopSequence', 'toolCalls'];
-  assert.deepEqual(heldInReserve, ['/v1/chat/completions', '/v1/messages', '/v1/responses']
-    .flatMap((surface) => perSurface.map((field) => `${surface} ${field}`)).sort());
+  assert.deepEqual(heldInReserve, [
+    '/v1/chat/completions stopSequence',
+    '/v1/messages stopSequence',
+    '/v1/responses stopSequence',
+  ], 'the set of never-read reasons changed: read the ones that became live before counting them');
 });
 
 test('the usage counts are free only while nothing compares a usage path', () => {

@@ -158,6 +158,36 @@ export function servedAnswer(rowAnswer) {
   };
 }
 
+/**
+ * Everything the harness hands the proxy for one turn.
+ *
+ * Written HERE and returned by `generate()` below, so the unchecked-input scan
+ * can run over what the proxy actually receives. It used to run over the row's
+ * `answer` instead, which made the table read as an audit of the harness's
+ * inputs while auditing one object inside them: `id`, `toolCalls` and
+ * `latencyMs` are constants this function invents, neither derived from the
+ * capture nor checked against it, and the scan could not see them because they
+ * are not members of `answer`.
+ *
+ * `stopReason` is deliberately OMITTED when the answer leaves it undefined —
+ * that is what makes the proxy derive `end_turn` — while the answer keeps it as
+ * an own key, because there "undefined" is the CLAIM that the turn simply
+ * ended. The two objects therefore answer two different questions, and the
+ * premise check asks each of them the one it can answer: bindings off the
+ * answer, unchecked inputs off the result.
+ */
+export function servedResult(answer, request) {
+  return {
+    id: 'local_test',
+    model: request?.model,
+    text: answer.text,
+    toolCalls: [],
+    usage: answer.usage,
+    latencyMs: 1,
+    ...(answer.stopReason === undefined ? {} : { stopReason: answer.stopReason }),
+  };
+}
+
 export function createReplayBackend() {
   let answer = DEFAULT_ANSWER;
   return {
@@ -169,15 +199,7 @@ export function createReplayBackend() {
       name: 'fake-backend',
       model: 'fake-local-model',
       async generate(request) {
-        return {
-          id: 'local_test',
-          model: request.model,
-          text: answer.text,
-          toolCalls: [],
-          usage: answer.usage,
-          latencyMs: 1,
-          ...(answer.stopReason === undefined ? {} : { stopReason: answer.stopReason }),
-        };
+        return servedResult(answer, request);
       },
       async close() {},
     },
@@ -671,10 +693,19 @@ export function leafPaths(value, prefix = '') {
  */
 export const FREE_ANSWER_FIELDS = {
   '/v1/chat/completions': {
-    id: "the proxy mints its own; no capture's id is reproducible",
-    model: 'echoed from the request, and the rows that care compare it',
-    toolCalls: 'always empty here; a row needing tool calls would have to bind them',
-    latencyMs: 'wall-clock, and nothing compares it',
+    // The three constants `servedResult` invents, and the one thing it does not
+    // invent. Each was unreachable by this scan until the scan started reading
+    // the object the proxy actually receives, so each reason below is new — the
+    // old ones were about a field nothing had ever handed anybody.
+    id: 'a constant the harness invents. The proxy mints its own id FROM it '
+      + "(`chatcmpl-${id}`, `resp_${id}`, `msg_${id}`) and no capture's id is reproducible, so nothing "
+      + 'compares one: `id` is in `PER_CALL` and both sides carry `.id:string` whatever it says',
+    model: 'not invented — `servedResult` returns `request.model`, the capture\'s own request bytes',
+    toolCalls: 'always empty here, and a non-empty one could not hide anything: it ADDS items and keys '
+      + 'the vendor body does not have, which is what the shape half reports first. A row that needs '
+      + 'tool calls would have to bind them',
+    latencyMs: 'a constant the harness invents, and no surface puts it on the wire — `latencyMs` does '
+      + 'not appear in src/proxy/http-server.ts at all',
     text: 'this surface compares echoed request options and shapes, not the answer text; '
       + 'no row on it reads the content back, so the text cannot carry a compensating value',
     stopSequence: 'not passed through on this surface: `stop_sequence` is shaped only for /v1/messages '
@@ -691,7 +722,9 @@ export const FREE_ANSWER_FIELDS = {
     // bound here by name.
     'usage.reasoningOutputTokens': 'no usage count reaches a comparison unless it is bound above by '
       + 'name: `usage` is in `PER_CALL` so the value half skips it, no row supplies or `alsoCompare`s a '
-      + 'usage path, and the shape half sees the same path on both sides whatever the number. The cache '
+      + 'usage path, and `reasoning_tokens: usage.reasoningOutputTokens ?? 0` '
+      + '(src/proxy/http-server.ts:2286, :2306) is emitted unconditionally, so no fixture value can add '
+      + 'or remove the path for the shape half either. The cache '
       + 'counters are bound for exactly that reason; this one cannot be, because our fake backend never '
       + 'reasons — claude-code-backend does not populate `reasoningOutputTokens` — while '
       + "`direct-responses-tools-parallel-false`'s vendor turn spent 9, so binding it would require a "
@@ -777,7 +810,10 @@ export function freeFieldsReached(rosters, bindings = ANSWER_BINDINGS, free = FR
   for (const rows of rosters) {
     for (const { surface, answer } of rows) {
       const covered = new Set((bindings[surface] ?? []).map(([field]) => field));
-      for (const field of leafPaths(servedAnswer(answer))) {
+      const merged = servedAnswer(answer);
+      // The same union the premise check scans; anything else would report a
+      // reason as unread while the check was reading it.
+      for (const field of new Set([...leafPaths(merged), ...leafPaths(servedResult(merged, {}))])) {
         if (covered.has(field)) continue;
         if (Object.prototype.hasOwnProperty.call(free[surface] ?? {}, field)) reached.add(`${surface} ${field}`);
       }
@@ -801,12 +837,13 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
     // is served `DEFAULT_ANSWER`, and a default nobody checks is a default
     // anybody can put a compensating value into.
     const answer = servedAnswer(declared);
+    const { body: vendor, request } = bodyOf(fixture);
     const table = bindings[surface];
     if (!table) {
       failures.push(`${fixture}: ${surface} has no binding table, so its premise is unchecked`);
       continue;
     }
-    const { body: vendor, request } = bodyOf(fixture);
+
     // A field the answer carries that no binding covers is unchecked, and an
     // unchecked field is where the next compensating fixture goes. By LEAF, not
     // by top-level key: `{usage: {anythingAtAll: 1}}` slipped past a scan of
@@ -816,7 +853,15 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
     // fixture cannot use them to contradict a capture without the comparison
     // saying so.
     const free = FREE_ANSWER_FIELDS[surface] ?? {};
-    for (const field of leafPaths(answer)) {
+    // Both objects, because they are different sets and an unchecked input in
+    // either is an unchecked input. The row's `answer` is what the roster
+    // WRITES — a field invented there is unchecked the day `servedResult` starts
+    // spreading it. `servedResult` is what the proxy RECEIVES, and a review
+    // reported that scanning the answer alone could never reach `id`,
+    // `toolCalls` or `latencyMs`: constants the harness invents, neither derived
+    // from the capture nor checked against it, while the table read as an audit
+    // of every input the proxy is given.
+    for (const field of new Set([...leafPaths(answer), ...leafPaths(servedResult(answer, request))])) {
       if (covered.has(field)) continue;
       if (Object.prototype.hasOwnProperty.call(free, field)) {
         if (!free[field]) failures.push(`${fixture}: ${field} is free with no reason given`);
