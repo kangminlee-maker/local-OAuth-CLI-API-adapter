@@ -825,7 +825,7 @@ export function freeFieldsReached(rosters, bindings = ANSWER_BINDINGS, free = FR
   };
 }
 
-export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) {
+export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, resultOf = servedResult) {
   const read = (answer, dotted) => dotted.split('.').reduce(
     (value, key) => (value === undefined || value === null ? undefined : value[key]),
     answer,
@@ -861,7 +861,7 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
     // `toolCalls` or `latencyMs`: constants the harness invents, neither derived
     // from the capture nor checked against it, while the table read as an audit
     // of every input the proxy is given.
-    for (const field of new Set([...leafPaths(answer), ...leafPaths(servedResult(answer, request))])) {
+    for (const field of new Set([...leafPaths(answer), ...leafPaths(resultOf(answer, request))])) {
       if (covered.has(field)) continue;
       if (Object.prototype.hasOwnProperty.call(free, field)) {
         if (!free[field]) failures.push(`${fixture}: ${field} is free with no reason given`);

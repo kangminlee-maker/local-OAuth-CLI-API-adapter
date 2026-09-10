@@ -401,7 +401,7 @@ test('deleting the only effect path fails the row that supplies the option', () 
   );
 });
 
-test('the free reasons no roster reaches are the five that are held in reserve', () => {
+test('the free reasons no roster reaches are the ones held in reserve', () => {
   // A reason nothing reads has the authority of a checked one and none of the
   // checking — which is how "not passed through on this surface" survived three
   // rounds of review while being false on all three. Four of the five this
@@ -699,6 +699,20 @@ test('an answer field that is neither bound nor named free is reported', () => {
     () => ({ body: { stop_reason: 'max_tokens', content: [], usage: {} }, request: {} }),
   );
   assert.match(failures.join('\n'), /somethingNew, which no binding checks/);
+});
+
+test('a constant the backend invents, that no row wrote, is reported', () => {
+  // The scan reads what the proxy is HANDED, not only what the roster wrote.
+  // `id`, `toolCalls` and `latencyMs` are constants `servedResult()` invents and
+  // every one of them is named free; the case that has to fail is the next
+  // constant somebody adds to it.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: {} }],
+    () => ({ body: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'OK' }], usage: {} }, request: {} }),
+    undefined,
+    (answer) => ({ ...answer, refusalMode: 'invented-by-the-harness' }),
+  );
+  assert.match(failures.join('\n'), /refusalMode, which no binding checks/);
 });
 
 test('a NESTED answer field that no binding covers is reported', () => {
