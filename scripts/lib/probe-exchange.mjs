@@ -55,6 +55,12 @@ export async function readProbeExchange({ url, headers, requestBody, stream, lab
 
   let res = null;
   let text = '';
+  // Whether `res.text()` finished. Without it the catch recorded `text`'s
+  // initial `''` as the response body, which `encodeBody` writes as a known
+  // zero-byte body with the empty string's digest — a turn that reads afterwards
+  // as one the vendor answered with nothing, rather than one whose answer never
+  // arrived. Both readers this replaced omitted the field and recorded null.
+  let read = false;
   let recorded = false;
   const record = (error) => {
     if (recorded) return;
@@ -71,7 +77,7 @@ export async function readProbeExchange({ url, headers, requestBody, stream, lab
       status: res?.status ?? null,
       statusText: res?.statusText ?? null,
       responseHeaders: res?.headers ?? null,
-      responseBody: text,
+      responseBody: read ? text : undefined,
       durationMs: Date.now() - startedAt,
       error: error ?? null,
     });
@@ -85,6 +91,7 @@ export async function readProbeExchange({ url, headers, requestBody, stream, lab
       signal: AbortSignal.timeout(timeoutMs),
     });
     text = await res.text();
+    read = true;
   } catch (error) {
     record(error);
     return { status: res?.status ?? null, text: '', wire: '', failed: String(error) };
