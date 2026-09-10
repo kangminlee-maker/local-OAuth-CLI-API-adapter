@@ -12,9 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { startCaptureRun } from '../scripts/lib/capture-recorder.mjs';
-import {
-  noiseFloor, resumePlan, SamplingAbort, sampleRow, SERIES, summarise, takeSample, visibleChars,
-} from '../scripts/lib/aa-sampler.mjs';
+import { abortedRow, defaultArtifactName, noiseFloor, resumePlan, sampleRow, SamplingAbort, SERIES, summarise, takeSample, visibleChars } from '../scripts/lib/aa-sampler.mjs';
 
 const servers = [];
 after(async () => {
@@ -522,4 +520,35 @@ test('a call is booked before it is made, not when its sample arrives', async ()
   });
   assert.equal(calls, 3, 'the retries did not happen');
   assert.deepEqual(seen, [1, 2, 3], 'a retried call reached the vendor without reaching the ledger');
+});
+
+// The artifact, which is where a paid observation is published from. The ledger
+// got a lock; these two are the ways a paid call still went missing from the
+// file the floor is re-derived out of.
+
+test('an aborted row still reaches the artifact with what it paid for', () => {
+  const row = { provider: 'openai', task: 'summarise', prompt: 'secret prompt' };
+  const samples = [{ chars: 400, outputTokens: 90 }, { chars: 420, outputTokens: 95 }];
+  const recorded = abortedRow(row, samples);
+  assert.equal(recorded.abortedMidRow, true);
+  assert.equal(recorded.settled, false);
+  assert.deepEqual(recorded.samples, samples, 'the samples this row paid for are not in the row');
+  assert.deepEqual(recorded.tokens, [90, 95], 'the billed series is the one the floor is taken over');
+  assert.equal(recorded.n, 2);
+  assert.equal(recorded.prompt, undefined, 'the artifact carries prompts it should not');
+});
+
+test('a row that collected nothing leaves no row behind', () => {
+  assert.equal(abortedRow({ provider: 'openai' }, []), null);
+  assert.equal(abortedRow({ provider: 'openai' }, undefined), null);
+});
+
+test('two partitions of one batch do not name one artifact', () => {
+  // `--only` is how a batch is split across processes, and hundreds of metered
+  // calls per partition used to land on one filename.
+  const day = new Date('2026-09-10T11:00:00Z');
+  assert.equal(defaultArtifactName(day, 'openai'), 'aa-noise-floor-20260910-openai.json');
+  assert.notEqual(defaultArtifactName(day, 'openai'), defaultArtifactName(day, 'anthropic'));
+  assert.equal(defaultArtifactName(day, null), 'aa-noise-floor-20260910.json');
+  assert.equal(defaultArtifactName(day, 'openai/summarise'), 'aa-noise-floor-20260910-openai-summarise.json');
 });

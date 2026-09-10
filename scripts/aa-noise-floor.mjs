@@ -26,7 +26,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
-import { noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+import { abortedRow, defaultArtifactName, noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
 import { acquireStateLock, canonicalStatePath } from './lib/state-lock.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -65,8 +65,14 @@ const reportPath = opt('--report', null);
 // A substring filter over `provider/task`, so the wiring can be proved on two
 // calls before four hundred and eighty are committed to it.
 const only = opt('--only', null);
-const outPath = opt('--out', resolve(repoRoot, 'bench-results',
-  `aa-noise-floor-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.json`));
+// The name carries `--only`, because the artifact needs the same protection the
+// ledger got and for the same reason. `--only` exists to partition a batch
+// across processes; with a name that carried the date alone, two partitions of
+// one batch — hundreds of metered calls each — wrote the same file and the
+// second erased the first. Worse after the state lock than before it: the lock
+// refuses two runs on one ledger, so the only way left to partition is separate
+// ledgers, which is exactly the configuration where the artifacts collide.
+const outPath = opt('--out', resolve(repoRoot, 'bench-results', defaultArtifactName(new Date(), only)));
 
 // Published list prices, read 2026-09-10 from developers.openai.com/api/docs/pricing
 // and platform.claude.com/docs/en/about-claude/pricing. They are here so the plan
@@ -230,11 +236,11 @@ if (reportPath) {
 // writes the WHOLE state object from its own snapshot, the second writer erases
 // rows the first had paid for. Through `--only`, which exists to partition a
 // batch across processes, that is the ordinary way to run it.
-if (statePath) {
-  const { lockPath, heldBy, release } = acquireStateLock(statePath);
+const hold = (path, what) => {
+  const { lockPath, heldBy, release } = acquireStateLock(path);
   if (!release) {
     console.error(`another run holds ${lockPath} (pid ${heldBy}). `
-      + 'Two runs sharing one state file each spend the whole budget and the second erases the '
+      + `Two runs sharing one ${what} each spend the whole budget and the second erases the `
       + "first's rows. If that process is gone, delete the lock deliberately.");
     process.exit(1);
   }
@@ -242,6 +248,17 @@ if (statePath) {
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, () => { release(); process.exit(130); });
   }
+};
+
+if (statePath) hold(statePath, 'state file');
+// Taken whether or not there is a ledger. A partitioned run without `--resume`
+// is the shortest way to run one, and it used to take no lock at all — while
+// still writing the artifact every partition writes.
+if (live) hold(outPath, 'artifact');
+if (live && existsSync(outPath)) {
+  console.error(`${outPath} already exists. Writing it would erase a run that has already been paid `
+    + 'for; pass --out with a name of your own, or move the old artifact aside deliberately.');
+  process.exit(1);
 }
 
 const state = statePath && existsSync(statePath)
@@ -364,6 +381,12 @@ for (const row of rows) {
     aborted = error.message;
     state.spent = budget.spent;
     saveState();
+    // The samples this row DID collect are paid for and already in the state
+    // file. Breaking without recording them left them out of the artifact, which
+    // is where `--report` re-derives the floor from — a paid observation the
+    // published floor is not taken over.
+    const paid = abortedRow(row, state.rows[key]?.samples);
+    if (paid) results.push(paid);
     process.stderr.write(`\nSTOPPED: ${aborted}\n`);
     break;
   }
@@ -398,7 +421,18 @@ const artifact = {
 };
 
 mkdirSync(dirname(outPath), { recursive: true });
-writeFileSync(outPath, `${JSON.stringify(artifact, null, 2)}\n`);
+// `wx`, so a name collision is refused rather than resolved by overwriting. The
+// check at startup is the one that saves the calls; this is the one that cannot
+// be raced.
+try {
+  writeFileSync(outPath, `${JSON.stringify(artifact, null, 2)}\n`, { flag: 'wx' });
+} catch (error) {
+  if (error?.code !== 'EEXIST') throw error;
+  const fallback = `${outPath.replace(/\.json$/, '')}-${Date.now()}.json`;
+  writeFileSync(fallback, `${JSON.stringify(artifact, null, 2)}\n`, { flag: 'wx' });
+  console.error(`${outPath} appeared while this run was sampling; wrote ${fallback} instead. `
+    + 'Neither run\'s calls were lost.');
+}
 console.log(JSON.stringify(artifact.floor, null, 2));
 console.log(`\nwrote ${outPath}  (${budget.spent} live calls)`);
 if (aborted) process.exit(1);

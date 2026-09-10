@@ -73,6 +73,23 @@ test('a late release does not free the lock somebody else now holds', () => {
   assert.ok(!existsSync(second.lockPath));
 });
 
+test("a release after the lock was cleared by hand does not take the next run's", () => {
+  // The once-flag covers the signal handler calling release before the `exit`
+  // hook does. It cannot cover this: the refusal message tells a user to delete
+  // a stale lock deliberately, so the FIRST release a process makes can already
+  // be aimed at somebody else's file. Only the token knows the difference.
+  const dir = scratch();
+  const state = join(dir, 'state.json');
+  const first = acquireStateLock(state);
+  rmSync(first.lockPath);
+
+  const second = acquireStateLock(state);
+  assert.ok(second.release, 'the lock was not free after it was cleared by hand');
+  first.release();
+  assert.ok(existsSync(second.lockPath), "a run's first release freed a lock it never owned");
+  second.release();
+});
+
 test('the holder is reported by pid, not by token', () => {
   const dir = scratch();
   const state = join(dir, 'state.json');

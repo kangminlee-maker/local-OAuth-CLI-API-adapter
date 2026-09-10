@@ -235,7 +235,7 @@ export async function sampleRow({
           consecutive += 1;
           done = true;
           if (consecutive >= maxConsecutiveFailures) {
-            return { ...seriesOf(samples), failures, deadLettered: true, ...summarise(lensOf()) };
+            return outcomeOf(samples, { failures, deadLettered: true });
           }
         } else {
           attempt += 1;
@@ -252,7 +252,7 @@ export async function sampleRow({
         && samples.length >= minReps
         && reading.ciHalfWidth !== null
         && decisiveWhen(reading)) {
-      return { ...seriesOf(samples), failures, deadLettered: false, stoppedEarly: true, ...reading };
+      return outcomeOf(samples, { failures, deadLettered: false, stoppedEarly: true });
     }
   }
 
@@ -260,13 +260,11 @@ export async function sampleRow({
   // of the loop without three failures in a row — a single rep that exhausted
   // its retries, say — used to return `deadLettered: false` with `n: 0`, which
   // is a hole a summary has to be read carefully to notice.
-  return {
-    ...seriesOf(samples),
+  return outcomeOf(samples, {
     failures,
     deadLettered: samples.length === 0,
     stoppedEarly: false,
-    ...summarise(lensOf()),
-  };
+  });
 }
 
 /**
@@ -279,7 +277,7 @@ export async function sampleRow({
  * reason the samples are kept whole. `samples` is returned beside them so the
  * pairing is recoverable from the artifact.
  */
-function seriesOf(samples) {
+export function seriesOf(samples) {
   const series = (key) => samples.map((sample) => sample[key]).filter((value) => typeof value === 'number');
   return {
     samples: [...samples],
@@ -288,6 +286,52 @@ function seriesOf(samples) {
     thinking: series('thinkingTokens'),
     latencies: series('latencyMs'),
   };
+}
+
+/**
+ * A row's outcome, assembled in ONE place.
+ *
+ * `sampleRow` returns this three times and the caller has to build it a fourth,
+ * when the budget aborts mid-row: those samples are paid for and reach the state
+ * file through `onSample`, but the caller used to `break` without recording
+ * them, so they never reached the artifact — and the artifact is what `--report`
+ * re-derives the published floor from. A partly-sampled row that is missing
+ * from `rows` is a paid observation the floor is not taken over.
+ */
+export function outcomeOf(samples, extra = {}) {
+  return { ...seriesOf(samples), ...summarise(samples.map((sample) => sample.chars)), ...extra };
+}
+
+/**
+ * The row a budget abort leaves behind, or null when the row collected nothing.
+ *
+ * The caller used to `break` out of the loop without recording anything, so the
+ * samples an aborted row had already paid for reached the state file and never
+ * reached the artifact. `--report` re-derives the published floor from
+ * `artifact.rows`, so those calls were bought and then not counted.
+ */
+export function abortedRow(row, samples) {
+  if (!samples || samples.length === 0) return null;
+  return {
+    ...row,
+    prompt: undefined,
+    ...outcomeOf(samples, { failures: null, deadLettered: false, stoppedEarly: false, abortedMidRow: true }),
+    settled: false,
+  };
+}
+
+/**
+ * The artifact name a run writes when `--out` is not given.
+ *
+ * `--only` is in it because `--only` is how a batch is partitioned across
+ * processes: with the date alone, two partitions of one batch wrote the same
+ * file and the second erased the first — the same failure the state lock exists
+ * to prevent, one file along, and made likelier by that lock, which leaves
+ * separate ledgers as the only way to partition.
+ */
+export function defaultArtifactName(date, only) {
+  const day = date.toISOString().slice(0, 10).replace(/-/g, '');
+  return `aa-noise-floor-${day}${only ? `-${only.replace(/[^a-zA-Z0-9]+/g, '-')}` : ''}.json`;
 }
 
 /**
