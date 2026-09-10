@@ -474,6 +474,54 @@ test('the premise check passes an answer that agrees with its capture', () => {
   assert.ok(checked >= 3, `only ${checked} field(s) were compared`);
 });
 
+test('an explicit undefined does not blank a bound field back to unchecked', () => {
+  // `undefined` is a VALUE the fixture can write, not an absence. Read as
+  // absence, it took a field out of the comparison entirely: this row's proxy
+  // answers `end_turn` while the capture says `max_tokens`, and nothing said so.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'blanked', surface: '/v1/messages', answer: { stopReason: undefined, text: '' } }],
+    () => ({
+      body: { stop_reason: 'max_tokens', content: [], usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+      request: {},
+    }),
+  );
+  assert.match(failures.join('\n'), /blanked: the answer's stopReason yields "end_turn", the capture says "max_tokens"/);
+});
+
+test('a stop reason that contradicts its capture fails on every surface', () => {
+  // One fixture field, three surfaces, and each one carries the contradiction to
+  // a different place on the wire. Both round-4 seats built this construction on
+  // the OpenAI pair, where the answer used to be free.
+  const chat = answerPremiseFailures(
+    [{ fixture: 'cut-off-chat', surface: '/v1/chat/completions', answer: { stopReason: 'max_tokens' } }],
+    () => ({ body: { choices: [{ finish_reason: 'stop' }], usage: {} }, request: {} }),
+  ).failures.join('\n');
+  assert.match(chat, /stopReason yields \["length"\], the capture says \["stop"\]/);
+
+  const responses = answerPremiseFailures(
+    [{ fixture: 'cut-off-responses', surface: '/v1/responses', answer: { stopReason: 'max_tokens' } }],
+    () => ({ body: { status: 'completed', incomplete_details: null, completed_at: 1, usage: {} }, request: {} }),
+  ).failures.join('\n');
+  assert.match(responses, /stopReason yields \{"status":"incomplete"/);
+
+  const messages = answerPremiseFailures(
+    [{ fixture: 'cut-off-messages', surface: '/v1/messages', answer: { stopReason: 'max_tokens', text: '' } }],
+    () => ({ body: { stop_reason: 'end_turn', content: [], usage: {} }, request: {} }),
+  ).failures.join('\n');
+  assert.match(messages, /stopReason yields "max_tokens", the capture says "end_turn"/);
+});
+
+test('a fan-out answers every choice, not just the first', () => {
+  // The chat binding is per choice because `n` is: a fixture that could move one
+  // finish reason while the others stayed put would be the `n` hole again, one
+  // field along.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'fanout', surface: '/v1/chat/completions', answer: {} }],
+    () => ({ body: { choices: [{ finish_reason: 'stop' }], usage: {} }, request: { n: 2 } }),
+  );
+  assert.match(failures.join('\n'), /yields \["stop","stop"\], the capture says \["stop"\]/);
+});
+
 // The echo rule's own controls, on synthetic readings. The rows above happen to
 // agree under the per-root rule and an aggregate one, so nothing there can show
 // the difference — and a rule no input distinguishes is an un-run input, not a
