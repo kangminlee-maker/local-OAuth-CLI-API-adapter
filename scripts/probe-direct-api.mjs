@@ -9,7 +9,8 @@
 // expectation is exactly when an instrument fails silently. So the detectors run
 // against a known-opposite input before any capture is believed, and the run
 // refuses to continue if a detector cannot tell the two apart.
-import { recordExchange, startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
+import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
+import { readProbeExchange } from './lib/probe-exchange.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -18,6 +19,9 @@ const args = process.argv.slice(2);
 const openAiModel = readArg('--openai-model') ?? 'gpt-5.6-terra';
 const anthropicModel = readArg('--anthropic-model') ?? 'claude-sonnet-5';
 const only = readArg('--only');
+// Generous: these are real vendor turns, and the point of a timeout here is that
+// a hung socket ends as a recorded exchange rather than a run that never returns.
+const PROBE_TIMEOUT_MS = 180_000;
 
 if (!process.env.OPENAI_API_KEY || !process.env.ANTHROPIC_API_KEY) {
   console.error('OPENAI_API_KEY and ANTHROPIC_API_KEY are required: these probes ask the vendors directly');
@@ -145,33 +149,24 @@ for (const probe of probes) {
     ? { authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'content-type': 'application/json' }
     : { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'content-type': 'application/json', ...(probe.omitVersionHeader ? {} : { 'anthropic-version': '2023-06-01' }) };
   const requestBody = JSON.stringify(probe.body);
-  const startedAt = Date.now();
-  let res; let text = ''; let wire = '';
-  try {
-    res = await fetch(probe.url, { method: 'POST', headers, body: requestBody });
-    text = await res.text();
-    if (probe.stream) wire = text;
-  } catch (err) {
-    recordExchange({ kind: probe.stream ? 'sse' : 'json', label: probe.id, url: probe.url, requestHeaders: headers, requestBody, error: err, durationMs: Date.now() - startedAt });
-    results.push({ id: probe.id, why: probe.why, error: String(err) });
+  // One function, in scripts/lib, because this file cannot be run without
+  // spending vendor calls: the check that this reads a stream without losing
+  // what arrived has to be able to call the thing that ships.
+  const { status, text, wire, failed } = await readProbeExchange({
+    url: probe.url,
+    headers,
+    requestBody,
+    stream: Boolean(probe.stream),
+    label: probe.id,
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
+  if (failed !== null) {
+    results.push({ id: probe.id, why: probe.why, error: failed });
     continue;
   }
-  recordExchange({
-    kind: probe.stream ? 'sse' : 'json',
-    label: probe.id,
-    url: probe.url,
-    requestHeaders: headers,
-    requestBody,
-    status: res.status,
-    statusText: res.statusText,
-    responseHeaders: res.headers,
-    responseBody: probe.stream ? undefined : text,
-    streamBytes: probe.stream ? wire : undefined,
-    durationMs: Date.now() - startedAt,
-  });
   let json = null;
   try { json = JSON.parse(text); } catch { /* streams and error pages are not one JSON object */ }
-  results.push({ id: probe.id, why: probe.why, status: res.status, observed: probe.read({ status: res.status, text, wire, json }) });
+  results.push({ id: probe.id, why: probe.why, status, observed: probe.read({ status, text, wire, json }) });
 }
 
 console.log(JSON.stringify({ openAiModel, anthropicModel, captures: captureSummary(), results }, null, 2));
