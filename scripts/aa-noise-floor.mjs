@@ -1,0 +1,243 @@
+#!/usr/bin/env node
+// The A/A noise floor: ask each vendor the SAME thing many times and measure how
+// much it varies against itself.
+//
+// `docs/conformance-suite-design.md` has said since 2026-08-28 that the length
+// axis of the direct-vs-proxy comparison is not a verdict until this exists:
+// "vendor 대 vendor 분산이 측정하려는 효과만큼 크면 그 축은 판정 불가로 보고한다."
+// The control taken that day used three samples per row — enough to see the
+// variance, not to bound it.
+//
+// This file hardcodes the vendor URLs on purpose. Making them overridable would
+// let a local fake produce an artifact that claims to be a vendor's own
+// variance, and that number is about to decide whether other numbers mean
+// anything. The part a test can drive is `scripts/lib/aa-sampler.mjs`, which
+// takes its URL as a parameter; `test/aa-sampler.test.mjs` calls it.
+//
+// It refuses to make a call without `--live`. A plan is the default because the
+// spend is real and metered, and a run that starts by accident is exactly what
+// happened to the benchmark runner once already.
+//
+// Usage:
+//   node scripts/aa-noise-floor.mjs                        # plan only, no calls
+//   node scripts/aa-noise-floor.mjs --live [--reps 24] [--resume <state.json>]
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
+import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
+import { SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const argv = process.argv.slice(2);
+const flag = (name) => argv.includes(name);
+const opt = (name, fallback) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : fallback);
+const num = (name, fallback) => {
+  const value = opt(name, null);
+  if (value === null) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error(`${name} must be a number, got ${value}`);
+  return parsed;
+};
+
+const live = flag('--live');
+const reps = num('--reps', 24);
+const minReps = num('--min-reps', 12);
+// The design's sequential rule: start at 24, stop when the interval decides, cap
+// at 60. "Decides" here is the 95% interval for the mean being inside this many
+// percent of the mean.
+const decisivePct = num('--decisive-pct', 3);
+const budgetCalls = num('--budget', null);
+const openAiModel = opt('--openai-model', 'gpt-5.6-terra');
+const anthropicModel = opt('--anthropic-model', 'claude-sonnet-5');
+const maxTokens = num('--max-tokens', 1536);
+const statePath = opt('--resume', null);
+// A substring filter over `provider/task`, so the wiring can be proved on two
+// calls before four hundred and eighty are committed to it.
+const only = opt('--only', null);
+const outPath = opt('--out', resolve(repoRoot, 'bench-results',
+  `aa-noise-floor-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.json`));
+
+const PROVIDERS = {
+  openai: {
+    url: 'https://api.openai.com/v1/chat/completions',
+    model: openAiModel,
+    headers: () => ({
+      authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      'content-type': 'application/json',
+    }),
+    body: (prompt) => JSON.stringify({
+      model: openAiModel,
+      messages: [{ role: 'user', content: prompt }],
+      max_completion_tokens: maxTokens,
+    }),
+    // Sampling controls are left at their defaults ON PURPOSE: this measures the
+    // vendor as the comparison actually calls it, and pinning temperature would
+    // measure a configuration nothing else uses.
+    readAnswer: (parsed) => ({
+      text: parsed.choices?.[0]?.message?.content ?? '',
+      outputTokens: parsed.usage?.completion_tokens ?? null,
+      stopReason: parsed.choices?.[0]?.finish_reason ?? null,
+    }),
+  },
+  anthropic: {
+    url: 'https://api.anthropic.com/v1/messages',
+    model: anthropicModel,
+    headers: () => ({
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    }),
+    body: (prompt) => JSON.stringify({
+      model: anthropicModel,
+      max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+    readAnswer: (parsed) => ({
+      text: parsed.content?.find((block) => block.type === 'text')?.text ?? '',
+      outputTokens: parsed.usage?.output_tokens ?? null,
+      stopReason: parsed.stop_reason ?? null,
+    }),
+  },
+};
+
+const tasks = qualityTasks();
+const rows = [];
+for (const provider of Object.keys(PROVIDERS)) {
+  for (const task of tasks) {
+    if (only && !`${provider}/${task.id}`.includes(only)) continue;
+    rows.push({ provider, task: task.id, prompt: task.prompt });
+  }
+}
+if (rows.length === 0) {
+  console.error(`--only ${only} matched no row; nothing to measure`);
+  process.exit(2);
+}
+
+// The worst case by default: a budget larger than the plan cannot stop anything,
+// and one smaller is a deliberate cap the operator asked for.
+const budgetTotal = budgetCalls ?? rows.length * reps;
+
+const plan = {
+  rows: rows.length,
+  reps,
+  minReps,
+  decisivePct,
+  worstCaseCalls: rows.length * reps,
+  budgetCalls: budgetTotal,
+  openAiModel,
+  anthropicModel,
+  maxTokens,
+  tasksDigest: qualityTasksDigest(),
+  only,
+};
+
+if (!live) {
+  console.log(JSON.stringify({ plan, wouldWrite: outPath, note: 'no call was made; pass --live to run' }, null, 2));
+  console.log(`\n${plan.worstCaseCalls} live vendor calls at worst (${rows.length} rows × ${reps}), `
+    + `fewer if rows settle inside ±${decisivePct}% of their mean after ${minReps}.`);
+  process.exit(0);
+}
+
+for (const [name, key] of [['openai', 'OPENAI_API_KEY'], ['anthropic', 'ANTHROPIC_API_KEY']]) {
+  if (!process.env[key]) {
+    console.error(`${key} is required: this measures ${name}'s own variance against itself`);
+    process.exit(2);
+  }
+}
+
+const state = statePath && existsSync(statePath)
+  ? JSON.parse(readFileSync(statePath, 'utf8'))
+  : { rows: {} };
+const saveState = () => {
+  if (!statePath) return;
+  mkdirSync(dirname(statePath), { recursive: true });
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+};
+
+startCaptureRun({
+  dir: resolve(repoRoot, 'artifacts/aa-noise-floor'),
+  meta: { probe: 'aa-noise-floor', openAiModel, anthropicModel, reps, tasksDigest: plan.tasksDigest },
+});
+
+// One budget across every row, so a resumed run cannot spend the batch twice.
+const budget = { remaining: budgetTotal, spent: 0 };
+const started = Date.now();
+const results = [];
+let aborted = null;
+
+for (const row of rows) {
+  const key = `${row.provider}/${row.task}`;
+  const vendor = PROVIDERS[row.provider];
+  const existing = state.rows[key]?.lens ?? [];
+  process.stderr.write(`\n[${key}] ${existing.length}/${reps} already, `
+    + `${budget.remaining} calls left in budget\n`);
+  let outcome;
+  try {
+    outcome = await sampleRow({
+      reps,
+      minReps,
+      existing,
+      budget,
+      // The design's sequential rule, in the units this row is in.
+      decisiveWhen: (reading) => (reading.ciHalfWidth / reading.mean) * 100 <= decisivePct,
+      take: async () => takeSample({
+        url: vendor.url,
+        headers: vendor.headers(),
+        body: vendor.body(row.prompt),
+        label: key,
+        timeoutMs: 180_000,
+        readAnswer: vendor.readAnswer,
+      }),
+      onSample: ({ index, chars, lens }) => {
+        state.rows[key] = { lens, updatedAt: new Date().toISOString() };
+        saveState();
+        const reading = summarise(lens);
+        process.stderr.write(`  ${index + 1}/${reps} ${chars} chars  `
+          + `mean ${reading.mean} sd ${reading.sd ?? '-'} ci±${reading.ciHalfWidth ?? '-'}\n`);
+      },
+    });
+  } catch (error) {
+    if (!(error instanceof SamplingAbort)) throw error;
+    aborted = error.message;
+    process.stderr.write(`\nSTOPPED: ${aborted}\n`);
+    break;
+  }
+
+  // The stopping rule is applied HERE, on the row that just finished, because
+  // "decisive" is a statement about this row's mean and not about a call.
+  const settled = outcome.ciHalfWidth !== null && outcome.mean > 0
+    && (outcome.ciHalfWidth / outcome.mean) * 100 <= decisivePct;
+  results.push({ ...row, prompt: undefined, ...outcome, settled });
+  state.rows[key] = { lens: outcome.lens, updatedAt: new Date().toISOString() };
+  saveState();
+}
+
+const measured = results.filter((row) => row.n >= 2);
+const artifact = {
+  ranAt: new Date().toISOString(),
+  elapsedMs: Date.now() - started,
+  plan,
+  budget,
+  aborted,
+  captures: captureSummary(),
+  // The floor itself: the widest a row varies against itself, which is the bar a
+  // direct-vs-proxy difference has to clear before it is a difference at all.
+  floor: {
+    rowsMeasured: measured.length,
+    rowsDeadLettered: results.filter((row) => row.deadLettered).length,
+    worstCvPct: measured.length ? Math.max(...measured.map((row) => row.cvPct ?? 0)) : null,
+    medianCvPct: measured.length
+      ? [...measured.map((row) => row.cvPct ?? 0)].sort((a, b) => a - b)[Math.floor(measured.length / 2)]
+      : null,
+    worstSpreadPct: measured.length ? Math.max(...measured.map((row) => row.spreadPct ?? 0)) : null,
+    rowsSettled: results.filter((row) => row.settled).length,
+  },
+  rows: results,
+};
+
+mkdirSync(dirname(outPath), { recursive: true });
+writeFileSync(outPath, `${JSON.stringify(artifact, null, 2)}\n`);
+console.log(JSON.stringify(artifact.floor, null, 2));
+console.log(`\nwrote ${outPath}  (${budget.spent} live calls)`);
+if (aborted) process.exit(1);
