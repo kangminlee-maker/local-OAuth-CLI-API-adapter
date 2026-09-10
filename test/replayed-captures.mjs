@@ -491,3 +491,41 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
   }
   return { failures, checked };
 }
+
+/**
+ * Every way a row's echo claim fails to hold, given what actually got compared.
+ *
+ * `echoed` is per ROOT: a boolean says the same thing about every option the row
+ * supplies, a map says it option by option. The map exists because a row can
+ * combine an option the surface echoes with one it does not, and a single
+ * boolean could only claim both — which is how `store: false` alongside
+ * `include` passed for a long time on `store`'s leaf while `include`, which
+ * R-25 records as producing no key at all, rode along uncompared.
+ *
+ * The rule is per root and not per row for the same reason. Asking whether the
+ * ROW compared anything let one echoing option carry every other option in the
+ * list; two independent reviews built that case on the same day.
+ */
+export function echoFailures({ supplied, echoed, alsoCompare, comparedByRoot, echoedPaths, rootOf }) {
+  const failures = [];
+  const asMap = typeof echoed === 'object' && echoed !== null;
+  const echoedFor = (root) => (asMap ? echoed[root] === true : echoed === true);
+  if (asMap) {
+    const unsaid = supplied.filter((root) => typeof echoed[root] !== 'boolean');
+    if (unsaid.length > 0) failures.push(`the echo map does not say what happens to ${unsaid.join(', ')}`);
+  }
+
+  const speaksFor = supplied.filter((root) => echoedFor(root));
+  for (const root of speaksFor) {
+    if ((comparedByRoot.get(root) ?? 0) === 0) failures.push(`${root} reached no comparison, so this row does not speak for it`);
+  }
+
+  const silentRoots = supplied.filter((root) => !echoedFor(root));
+  const nowEchoed = echoedPaths.filter((path) => silentRoots.includes(rootOf(path)));
+  if (nowEchoed.length > 0) failures.push(`the vendor now echoes ${nowEchoed.join(', ')}, so this row's claim is stale`);
+
+  for (const path of alsoCompare ?? []) {
+    if ((comparedByRoot.get(path) ?? 0) === 0) failures.push(`${path} did not reach the comparison`);
+  }
+  return failures;
+}

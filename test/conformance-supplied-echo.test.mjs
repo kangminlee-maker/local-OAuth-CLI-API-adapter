@@ -35,6 +35,7 @@ import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDecl
 import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder,
   createReplayBackend,
   answerPremiseFailures,
+  echoFailures,
 } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
@@ -267,39 +268,15 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harne
 
     const { compared, comparedByRoot, differences, echoedPaths } = readEcho({ fixture, surface, supplied, alsoCompare });
 
-    // `echoed` is per ROOT. A boolean says the same thing about every option the
-    // row supplies; a map says it option by option, which is what a row
-    // combining an echoed option with a silent one needs. The single boolean
-    // hid exactly that case: `store: false` alongside `include` claimed both
-    // were echoed, `store` was, and `include` — which R-25 records as producing
-    // no key at all — rode along uncompared.
-    const echoedFor = (root) => (typeof echoed === 'object' && echoed !== null ? echoed[root] === true : echoed === true);
-    if (typeof echoed === 'object' && echoed !== null) {
-      assert.deepEqual(
-        supplied.filter((root) => typeof echoed[root] !== 'boolean'),
-        [],
-        `${fixture}: the echo map does not say what happens to every option this row supplies`,
-      );
-    }
-
-    // EACH option the row says IS echoed must reach a comparison of its own.
-    const speaksFor = supplied.filter((root) => echoedFor(root));
-    const silent = speaksFor.filter((root) => (comparedByRoot.get(root) ?? 0) === 0);
-    assert.deepEqual(silent, [], `${fixture}: ${silent.join(', ')} reached no comparison, so this row does not speak for ${silent.length === 1 ? 'it' : 'them'}`);
-
-    // The other direction is a claim too. Chat's answer carries no `n`, no
-    // `logprobs` and no `response_format`, so a client cannot read back what it
-    // asked for — and if that ever changes, this row should fail rather than
-    // quietly start comparing something new.
-    const silentRoots = supplied.filter((root) => !echoedFor(root));
-    const nowEchoed = echoedPaths.filter((path) => silentRoots.includes(rootOf(path)));
-    assert.deepEqual(nowEchoed, [], `${fixture}: the vendor now echoes ${silentRoots.join(', ')}, so this row's claim is stale`);
-
-    // Each named path, not the count. Two paths where one was compared twice and
-    // another not at all reached the same total.
-    const missing = (alsoCompare ?? []).filter((path) => (comparedByRoot.get(path) ?? 0) === 0);
-    assert.deepEqual(missing, [], `${fixture}: ${missing.join(', ')} did not reach the comparison`);
-    if (speaksFor.length === 0) {
+    assert.deepEqual(
+      echoFailures({ supplied, echoed, alsoCompare, comparedByRoot, echoedPaths, rootOf }),
+      [],
+      `${fixture}: this row's echo claim does not hold`,
+    );
+    // A row that claims no echoed option still has to have compared exactly the
+    // paths it named, and nothing else.
+    const speaksForNothing = supplied.every((root) => (typeof echoed === 'object' && echoed !== null ? echoed[root] !== true : echoed !== true));
+    if (speaksForNothing) {
       assert.equal(compared, (alsoCompare ?? []).length, `${fixture}: the paths this row claims did not all reach the comparison`);
     }
     assert.deepEqual(differences, [], `${fixture}: the proxy answers ${supplied.join(', ')} differently`);
@@ -402,4 +379,57 @@ test('the premise check passes an answer that agrees with its capture', () => {
   );
   assert.deepEqual(failures, []);
   assert.equal(checked, 1);
+});
+
+// The echo rule's own controls, on synthetic readings. The rows above happen to
+// agree under the per-root rule and an aggregate one, so nothing there can show
+// the difference — and a rule no input distinguishes is an un-run input, not a
+// guard that has been proved unnecessary.
+test('an echoed option that compared nothing fails even when a sibling compared plenty', () => {
+  const failures = echoFailures({
+    supplied: ['store', 'include'],
+    echoed: true,
+    alsoCompare: [],
+    comparedByRoot: new Map([['store', 9]]),
+    echoedPaths: [],
+    rootOf,
+  });
+  assert.equal(failures.length, 1, `expected include to fail, got ${JSON.stringify(failures)}`);
+  assert.match(failures[0], /^include reached no comparison/);
+});
+
+test('an echo map must say what happens to every option the row supplies', () => {
+  const failures = echoFailures({
+    supplied: ['store', 'include'],
+    echoed: { store: true },
+    alsoCompare: [],
+    comparedByRoot: new Map([['store', 1]]),
+    echoedPaths: [],
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /does not say what happens to include/);
+});
+
+test('a root the row says is silent must stay silent', () => {
+  const failures = echoFailures({
+    supplied: ['n'],
+    echoed: false,
+    alsoCompare: [],
+    comparedByRoot: new Map(),
+    echoedPaths: ['.n'],
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /now echoes \.n/);
+});
+
+test('an alsoCompare path that reached nothing fails by name', () => {
+  const failures = echoFailures({
+    supplied: ['stop_sequences'],
+    echoed: false,
+    alsoCompare: ['.stop_reason', '.stop_sequence'],
+    comparedByRoot: new Map([['.stop_reason', 1]]),
+    echoedPaths: [],
+    rootOf,
+  });
+  assert.deepEqual(failures, ['.stop_sequence did not reach the comparison']);
 });
