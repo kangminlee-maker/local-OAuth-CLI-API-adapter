@@ -758,9 +758,9 @@ test('an option THIS row does not claim is named, even if a sibling claims it', 
     'a row stopped claiming an option its own request carries and nothing said so');
 });
 
-test('a per-row exception excuses only the row that names it', () => {
+test('a row opts out only where the surface already says the probe shapes the key', () => {
   const rows = [
-    { fixture: 'excused', surface: '/v1/responses', supplied: ['top_logprobs'], unclaimed: { reasoning: 'why' } },
+    { fixture: 'excused', surface: '/v1/responses', supplied: ['top_logprobs'], unclaimed: ['reasoning'] },
     { fixture: 'bare', surface: '/v1/responses', supplied: ['top_logprobs'] },
   ];
   const { unclaimed, staleExceptions } = unclaimedRequestOptions(
@@ -768,26 +768,57 @@ test('a per-row exception excuses only the row that names it', () => {
     () => ['model', 'input', 'top_logprobs', 'reasoning'],
     { '/v1/responses': ['model', 'input'] },
     {},
+    { '/v1/responses': { reasoning: 'the probe sets it' } },
   );
-  assert.deepEqual(unclaimed, ['bare reasoning']);
+  assert.deepEqual(unclaimed, ['bare reasoning'], 'the opt-out excused a row that did not take it');
   assert.deepEqual(staleExceptions, []);
 });
 
-test('a per-row exception with no reason, or for a key the row claims, is stale', () => {
+test('a row cannot mint its own excuse for the option it stopped claiming', () => {
+  // The construction: narrow `supplied` by one word AND write a true sentence
+  // about why this row need not claim it, in the same object. The rule asked the
+  // question per row and read the answer off the same row. The reasons live
+  // outside the rosters now, and a key that is not listed there cannot be opted
+  // out of at all.
+  const { unclaimed, staleExceptions } = unclaimedRequestOptions(
+    [{ fixture: 'narrowed', surface: '/v1/responses', supplied: ['top_logprobs'], unclaimed: ['reasoning'] }],
+    () => ['model', 'input', 'top_logprobs', 'reasoning'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+    { '/v1/responses': {} },
+  );
+  assert.match(staleExceptions.join('\n'),
+    /narrowed reasoning: opted out of a key this surface does not list as probe-shaped/);
+  assert.deepEqual(unclaimed, [], 'the key was reported twice, once as unclaimed and once as a bad opt-out');
+});
+
+test('an opt-out for a key the row claims, or one its request lacks, is stale', () => {
   const { staleExceptions } = unclaimedRequestOptions(
     [
-      { fixture: 'silent', surface: '/v1/responses', supplied: ['store'], unclaimed: { reasoning: '' } },
-      { fixture: 'both-ways', surface: '/v1/responses', supplied: ['reasoning'], unclaimed: { reasoning: 'why' } },
-      { fixture: 'absent-key', surface: '/v1/responses', supplied: ['store'], unclaimed: { nowhere: 'why' } },
+      { fixture: 'both-ways', surface: '/v1/responses', supplied: ['reasoning'], unclaimed: ['reasoning'] },
+      { fixture: 'absent-key', surface: '/v1/responses', supplied: ['store'], unclaimed: ['nowhere'] },
     ],
     () => ['model', 'input', 'store', 'reasoning'],
     { '/v1/responses': ['model', 'input'] },
     {},
+    { '/v1/responses': { reasoning: 'the probe sets it', nowhere: 'nothing sends it' } },
   );
   const said = staleExceptions.join('\n');
-  assert.match(said, /silent reasoning: excused with no reason/);
   assert.match(said, /both-ways reasoning: excused but this row claims it/);
   assert.match(said, /absent-key nowhere: excused but its request does not carry it/);
+});
+
+test('a probe-shaped key with no reason, or one nothing sends, is stale', () => {
+  const { staleExceptions } = unclaimedRequestOptions(
+    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['store'] }],
+    () => ['model', 'input', 'store'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+    { '/v1/responses': { store: '', gone: 'a reason for a key nothing sends' } },
+  );
+  const said = staleExceptions.join('\n');
+  assert.match(said, /store: listed as probe-shaped with no reason/);
+  assert.match(said, /gone: listed as probe-shaped but no capture's request carries it/);
 });
 
 test('a SURFACE exception no capture sends, or one a row claims, is stale', () => {

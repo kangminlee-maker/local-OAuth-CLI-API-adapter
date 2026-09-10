@@ -244,11 +244,11 @@ export const SUPPLIED_ECHO_CAPTURES = [
     vendorPaths: 99,
   },
   { fixture: 'direct-responses-top-logprobs-effort-none', surface: '/v1/responses', supplied: ['top_logprobs', 'reasoning'], echoed: true, vendorPaths: 76 },
-  { fixture: 'direct-chat-service-tier-flex', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-response-format-json-object', surface: '/v1/chat/completions', supplied: ['response_format'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-service-tier-flex', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-response-format-json-object', surface: '/v1/chat/completions', supplied: ['response_format'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
   {
     fixture: 'direct-chat-n-2',
-    unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT },
+    unclaimed: ['reasoning_effort'],
     surface: '/v1/chat/completions',
     supplied: ['n'],
     echoed: false,
@@ -317,15 +317,15 @@ export const SUPPLIED_ECHO_CAPTURES = [
     declaredAbsent: ['moderation'],
     vendorPaths: 155,
   },
-  { fixture: 'direct-chat-service-tier-default', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-service-tier-priority', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-service-tier-default', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-service-tier-priority', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
   { fixture: 'direct-chat-reasoning-effort-none', surface: '/v1/chat/completions', supplied: ['reasoning_effort'], echoed: false, vendorPaths: 28 },
-  { fixture: 'direct-chat-seed', surface: '/v1/chat/completions', supplied: ['seed'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-store-true', surface: '/v1/chat/completions', supplied: ['store'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-metadata-user-safety-identifier', surface: '/v1/chat/completions', supplied: ['metadata', 'user', 'safety_identifier'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-prompt-cache-key-options', surface: '/v1/chat/completions', supplied: ['prompt_cache_key', 'prompt_cache_options'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-prompt-cache-retention', surface: '/v1/chat/completions', supplied: ['prompt_cache_retention'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-verbosity', surface: '/v1/chat/completions', supplied: ['verbosity'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-seed', surface: '/v1/chat/completions', supplied: ['seed'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-store-true', surface: '/v1/chat/completions', supplied: ['store'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-metadata-user-safety-identifier', surface: '/v1/chat/completions', supplied: ['metadata', 'user', 'safety_identifier'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-prompt-cache-key-options', surface: '/v1/chat/completions', supplied: ['prompt_cache_key', 'prompt_cache_options'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-prompt-cache-retention', surface: '/v1/chat/completions', supplied: ['prompt_cache_retention'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-verbosity', surface: '/v1/chat/completions', supplied: ['verbosity'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
   { fixture: 'direct-chat-tools', surface: '/v1/chat/completions', supplied: ['tools', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
   { fixture: 'direct-chat-parallel-tool-calls-false', surface: '/v1/chat/completions', supplied: ['tools', 'parallel_tool_calls', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
   { fixture: 'direct-chat-functions-function-call', surface: '/v1/chat/completions', supplied: ['functions', 'function_call', 'reasoning_effort'], echoed: false, vendorPaths: 28 },
@@ -337,9 +337,9 @@ export const SUPPLIED_ECHO_CAPTURES = [
   // claim they carry is the STATUS — the vendor answers 200 to each, and so
   // must this proxy — with the echo half saying that neither side reports the
   // messages back.
-  { fixture: 'direct-chat-message-name', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-message-unknown-member', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
-  { fixture: 'direct-chat-message-refusal', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: { reasoning_effort: PROBE_SHAPING_EFFORT } },
+  { fixture: 'direct-chat-message-name', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-message-unknown-member', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
+  { fixture: 'direct-chat-message-refusal', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28, unclaimed: ['reasoning_effort'] },
   // Six turns whose shape is a function of what the VENDOR generated rather than
   // of the option supplied, each answered here the way its own turn went. A
   // backend that says `OK` to everything cannot produce an empty `content`, a
@@ -996,6 +996,33 @@ export const UNCLAIMED_REQUEST_KEYS = {
 };
 
 /**
+ * The only keys a row may decline to claim, per surface, each with the reason.
+ *
+ * OUTSIDE every roster, which is the whole point. The first per-row rule let the
+ * row carry its own excuse: `row.unclaimed` was a free-form map, so a row could
+ * stop claiming an option and, in the same object, write a true sentence about
+ * why it need not. A review did exactly that — `supplied: ['top_logprobs',
+ * 'reasoning']` narrowed to `['top_logprobs']` plus one `unclaimed.reasoning`
+ * sentence modelled on the one below — and a client-visible defect
+ * (`reasoning.effort: "none"` answered `"medium"`) went from one failing test
+ * back to 2303/2303. The rule asked the question per row and then read the
+ * answer off the same row.
+ *
+ * So a row can only OPT IN to an excuse that already exists here. Minting one is
+ * an edit to this table, on its own line, in a diff a reviewer reads — not a
+ * field inside the row that stopped claiming.
+ *
+ * An entry that no capture on its surface carries is stale and fails.
+ */
+export const PROBE_SHAPED_KEYS = {
+  '/v1/chat/completions': {
+    reasoning_effort: PROBE_SHAPING_EFFORT,
+  },
+  '/v1/responses': {},
+  '/v1/messages': {},
+};
+
+/**
  * Every option the store's requests carry that no row on that surface claims.
  *
  * The `supplied` assertion ran ONE WAY: a row could not claim an option its
@@ -1009,7 +1036,8 @@ export const UNCLAIMED_REQUEST_KEYS = {
  * answer is missing, which is a claim about it.
  */
 export function unclaimedRequestOptions(rows, requestKeysOf,
-  mandatoryKeys = MANDATORY_REQUEST_KEYS, surfaceExceptions = UNCLAIMED_REQUEST_KEYS) {
+  mandatoryKeys = MANDATORY_REQUEST_KEYS, surfaceExceptions = UNCLAIMED_REQUEST_KEYS,
+  probeShaped = PROBE_SHAPED_KEYS) {
   const claimedOnSurface = new Map();
   const presentOnSurface = new Map();
   for (const row of rows) {
@@ -1026,7 +1054,10 @@ export function unclaimedRequestOptions(rows, requestKeysOf,
   for (const row of rows) {
     const mandatory = new Set(mandatoryKeys[row.surface] ?? []);
     const surfaceExcused = surfaceExceptions[row.surface] ?? {};
-    const rowExcused = row.unclaimed ?? {};
+    // A LIST of keys the row opts out of, not a map of reasons it writes. The
+    // reasons live in `probeShaped`, where no row owns them.
+    const rowExcused = new Set(row.unclaimed ?? []);
+    const excusable = probeShaped[row.surface] ?? {};
     const claims = new Set([...(row.supplied ?? []), ...(row.declaredAbsent ?? [])]);
     const keys = requestKeysOf(row.fixture);
     // PER ROW. Per surface was not this property: a key stays claimed on a
@@ -1038,8 +1069,10 @@ export function unclaimedRequestOptions(rows, requestKeysOf,
     // witnessed it, while another row on the same surface kept the key claimed.
     for (const key of keys) {
       if (mandatory.has(key) || claims.has(key)) continue;
-      if (Object.prototype.hasOwnProperty.call(rowExcused, key)) {
-        if (!rowExcused[key]) staleExceptions.push(`${row.fixture} ${key}: excused with no reason`);
+      if (rowExcused.has(key)) {
+        if (!excusable[key]) {
+          staleExceptions.push(`${row.fixture} ${key}: opted out of a key this surface does not list as probe-shaped`);
+        }
         continue;
       }
       if (Object.prototype.hasOwnProperty.call(surfaceExcused, key)) {
@@ -1048,11 +1081,23 @@ export function unclaimedRequestOptions(rows, requestKeysOf,
       }
       unclaimed.push(`${row.fixture} ${key}`);
     }
-    for (const key of Object.keys(rowExcused)) {
+    for (const key of rowExcused) {
       if (!keys.includes(key)) staleExceptions.push(`${row.fixture} ${key}: excused but its request does not carry it`);
       else if (claims.has(key)) staleExceptions.push(`${row.fixture} ${key}: excused but this row claims it`);
     }
 
+  }
+
+  // An excusable key nothing sends has outlived whatever it was for. It cannot
+  // also be required to go unclaimed by every row — `reasoning_effort` is
+  // exactly a key the probe shapes AND one row is about.
+  for (const [surface, excusable] of Object.entries(probeShaped)) {
+    if (!presentOnSurface.has(surface)) continue;
+    const present = presentOnSurface.get(surface);
+    for (const [key, why] of Object.entries(excusable)) {
+      if (!why) staleExceptions.push(`${surface} ${key}: listed as probe-shaped with no reason`);
+      else if (!present.has(key)) staleExceptions.push(`${surface} ${key}: listed as probe-shaped but no capture's request carries it`);
+    }
   }
 
   // A surface-level exception is for a key NO row claims — the shape of a knob
