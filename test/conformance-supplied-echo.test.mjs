@@ -292,7 +292,10 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, ha
 }
 
 test('every row answer describes the turn its own capture recorded', () => {
-  const { failures, checked } = answerPremiseFailures(CAPTURES, (fixture) => JSON.parse(load(fixture).body));
+  const { failures, checked } = answerPremiseFailures(CAPTURES, (fixture) => {
+    const capture = load(fixture);
+    return { body: JSON.parse(capture.body), request: JSON.parse(capture.request) };
+  });
   assert.deepEqual(failures, [], 'a fixture that contradicts its own capture can hide a defect');
   assert.ok(checked > 0, 'no answer field was bound to its capture, so this check compared nothing');
 });
@@ -358,7 +361,7 @@ test('every capture in the store is replayed by a gate', () => {
 test('the premise check refuses an answer on a surface it cannot check', () => {
   const { failures, checked } = answerPremiseFailures(
     [{ fixture: 'made-up', surface: '/v1/nowhere', answer: { stopReason: 'end_turn' } }],
-    () => ({}),
+    () => ({ body: {}, request: {} }),
   );
   assert.equal(checked, 0);
   assert.equal(failures.length, 1, 'an unbound surface was skipped instead of failing');
@@ -372,8 +375,8 @@ test('the premise check catches an answer that contradicts its capture', () => {
     answer: { stopReason: 'end_turn', usage: { cachedInputTokens: 1 } },
   }];
   const { failures } = answerPremiseFailures(rows, () => ({
-    stop_reason: 'max_tokens',
-    usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    body: { stop_reason: 'max_tokens', usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+    request: {},
   }));
   assert.equal(failures.length, 2, `expected both fields to be caught, got ${JSON.stringify(failures)}`);
   assert.match(failures.join('\n'), /stopReason/);
@@ -383,7 +386,7 @@ test('the premise check catches an answer that contradicts its capture', () => {
 test('the premise check passes an answer that agrees with its capture', () => {
   const { failures, checked } = answerPremiseFailures(
     [{ fixture: 'made-up', surface: '/v1/messages', answer: { stopReason: 'max_tokens' } }],
-    () => ({ stop_reason: 'max_tokens', usage: {} }),
+    () => ({ body: { stop_reason: 'max_tokens', usage: {} }, request: {} }),
   );
   assert.deepEqual(failures, []);
   assert.equal(checked, 1);

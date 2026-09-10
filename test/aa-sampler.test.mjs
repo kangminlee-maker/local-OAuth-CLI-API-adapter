@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { startCaptureRun } from '../scripts/lib/capture-recorder.mjs';
 import {
-  noiseFloor, SamplingAbort, sampleRow, SERIES, summarise, takeSample, visibleChars,
+  noiseFloor, resumePlan, SamplingAbort, sampleRow, SERIES, summarise, takeSample, visibleChars,
 } from '../scripts/lib/aa-sampler.mjs';
 
 const servers = [];
@@ -456,4 +456,43 @@ test('dead-lettered and settled rows are counted, not silently dropped', () => {
   assert.equal(floor.rowsTotal, 2);
   assert.equal(floor.rowsSettled, 1);
   assert.equal(floor.rowsDeadLettered, 1);
+});
+
+// --- what a saved state says about resuming ---------------------------------
+
+test('a resumed run continues the budget it already spent', () => {
+  // The defect this replaces: the runner rebuilt `{remaining: total, spent: 0}`
+  // on every invocation, so a run resumed twice against a ceiling of two spent
+  // four calls — and each invocation truthfully reported spending its share.
+  const plan = resumePlan({ rows: { 'a/b': { samples: [{ chars: 1 }] } }, spent: 2 }, 2);
+  assert.equal(plan.spent, 2);
+  assert.equal(plan.remaining, 0);
+  assert.equal(plan.exhausted, true, 'a spent budget was reopened by resuming');
+});
+
+test('a run with budget left resumes with what is left, not with all of it', () => {
+  const plan = resumePlan({ rows: {}, spent: 3 }, 10);
+  assert.equal(plan.remaining, 7);
+  assert.equal(plan.exhausted, false);
+});
+
+test('a state with no ledger is a fresh run, not an overspent one', () => {
+  const plan = resumePlan({ rows: {} }, 5);
+  assert.equal(plan.spent, 0);
+  assert.equal(plan.remaining, 5);
+  assert.deepEqual(plan.legacy, []);
+});
+
+test('a row recorded before whole samples were kept is named, not silently restarted', () => {
+  // Reading `?.samples ?? []` made a legacy row look ABSENT, so the runner
+  // started it over and the first new sample overwrote observations that had
+  // been paid for and could no longer be read.
+  const plan = resumePlan({
+    rows: {
+      'openai/old': { lens: [80, 90] },
+      'openai/new': { samples: [{ chars: 80, outputTokens: 3 }] },
+    },
+    spent: 2,
+  }, 10);
+  assert.deepEqual(plan.legacy, ['openai/old']);
 });

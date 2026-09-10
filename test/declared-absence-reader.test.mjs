@@ -78,3 +78,26 @@ test('both readers answer for the same subtree, over the paths each one sees', (
   const stillAnswered = leaves.filter((path) => isDeclaredAbsent(new Set(['.moderation']), path, weReportIt));
   assert.deepEqual(stillAnswered, [], 'the echo reader kept crediting a declaration that had stopped being true');
 });
+
+test('an exactly-declared leaf stops being exempt once we report it', () => {
+  const absent = new Set(['.reasoning.mode']);
+  const path = '.reasoning.mode';
+  assert.ok(isDeclaredAbsent(absent, path, new Set()), 'the premise of this case does not hold');
+  // We now emit `reasoning.mode` — with a wrong value, say. The declaration has
+  // stopped being true, and the echo comparison must stop crediting it just as
+  // the shape comparison does. The guard used to apply only to the ancestor
+  // walk, so an EXACT declaration kept the two readers disagreeing.
+  assert.equal(isDeclaredAbsent(absent, path, new Set(['.reasoning.mode'])), false);
+});
+
+test('an indexed leaf declared without its index stops being exempt too', () => {
+  const absent = new Set(['.output[].summary']);
+  assert.ok(isDeclaredAbsent(absent, '.output[0].summary', new Set()));
+  assert.equal(isDeclaredAbsent(absent, '.output[0].summary', new Set(['.output[].summary'])), false);
+});
+
+test('a declared cardinality path stops being exempt once we report the array', () => {
+  const absent = new Set(['.tool_usage']);
+  assert.ok(isDeclaredAbsent(absent, '.tool_usage[]#', new Set()));
+  assert.equal(isDeclaredAbsent(absent, '.tool_usage[]#', new Set(['.tool_usage'])), false);
+});

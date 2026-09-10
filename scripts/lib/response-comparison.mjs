@@ -339,8 +339,16 @@ export function leafValues(value, prefix, out) {
  */
 export function isDeclaredAbsent(absent, path, ourFields = new Set()) {
   const indexless = path.replace(/\[\d+\]/g, '[]');
-  if (absent.has(path) || absent.has(indexless)) return true;
   const base = indexless.replace(/\[\]#$/, '');
+  // The guard applies to EVERY way a declaration can match, not only to the
+  // ancestor walk. The first version returned true on an exact hit before
+  // `ourFields` was consulted, so a declaration naming a leaf kept exempting
+  // that leaf after we started reporting it: plant a wrong `reasoning.mode` and
+  // the shape comparison goes red on 19 rows while the echo comparison, reading
+  // the same declaration, says nothing. Which is the disagreement this function
+  // was consolidated to end — closed on the subtree case and left open on the
+  // exact one.
+  if ((absent.has(path) || absent.has(indexless)) && !ourFields.has(base)) return true;
   return ancestors(base).some((field) => absent.has(field) && !ourFields.has(field));
 }
 

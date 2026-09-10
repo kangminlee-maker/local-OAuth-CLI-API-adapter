@@ -26,7 +26,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
-import { noiseFloor, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+import { noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -222,6 +222,36 @@ if (reportPath) {
   process.exit(0);
 }
 
+const state = statePath && existsSync(statePath)
+  ? JSON.parse(readFileSync(statePath, 'utf8'))
+  : { rows: {}, spent: 0 };
+const saveState = () => {
+  if (!statePath) return;
+  mkdirSync(dirname(statePath), { recursive: true });
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+};
+
+// A row whose state predates whole samples cannot say what its calls MEASURED —
+// only how long their answers were. `sampleRow` refuses such a row, but only if
+// it is handed one: reading `?.samples ?? []` turned a legacy row into an empty
+// one, which then overwrote the observations it could not read. Losing paid
+// measurements is worse than refusing to start.
+const resume = resumePlan(state, budgetTotal);
+const legacyRows = resume.legacy;
+if (legacyRows.length > 0) {
+  console.error(`this state file holds ${legacyRows.length} row(s) recorded before whole samples were kept `
+    + `(${legacyRows.join(', ')}). They carry character lengths and no token, thinking or latency readings, `
+    + 'so resuming them would report a partly-restored series as a complete one. Re-run those rows, or drop '
+    + 'them from the state file deliberately.');
+  process.exit(1);
+}
+
+// The budget is a property of the RUN, not of an invocation. It used to be
+// rebuilt at full size every time the process started, so a resumed run spent
+// the whole batch again — and again — while each invocation truthfully reported
+// having spent its share. The ledger travels with the state.
+if (state.spent === undefined) state.spent = 0;
+
 if (!live) {
   const cost = estimate();
   console.log(JSON.stringify({ plan, cost, wouldWrite: outPath, note: 'no call was made; pass --live to run' }, null, 2));
@@ -241,22 +271,24 @@ for (const [name, key] of [['openai', 'OPENAI_API_KEY'], ['anthropic', 'ANTHROPI
   }
 }
 
-const state = statePath && existsSync(statePath)
-  ? JSON.parse(readFileSync(statePath, 'utf8'))
-  : { rows: {} };
-const saveState = () => {
-  if (!statePath) return;
-  mkdirSync(dirname(statePath), { recursive: true });
-  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
-};
 
 startCaptureRun({
   dir: resolve(repoRoot, 'artifacts/aa-noise-floor'),
   meta: { probe: 'aa-noise-floor', openAiModel, anthropicModel, reps, tasksDigest: plan.tasksDigest },
 });
 
-// One budget across every row, so a resumed run cannot spend the batch twice.
-const budget = { remaining: budgetTotal, spent: 0 };
+// One budget across every row AND every resume of the run: `state.spent` is what
+// this run has already paid, so the ceiling is the batch's, not the process's.
+const budget = { remaining: resume.remaining, spent: resume.spent };
+if (statePath && state.spent > 0) {
+  process.stderr.write(`\nresuming: ${state.spent} of ${budgetTotal} calls already spent, `
+    + `${budget.remaining} left\n`);
+}
+if (resume.exhausted) {
+  console.error(`this run has already spent its ${budgetTotal}-call budget (${state.spent} used). `
+    + 'Raise --budget deliberately if more calls are intended.');
+  process.exit(1);
+}
 const started = Date.now();
 const results = [];
 let aborted = null;
@@ -290,6 +322,10 @@ for (const row of rows) {
       }),
       onSample: ({ index, chars, lens, samples }) => {
         state.rows[key] = { samples, updatedAt: new Date().toISOString() };
+        // Booked from the sampler's own counter, not from the sample count: a
+        // retried call and a call that failed outright are both spent money and
+        // neither leaves a sample behind.
+        state.spent = budget.spent;
         saveState();
         const reading = summarise(lens);
         process.stderr.write(`  ${index + 1}/${reps} ${chars} chars  `
@@ -299,6 +335,8 @@ for (const row of rows) {
   } catch (error) {
     if (!(error instanceof SamplingAbort)) throw error;
     aborted = error.message;
+    state.spent = budget.spent;
+    saveState();
     process.stderr.write(`\nSTOPPED: ${aborted}\n`);
     break;
   }
@@ -309,6 +347,7 @@ for (const row of rows) {
     && (outcome.ciHalfWidth / outcome.mean) * 100 <= decisivePct;
   results.push({ ...row, prompt: undefined, ...outcome, settled });
   state.rows[key] = { samples: outcome.samples, updatedAt: new Date().toISOString() };
+  state.spent = budget.spent;
   saveState();
 }
 

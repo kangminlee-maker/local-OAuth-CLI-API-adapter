@@ -463,6 +463,24 @@ export function assertRosterReplayed(group, seen) {
  * cache-read report — from six red tests into 117 green ones. Nothing checked
  * that an answer described the turn the frozen capture recorded.
  */
+/**
+ * The text a turn produces after the request's own stop sequences are applied.
+ *
+ * Re-derived here rather than imported from the proxy: a premise check that
+ * asks the code under test what the answer should be cannot catch that code
+ * being wrong. Earliest match wins, ties go to the caller's array order, which
+ * is the rule matrix A-17 records.
+ */
+function afterStopSequences(text, sequences) {
+  let cut = null;
+  for (const sequence of sequences ?? []) {
+    if (typeof sequence !== 'string' || sequence === '') continue;
+    const at = text.indexOf(sequence);
+    if (at !== -1 && (cut === null || at < cut)) cut = at;
+  }
+  return cut === null ? text : text.slice(0, cut);
+}
+
 export const ANSWER_BINDINGS = {
   '/v1/messages': [
     ['stopReason', (body) => body.stop_reason],
@@ -470,6 +488,16 @@ export const ANSWER_BINDINGS = {
     ['usage.cacheReadInputTokens', (body) => body.usage?.cache_read_input_tokens],
     ['usage.cachedInputTokens', (body) => (body.usage?.cache_creation_input_tokens ?? 0)
       + (body.usage?.cache_read_input_tokens ?? 0)],
+    // Not the raw text — `AAZZtail` is a LEGITIMATE fixture for a turn whose
+    // answer is `AA`, because the sequence is what cuts it. What must agree is
+    // the text the capture's own request would leave behind. Without this a
+    // compensating fixture still passed: a serializer that dropped the first
+    // character of every answer stayed green once the rows said `AAAZZtail`,
+    // which is the class the cache binding closed only one instance of.
+    ['text', (body, request) => (body.content ?? [])
+      .filter((block) => block?.type === 'text')
+      .map((block) => block.text ?? '')
+      .join(''), (answer, request) => afterStopSequences(answer.text ?? '', request.stop_sequences)],
   ],
 };
 
@@ -496,14 +524,23 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
       failures.push(`${fixture}: ${surface} has an answer but no binding table, so its premise is unchecked`);
       continue;
     }
-    const vendor = bodyOf(fixture);
-    for (const [field, ofVendor] of table) {
+    const { body: vendor, request } = bodyOf(fixture);
+    // A field the answer carries that no binding covers is unchecked, and an
+    // unchecked field is where the next compensating fixture goes. Naming it is
+    // the smallest honest failure.
+    const covered = new Set(table.map(([field]) => field.split('.')[0]));
+    for (const field of Object.keys(answer)) {
+      if (!covered.has(field)) failures.push(`${fixture}: the answer sets ${field}, which no binding checks against the capture`);
+    }
+    for (const [field, ofVendor, ofAnswer] of table) {
       const supplied = read(answer, field);
       if (supplied === undefined) continue;
       checked += 1;
-      const theirs = ofVendor(vendor);
-      if (JSON.stringify(supplied) !== JSON.stringify(theirs)) {
-        failures.push(`${fixture}: the answer says ${field} is ${JSON.stringify(supplied)}, `
+      const theirs = ofVendor(vendor, request);
+      // Some fields are compared through the effect they have, not literally.
+      const ours = ofAnswer ? ofAnswer(answer, request) : supplied;
+      if (JSON.stringify(ours) !== JSON.stringify(theirs)) {
+        failures.push(`${fixture}: the answer's ${field} yields ${JSON.stringify(ours)}, `
           + `the capture says ${JSON.stringify(theirs)}`);
       }
     }

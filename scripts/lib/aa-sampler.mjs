@@ -346,3 +346,33 @@ export async function takeSample({ url, headers, body, label, timeoutMs, readAns
     status: res.status,
   };
 }
+
+/**
+ * What a saved state says about resuming a run: what it already spent, and
+ * which of its rows cannot be resumed at all.
+ *
+ * Both were decided inline in the runner, where nothing could reach them. A
+ * review reproduced the consequence by extracting the orchestration loop
+ * verbatim: the budget was rebuilt at full size on every invocation, so a run
+ * resumed twice against a ceiling of two spent four calls while each invocation
+ * truthfully reported spending its share. `sampleRow` guarding a budget OBJECT
+ * says nothing about who builds that object.
+ *
+ * `legacy` names rows recorded before whole samples were kept. Those carry
+ * character lengths and nothing else, and the runner used to read them as an
+ * ABSENT row — starting over and overwriting paid observations it could not
+ * read. Refusing is the smaller loss.
+ */
+export function resumePlan(state, budgetTotal) {
+  const rows = state?.rows ?? {};
+  const spent = Number.isFinite(state?.spent) ? state.spent : 0;
+  return {
+    spent,
+    remaining: budgetTotal - spent,
+    exhausted: budgetTotal - spent <= 0,
+    legacy: Object.entries(rows)
+      .filter(([, row]) => !Array.isArray(row?.samples))
+      .map(([key]) => key)
+      .sort(),
+  };
+}
