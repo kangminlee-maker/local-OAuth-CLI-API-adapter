@@ -41,10 +41,15 @@ const num = (name, fallback) => {
 };
 
 const live = flag('--live');
-const reps = num('--reps', 24);
-const minReps = num('--min-reps', 12);
-// The design's sequential rule: start at 24, stop when the interval decides, cap
-// at 60. "Decides" here is the 95% interval for the mean being inside this many
+// The design's sequential rule, in the design's own numbers: start at 24, stop
+// when the interval decides, cap at 60 (`docs/conformance-suite-design.md`
+// §"릴리즈 코호트는 vendor당 24개에서 시작해 60개를 상한으로 순차 표집"). The first version
+// shipped 12/24 — half of both — directly under a comment quoting 24/60, so a
+// row could stop at 12 and could never reach 25. The 2026-09-10 run was taken
+// at those halved numbers and its artifact records them in `plan`.
+const reps = num('--reps', 60);
+const minReps = num('--min-reps', 24);
+// "Decides" here is the 95% interval for the mean being inside this many
 // percent of the mean.
 const decisivePct = num('--decisive-pct', 3);
 const budgetCalls = num('--budget', null);
@@ -259,7 +264,11 @@ let aborted = null;
 for (const row of rows) {
   const key = `${row.provider}/${row.task}`;
   const vendor = PROVIDERS[row.provider];
-  const existing = state.rows[key]?.lens ?? [];
+  // Whole samples. The first version stored `lens` alone, so a resumed row came
+  // back with five character readings and two token readings and reported both
+  // as complete — and the floor is taken over the token series. `sampleRow`
+  // refuses a bare-length state rather than restoring half a row.
+  const existing = state.rows[key]?.samples ?? [];
   process.stderr.write(`\n[${key}] ${existing.length}/${reps} already, `
     + `${budget.remaining} calls left in budget\n`);
   let outcome;
@@ -279,8 +288,8 @@ for (const row of rows) {
         timeoutMs: 180_000,
         readAnswer: vendor.readAnswer,
       }),
-      onSample: ({ index, chars, lens }) => {
-        state.rows[key] = { lens, updatedAt: new Date().toISOString() };
+      onSample: ({ index, chars, lens, samples }) => {
+        state.rows[key] = { samples, updatedAt: new Date().toISOString() };
         saveState();
         const reading = summarise(lens);
         process.stderr.write(`  ${index + 1}/${reps} ${chars} chars  `
@@ -299,7 +308,7 @@ for (const row of rows) {
   const settled = outcome.ciHalfWidth !== null && outcome.mean > 0
     && (outcome.ciHalfWidth / outcome.mean) * 100 <= decisivePct;
   results.push({ ...row, prompt: undefined, ...outcome, settled });
-  state.rows[key] = { lens: outcome.lens, updatedAt: new Date().toISOString() };
+  state.rows[key] = { samples: outcome.samples, updatedAt: new Date().toISOString() };
   saveState();
 }
 

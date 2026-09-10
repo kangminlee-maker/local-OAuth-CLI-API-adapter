@@ -304,11 +304,84 @@ test('a resumed row keeps what it already has and asks only for the rest', async
   const taken = [];
   const row = await sampleRow({
     reps: 5,
-    existing: [10, 20, 30],
-    take: async (index) => { taken.push(index); return { chars: 40, outputTokens: 1, latencyMs: 1 }; },
+    existing: [10, 20, 30].map((chars) => ({ chars, outputTokens: chars, thinkingTokens: chars, latencyMs: chars })),
+    take: async (index) => {
+      taken.push(index);
+      return { chars: 40, outputTokens: 41, thinkingTokens: 42, latencyMs: 43 };
+    },
   });
   assert.deepEqual(row.lens, [10, 20, 30, 40, 40]);
   assert.deepEqual(taken, [3, 4], 'a resumed run re-spent calls it had already made');
+  // Every series, not just the one the state file used to hold. A resumed row
+  // that returns five character readings beside two token readings reports both
+  // as complete, and the floor is taken over the token series.
+  assert.deepEqual(row.tokens, [10, 20, 30, 41, 41], 'the token series was not restored');
+  assert.deepEqual(row.thinking, [10, 20, 30, 42, 42], 'the thinking series was not restored');
+  assert.deepEqual(row.latencies, [10, 20, 30, 43, 43], 'the latency series was not restored');
+  assert.equal(row.samples.length, 5);
+});
+
+test('a resume state holding bare lengths is refused, not half-restored', async () => {
+  await assert.rejects(
+    () => sampleRow({ reps: 5, existing: [10, 20, 30], take: async () => ({ chars: 1, outputTokens: 1, latencyMs: 1 }) }),
+    (error) => {
+      assert.ok(error instanceof SamplingAbort, `threw ${error?.name}`);
+      assert.match(error.message, /bare lengths/);
+      return true;
+    },
+  );
+});
+
+test('a retry cannot spend past the shared budget', async () => {
+  const budget = { remaining: 1, spent: 0 };
+  let calls = 0;
+  await assert.rejects(
+    () => sampleRow({
+      reps: 1,
+      budget,
+      maxRetries: 4,
+      sleepFor: async () => {},
+      take: async () => {
+        calls += 1;
+        const error = new Error('429 slow down');
+        error.retryable = true;
+        throw error;
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof SamplingAbort, `threw ${error?.name}`);
+      assert.match(error.message, /budget is spent/);
+      return true;
+    },
+  );
+  // One call is what a ceiling of one authorises. The check used to sit outside
+  // the retry loop while the decrement sat inside it, so this construction made
+  // five metered calls and returned normally.
+  assert.equal(calls, 1, `the budget authorised 1 call and ${calls} were made`);
+  assert.equal(budget.spent, 1);
+  assert.ok(budget.remaining >= 0, `the budget went to ${budget.remaining}`);
+});
+
+test('a retry inside the budget still happens', async () => {
+  const budget = { remaining: 4, spent: 0 };
+  let calls = 0;
+  const row = await sampleRow({
+    reps: 1,
+    budget,
+    sleepFor: async () => {},
+    take: async () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = new Error('429 slow down');
+        error.retryable = true;
+        throw error;
+      }
+      return { chars: 10, outputTokens: 2, thinkingTokens: 1, latencyMs: 3 };
+    },
+  });
+  assert.equal(calls, 2, 'the retry did not happen');
+  assert.deepEqual(row.lens, [10]);
+  assert.equal(budget.spent, 2, 'a retry is a call and must be booked as one');
 });
 
 // --- the floor over a finished run -----------------------------------------

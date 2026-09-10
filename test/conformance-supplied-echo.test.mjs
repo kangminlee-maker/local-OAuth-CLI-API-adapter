@@ -34,6 +34,7 @@ import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, valueDivergencesFor } from '../scripts/lib/response-comparison.mjs';
 import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder,
   createReplayBackend,
+  answerPremiseFailures,
 } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
@@ -168,6 +169,11 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
 
   const differences = [];
   const exhibited = new Set();
+  // Per ROOT, not one total. `compared > 0` summed every claimed root together,
+  // so a row supplying four options passed on the strength of whichever one
+  // echoed — `model`, in every row that had this shape. Two independent reviews
+  // built that case from different directions on the same day.
+  const comparedByRoot = new Map();
   let compared = 0;
   for (const [path, value] of vendorLeaves) {
     // Only what this row claims. The rest of the body is the sibling gate's
@@ -178,6 +184,8 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
     if (PER_CALL.has(rootOf(path)) && !path.endsWith('[]#')) continue;
     if (isDeclaredAbsent(absent, path)) continue;
     compared += 1;
+    const claimedBy = supplied.includes(rootOf(path)) ? rootOf(path) : path;
+    comparedByRoot.set(claimedBy, (comparedByRoot.get(claimedBy) ?? 0) + 1);
     const ourValue = ourLeaves.get(path);
 
     if (ourValue === value) continue;
@@ -201,7 +209,7 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
   }
 
   const echoedPaths = [...vendorLeaves.keys()].filter((path) => supplied.includes(rootOf(path)));
-  return { compared, differences, exhibited, echoedPaths };
+  return { compared, comparedByRoot, differences, exhibited, echoedPaths };
 }
 
 for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harnessPremise, vendorPaths } of CAPTURES) {
@@ -257,23 +265,52 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harne
     const ours = answers.get(fixture);
     assert.equal(ours.status, capture.status, `${fixture}: refused, so there is no echo to read`);
 
-    const { compared, differences, echoedPaths } = readEcho({ fixture, surface, supplied, alsoCompare });
+    const { compared, comparedByRoot, differences, echoedPaths } = readEcho({ fixture, surface, supplied, alsoCompare });
 
-    if (echoed) {
-      // An option that contributes no leaf is an option this row cannot speak
-      // for: the check would pass by comparing nothing.
-      assert.ok(compared > 0, `${fixture}: none of ${supplied.join(', ')} reached the comparison`);
-    } else {
-      // The other direction is a claim too. Chat's answer carries no `n`, no
-      // `logprobs` and no `response_format`, so a client cannot read back what
-      // it asked for — and if that ever changes, this row should fail rather
-      // than quietly start comparing something new.
-      assert.deepEqual(echoedPaths, [], `${fixture}: the vendor now echoes ${supplied.join(', ')}, so this row's claim is stale`);
+    // `echoed` is per ROOT. A boolean says the same thing about every option the
+    // row supplies; a map says it option by option, which is what a row
+    // combining an echoed option with a silent one needs. The single boolean
+    // hid exactly that case: `store: false` alongside `include` claimed both
+    // were echoed, `store` was, and `include` — which R-25 records as producing
+    // no key at all — rode along uncompared.
+    const echoedFor = (root) => (typeof echoed === 'object' && echoed !== null ? echoed[root] === true : echoed === true);
+    if (typeof echoed === 'object' && echoed !== null) {
+      assert.deepEqual(
+        supplied.filter((root) => typeof echoed[root] !== 'boolean'),
+        [],
+        `${fixture}: the echo map does not say what happens to every option this row supplies`,
+      );
+    }
+
+    // EACH option the row says IS echoed must reach a comparison of its own.
+    const speaksFor = supplied.filter((root) => echoedFor(root));
+    const silent = speaksFor.filter((root) => (comparedByRoot.get(root) ?? 0) === 0);
+    assert.deepEqual(silent, [], `${fixture}: ${silent.join(', ')} reached no comparison, so this row does not speak for ${silent.length === 1 ? 'it' : 'them'}`);
+
+    // The other direction is a claim too. Chat's answer carries no `n`, no
+    // `logprobs` and no `response_format`, so a client cannot read back what it
+    // asked for — and if that ever changes, this row should fail rather than
+    // quietly start comparing something new.
+    const silentRoots = supplied.filter((root) => !echoedFor(root));
+    const nowEchoed = echoedPaths.filter((path) => silentRoots.includes(rootOf(path)));
+    assert.deepEqual(nowEchoed, [], `${fixture}: the vendor now echoes ${silentRoots.join(', ')}, so this row's claim is stale`);
+
+    // Each named path, not the count. Two paths where one was compared twice and
+    // another not at all reached the same total.
+    const missing = (alsoCompare ?? []).filter((path) => (comparedByRoot.get(path) ?? 0) === 0);
+    assert.deepEqual(missing, [], `${fixture}: ${missing.join(', ')} did not reach the comparison`);
+    if (speaksFor.length === 0) {
       assert.equal(compared, (alsoCompare ?? []).length, `${fixture}: the paths this row claims did not all reach the comparison`);
     }
     assert.deepEqual(differences, [], `${fixture}: the proxy answers ${supplied.join(', ')} differently`);
   });
 }
+
+test('every row answer describes the turn its own capture recorded', () => {
+  const { failures, checked } = answerPremiseFailures(CAPTURES, (fixture) => JSON.parse(load(fixture).body));
+  assert.deepEqual(failures, [], 'a fixture that contradicts its own capture can hide a defect');
+  assert.ok(checked > 0, 'no answer field was bound to its capture, so this check compared nothing');
+});
 
 // A declaration nothing exercises is a claim nobody checks — and "exercised"
 // has to mean a capture THIS GATE REPLAYS, not a capture that happens to sit in
@@ -328,4 +365,41 @@ test('every capture in the store is replayed by a gate', () => {
   // and the carve-out is what let the registry lose the stream gate unnoticed.
   const unread = stored.filter((name) => !REPLAYED_FIXTURES.has(name));
   assert.deepEqual(unread, [], 'promoted captures that no gate replays');
+});
+
+// The premise check's own controls, on a synthetic roster. The case above runs
+// it over the real one, where every surface happens to be bound and every answer
+// happens to agree — so nothing there can show what it does when they do not.
+test('the premise check refuses an answer on a surface it cannot check', () => {
+  const { failures, checked } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/nowhere', answer: { stopReason: 'end_turn' } }],
+    () => ({}),
+  );
+  assert.equal(checked, 0);
+  assert.equal(failures.length, 1, 'an unbound surface was skipped instead of failing');
+  assert.match(failures[0], /no binding table/);
+});
+
+test('the premise check catches an answer that contradicts its capture', () => {
+  const rows = [{
+    fixture: 'made-up',
+    surface: '/v1/messages',
+    answer: { stopReason: 'end_turn', usage: { cachedInputTokens: 1 } },
+  }];
+  const { failures } = answerPremiseFailures(rows, () => ({
+    stop_reason: 'max_tokens',
+    usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+  }));
+  assert.equal(failures.length, 2, `expected both fields to be caught, got ${JSON.stringify(failures)}`);
+  assert.match(failures.join('\n'), /stopReason/);
+  assert.match(failures.join('\n'), /cachedInputTokens/);
+});
+
+test('the premise check passes an answer that agrees with its capture', () => {
+  const { failures, checked } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: { stopReason: 'max_tokens' } }],
+    () => ({ stop_reason: 'max_tokens', usage: {} }),
+  );
+  assert.deepEqual(failures, []);
+  assert.equal(checked, 1);
 });

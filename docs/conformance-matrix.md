@@ -100,7 +100,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | 12 | `audio` | `{voice, format}`; required when `modalities` includes `audio` | absent | audio bytes in `message.audio.data` | 400 / `invalid_request_error` / `audio` / — | refused as an unknown key (measured: `unknown_parameter`) | VERIFIED (§5.5.5) |
 | 13 | `temperature` | number 0-2 | `1` (see instrument caveat) | sampling spread | 400 / `invalid_request_error` / `temperature` / `unsupported_value` on reasoning models that fix it at 1 | **rejected unless `1`** (null = omission): 400 `unsupported_value`, message `Unsupported value: 'temperature' does not support 0.5 with this model. Only the default (1) value is supported.` — the direct envelope, mirrored (`normalizers.ts` `rejectUnsupportedOpenAiSampling`). Nothing behind the surface applies it | VERIFIED (direct `gpt-5.6-terra` 2026-08-29: 0.5 → 400 `unsupported_value`, 1 → 200) |
 | 14 | `top_p` | number 0-1 | `1` (caveat) | nucleus cutoff | 400 / `invalid_request_error` / `top_p` / `unsupported_parameter` | **rejected unless `1`** (null = omission): 400 `unsupported_parameter`, `Unsupported parameter: 'top_p' is not supported with this model.` | VERIFIED (direct 2026-08-29: 0.5 → 400 `unsupported_parameter`, 1 → 200) |
-| 15 | `n` | integer ≥1 | `1` (caveat) | `choices` array length | 400 / `invalid_request_error` / `n` / — (and `n>1` unsupported on some models) | **validated** (integer, 1..8 — the ceiling measured) **and realized**: n backend turns, one per `choices[]` entry, on the buffered and the streamed path. Usage reports the prompt once and sums the completions, as the direct API does | VERIFIED (§5.5.5; live `n: 2` through the Codex backend: 2 turns, 2 choices, one usage chunk; `n: 1` replayed against `spec/captures/direct-chat-n-one.json`) |
+| 15 | `n` | integer ≥1 | `1` (caveat) | `choices` array length | 400 / `invalid_request_error` / `n` / — (and `n>1` unsupported on some models) | **validated** (integer, 1..8 — the ceiling measured) **and realized**: n backend turns, one per `choices[]` entry, on the buffered and the streamed path. Usage reports the prompt once and sums the completions, as the direct API does | VERIFIED (§5.5.5; live `n: 2` through the Codex backend: 2 turns, 2 choices, one usage chunk) |
 | 16 | `stop` | string \| array (≤4) \| null | `null` | truncates output at the sequence; `finish_reason:"stop"` | 400 / `invalid_request_error` / `stop` / — | **refused** with the direct envelope for this family: `unsupported_parameter` / `param: stop` | VERIFIED (§5.5.5, P-9) |
 | 17 | `max_tokens` | integer (deprecated) | model max | caps output; `finish_reason:"length"` | 400 / `invalid_request_error` / `max_tokens` / `unsupported_parameter` on o-series | **refused** with the direct message: `Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.` | VERIFIED (§5.5.5) |
 | 18 | `max_completion_tokens` | integer | model max | as above, counts reasoning tokens | 400 / `invalid_request_error` / `max_completion_tokens` / — | validated (integer >= 1, `integer_below_min_value` below it) and passed to the backend as the max-token hint | VERIFIED (§5.5.5) |
@@ -240,7 +240,7 @@ So: the repo's total wire-level knowledge of the direct APIs is (a) assertion ou
 | A-14 | `temperature` | number **0..1** | (not applied) | sampling | 400 `invalid_request_error` `temperature: range: 0..1`; non-number or **null** → `temperature: Input should be a valid number` (measured 2026-08-30) | mirrored (`rejectInvalidAnthropicSampling`); a valid value is accepted and inert — the Claude CLI has no sampling control, and nothing echoes it | VERIFIED (§5.5.4) |
 | A-15 | `top_p` | number 0..1 | (not applied) | nucleus | `top_p: range: 0..1` / `Input should be a valid number` (measured) | mirrored; accepted and inert | VERIFIED (§5.5.4) |
 | A-16 | `top_k` | integer (negatives accepted by the direct API) | (not applied) | top-K truncation | non-integer → `top_k: Input should be a valid integer` (measured); `-1` accepted | mirrored; accepted and inert | VERIFIED (§5.5.4) |
-| A-17 | `stop_sequences` | array of strings | `[]` | stops output; `stop_reason:"stop_sequence"` **and `stop_sequence` echoes the matched string** | 400 / `invalid_request_error` | **realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`). Replayed since 2026-09-10 against three captures — a turn that hit the sequence (`spec/captures/direct-messages-stop-sequence-hit.json`, and the P-8 turn `spec/captures/direct-messages-stop-sequence-hit-p8.json`, both answering `stop_reason: "stop_sequence"` with `stop_sequence: "ZZ"`) and one whose `stop_sequences: []` never fires (`spec/captures/direct-messages-stop-sequences-empty.json`, `stop_reason: "max_tokens"`, `stop_sequence: null`). Those three sat unpromoted until the replay could tell its own backend what the vendor's turn had generated: a backend that answers `OK` to everything cannot hit a stop sequence, and the mismatch read as the proxy's | VERIFIED (P-8, §5.5.5-A; `spec/captures/direct-messages-stop-sequence-hit.json`) |
+| A-17 | `stop_sequences` | array of strings | `[]` | stops output; `stop_reason:"stop_sequence"` **and `stop_sequence` echoes the matched string** | 400 / `invalid_request_error` | **realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`). Replayed since 2026-09-10 against three captures — a turn that hit the sequence (`spec/captures/direct-messages-stop-sequence-hit.json`, and the P-8 turn `spec/captures/direct-messages-stop-sequence-hit-p8.json`, both answering `stop_reason: "stop_sequence"` with `stop_sequence: "ZZ"`) and one whose `stop_sequences: []` never fires (`spec/captures/direct-messages-stop-sequences-empty.json`, `stop_reason: "max_tokens"`, `stop_sequence: null`). Those three sat unpromoted until the replay could tell its own backend what the vendor's turn had generated: a backend that answers `OK` to everything cannot hit a stop sequence, and the mismatch read as the proxy's. What the rows compare is the PROXY's own work on that text — `.stop_reason`, `.stop_sequence` and the cut `.content[0].text` — not the option coming back, which this surface never echoes. The first version of these rows compared `.model` and nothing else, and removing the buffered truncation left `AAZZtail` on the wire through a green gate; two independent reviews found that on 2026-09-10 and it is pinned now | VERIFIED (P-8, §5.5.5-A; `spec/captures/direct-messages-stop-sequence-hit.json`) |
 | A-18 | `stream` | boolean | `false` | SSE events | 400 / `invalid_request_error` | supported | VERIFIED-weak (`anthropic.messages.stream`) |
 | A-19 | `tools` | array of `{name, description, input_schema}` + server tools (`web_search`, `bash`, `text_editor`, `computer`, …) | absent | `tool_use` blocks; `stop_reason:"tool_use"` | 400 / `invalid_request_error` | **custom tools only**; server-tool entries UNKNOWN (probe P-35) | VERIFIED-weak (`anthropic.messages.tool_use`) |
 | A-20 | `tools[].input_schema` | JSON Schema object, required | none | argument shape | 400 / `invalid_request_error` | preserved (contract `:311`) | DOC |
@@ -637,7 +637,7 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 | --- | --- | --- |
 | `/v1/chat/completions` | ~~`usage.prompt_tokens_details.cache_write_tokens`~~ → **없음**(2026-09-09 채움) | 없음 |
 | `/v1/responses` | ~~`usage.input_tokens_details.cache_write_tokens`~~(2026-09-09 채움), `reasoning.mode`, `tool_usage.web_search.num_requests`, `tool_usage.image_gen.*`(8개) — 남은 것은 **선언**됨 | 없음 |
-| `/v1/messages` | ~~`usage.output_tokens_details.thinking_tokens`~~ → **없음**(2026-09-10 채움), `usage.cache_creation_input_tokens`·`usage.cache_read_input_tokens`(런타임이 수를 줄 때만 — 아래 결정), `usage.cache_creation`·`.ephemeral_1h_input_tokens`·`.ephemeral_5m_input_tokens`, `usage.service_tier`, `usage.inference_geo` — 남은 것은 **선언**됨(`messages-vendor-routing-usage-is-not-reported`) | 없음 |
+| `/v1/messages` | `usage.cache_creation_input_tokens`·`usage.cache_read_input_tokens`(런타임이 수를 줄 때만 — 아래 결정), `usage.cache_creation`·`.ephemeral_1h_input_tokens`·`.ephemeral_5m_input_tokens`, `usage.output_tokens_details`·`.thinking_tokens`, `usage.service_tier`, `usage.inference_geo` — 전부 **선언**됨(`messages-vendor-routing-usage-is-not-reported`) | 없음 |
 
 **한 방향으로만 어긋난다** — 프록시가 없는 필드를 지어내지는 않는다. 하지만 direct가 늘 주는 필드를 읽는
 클라이언트는 `0`이 아니라 `undefined`를 받는다.
@@ -648,15 +648,24 @@ direct의 가장 긴 문장은 **713자**(항목 타입 유니온)라 미러가 
 캐시를 실제로 쓰지 않는 런타임이 `0`을 보고하는 것과, 보고 자체를 하지 않는 것 중 무엇이 클라이언트에게
 정직한지는 **트레이드오프이지 결함이 아니다** — 이 표는 그 결정을 되돌리지 않고 사실만 남긴다.
 `tool_usage`·`reasoning.mode`는 이 프록시가 실행하지 않는 기능의 보고 필드라 값의 의미를
-따로 측정해야 하며, 추측으로 채우지 않는다.
+따로 측정해야 하며, 추측으로 채우지 않는다. `thinking_tokens`는 이 부류가 아니다 — 아래를 보라.
 
-**`thinking_tokens` 종결(2026-09-10).** 이 줄에 `thinking_tokens`가 같이 적혀 있었던 것은 오분류였다 —
-`cache_write_tokens`와 같은 종류의 착오다. 그것은 **우리 데이터였다**: `LocalUsage.reasoningOutputTokens`가
-이미 있었고, OpenAI 두 표면은 그 값을 `completion_tokens_details.reasoning_tokens`·`output_tokens_details.reasoning_tokens`로
-**줄곧 내보내고 있었다**. `/v1/messages`에서만 빠져 있었으므로, Anthropic SDK로 읽는 클라이언트만 같은 턴의 사고 비용을
-못 받았다 — 문 하나에 따라 다른 답을 하는 이 저장소의 단골 결함 모양이다. `anthropicUsage`가 이제
-`output_tokens_details.thinking_tokens`를 **항상** 내보낸다(OpenAI 쪽과 같은 `?? 0`). 위 캐시 카운터의 조건부는
-그 자리의 다른 판단이며 그대로 남는다.
+**`thinking_tokens`는 여전히 미결이며, 이유가 바뀌었다(2026-09-10).** 이 줄이 `thinking_tokens`를
+`tool_usage`·`reasoning.mode`와 함께 "실행하지 않는 기능의 보고 필드"로 묶어 둔 것은 오분류였다. 그 수는
+**우리 데이터다** — `LocalUsage.reasoningOutputTokens`가 이미 있고, OpenAI 두 표면은 그 값을
+`completion_tokens_details.reasoning_tokens`·`output_tokens_details.reasoning_tokens`로 줄곧 내보낸다.
+
+그래서 같은 날 `anthropicUsage`가 그것을 `?? 0`으로 내보내도록 고쳤고, **같은 날 되돌렸다.** 리뷰가 재현한 것:
+`claude-code-backend.ts`의 `usageFromClaude`는 `reasoningOutputTokens`를 **한 번도 채우지 않는다.**
+`/v1/messages`는 그 백엔드가 서비스하는 표면이므로, 그 필드는 모든 턴에서 상수 `0`이었다 — 생각하는 모델이
+생각하지 않았다고 보고하는 것. `anthropicUsage` 두 줄 위가 캐시 카운터에 대해 이미 내린 판단("A zero is not a
+report")이 그대로 적용된다. OpenAI 두 표면과의 파리티 논거도 순환이었다: 그 둘도 같은 부재를 0으로 강제한다.
+**하나의 결함이 세 표면에 있는 것이지, 맞춰야 할 기준이 아니다.**
+
+측정됐을 때만 보고하는 것이 옳은 답이고, 그것은 한 줄 변경이 아니다 — 두 백엔드의 파서(둘 다 파싱 시점에
+부재를 0으로 강제), 두 병합 함수, 알려진 절반만 더해 총계로 내보내는 Chat fan-out, 그리고 세 직렬화기를
+모두 지나야 하며, 세 벤더 모두 이 필드를 **항상** 보내므로 표면마다 선언이 필요하다.
+`docs/design-task-unmeasured-thinking-tokens.md`로 등록했다.
 
 **종결(2026-09-09).** OpenAI 두 표면의 `cache_write_tokens`는 **추측이 아니라 우리 데이터였다**: `LocalUsage.cacheCreationInputTokens`가
 이미 있었고 `/v1/messages`는 그것을 `cache_creation_input_tokens`로 내보내고 있었다. OpenAI 표면만 그 값을 `cached_tokens`에 **접어 넣어**

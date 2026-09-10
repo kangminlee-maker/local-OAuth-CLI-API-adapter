@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "608f202638d4f374ac22985533516f4832644f677fd7b03a1b7126fa5f93a16a",
+    "matrixDigest": "9323375039ab0620259e5428c019f055f23c385bb8b1921c177e3966adf926e1",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -180,7 +180,7 @@
     {
       "id": "messages-vendor-routing-usage-is-not-reported",
       "surface": "/v1/messages",
-      "evidence": "artifacts/direct-api-captures (six /v1/messages 200 responses), src/proxy/http-server.ts anthropicUsage",
+      "evidence": "artifacts/direct-api-captures (six /v1/messages 200 responses), src/proxy/http-server.ts anthropicUsage; docs/design-task-unmeasured-thinking-tokens.md",
       "measuredAt": "2026-09-10"
     }
   ],
@@ -512,7 +512,7 @@
       "claimedLeadInLegend": false,
       "claimedNote": "**validated** (integer, 1..8 — the ceiling measured) **and realized**: n backend turns, one per `choices[]` entry, on the buffered and the streamed path. Usage reports the prompt once and sums the completions, as the direct API does",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5; live `n: 2` through the Codex backend: 2 turns, 2 choices, one usage chunk; `n: 1` replayed against `spec/captures/direct-chat-n-one.json`)",
+      "evidenceNote": "VERIFIED (§5.5.5; live `n: 2` through the Codex backend: 2 turns, 2 choices, one usage chunk)",
       "liveParityRow": true
     },
     {
@@ -3032,7 +3032,7 @@
       },
       "claimedLead": "realized",
       "claimedLeadInLegend": false,
-      "claimedNote": "**realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`). Replayed since 2026-09-10 against three captures — a turn that hit the sequence (`spec/captures/direct-messages-stop-sequence-hit.json`, and the P-8 turn `spec/captures/direct-messages-stop-sequence-hit-p8.json`, both answering `stop_reason: \"stop_sequence\"` with `stop_sequence: \"ZZ\"`) and one whose `stop_sequences: []` never fires (`spec/captures/direct-messages-stop-sequences-empty.json`, `stop_reason: \"max_tokens\"`, `stop_sequence: null`). Those three sat unpromoted until the replay could tell its own backend what the vendor's turn had generated: a backend that answers `OK` to everything cannot hit a stop sequence, and the mismatch read as the proxy's",
+      "claimedNote": "**realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`). Replayed since 2026-09-10 against three captures — a turn that hit the sequence (`spec/captures/direct-messages-stop-sequence-hit.json`, and the P-8 turn `spec/captures/direct-messages-stop-sequence-hit-p8.json`, both answering `stop_reason: \"stop_sequence\"` with `stop_sequence: \"ZZ\"`) and one whose `stop_sequences: []` never fires (`spec/captures/direct-messages-stop-sequences-empty.json`, `stop_reason: \"max_tokens\"`, `stop_sequence: null`). Those three sat unpromoted until the replay could tell its own backend what the vendor's turn had generated: a backend that answers `OK` to everything cannot hit a stop sequence, and the mismatch read as the proxy's. What the rows compare is the PROXY's own work on that text — `.stop_reason`, `.stop_sequence` and the cut `.content[0].text` — not the option coming back, which this surface never echoes. The first version of these rows compared `.model` and nothing else, and removing the buffered truncation left `AAZZtail` on the wire through a green gate; two independent reviews found that on 2026-09-10 and it is pinned now",
       "evidenceGrade": "VERIFIED",
       "evidenceNote": "VERIFIED (P-8, §5.5.5-A; `spec/captures/direct-messages-stop-sequence-hit.json`)",
       "liveParityRow": true

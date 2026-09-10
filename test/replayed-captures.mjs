@@ -70,6 +70,12 @@ const HARNESS_GAPS_NO_REASONING_ITEM = [
  */
 export const DEFAULT_ANSWER = {
   text: 'OK',
+  // How the turn ENDED, not only what it said. A vendor turn that ran out of
+  // tokens reports `max_tokens`; a fake result with no `stopReason` derives
+  // `end_turn`, so a row comparing stop reasons was comparing a stopped turn
+  // against a finished one and calling the difference the proxy's. Left
+  // undefined here because "the turn simply ended" is what most rows replay.
+  stopReason: undefined,
   usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8, cachedInputTokens: 0, reasoningOutputTokens: 0, source: 'provider' },
 };
 
@@ -106,6 +112,7 @@ export function createReplayBackend() {
           toolCalls: [],
           usage: answer.usage,
           latencyMs: 1,
+          ...(answer.stopReason === undefined ? {} : { stopReason: answer.stopReason }),
         };
       },
       async close() {},
@@ -183,7 +190,10 @@ export const SUPPLIED_ECHO_CAPTURES = [
   { fixture: 'direct-responses-include-encrypted-content', surface: '/v1/responses', supplied: ['include'], echoed: false, vendorPaths: 76 },
   { fixture: 'direct-responses-context-management', surface: '/v1/responses', supplied: ['context_management'], echoed: false, vendorPaths: 76 },
   // Two options at once, and only one of them comes back — which is the claim.
-  { fixture: 'direct-responses-store-false-include-encrypted', surface: '/v1/responses', supplied: ['include', 'store'], echoed: true, vendorPaths: 76 },
+  // Two options, and the surface treats them differently: `store` comes back,
+  // `include` produces no key at all (R-25). One boolean could only claim both,
+  // and claiming `include` was echoed passed for years on `store`'s leaf alone.
+  { fixture: 'direct-responses-store-false-include-encrypted', surface: '/v1/responses', supplied: ['include', 'store'], echoed: { include: false, store: true }, vendorPaths: 76 },
 
   // /v1/chat/completions — this surface echoes almost nothing, and each row
   // below says so about one more option. `service_tier` is the exception.
@@ -216,58 +226,77 @@ export const SUPPLIED_ECHO_CAPTURES = [
   // `stop_sequence` that was actually hit, or cache numbers — and reading that
   // as "the proxy differs" reads the answer we supplied as a fact about the
   // proxy. The vendor side stays frozen; this is our own side's input.
+  // Each of these claims ITS OWN option, not the mandatory request fields that
+  // ride along with it. The first version listed `max_tokens`, `messages` and
+  // `model` beside the option and set `echoed: true`, which passed because
+  // `model` comes back — one echoing root satisfying a row that claimed four.
+  // Two independent reviews reached that from different directions on the same
+  // day. What each row compares now is the option's own observable EFFECT.
   {
     fixture: 'direct-messages-metadata-user-id',
     surface: '/v1/messages',
-    supplied: ['max_tokens', 'messages', 'metadata', 'model'],
-    echoed: true,
+    supplied: ['metadata'],
+    // Neither side sends it back. That is the claim: A-27 says the proxy
+    // validates `metadata.user_id` and does not apply it, and the vendor's own
+    // answer carries no `metadata` key either.
+    echoed: false,
     vendorPaths: 20,
-    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+    answer: { text: '', stopReason: 'max_tokens', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
   },
   {
     fixture: 'direct-messages-service-tier-standard-only',
     surface: '/v1/messages',
-    supplied: ['max_tokens', 'messages', 'model', 'service_tier'],
-    echoed: true,
+    supplied: ['service_tier'],
+    // Not echoed at the top level by either side. Where the vendor DOES report
+    // the tier — `usage.service_tier` — is declared absent for this proxy, so
+    // the shape half of this row is what carries that claim.
+    echoed: false,
     vendorPaths: 20,
-    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+    answer: { text: '', stopReason: 'max_tokens', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
   },
   {
     fixture: 'direct-messages-inference-geo-us',
     surface: '/v1/messages',
-    supplied: ['inference_geo', 'max_tokens', 'messages', 'model'],
-    echoed: true,
+    supplied: ['inference_geo'],
+    echoed: false,
     vendorPaths: 20,
-    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+    answer: { text: '', stopReason: 'max_tokens', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
   },
   {
     fixture: 'direct-messages-stop-sequences-empty',
     surface: '/v1/messages',
-    supplied: ['max_tokens', 'messages', 'model', 'stop_sequences'],
-    echoed: true,
+    supplied: ['stop_sequences'],
+    echoed: false,
+    // An empty list cannot fire, so the turn runs to the token limit instead.
+    // Both halves are the claim: the reason it stopped, and that no sequence is
+    // named.
+    alsoCompare: ['.stop_reason', '.stop_sequence'],
     vendorPaths: 20,
-    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+    answer: { text: '', stopReason: 'max_tokens', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
   },
   {
-    // The vendor's own text ran into `ZZ`, so its turn reports which sequence
-    // stopped it. Ours has to contain one too or the row compares a stopped turn
-    // against a finished one.
+    // The vendor's own text ran into `ZZ`. Ours is given text that contains one
+    // too, and what this row compares is what the PROXY then did with it: the
+    // text cut before the sequence, the reason, and which sequence was matched.
+    // Removing the buffered truncation leaves `AAZZtail` on the wire, and until
+    // these three paths were compared this gate stayed green through it.
     fixture: 'direct-messages-stop-sequence-hit',
     surface: '/v1/messages',
-    supplied: ['max_tokens', 'messages', 'model', 'stop_sequences'],
-    echoed: true,
+    supplied: ['stop_sequences'],
+    echoed: false,
+    alsoCompare: ['.stop_reason', '.stop_sequence', '.content[0].text', '.content[0].type'],
     vendorPaths: 23,
-    answer: { text: 'AAZZtail', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+    answer: { text: 'AAZZtail', stopReason: 'stop_sequence', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
   },
   {
     fixture: 'direct-messages-stop-sequence-hit-p8',
     surface: '/v1/messages',
-    supplied: ['max_tokens', 'messages', 'model', 'stop_sequences'],
-    echoed: true,
+    supplied: ['stop_sequences'],
+    echoed: false,
+    alsoCompare: ['.stop_reason', '.stop_sequence', '.content[0].text', '.content[0].type'],
     vendorPaths: 23,
-    answer: { text: 'AAZZtail', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+    answer: { text: 'AAZZtail', stopReason: 'stop_sequence', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
   },
-  { fixture: 'direct-chat-n-one', surface: '/v1/chat/completions', supplied: ['max_completion_tokens', 'messages', 'model', 'n'], echoed: true, vendorPaths: 28 },
 ];
 
 // The two denominators, pinned rather than bounded. `echoedDefaults` counts the
@@ -404,4 +433,61 @@ export function assertRosterReplayed(group, seen) {
     return `${call.surface} ${call.request} (${named?.fixture ?? 'no row in the registry sends these bytes here'})`;
   });
   assert.deepEqual(measured.sort(), expected.sort(), `${group}: what crossed the wire is not what the registry names`);
+}
+
+/**
+ * Where a row's `answer` names something the vendor's own body also reports.
+ *
+ * A row's `answer` is our own side's INPUT, and an input can be chosen to make a
+ * comparison pass. A review built exactly that: adding `cachedInputTokens: 1` to
+ * six rows' answers turned a real proxy defect — dropping the runtime's explicit
+ * cache-read report — from six red tests into 117 green ones. Nothing checked
+ * that an answer described the turn the frozen capture recorded.
+ */
+export const ANSWER_BINDINGS = {
+  '/v1/messages': [
+    ['stopReason', (body) => body.stop_reason],
+    ['usage.cacheCreationInputTokens', (body) => body.usage?.cache_creation_input_tokens],
+    ['usage.cacheReadInputTokens', (body) => body.usage?.cache_read_input_tokens],
+    ['usage.cachedInputTokens', (body) => (body.usage?.cache_creation_input_tokens ?? 0)
+      + (body.usage?.cache_read_input_tokens ?? 0)],
+  ],
+};
+
+/**
+ * Every way a roster's answers contradict the captures they are replayed
+ * against, plus how many fields were actually compared.
+ *
+ * This does not make an answer "right". It makes an answer that CONTRADICTS its
+ * own capture a failure, which is the shape a compensating fixture has to take.
+ * A surface with no binding table is itself a failure: skipping one silently is
+ * how a premise stops being checked.
+ */
+export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) {
+  const read = (answer, dotted) => dotted.split('.').reduce(
+    (value, key) => (value === undefined || value === null ? undefined : value[key]),
+    answer,
+  );
+  const failures = [];
+  let checked = 0;
+  for (const { fixture, surface, answer } of rows) {
+    if (!answer) continue;
+    const table = bindings[surface];
+    if (!table) {
+      failures.push(`${fixture}: ${surface} has an answer but no binding table, so its premise is unchecked`);
+      continue;
+    }
+    const vendor = bodyOf(fixture);
+    for (const [field, ofVendor] of table) {
+      const supplied = read(answer, field);
+      if (supplied === undefined) continue;
+      checked += 1;
+      const theirs = ofVendor(vendor);
+      if (JSON.stringify(supplied) !== JSON.stringify(theirs)) {
+        failures.push(`${fixture}: the answer says ${field} is ${JSON.stringify(supplied)}, `
+          + `the capture says ${JSON.stringify(theirs)}`);
+      }
+    }
+  }
+  return { failures, checked };
 }

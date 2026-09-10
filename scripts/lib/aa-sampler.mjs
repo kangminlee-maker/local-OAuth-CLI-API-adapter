@@ -136,15 +136,22 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Three limits, all of them real:
  *   - `maxConsecutiveFailures` ends THIS row and dead-letters it.
  *   - `budget.remaining` ends the whole run — a shared counter across rows, so a
- *     resumed run cannot spend the batch twice.
+ *     resumed run cannot spend the batch twice. It is checked before EVERY call
+ *     including a retry, and its exhaustion is a `SamplingAbort` that passes
+ *     through the row's own failure handling rather than counting as one.
  *   - `decisiveWhen(reading)` stops early once the mean's interval is tight
  *     enough, which is the design's own sequential rule: start at 24, cap at
  *     60, stop when the interval decides.
+ *
+ * `existing` resumes a row from whole SAMPLES, not from character lengths. A
+ * bare-length state is refused: it cannot say what the token or thinking
+ * readings for those calls were, and a floor taken over a partly-restored
+ * series is not the floor.
  */
 export async function sampleRow({
   reps,
   take,
-  minReps = 12,
+  minReps = 24,
   // Decided as a QUESTION about the reading, not a number of characters. Rows
   // here run from ~350 to ~1100 characters, so one absolute half-width would
   // stop the short rows far too early and never stop the long ones.
@@ -163,38 +170,59 @@ export async function sampleRow({
   jitterFor = () => Math.floor(Math.random() * 250),
   existing = [],
 }) {
-  const lens = [...existing];
-  const tokens = [];
-  const thinking = [];
-  const latencies = [];
+  // Whole SAMPLES, not a length. A resumed row used to carry `lens` alone and
+  // start every other series empty, so a run that stopped and continued
+  // reported five character readings beside two token readings as if both were
+  // complete — and the floor is taken over the token series. One record per
+  // sample makes that unrepresentable: the series are derived from it at the
+  // end, never accumulated in parallel.
+  const samples = existing.map((entry) => {
+    if (typeof entry === 'number' || entry === null || typeof entry !== 'object') {
+      throw new SamplingAbort('resume state holds bare lengths, not samples: it cannot say what the '
+        + 'token or thinking readings for those calls were, and a floor taken over a partly-restored '
+        + 'series is not the floor. Re-run the row, or re-record the state with whole samples.');
+    }
+    return entry;
+  });
+  const lensOf = () => samples.map((sample) => sample.chars);
   const failures = [];
   let consecutive = 0;
 
-  for (let index = lens.length; index < reps; index += 1) {
-    if (budget && budget.remaining <= 0) {
-      throw new SamplingAbort(`the run's call budget is spent (${budget.spent} used)`);
-    }
+  for (let index = samples.length; index < reps; index += 1) {
     let attempt = 0;
     let done = false;
     while (!done) {
       try {
+        // Inside the retry loop, because a retry is a CALL. The check used to
+        // sit outside it and the decrement inside, so a row that began its last
+        // permitted call and hit a 429 spent up to `maxRetries` more — five
+        // metered calls against a ceiling of one.
+        if (budget && budget.remaining <= 0) {
+          throw new SamplingAbort(`the run's call budget is spent (${budget.spent} used)`);
+        }
         if (budget) { budget.remaining -= 1; budget.spent += 1; }
         const sample = await take(index);
-        lens.push(sample.chars);
-        if (typeof sample.outputTokens === 'number') tokens.push(sample.outputTokens);
-        if (typeof sample.thinkingTokens === 'number') thinking.push(sample.thinkingTokens);
-        if (typeof sample.latencyMs === 'number') latencies.push(sample.latencyMs);
+        samples.push({
+          chars: sample.chars,
+          outputTokens: sample.outputTokens,
+          thinkingTokens: sample.thinkingTokens,
+          latencyMs: sample.latencyMs,
+        });
         consecutive = 0;
         done = true;
-        onSample({ index, ...sample, lens: [...lens] });
+        onSample({ index, ...sample, samples: [...samples], lens: lensOf() });
       } catch (error) {
+        // An exhausted budget ends the RUN. Booking it as this row's failure
+        // would let the next row start, and the three-failures rule would read
+        // "we ran out of money" as "this row is broken".
+        if (error instanceof SamplingAbort) throw error;
         const retryable = error?.retryable === true && attempt < maxRetries;
         failures.push({ index, attempt, retryable, said: String(error?.message ?? error) });
         if (!retryable) {
           consecutive += 1;
           done = true;
           if (consecutive >= maxConsecutiveFailures) {
-            return { lens, tokens, thinking, latencies, failures, deadLettered: true, ...summarise(lens) };
+            return { ...seriesOf(samples), failures, deadLettered: true, ...summarise(lensOf()) };
           }
         } else {
           attempt += 1;
@@ -206,12 +234,12 @@ export async function sampleRow({
       }
     }
 
-    const reading = summarise(lens);
+    const reading = summarise(lensOf());
     if (decisiveWhen !== null
-        && lens.length >= minReps
+        && samples.length >= minReps
         && reading.ciHalfWidth !== null
         && decisiveWhen(reading)) {
-      return { lens, tokens, thinking, latencies, failures, deadLettered: false, stoppedEarly: true, ...reading };
+      return { ...seriesOf(samples), failures, deadLettered: false, stoppedEarly: true, ...reading };
     }
   }
 
@@ -220,10 +248,32 @@ export async function sampleRow({
   // its retries, say — used to return `deadLettered: false` with `n: 0`, which
   // is a hole a summary has to be read carefully to notice.
   return {
-    lens, tokens, thinking, latencies, failures,
-    deadLettered: lens.length === 0,
+    ...seriesOf(samples),
+    failures,
+    deadLettered: samples.length === 0,
     stoppedEarly: false,
-    ...summarise(lens),
+    ...summarise(lensOf()),
+  };
+}
+
+/**
+ * The four series a run publishes, derived from the samples that produced them.
+ *
+ * A series drops a sample only where that sample carries no such measurement —
+ * a turn whose answer arrived with no usage block has a character count and no
+ * token count — so a series can legitimately be shorter than `samples`. What it
+ * can no longer be is shorter because the row was RESUMED, which is the whole
+ * reason the samples are kept whole. `samples` is returned beside them so the
+ * pairing is recoverable from the artifact.
+ */
+function seriesOf(samples) {
+  const series = (key) => samples.map((sample) => sample[key]).filter((value) => typeof value === 'number');
+  return {
+    samples: [...samples],
+    lens: series('chars'),
+    tokens: series('outputTokens'),
+    thinking: series('thinkingTokens'),
+    latencies: series('latencyMs'),
   };
 }
 

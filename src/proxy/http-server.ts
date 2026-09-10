@@ -2522,18 +2522,24 @@ function anthropicUsage(usage: LocalUsage): Record<string, unknown> {
       ? { cache_creation_input_tokens: usage.cacheCreationInputTokens }
       : {}),
     ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
-    // The same number the OpenAI shapes have always published as
-    // `reasoning_tokens`, under the name this surface's vendor uses. It was
-    // missing here and nowhere else, so a client reading thinking cost through
-    // an Anthropic SDK got nothing while the same turn reported it through the
-    // other two — one runtime answering the same question differently depending
-    // on which door was used, which is the defect shape this repository keeps
-    // producing. Unconditional `?? 0` because that is what the OpenAI shapes do
-    // with the same field; the cache numbers above stay conditional for the
-    // reason written over them, which is a different question.
-    output_tokens_details: {
-      thinking_tokens: usage.reasoningOutputTokens ?? 0,
-    },
+    // `output_tokens_details.thinking_tokens` is NOT here, and the reason is
+    // the sentence above about the cache. A version of this function published
+    // it as `usage.reasoningOutputTokens ?? 0` on 2026-09-10, arguing parity
+    // with the OpenAI shapes, which publish the same value as
+    // `reasoning_tokens`. A review reproduced what that does behind the runtime
+    // this surface exists for: `claude-code-backend.ts` never populates
+    // `reasoningOutputTokens` at all, so the field was a hard `0` on every turn
+    // — a thinking model reporting that it did not think. The parity argument
+    // was circular besides: the OpenAI shapes coerce the same absence to zero,
+    // which makes it one defect on three surfaces rather than a standard to
+    // match.
+    //
+    // Reporting it only when the runtime measures it is the right answer and is
+    // not a one-line change: it has to survive the two backends' parsers (both
+    // coerce an absent count to 0), the two merge functions, the Chat fan-out
+    // that sums a known subset as if it were a total, and three serializers —
+    // and each surface's vendor ALWAYS emits the field, so each needs its own
+    // declaration. That is `docs/design-task-unmeasured-thinking-tokens.md`.
   };
 }
 
