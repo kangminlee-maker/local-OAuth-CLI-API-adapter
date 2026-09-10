@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "9dca31e6452f3599ee95e8e472a1450710e29df389a7cfd16c863a446977dadc",
+    "matrixDigest": "608f202638d4f374ac22985533516f4832644f677fd7b03a1b7126fa5f93a16a",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -176,6 +176,12 @@
       "surface": "/v1/responses",
       "evidence": "spec/captures/direct-responses-reasoning-summary-auto.json; docs/conformance-matrix.md R-22",
       "measuredAt": "2026-09-09"
+    },
+    {
+      "id": "messages-vendor-routing-usage-is-not-reported",
+      "surface": "/v1/messages",
+      "evidence": "artifacts/direct-api-captures (six /v1/messages 200 responses), src/proxy/http-server.ts anthropicUsage",
+      "measuredAt": "2026-09-10"
     }
   ],
   "claims": [
@@ -506,7 +512,7 @@
       "claimedLeadInLegend": false,
       "claimedNote": "**validated** (integer, 1..8 — the ceiling measured) **and realized**: n backend turns, one per `choices[]` entry, on the buffered and the streamed path. Usage reports the prompt once and sums the completions, as the direct API does",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5; live `n: 2` through the Codex backend: 2 turns, 2 choices, one usage chunk)",
+      "evidenceNote": "VERIFIED (§5.5.5; live `n: 2` through the Codex backend: 2 turns, 2 choices, one usage chunk; `n: 1` replayed against `spec/captures/direct-chat-n-one.json`)",
       "liveParityRow": true
     },
     {
@@ -3026,9 +3032,9 @@
       },
       "claimedLead": "realized",
       "claimedLeadInLegend": false,
-      "claimedNote": "**realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`)",
+      "claimedNote": "**realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`). Replayed since 2026-09-10 against three captures — a turn that hit the sequence (`spec/captures/direct-messages-stop-sequence-hit.json`, and the P-8 turn `spec/captures/direct-messages-stop-sequence-hit-p8.json`, both answering `stop_reason: \"stop_sequence\"` with `stop_sequence: \"ZZ\"`) and one whose `stop_sequences: []` never fires (`spec/captures/direct-messages-stop-sequences-empty.json`, `stop_reason: \"max_tokens\"`, `stop_sequence: null`). Those three sat unpromoted until the replay could tell its own backend what the vendor's turn had generated: a backend that answers `OK` to everything cannot hit a stop sequence, and the mismatch read as the proxy's",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (P-8, §5.5.5-A)",
+      "evidenceNote": "VERIFIED (P-8, §5.5.5-A; `spec/captures/direct-messages-stop-sequence-hit.json`)",
       "liveParityRow": true
     },
     {
@@ -3246,9 +3252,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated as the direct API validates it — `user_id` only, and a string — then not applied",
+      "claimedNote": "validated as the direct API validates it — `user_id` only, and a string — then not applied. Not applied and **not echoed either**, which the replay compares: the direct API's own answer carries no `metadata` key back, so the two sides agree on the whole envelope (`spec/captures/direct-messages-metadata-user-id.json`, replayed by `conformance-supplied-echo.test`)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "evidenceNote": "VERIFIED (§5.5.5-A; `spec/captures/direct-messages-metadata-user-id.json`)",
       "liveParityRow": true
     },
     {
@@ -3268,9 +3274,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated (`Input should be 'auto' or 'standard_only'`) and not applied. `usage.service_tier` is **not emitted**, where the direct API always emits it: a local CLI runs in no tier, and the proxy reports the runtime's numbers rather than inventing one",
+      "claimedNote": "validated (`Input should be 'auto' or 'standard_only'`) and not applied. `usage.service_tier` is **not emitted**, where the direct API always emits it: a local CLI runs in no tier, and the proxy reports the runtime's numbers rather than inventing one. That absence stopped being prose on 2026-09-10 — it is declared as `messages-vendor-routing-usage-is-not-reported` in `spec/declared-divergences.json` and replayed against the capture, so a build that started emitting a tier fails the gate instead of quietly agreeing with a paragraph (`spec/captures/direct-messages-service-tier-standard-only.json`)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "evidenceNote": "VERIFIED (§5.5.5-A; `spec/captures/direct-messages-service-tier-standard-only.json`)",
       "liveParityRow": true
     },
     {
@@ -3312,9 +3318,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated (`must be one of ['global', 'us']`) and not applied; `usage.inference_geo` is not emitted, for the same reason as A-28",
+      "claimedNote": "validated (`must be one of ['global', 'us']`) and not applied; `usage.inference_geo` is not emitted, for the same reason as A-28 and under the same declaration — the capture shows the direct API echoing the REQUESTED geography back in `usage.inference_geo: \"us\"`, which is exactly the routing claim this proxy has no route to make (`spec/captures/direct-messages-inference-geo-us.json`)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "evidenceNote": "VERIFIED (§5.5.5-A; `spec/captures/direct-messages-inference-geo-us.json`)",
       "liveParityRow": true
     },
     {

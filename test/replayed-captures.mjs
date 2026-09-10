@@ -62,6 +62,57 @@ const HARNESS_GAPS_NO_REASONING_ITEM = [
 //                per row so it cannot quietly cover a real gap.
 //   vendorPaths  how much shape the comparison actually reads. The vendor side
 //                is frozen, so this number only moves when the fixture does.
+/**
+ * What the backend behind the replay answers, when a row does not say otherwise.
+ *
+ * `text: 'OK'` and no cache numbers is what both gates hardcoded, separately, in
+ * two copies of the same closure.
+ */
+export const DEFAULT_ANSWER = {
+  text: 'OK',
+  usage: { inputTokens: 7, outputTokens: 1, totalTokens: 8, cachedInputTokens: 0, reasoningOutputTokens: 0, source: 'provider' },
+};
+
+/**
+ * The fake backend both live gates run behind, answerable per row.
+ *
+ * A row's shape is not always a function of the OPTION it supplies. A vendor
+ * turn that hit `max_tokens` before writing anything has an empty `content`; a
+ * turn whose text ran into a `stop_sequence` reports which one; a turn served
+ * from cache reports what it read. None of those can be replayed by a backend
+ * that says `OK` to everything, and the rows that need them sat unpromoted for
+ * exactly that reason — read as "the proxy differs" when what differed was the
+ * answer it had been given.
+ *
+ * The vendor side stays frozen. What this changes is our own side's INPUT, which
+ * is a fixture choice like the request bytes are, and it is declared in the same
+ * registry the rows live in so a row and its answer cannot come apart.
+ */
+export function createReplayBackend() {
+  let answer = DEFAULT_ANSWER;
+  return {
+    /** Answer the next replayed request this way. Called before each fetch. */
+    answerWith(next) {
+      answer = { ...DEFAULT_ANSWER, ...(next ?? {}), usage: { ...DEFAULT_ANSWER.usage, ...(next?.usage ?? {}) } };
+    },
+    backend: {
+      name: 'fake-backend',
+      model: 'fake-local-model',
+      async generate(request) {
+        return {
+          id: 'local_test',
+          model: request.model,
+          text: answer.text,
+          toolCalls: [],
+          usage: answer.usage,
+          latencyMs: 1,
+        };
+      },
+      async close() {},
+    },
+  };
+}
+
 export const SUPPLIED_ECHO_CAPTURES = [
   { fixture: 'direct-responses-service-tier-flex', surface: '/v1/responses', supplied: ['service_tier'], echoed: true, vendorPaths: 76 },
   { fixture: 'direct-responses-store-false', surface: '/v1/responses', supplied: ['store'], echoed: true, vendorPaths: 76 },
@@ -159,6 +210,64 @@ export const SUPPLIED_ECHO_CAPTURES = [
   { fixture: 'direct-chat-message-name', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
   { fixture: 'direct-chat-message-unknown-member', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
   { fixture: 'direct-chat-message-refusal', surface: '/v1/chat/completions', supplied: ['messages'], echoed: false, vendorPaths: 28 },
+  // Six turns whose shape is a function of what the VENDOR generated rather than
+  // of the option supplied, each answered here the way its own turn went. A
+  // backend that says `OK` to everything cannot produce an empty `content`, a
+  // `stop_sequence` that was actually hit, or cache numbers — and reading that
+  // as "the proxy differs" reads the answer we supplied as a fact about the
+  // proxy. The vendor side stays frozen; this is our own side's input.
+  {
+    fixture: 'direct-messages-metadata-user-id',
+    surface: '/v1/messages',
+    supplied: ['max_tokens', 'messages', 'metadata', 'model'],
+    echoed: true,
+    vendorPaths: 20,
+    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+  },
+  {
+    fixture: 'direct-messages-service-tier-standard-only',
+    surface: '/v1/messages',
+    supplied: ['max_tokens', 'messages', 'model', 'service_tier'],
+    echoed: true,
+    vendorPaths: 20,
+    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+  },
+  {
+    fixture: 'direct-messages-inference-geo-us',
+    surface: '/v1/messages',
+    supplied: ['inference_geo', 'max_tokens', 'messages', 'model'],
+    echoed: true,
+    vendorPaths: 20,
+    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+  },
+  {
+    fixture: 'direct-messages-stop-sequences-empty',
+    surface: '/v1/messages',
+    supplied: ['max_tokens', 'messages', 'model', 'stop_sequences'],
+    echoed: true,
+    vendorPaths: 20,
+    answer: { text: '', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+  },
+  {
+    // The vendor's own text ran into `ZZ`, so its turn reports which sequence
+    // stopped it. Ours has to contain one too or the row compares a stopped turn
+    // against a finished one.
+    fixture: 'direct-messages-stop-sequence-hit',
+    surface: '/v1/messages',
+    supplied: ['max_tokens', 'messages', 'model', 'stop_sequences'],
+    echoed: true,
+    vendorPaths: 23,
+    answer: { text: 'AAZZtail', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+  },
+  {
+    fixture: 'direct-messages-stop-sequence-hit-p8',
+    surface: '/v1/messages',
+    supplied: ['max_tokens', 'messages', 'model', 'stop_sequences'],
+    echoed: true,
+    vendorPaths: 23,
+    answer: { text: 'AAZZtail', usage: { cacheCreationInputTokens: 0, cacheReadInputTokens: 0 } },
+  },
+  { fixture: 'direct-chat-n-one', surface: '/v1/chat/completions', supplied: ['max_completion_tokens', 'messages', 'model', 'n'], echoed: true, vendorPaths: 28 },
 ];
 
 // The two denominators, pinned rather than bounded. `echoedDefaults` counts the

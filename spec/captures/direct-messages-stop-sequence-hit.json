@@ -1,0 +1,33 @@
+{
+  "claimEvidence": "direct-messages-stop-sequence-hit",
+  "originRoot": "artifacts/direct-api-captures",
+  "originRun": "3e0b8b03-d858-441c-a895-c57deac20f83",
+  "originFile": "0083-value-metadata.user_id-stop_sequences-hit.json",
+  "promotedAt": "2026-09-10T13:39:20.004Z",
+  "requiredContent": {
+    "mustContain": null,
+    "mustNotContain": null,
+    "requestMustBe": "{\"model\":\"claude-sonnet-5\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: AAZZBB\"}],\"stop_sequences\":[\"ZZ\"]}"
+  },
+  "promotedFrom": {
+    "revision": "933324954beaacb4e6603bcdc85e2c9e453e2ca6",
+    "sources": [
+      {
+        "path": "scripts/lib/capture-provenance.mjs",
+        "blob": "cdfaf9f32fef52eac3b97e7f43602c036153f7d6"
+      },
+      {
+        "path": "scripts/promote-capture.mjs",
+        "blob": "ed5a0dbc6f07ca6440c9a4d2bcef11051b65f8b2"
+      }
+    ]
+  },
+  "url": "https://api.anthropic.com/v1/messages",
+  "status": 200,
+  "kind": "json",
+  "requestSha256": "b042b724d0ac52d1d0a303518b43b3bf794c40c5ed1e1e98dc065eb56848918f",
+  "request": "{\"model\":\"claude-sonnet-5\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: AAZZBB\"}],\"stop_sequences\":[\"ZZ\"]}",
+  "bodySha256": "eb87fd00c9ea162ac5244a356c596f8d8fb2aedbf093db600cf6044fc21dbf98",
+  "bodyBytes": 492,
+  "body": "{\"model\":\"claude-sonnet-5\",\"id\":\"msg_011CeYfDZ9Ym4Hr7yW9uiP3w\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"AA\"}],\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"ZZ\",\"stop_details\":null,\"usage\":{\"input_tokens\":20,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0},\"output_tokens\":4,\"output_tokens_details\":{\"thinking_tokens\":0},\"service_tier\":\"standard\",\"inference_geo\":\"global\"}}"
+}

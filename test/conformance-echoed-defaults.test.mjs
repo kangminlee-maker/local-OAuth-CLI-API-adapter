@@ -31,7 +31,9 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
-import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed, startReplayRecorder } from './replayed-captures.mjs';
+import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed, startReplayRecorder,
+  createReplayBackend,
+} from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
@@ -58,36 +60,17 @@ test('the gate covers the surfaces it claims to, once each', () => {
 });
 
 let started;
+let replay;
 let recorder;
 const bodies = new Map();
 
 before(async () => {
+  replay = createReplayBackend();
   started = await startLocalApiProxy({
     host: '127.0.0.1',
     port: 0,
     requestTimeoutMs: 10_000,
-    backend: {
-      name: 'fake-backend',
-      model: 'fake-local-model',
-      async generate(request) {
-        return {
-          id: 'local_test',
-          model: request.model,
-          text: 'OK',
-          toolCalls: [],
-          usage: {
-            inputTokens: 7,
-            outputTokens: 1,
-            totalTokens: 8,
-            cachedInputTokens: 0,
-            reasoningOutputTokens: 0,
-            source: 'provider',
-          },
-          latencyMs: 1,
-        };
-      },
-      async close() {},
-    },
+    backend: replay.backend,
   });
   recorder = await startReplayRecorder(started.url);
 
@@ -96,8 +79,9 @@ before(async () => {
   // body is not "every optional field omitted" either: it supplies the output
   // cap to bound what the probe costs, which is why the check below counts
   // supplied echoes apart from defaults.
-  for (const { surface, fixture } of SURFACES) {
+  for (const { surface, fixture, answer } of SURFACES) {
     const capture = load(fixture);
+    replay.answerWith(answer);
     const res = await fetch(`${recorder.url}${surface}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },

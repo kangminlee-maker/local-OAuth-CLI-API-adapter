@@ -2505,7 +2505,7 @@ function missingTextTail(streamed: string, final: string): string {
   return final.startsWith(streamed) ? final.slice(streamed.length) : '';
 }
 
-function anthropicUsage(usage: LocalUsage): Record<string, number> {
+function anthropicUsage(usage: LocalUsage): Record<string, unknown> {
   // A zero is not a report: the OpenAI-shaped producers read `cached_tokens`
   // with a numeric default, and merged usages sum absent halves into 0, so
   // treating 0 as "this runtime reports caching" put `cache_read_input_tokens:
@@ -2522,6 +2522,18 @@ function anthropicUsage(usage: LocalUsage): Record<string, number> {
       ? { cache_creation_input_tokens: usage.cacheCreationInputTokens }
       : {}),
     ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+    // The same number the OpenAI shapes have always published as
+    // `reasoning_tokens`, under the name this surface's vendor uses. It was
+    // missing here and nowhere else, so a client reading thinking cost through
+    // an Anthropic SDK got nothing while the same turn reported it through the
+    // other two — one runtime answering the same question differently depending
+    // on which door was used, which is the defect shape this repository keeps
+    // producing. Unconditional `?? 0` because that is what the OpenAI shapes do
+    // with the same field; the cache numbers above stay conditional for the
+    // reason written over them, which is a different question.
+    output_tokens_details: {
+      thinking_tokens: usage.reasoningOutputTokens ?? 0,
+    },
   };
 }
 

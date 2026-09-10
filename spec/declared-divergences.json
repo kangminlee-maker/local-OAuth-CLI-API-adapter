@@ -149,6 +149,22 @@
       "why": "One sample of one alias at one effort is not an alias table. Mirroring it would encode `auto -> detailed` for every effort and every model on the strength of a single turn, and the value is precisely the one a client reads to learn what it will get. Matrix R-22 records the larger fact: this proxy emits no reasoning summaries at all, so resolving the alias would name a summary style for a summary that never arrives. Measuring `auto` at the other efforts is three cheap calls and is listed in the probe plan.",
       "measuredAt": "2026-09-09",
       "evidence": "spec/captures/direct-responses-reasoning-summary-auto.json; docs/conformance-matrix.md R-22"
+    },
+    {
+      "id": "messages-vendor-routing-usage-is-not-reported",
+      "surface": "/v1/messages",
+      "claim": "supplied-echo",
+      "absentPaths": [
+        ".usage.service_tier",
+        ".usage.inference_geo",
+        ".usage.cache_creation",
+        ".usage.cache_creation.ephemeral_5m_input_tokens",
+        ".usage.cache_creation.ephemeral_1h_input_tokens"
+      ],
+      "behavior": "The direct API reports four things about how IT ran the turn: which service tier served it, which inference geography it ran in, and a breakdown of cache writes by the TTL they were written at. This proxy reports none of them. It does report `cache_creation_input_tokens` and `cache_read_input_tokens` when the runtime behind it gives numbers for them, and `output_tokens_details.thinking_tokens` always — those are not in this declaration.",
+      "why": "Measured 2026-09-10 over the six anthropic captures in `artifacts/direct-api-captures`: `service_tier` is \"standard\" in all six, `inference_geo` is \"global\" or \"us\" following the request, and `cache_creation` carries `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`, 0 in all six. Each names a mechanism this proxy does not have rather than a number it is failing to pass on. There is no tier system here: one local runtime answers every turn. There is no inference geography: the runtime is the machine the proxy runs on, and echoing the requested value would publish a routing claim nothing routes. And the cache TTL breakdown needs a cache that distinguishes a five-minute write from a one-hour one, which neither backend reports — the flat `cache_creation_input_tokens` is as fine-grained as what reaches us. Filling any of them with a constant would be this proxy claiming to run an infrastructure it does not run.",
+      "measuredAt": "2026-09-10",
+      "evidence": "artifacts/direct-api-captures (six /v1/messages 200 responses), src/proxy/http-server.ts anthropicUsage"
     }
   ]
 }

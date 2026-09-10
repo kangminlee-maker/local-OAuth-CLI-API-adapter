@@ -32,7 +32,9 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, valueDivergencesFor } from '../scripts/lib/response-comparison.mjs';
-import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder } from './replayed-captures.mjs';
+import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder,
+  createReplayBackend,
+} from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 // A capture this gate's roster does not name cannot be read here. A review
@@ -47,6 +49,7 @@ const load = (name) => {
 };
 
 let started;
+let replay;
 let recorder;
 const answers = new Map();
 // A declared value divergence is identified by the WHOLE tuple. Keying it by
@@ -60,35 +63,25 @@ const answers = new Map();
 const tupleKey = (surface, entry) => JSON.stringify([surface, entry.path, entry.vendor, entry.proxy]);
 
 before(async () => {
+  replay = createReplayBackend();
   started = await startLocalApiProxy({
     host: '127.0.0.1',
     port: 0,
     requestTimeoutMs: 10_000,
-    backend: {
-      name: 'fake-backend',
-      model: 'fake-local-model',
-      async generate(request) {
-        return {
-          id: 'local_test',
-          model: request.model,
-          text: 'OK',
-          toolCalls: [],
-          usage: {
-            inputTokens: 7, outputTokens: 1, totalTokens: 8,
-            cachedInputTokens: 0, reasoningOutputTokens: 0, source: 'provider',
-          },
-          latencyMs: 1,
-        };
-      },
-      async close() {},
-    },
+    backend: replay.backend,
   });
   recorder = await startReplayRecorder(started.url);
 
   // The capture's own request bytes, forwarded verbatim: re-typing them would
   // ask a different question than the one the vendor answered.
-  for (const { fixture, surface } of CAPTURES) {
+  for (const { fixture, surface, answer } of CAPTURES) {
     const capture = load(fixture);
+    // What the backend behind the proxy says for THIS row. A vendor turn that
+    // ran out of tokens before writing anything, or ran its text into a stop
+    // sequence, has a shape our side cannot reach while the backend answers
+    // `OK` to everything — and reading that as "the proxy differs" is reading
+    // the answer we supplied as a fact about the proxy.
+    replay.answerWith(answer);
     const res = await fetch(`${recorder.url}${surface}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -117,9 +110,12 @@ after(async () => {
 
 test('the gate covers each capture once, on a surface it names', () => {
   assert.equal(new Set(CAPTURES.map((row) => row.fixture)).size, CAPTURES.length);
+  // Three surfaces now. `/v1/messages` arrived last because its turns are the
+  // ones whose shape follows what the vendor generated, and the gate could not
+  // answer the way those turns went until a row could name its own answer.
   assert.deepEqual(
     [...new Set(CAPTURES.map((row) => row.surface))].sort(),
-    ['/v1/chat/completions', '/v1/responses'],
+    ['/v1/chat/completions', '/v1/messages', '/v1/responses'],
   );
 });
 
