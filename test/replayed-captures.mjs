@@ -197,6 +197,25 @@ export const SUPPLIED_ECHO_CAPTURES = [
 
   // /v1/chat/completions — this surface echoes almost nothing, and each row
   // below says so about one more option. `service_tier` is the exception.
+  {
+    // The one option this surface accepts and answers with a whole FEATURE:
+    // the direct API attaches 127 paths of moderation verdicts. This proxy
+    // moderates nothing and emits no `moderation` key, which is declared
+    // (`chat-moderation-results-are-not-reported`) rather than described —
+    // matrix row 49 had carried it in prose since 2026-08-30, so a build that
+    // started emitting a block would have agreed with a paragraph.
+    //
+    // `declaredAbsent` is the row's third state, and this capture is why it
+    // exists: `echoed: true` wants a compared leaf and `echoed: false` wants no
+    // echoed path, and a root the vendor fills 127 times while we report none
+    // of it satisfies neither.
+    fixture: 'direct-chat-moderation-model',
+    surface: '/v1/chat/completions',
+    supplied: ['reasoning_effort'],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    vendorPaths: 155,
+  },
   { fixture: 'direct-chat-service-tier-default', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
   { fixture: 'direct-chat-service-tier-priority', surface: '/v1/chat/completions', supplied: ['service_tier'], echoed: true, vendorPaths: 28 },
   { fixture: 'direct-chat-reasoning-effort-none', surface: '/v1/chat/completions', supplied: ['reasoning_effort'], echoed: false, vendorPaths: 28 },
@@ -506,10 +525,33 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
  * ROW compared anything let one echoing option carry every other option in the
  * list; two independent reviews built that case on the same day.
  */
-export function echoFailures({ supplied, echoed, alsoCompare, comparedByRoot, echoedPaths, rootOf }) {
+export function echoFailures({
+  supplied, echoed, alsoCompare, declaredAbsent, comparedByRoot, echoedPaths, vendorRoots, ourRoots, rootOf,
+}) {
   const failures = [];
+  const declared = declaredAbsent ?? [];
   const asMap = typeof echoed === 'object' && echoed !== null;
   const echoedFor = (root) => (asMap ? echoed[root] === true : echoed === true);
+
+  // The third state. `echoed: true` wants a compared leaf and `echoed: false`
+  // wants no echoed path, and a root the vendor fills while a declaration says
+  // we report nothing satisfies NEITHER: the vendor echoes 127 paths under it
+  // and we compare none of them. Saying so out loud is what keeps the row from
+  // being written as one of the two states it is not.
+  for (const root of declared) {
+    if (!(vendorRoots ?? new Set()).has(root)) {
+      failures.push(`${root} is declared absent but the vendor's own answer carries nothing under it, so this row proves nothing`);
+    }
+    if ((comparedByRoot.get(root) ?? 0) !== 0) {
+      failures.push(`${root} is declared absent yet ${comparedByRoot.get(root)} of its leaves were compared`);
+    }
+    if ((ourRoots ?? new Set()).has(root)) {
+      failures.push(`${root} is declared absent and this answer reports it`);
+    }
+    if (supplied.includes(root)) {
+      failures.push(`${root} is both supplied and declared absent; a row says one or the other about a root`);
+    }
+  }
   if (asMap) {
     const unsaid = supplied.filter((root) => typeof echoed[root] !== 'boolean');
     if (unsaid.length > 0) failures.push(`the echo map does not say what happens to ${unsaid.join(', ')}`);

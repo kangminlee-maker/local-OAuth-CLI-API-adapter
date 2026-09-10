@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "9323375039ab0620259e5428c019f055f23c385bb8b1921c177e3966adf926e1",
+    "matrixDigest": "3fa4d5e015b72e190257a3bd941ee73dfcda03415f1aefdae152107a46c2b58c",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -182,6 +182,12 @@
       "surface": "/v1/messages",
       "evidence": "artifacts/direct-api-captures (six /v1/messages 200 responses), src/proxy/http-server.ts anthropicUsage; docs/design-task-unmeasured-thinking-tokens.md",
       "measuredAt": "2026-09-10"
+    },
+    {
+      "id": "chat-moderation-results-are-not-reported",
+      "surface": "/v1/chat/completions",
+      "evidence": "spec/captures/direct-chat-moderation-model.json; docs/conformance-matrix.md row 49, §5.5.5",
+      "measuredAt": "2026-08-30"
     }
   ],
   "claims": [
@@ -1258,9 +1264,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated as the direct API validates it (`moderation.model` required) and not applied — the local runtimes moderate nothing, so the response carries no `moderation` object",
-      "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5)",
+      "claimedNote": "validated as the direct API validates it (`moderation.model` required) and not applied — the local runtimes moderate nothing, so the response carries no `moderation` object. The direct answer is not empty: it is 200 **plus a 127-path `moderation` block** — `input` and `output`, each a `moderation_results` carrying `flagged`, 13 `categories`, 13 `category_scores` and 13 `category_applied_input_types`. Since 2026-09-10 that absence is **declared** (`chat-moderation-results-are-not-reported`) and replayed, not described: the values are a classifier's verdicts, not counters, so a `flagged: false` would be this proxy asserting the outcome of a check it never ran. **Unmeasured on the request side**: this proxy reads only `moderation.model` while the type above shows a nested `policy`, and the direct API is strict about nested members elsewhere — whether `{model, bogus}` is a 400 there and a 200 here is one free refusal probe and is not claimed either way",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-chat-moderation-model.json`)",
       "liveParityRow": true
     },
     {
@@ -2154,15 +2160,15 @@
       "field": "`moderation`",
       "vendor": {
         "valueSpace": "`{model, policy}`",
-        "defaultWhenOmitted": "absent",
+        "defaultWhenOmitted": "**`null`** — measured, not absent",
         "observableEffect": "moderated output",
         "invalidValue": "UNKNOWN"
       },
       "claimedLead": "silently ignored",
       "claimedLeadInLegend": true,
-      "claimedNote": "silently ignored; `moderation` echoed as hard `null` (`http-server.ts:2009`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "silently ignored; `moderation` echoed as hard `null` (`http-server.ts:2384`). This cell read \"default when omitted: absent\" and cited a line number that had moved, until 2026-09-10: all **19** promoted `/v1/responses` captures carry `moderation: null`, and `conformance-echoed-defaults.test` compares it on every run. What the vendor answers when a request DOES carry `moderation` on this surface is **unmeasured** — if it fills the field there, this hard `null` is a value divergence rather than a mirror",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-minimal.json`)",
       "liveParityRow": true
     },
     {

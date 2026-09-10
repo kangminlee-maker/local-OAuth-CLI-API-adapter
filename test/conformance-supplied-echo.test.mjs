@@ -167,6 +167,9 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
   }
   const vendorLeaves = leafValues(vendor, '', new Map());
   const ourLeaves = leafValues(ours.body, '', new Map());
+  // What WE report, by field. A declared ancestor stops answering for its
+  // descendants the moment our own answer carries it.
+  const ourFields = new Set(keyPaths(ours.body).values());
 
   const differences = [];
   const exhibited = new Set();
@@ -183,7 +186,7 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
     const claimed = supplied.includes(rootOf(path)) || (alsoCompare ?? []).includes(path);
     if (!claimed) continue;
     if (PER_CALL.has(rootOf(path)) && !path.endsWith('[]#')) continue;
-    if (isDeclaredAbsent(absent, path)) continue;
+    if (isDeclaredAbsent(absent, path, ourFields)) continue;
     compared += 1;
     const claimedBy = supplied.includes(rootOf(path)) ? rootOf(path) : path;
     comparedByRoot.set(claimedBy, (comparedByRoot.get(claimedBy) ?? 0) + 1);
@@ -213,7 +216,7 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
   return { compared, comparedByRoot, differences, exhibited, echoedPaths };
 }
 
-for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harnessPremise, vendorPaths } of CAPTURES) {
+for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, harnessGaps, harnessPremise, vendorPaths } of CAPTURES) {
   test(`${fixture}: the proxy answers in the vendor's shape`, () => {
     const capture = load(fixture);
     const vendor = JSON.parse(capture.body);
@@ -268,8 +271,13 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harne
 
     const { compared, comparedByRoot, differences, echoedPaths } = readEcho({ fixture, surface, supplied, alsoCompare });
 
+    const vendorRoots = new Set([...keyPaths(JSON.parse(capture.body)).values()].map(rootOf));
+    const ourRoots = new Set([...keyPaths(ours.body).values()].map(rootOf));
     assert.deepEqual(
-      echoFailures({ supplied, echoed, alsoCompare, comparedByRoot, echoedPaths, rootOf }),
+      echoFailures({
+        supplied, echoed, alsoCompare, declaredAbsent, comparedByRoot, echoedPaths,
+        vendorRoots, ourRoots, rootOf,
+      }),
       [],
       `${fixture}: this row's echo claim does not hold`,
     );
@@ -432,4 +440,64 @@ test('an alsoCompare path that reached nothing fails by name', () => {
     rootOf,
   });
   assert.deepEqual(failures, ['.stop_sequence did not reach the comparison']);
+});
+
+// The third row state's own controls. `declaredAbsent` says a whole root is
+// answered for by a declaration, which `echoed: true` and `echoed: false` both
+// get wrong: the vendor fills the root, we report none of it, so there is a
+// compared count of zero AND a long list of echoed paths.
+test('a declared-absent root that the vendor does not fill proves nothing', () => {
+  const failures = echoFailures({
+    supplied: ['reasoning_effort'],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map(),
+    echoedPaths: [],
+    vendorRoots: new Set(['id', 'choices']),
+    ourRoots: new Set(['id', 'choices']),
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /carries nothing under it, so this row proves nothing/);
+});
+
+test('a declared-absent root this answer reports is a failure', () => {
+  const failures = echoFailures({
+    supplied: ['reasoning_effort'],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map(),
+    echoedPaths: [],
+    vendorRoots: new Set(['moderation']),
+    ourRoots: new Set(['moderation']),
+    rootOf,
+  });
+  assert.deepEqual(failures, ['moderation is declared absent and this answer reports it']);
+});
+
+test('a declared-absent root whose leaves got compared is a failure', () => {
+  const failures = echoFailures({
+    supplied: [],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map([['moderation', 3]]),
+    echoedPaths: [],
+    vendorRoots: new Set(['moderation']),
+    ourRoots: new Set(),
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /3 of its leaves were compared/);
+});
+
+test('a root cannot be both supplied and declared absent', () => {
+  const failures = echoFailures({
+    supplied: ['moderation'],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map(),
+    echoedPaths: [],
+    vendorRoots: new Set(['moderation']),
+    ourRoots: new Set(),
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /says one or the other about a root/);
 });

@@ -145,20 +145,30 @@ const segmentFor = (key) => (/^[A-Za-z0-9_]+$/.test(key) ? `.${key}` : `[${JSON.
  * a declaration does. The caller is required to prove the exemption's premise
  * before passing it.
  */
+/**
+ * A field and every field that contains it, nearest first.
+ *
+ * Module scope because TWO readers of the same declarations need it, and for a
+ * while only one had it: the shape comparison walked ancestors while the echo
+ * comparison matched exactly, so `.moderation` credited all 127 paths under it
+ * on one side and none on the other. Three readers of one declaration is the
+ * shape this repository keeps producing; this is the one they share.
+ */
+function ancestors(field) {
+  const out = [field];
+  let rest = field;
+  while (true) {
+    const cut = Math.max(rest.lastIndexOf('.'), rest.lastIndexOf('['));
+    if (cut <= 0) return out;
+    rest = rest.slice(0, cut);
+    if (rest.endsWith('[]')) rest = rest.slice(0, -2);
+    if (rest === '') return out;
+    out.push(rest);
+  }
+}
+
 export function creditedAbsences(declared, exempt, onlyVendorPaths, ourPaths) {
   const ourFields = new Set(ourPaths.values());
-  const ancestors = (field) => {
-    const out = [field];
-    let rest = field;
-    while (true) {
-      const cut = Math.max(rest.lastIndexOf('.'), rest.lastIndexOf('['));
-      if (cut <= 0) return out;
-      rest = rest.slice(0, cut);
-      if (rest.endsWith('[]')) rest = rest.slice(0, -2);
-      if (rest === '') return out;
-      out.push(rest);
-    }
-  };
   const owner = (field) => {
     for (const candidate of ancestors(field)) {
       if (declared.includes(candidate) && !ourFields.has(candidate)) return candidate;
@@ -311,11 +321,27 @@ export function leafValues(value, prefix, out) {
  * declared `.tools[].parameters.required` did not cover the length leaf that
  * belongs to it.
  */
-export function isDeclaredAbsent(absent, path) {
+/**
+ * Is this vendor leaf answered for by a declared absence?
+ *
+ * The same ancestor rule `creditedAbsences` uses, so one declaration reads the
+ * same way on both sides of the comparison. It used to match exactly, which
+ * meant a declaration naming a subtree — the only form in which a whole absent
+ * feature can be declared at all — credited every path under it on the shape
+ * side and nothing on the echo side.
+ *
+ * `ourFields` is the guard, and it is what makes this safe rather than merely
+ * permissive: a declared ancestor stops counting the moment WE start reporting
+ * it. Without it, a build that began emitting a `moderation` block of its own
+ * would have every leaf under it silently exempted here while the shape side
+ * went red — two readers of one declaration disagreeing again, which is the
+ * thing this function exists to end.
+ */
+export function isDeclaredAbsent(absent, path, ourFields = new Set()) {
   const indexless = path.replace(/\[\d+\]/g, '[]');
-  return absent.has(path)
-    || absent.has(indexless)
-    || absent.has(indexless.replace(/\[\]#$/, ''));
+  if (absent.has(path) || absent.has(indexless)) return true;
+  const base = indexless.replace(/\[\]#$/, '');
+  return ancestors(base).some((field) => absent.has(field) && !ourFields.has(field));
 }
 
 export const rootOf = (path) => path.replace(/^\./, '').split(/[.[]/, 1)[0];

@@ -30,7 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
-import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
+import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
 import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed, startReplayRecorder,
   createReplayBackend,
 } from './replayed-captures.mjs';
@@ -356,6 +356,7 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
 
     const vendorLeaves = leafValues(direct, '', new Map());
     const ourLeaves = leafValues(ours, '', new Map());
+    const ourFields = new Set(keyPaths(ours).values());
     const differences = [];
     const counts = { defaults: 0, echoes: 0 };
     for (const [path, value] of vendorLeaves) {
@@ -364,8 +365,11 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
       // and skipping the whole subtree hid it — so array counts survive the
       // skip even where the values below them do not.
       if (PER_CALL.has(rootOf(path)) && !path.endsWith('[]#')) continue;
-      // `[]` in a declaration stands for any index; leaves carry real ones.
-      if (absent.has(path) || absent.has(path.replace(/\[\d+\]/g, '[]'))) continue;
+      // The SAME reader the other gate uses. This was a third copy of the rule
+      // and already a different one — no `[]#` stripping, no ancestor walk — so
+      // one declaration meant three things depending on who asked. It had not
+      // bitten only because no defaults capture carries a declared array.
+      if (isDeclaredAbsent(absent, path, ourFields)) continue;
       counts[supplied.has(rootOf(path)) ? 'echoes' : 'defaults'] += 1;
       const ourValue = ourLeaves.get(path);
       if (ourValue !== value) differences.push(`${path}: vendor ${value}, proxy ${ourValue ?? '(absent)'}`);
