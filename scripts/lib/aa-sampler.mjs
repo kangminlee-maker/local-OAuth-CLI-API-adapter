@@ -329,6 +329,27 @@ export function abortedRow(row, samples) {
  * to prevent, one file along, and made likelier by that lock, which leaves
  * separate ledgers as the only way to partition.
  */
+/**
+ * Where a run's paid observations land while it is still running.
+ *
+ * A ledger is a consequence of SPENDING, not of a flag. `--live` and `--resume`
+ * were independent, so the shortest way to run a partition — `--live --only x`,
+ * no `--resume` — had exactly one sink for a paid observation and wrote it once,
+ * after the last row. A review interrupted that run at its fifth call and
+ * measured what was on disk: with a ledger, four of four paid observations
+ * survive; without one, zero, and the default batch prices at hundreds of calls
+ * per partition. The SIGINT handler released the lock and saved nothing, because
+ * there was nothing to save into.
+ *
+ * Beside the artifact, so it inherits the name that already carries `--only` and
+ * cannot collide across partitions.
+ */
+export function ledgerFor({ resume = null, live = false, outPath = null } = {}) {
+  if (resume) return resume;
+  if (!live || !outPath) return null;
+  return `${outPath}.state.json`;
+}
+
 export function defaultArtifactName(date, only) {
   const day = date.toISOString().slice(0, 10).replace(/-/g, '');
   return `aa-noise-floor-${day}${only ? `-${only.replace(/[^a-zA-Z0-9]+/g, '-')}` : ''}.json`;

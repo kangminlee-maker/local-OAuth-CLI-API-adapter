@@ -26,7 +26,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
-import { abortedRow, defaultArtifactName, noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
 import { acquireStateLock, canonicalStatePath } from './lib/state-lock.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -57,9 +57,7 @@ const budgetCalls = num('--budget', null);
 const openAiModel = opt('--openai-model', 'gpt-5.6-terra');
 const anthropicModel = opt('--anthropic-model', 'claude-sonnet-5');
 const maxTokens = num('--max-tokens', 1536);
-// Canonical from here down: the lock, the reads and the writes all have to mean
-// the same inode, and only the reads and writes followed symlinks before.
-const statePath = canonicalStatePath(opt('--resume', null));
+const resumePath = opt('--resume', null);
 // Re-read a finished run's artifact and print its floor. Makes no vendor call.
 const reportPath = opt('--report', null);
 // A substring filter over `provider/task`, so the wiring can be proved on two
@@ -73,6 +71,11 @@ const only = opt('--only', null);
 // refuses two runs on one ledger, so the only way left to partition is separate
 // ledgers, which is exactly the configuration where the artifacts collide.
 const outPath = opt('--out', resolve(repoRoot, 'bench-results', defaultArtifactName(new Date(), only)));
+// A ledger is a consequence of SPENDING, not of a flag: a live run without
+// `--resume` used to keep every paid observation in memory until the last row,
+// so an interrupt lost all of them. Canonical from here down — the lock, the
+// reads and the writes all have to mean the same inode.
+const statePath = canonicalStatePath(ledgerFor({ resume: resumePath, live, outPath }));
 
 // Published list prices, read 2026-09-10 from developers.openai.com/api/docs/pricing
 // and platform.claude.com/docs/en/about-claude/pricing. They are here so the plan
@@ -423,6 +426,7 @@ const artifact = {
 };
 
 mkdirSync(dirname(outPath), { recursive: true });
+let wrote = outPath;
 // `wx`, so a name collision is refused rather than resolved by overwriting. The
 // check at startup is the one that saves the calls; this is the one that cannot
 // be raced.
@@ -434,7 +438,10 @@ try {
   writeFileSync(fallback, `${JSON.stringify(artifact, null, 2)}\n`, { flag: 'wx' });
   console.error(`${outPath} appeared while this run was sampling; wrote ${fallback} instead. `
     + 'Neither run\'s calls were lost.');
+  wrote = fallback;
 }
 console.log(JSON.stringify(artifact.floor, null, 2));
-console.log(`\nwrote ${outPath}  (${budget.spent} live calls)`);
+// The name this run actually wrote. The fallback branch used to print `outPath`,
+// naming a file it had not written.
+console.log(`\nwrote ${wrote}  (${budget.spent} live calls)`);
 if (aborted) process.exit(1);

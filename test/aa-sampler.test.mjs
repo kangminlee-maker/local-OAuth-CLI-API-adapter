@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { startCaptureRun } from '../scripts/lib/capture-recorder.mjs';
-import { abortedRow, defaultArtifactName, noiseFloor, resumePlan, sampleRow, SamplingAbort, SERIES, summarise, takeSample, visibleChars } from '../scripts/lib/aa-sampler.mjs';
+import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, sampleRow, SamplingAbort, SERIES, summarise, takeSample, visibleChars } from '../scripts/lib/aa-sampler.mjs';
 
 const servers = [];
 after(async () => {
@@ -552,3 +552,22 @@ test('two partitions of one batch do not name one artifact', () => {
   assert.equal(defaultArtifactName(day, null), 'aa-noise-floor-20260910.json');
   assert.equal(defaultArtifactName(day, 'openai/summarise'), 'aa-noise-floor-20260910-openai-summarise.json');
 });
+
+test('a run that spends gets a ledger whether or not it was asked for one', () => {
+  // `--live` and `--resume` were independent, so the shortest way to run a
+  // partition kept every paid observation in memory until the last row. A review
+  // interrupted that run at its fifth call: with a ledger four of four paid
+  // observations survive on disk, without one, zero.
+  assert.equal(ledgerFor({ live: true, outPath: '/runs/aa-20260910-openai.json' }),
+    '/runs/aa-20260910-openai.json.state.json');
+  // Beside the artifact, so it inherits the name that already carries `--only`.
+  assert.notEqual(
+    ledgerFor({ live: true, outPath: '/runs/aa-openai.json' }),
+    ledgerFor({ live: true, outPath: '/runs/aa-anthropic.json' }),
+  );
+  // An explicit `--resume` still wins, and a run that spends nothing needs none.
+  assert.equal(ledgerFor({ resume: '/tmp/mine.json', live: true, outPath: '/runs/a.json' }), '/tmp/mine.json');
+  assert.equal(ledgerFor({ live: false, outPath: '/runs/a.json' }), null);
+  assert.equal(ledgerFor({ resume: '/tmp/mine.json' }), '/tmp/mine.json');
+});
+
