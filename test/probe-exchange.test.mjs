@@ -52,14 +52,19 @@ async function serving(handler) {
 }
 
 /** What the server got, asserted against what the caller asked to send. */
-function received(seen) {
+function received(seen, record) {
   assert.equal(seen.length, 1, `the server saw ${seen.length} requests for one probe`);
   const [request] = seen;
   assert.equal(request.method, 'POST');
+  assert.equal(request.path, '/', 'the helper sent the right bytes to the wrong place');
   assert.equal(request.body, requestBody, 'the helper sent a body other than the probe\'s');
   assert.equal(request.headers['content-type'], headers['content-type']);
   assert.equal(request.headers['x-probe-marker'], headers['x-probe-marker'],
     'the helper dropped a header the probe supplied');
+  if (record) {
+    assert.equal(record.request.text, request.body,
+      'the record describes a request the server did not get');
+  }
   return request;
 }
 
@@ -93,7 +98,6 @@ test('a streamed answer comes back whole, and is recorded once', async () => {
   const run = capturing();
 
   const got = await probe(url, true);
-  received(seen);
   assert.equal(got.failed, null);
   assert.equal(got.status, 200);
   // Both, because `probe.read` is handed both and reads them for different things.
@@ -101,12 +105,12 @@ test('a streamed answer comes back whole, and is recorded once', async () => {
   assert.equal(got.wire, got.text);
 
   const record = run.sole();
+  // The record's request side has to be what the server got, not what the
+  // caller meant to send.
+  received(seen, record);
   assert.equal(record.status, 200);
   assert.equal(record.stream.text, got.wire);
   assert.equal(record.error, null);
-  // The record's request side has to be what the server got, not what the
-  // caller meant to send.
-  assert.equal(record.request.text, seen[0].body);
 });
 
 test('a refusal is an observation, not a failed exchange', async () => {
@@ -120,13 +124,13 @@ test('a refusal is an observation, not a failed exchange', async () => {
   const run = capturing();
 
   const got = await probe(url, true);
-  received(seen);
   assert.equal(got.failed, null, 'a refusal was reported as a failed probe');
   assert.equal(got.status, 400);
   assert.equal(got.text, '{"error":{"message":"bad stream_options"}}');
   assert.equal(got.wire, got.text);
 
   const record = run.sole();
+  received(seen, record);
   assert.equal(record.status, 400);
   assert.equal(record.stream.text, got.text);
   assert.equal(record.error, null);
@@ -137,11 +141,12 @@ test('a streamed 204 is an observation too', async () => {
   const run = capturing();
 
   const got = await probe(url, true);
-  received(seen);
   assert.equal(got.failed, null);
   assert.equal(got.status, 204);
   assert.equal(got.text, '');
-  assert.equal(run.sole().error, null);
+  const record = run.sole();
+  received(seen, record);
+  assert.equal(record.error, null);
 });
 
 test('a stream cut halfway keeps its status and its bytes', async () => {
@@ -156,10 +161,10 @@ test('a stream cut halfway keeps its status and its bytes', async () => {
   const run = capturing();
 
   const got = await probe(url, true);
-  received(seen);
   assert.ok(got.failed, 'a cut stream was reported as a readable answer');
 
   const record = run.sole();
+  received(seen, record);
   assert.equal(record.status, 200, 'a cut stream recorded no status');
   assert.ok(record.stream, 'a cut stream recorded no bytes at all');
   assert.match(record.stream.text, /"n":1/);
@@ -174,9 +179,28 @@ test('a request that never reached a response is still recorded', async () => {
   const got = await probe(url, true);
   assert.ok(got.failed);
   const record = run.sole();
+  received(seen, record);
   assert.equal(record.status, null);
   assert.ok(record.error);
-  assert.equal(record.response, null, 'a turn that reached nobody was recorded with a body');
+});
+
+test('a buffered request that never reached a response records no body', async () => {
+  // The OTHER buffered failure point. The case below reaches the mid-read one;
+  // this one dies before a response exists, and the two used to be confused: the
+  // assertion meant for this exit was written on a STREAM probe, where `response`
+  // is null for a different reason entirely.
+  const { url, seen } = await serving((req, res) => { res.socket.destroy(); });
+  const run = capturing();
+
+  const got = await probe(url, false);
+  assert.ok(got.failed);
+  assert.equal(got.status, null);
+
+  const record = run.sole();
+  received(seen, record);
+  assert.equal(record.status, null, 'a turn that got no response recorded one');
+  assert.equal(record.response, null, 'a body that never arrived was recorded as an empty one');
+  assert.ok(record.error);
 });
 
 test('a buffered answer is recorded with its body', async () => {
@@ -187,13 +211,13 @@ test('a buffered answer is recorded with its body', async () => {
   const run = capturing();
 
   const got = await probe(url, false);
-  received(seen);
   assert.equal(got.failed, null);
   assert.equal(got.status, 200);
   assert.equal(got.text, '{"ok":true}');
   assert.equal(got.wire, '', 'a buffered turn has no wire to read');
 
   const record = run.sole();
+  received(seen, record);
   assert.equal(record.status, 200);
   assert.equal(record.response.text, '{"ok":true}');
   assert.equal(record.error, null);
@@ -207,10 +231,10 @@ test('a buffered body that dies mid-read keeps the status the vendor gave', asyn
   const run = capturing();
 
   const got = await probe(url, false);
-  received(seen);
   assert.ok(got.failed);
 
   const record = run.sole();
+  received(seen, record);
   assert.equal(record.status, 500, 'the head had already arrived and the record forgot it');
   assert.ok(record.error);
   // Not the empty string: a body that never arrived and a body that was empty
