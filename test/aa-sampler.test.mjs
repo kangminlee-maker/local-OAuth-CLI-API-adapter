@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { startCaptureRun } from '../scripts/lib/capture-recorder.mjs';
 import {
-  SamplingAbort, sampleRow, summarise, takeSample, visibleChars,
+  noiseFloor, SamplingAbort, sampleRow, SERIES, summarise, takeSample, visibleChars,
 } from '../scripts/lib/aa-sampler.mjs';
 
 const servers = [];
@@ -309,4 +309,70 @@ test('a resumed row keeps what it already has and asks only for the rest', async
   });
   assert.deepEqual(row.lens, [10, 20, 30, 40, 40]);
   assert.deepEqual(taken, [3, 4], 'a resumed run re-spent calls it had already made');
+});
+
+// --- the floor over a finished run -----------------------------------------
+
+/** A row shaped the way the runner writes one, with only the fields the floor reads. */
+const finished = (provider, task, lens, tokens, thinking, extra = {}) => ({
+  provider, task, lens, tokens, thinking, settled: false, deadLettered: false, ...extra,
+});
+
+test('the floor covers every series a row records, not just the visible one', () => {
+  const floor = noiseFloor([
+    // Characters barely move; the billed tokens move a lot, because the vendor
+    // thought on two samples of four and not on the other two. This is the
+    // shape the first live run actually produced.
+    finished('openai', 'a', [400, 402, 398, 400], [300, 70, 310, 72], [200, 0, 210, 0]),
+  ]);
+  assert.deepEqual(Object.keys(floor.series), SERIES.map(([name]) => name));
+  assert.ok(floor.series.chars.worstCvPct < 1, `chars read ${floor.series.chars.worstCvPct}`);
+  assert.ok(
+    floor.series.outputTokens.worstCvPct > 50,
+    `the billed series read ${floor.series.outputTokens.worstCvPct}, so a cost difference `
+      + 'that is inside the noise would clear the published floor',
+  );
+});
+
+test('a row with no proportion to take is unmeasured BY NAME, not a zero', () => {
+  const floor = noiseFloor([
+    finished('openai', 'thinks', [100, 120], [50, 60], [40, 10]),
+    // Never thought. There is no proportion to take, and reading that as 0%
+    // makes the whole series look tighter than the rows that WERE measured say.
+    finished('openai', 'never-thinks', [100, 120], [50, 60], [0, 0]),
+  ]);
+  const thinking = floor.series.thinking;
+  assert.deepEqual(thinking.rowsUnmeasured, ['openai/never-thinks']);
+  assert.equal(thinking.rowsMeasured, 1);
+  // The one measured row's own cv, unchanged by the row nobody could measure.
+  assert.equal(thinking.worstCvPct, summarise([40, 10]).cvPct);
+  assert.equal(thinking.medianCvPct, summarise([40, 10]).cvPct);
+  assert.equal(thinking.worstRow, 'openai/thinks');
+});
+
+test('a single-sample row cannot be the floor', () => {
+  const floor = noiseFloor([finished('openai', 'one', [100], [50], [10])]);
+  assert.equal(floor.series.chars.rowsMeasured, 0);
+  assert.equal(floor.series.chars.worstCvPct, null);
+  assert.equal(floor.series.chars.medianCvPct, null);
+  assert.equal(floor.rowsTotal, 1);
+});
+
+test('the floor names the row it came from', () => {
+  const floor = noiseFloor([
+    finished('openai', 'steady', [100, 101], [50, 50], [10, 10]),
+    finished('anthropic', 'wild', [100, 300], [50, 50], [10, 10]),
+  ]);
+  assert.equal(floor.series.chars.worstRow, 'anthropic/wild');
+  assert.ok(floor.series.chars.worstCvPct > 50, 'the wilder row did not set the worst');
+});
+
+test('dead-lettered and settled rows are counted, not silently dropped', () => {
+  const floor = noiseFloor([
+    finished('openai', 'a', [100, 101], [50, 50], [10, 10], { settled: true }),
+    finished('openai', 'b', [100, 101], [50, 50], [10, 10], { deadLettered: true }),
+  ]);
+  assert.equal(floor.rowsTotal, 2);
+  assert.equal(floor.rowsSettled, 1);
+  assert.equal(floor.rowsDeadLettered, 1);
 });

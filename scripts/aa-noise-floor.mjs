@@ -26,7 +26,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
-import { SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+import { noiseFloor, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -52,6 +52,8 @@ const openAiModel = opt('--openai-model', 'gpt-5.6-terra');
 const anthropicModel = opt('--anthropic-model', 'claude-sonnet-5');
 const maxTokens = num('--max-tokens', 1536);
 const statePath = opt('--resume', null);
+// Re-read a finished run's artifact and print its floor. Makes no vendor call.
+const reportPath = opt('--report', null);
 // A substring filter over `provider/task`, so the wiring can be proved on two
 // calls before four hundred and eighty are committed to it.
 const only = opt('--only', null);
@@ -204,6 +206,17 @@ function estimate() {
   return { perProvider: lines, usdTotal: Number(usd.toFixed(2)), pricesReadAt: '2026-09-10' };
 }
 
+// Re-derive the floor from a finished run's own samples. It makes no call — the
+// samples are already on disk, and a reading that has to be re-taken to be
+// re-read is a reading that costs money to correct. This exists because the
+// first published floor covered one of the three series, and the run that
+// produced it had already recorded all three.
+if (reportPath) {
+  const artifact = JSON.parse(readFileSync(resolve(reportPath), 'utf8'));
+  console.log(JSON.stringify(noiseFloor(artifact.rows ?? []), null, 2));
+  process.exit(0);
+}
+
 if (!live) {
   const cost = estimate();
   console.log(JSON.stringify({ plan, cost, wouldWrite: outPath, note: 'no call was made; pass --live to run' }, null, 2));
@@ -290,7 +303,6 @@ for (const row of rows) {
   saveState();
 }
 
-const measured = results.filter((row) => row.n >= 2);
 const artifact = {
   ranAt: new Date().toISOString(),
   elapsedMs: Date.now() - started,
@@ -300,16 +312,13 @@ const artifact = {
   captures: captureSummary(),
   // The floor itself: the widest a row varies against itself, which is the bar a
   // direct-vs-proxy difference has to clear before it is a difference at all.
-  floor: {
-    rowsMeasured: measured.length,
-    rowsDeadLettered: results.filter((row) => row.deadLettered).length,
-    worstCvPct: measured.length ? Math.max(...measured.map((row) => row.cvPct ?? 0)) : null,
-    medianCvPct: measured.length
-      ? [...measured.map((row) => row.cvPct ?? 0)].sort((a, b) => a - b)[Math.floor(measured.length / 2)]
-      : null,
-    worstSpreadPct: measured.length ? Math.max(...measured.map((row) => row.spreadPct ?? 0)) : null,
-    rowsSettled: results.filter((row) => row.settled).length,
-  },
+  //
+  // Per SERIES, all three. The first version published the character series
+  // alone and called it "the floor" — the tightest of the three, and the one
+  // nobody is billed on. On this instrument's own first run that reads 16.7%
+  // where the billed-token series reads 65.4%, so a cost difference of 30%
+  // would have cleared the published floor and been inside the real one.
+  floor: noiseFloor(results),
   rows: results,
 };
 

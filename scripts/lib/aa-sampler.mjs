@@ -54,6 +54,68 @@ export function summarise(lens) {
   };
 }
 
+/**
+ * The series a row records, and where each one lives on the row.
+ *
+ * Three, not one. Visible characters are what a reader sees; output tokens are
+ * what the bill is drawn on; thinking tokens are the part of that bill nobody
+ * reads. They are kept apart because they answer different questions, and the
+ * first run of this instrument proved they also MOVE differently: a row whose
+ * characters held to 4.4% varied its billed tokens by 43.7%, because the vendor
+ * thought on nine samples of twelve and not on the other three.
+ */
+export const SERIES = [
+  ['chars', 'lens'],
+  ['outputTokens', 'tokens'],
+  ['thinking', 'thinking'],
+];
+
+/**
+ * The floor, per series, over the rows of a finished run.
+ *
+ * A row whose `cvPct` is null is NOT measured — n < 2, or every sample was zero
+ * so there is no proportion to take. It is counted as unmeasured and left out of
+ * the max and the median. The first version of this read `cvPct ?? 0`, which
+ * fed a null into `Math.max` as a zero and into the median as the lowest value
+ * there is: a row nobody could measure made the floor look tighter than the
+ * measured rows alone say it is. A missing reading is not a small reading.
+ */
+export function noiseFloor(rows) {
+  const floor = {
+    rowsTotal: rows.length,
+    rowsDeadLettered: rows.filter((row) => row.deadLettered).length,
+    rowsSettled: rows.filter((row) => row.settled).length,
+    series: {},
+  };
+  for (const [name, field] of SERIES) {
+    const readings = rows
+      .map((row) => ({ row, reading: summarise(row[field] ?? []) }))
+      .filter(({ reading }) => reading.n >= 2);
+    const measured = readings.filter(({ reading }) => reading.cvPct !== null);
+    const cvs = measured.map(({ reading }) => reading.cvPct).sort((a, b) => a - b);
+    const worst = measured.reduce(
+      (best, entry) => (best === null || entry.reading.cvPct > best.reading.cvPct ? entry : best),
+      null,
+    );
+    floor.series[name] = {
+      rowsMeasured: measured.length,
+      // Named, not just counted: a series with no proportion to take is a fact
+      // about the vendor (it never thought on this task), and a reader who sees
+      // only a count cannot tell which fact it is.
+      rowsUnmeasured: readings
+        .filter(({ reading }) => reading.cvPct === null)
+        .map(({ row }) => `${row.provider}/${row.task}`),
+      worstCvPct: cvs.length ? cvs[cvs.length - 1] : null,
+      worstRow: worst ? `${worst.row.provider}/${worst.row.task}` : null,
+      medianCvPct: cvs.length ? cvs[Math.floor(cvs.length / 2)] : null,
+      worstSpreadPct: measured.length
+        ? Math.max(...measured.map(({ reading }) => reading.spreadPct ?? 0))
+        : null,
+    };
+  }
+  return floor;
+}
+
 /** A failure that should stop the whole run rather than just this row. */
 export class SamplingAbort extends Error {
   constructor(message) {
