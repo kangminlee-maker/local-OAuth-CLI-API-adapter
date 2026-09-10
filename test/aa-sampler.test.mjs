@@ -496,3 +496,30 @@ test('a row recorded before whole samples were kept is named, not silently resta
   }, 10);
   assert.deepEqual(plan.legacy, ['openai/old']);
 });
+
+test('a call is booked before it is made, not when its sample arrives', async () => {
+  // A retry leaves no sample, so a ledger written at `onSample` missed every
+  // retried call: three consecutive indices at four retries each is fifteen
+  // live calls on the meter and none on disk, and an interrupt during a backoff
+  // re-granted all fifteen.
+  const seen = [];
+  const budget = { remaining: 10, spent: 0 };
+  let calls = 0;
+  await sampleRow({
+    reps: 1,
+    budget,
+    sleepFor: async () => {},
+    onSpend: ({ spent }) => { seen.push(spent); },
+    take: async () => {
+      calls += 1;
+      if (calls <= 2) {
+        const error = new Error('429');
+        error.retryable = true;
+        throw error;
+      }
+      return { chars: 5, outputTokens: 1, thinkingTokens: 0, latencyMs: 1 };
+    },
+  });
+  assert.equal(calls, 3, 'the retries did not happen');
+  assert.deepEqual(seen, [1, 2, 3], 'a retried call reached the vendor without reaching the ledger');
+});

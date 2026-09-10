@@ -31,7 +31,7 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
-import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed, startReplayRecorder,
+import { MINIMAL_SURFACES as SURFACES, answerPremiseFailures, assertRosterReplayed, startReplayRecorder,
   createReplayBackend,
 } from './replayed-captures.mjs';
 
@@ -387,3 +387,17 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
     assert.deepEqual(differences, [], `${surface} echoes different defaults than the vendor:\n  ${differences.join('\n  ')}`);
   });
 }
+
+// This gate's rows declare no answer at all, so every one of them is served
+// `DEFAULT_ANSWER` — which for a long time was bound to no capture anywhere. A
+// review moved a compensating value into that default and both gates went green
+// over a real proxy defect. A default nobody checks is a default anybody can put
+// a compensating value into.
+test('the default answer this gate is served describes the turns its captures recorded', () => {
+  const { failures, checked } = answerPremiseFailures(SURFACES, (fixture) => {
+    const capture = load(fixture);
+    return { body: JSON.parse(capture.body), request: JSON.parse(capture.request) };
+  });
+  assert.deepEqual(failures, [], 'a fixture that contradicts its own capture can hide a defect');
+  assert.ok(checked > 0, 'no answer field was bound to its capture, so this check compared nothing');
+});

@@ -94,12 +94,35 @@ export const DEFAULT_ANSWER = {
  * is a fixture choice like the request bytes are, and it is declared in the same
  * registry the rows live in so a row and its answer cannot come apart.
  */
+/**
+ * What the backend actually SERVES for a row: its own answer over the default.
+ *
+ * Exported, and the one place the merge is written, because the premise check
+ * has to read exactly what the backend will hand the proxy. It read `row.answer`
+ * instead — the row's DECLARED half — and `DEFAULT_ANSWER` was bound to no
+ * capture anywhere, so moving a compensating value one scope outward defeated
+ * the whole check: with `cachedInputTokens: 1` in the default and the
+ * cache-read defect installed, both gates went green at 122/122.
+ *
+ * That is the third round in a row where a fixture compensated for a real
+ * defect. The first two closed the field in front of them; what they had in
+ * common is that they validated the DECLARED input and the proxy is served the
+ * MERGED one.
+ */
+export function servedAnswer(rowAnswer) {
+  return {
+    ...DEFAULT_ANSWER,
+    ...(rowAnswer ?? {}),
+    usage: { ...DEFAULT_ANSWER.usage, ...(rowAnswer?.usage ?? {}) },
+  };
+}
+
 export function createReplayBackend() {
   let answer = DEFAULT_ANSWER;
   return {
     /** Answer the next replayed request this way. Called before each fetch. */
     answerWith(next) {
-      answer = { ...DEFAULT_ANSWER, ...(next ?? {}), usage: { ...DEFAULT_ANSWER.usage, ...(next?.usage ?? {}) } };
+      answer = servedAnswer(next);
     },
     backend: {
       name: 'fake-backend',
@@ -481,7 +504,21 @@ function afterStopSequences(text, sequences) {
   return cut === null ? text : text.slice(0, cut);
 }
 
+/**
+ * The cache numbers, which every surface reports and every fixture can lie
+ * about. `cachedInputTokens` is what the OpenAI shapes read; the Anthropic shape
+ * reads the two halves separately. A surface missing from this table used to be
+ * a silent exemption for an entire gate.
+ */
 export const ANSWER_BINDINGS = {
+  '/v1/chat/completions': [
+    ['usage.cachedInputTokens', (body) => body.usage?.prompt_tokens_details?.cached_tokens],
+    ['usage.cacheCreationInputTokens', (body) => body.usage?.prompt_tokens_details?.cache_write_tokens],
+  ],
+  '/v1/responses': [
+    ['usage.cachedInputTokens', (body) => body.usage?.input_tokens_details?.cached_tokens],
+    ['usage.cacheCreationInputTokens', (body) => body.usage?.input_tokens_details?.cache_write_tokens],
+  ],
   '/v1/messages': [
     ['stopReason', (body) => body.stop_reason],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.cache_creation_input_tokens],
@@ -510,6 +547,14 @@ export const ANSWER_BINDINGS = {
  * A surface with no binding table is itself a failure: skipping one silently is
  * how a premise stops being checked.
  */
+/** Every leaf path of an object, dotted. `{usage: {a: 1}}` -> `['usage.a']`. */
+function leafPaths(value, prefix = '') {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return [prefix];
+  const keys = Object.keys(value);
+  if (keys.length === 0) return [prefix];
+  return keys.flatMap((key) => leafPaths(value[key], prefix ? `${prefix}.${key}` : key));
+}
+
 export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) {
   const read = (answer, dotted) => dotted.split('.').reduce(
     (value, key) => (value === undefined || value === null ? undefined : value[key]),
@@ -517,20 +562,37 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) 
   );
   const failures = [];
   let checked = 0;
-  for (const { fixture, surface, answer } of rows) {
-    if (!answer) continue;
+  for (const { fixture, surface, answer: declared } of rows) {
+    // EVERY row, not only the ones that declare an answer. A row with no answer
+    // is served `DEFAULT_ANSWER`, and a default nobody checks is a default
+    // anybody can put a compensating value into.
+    const answer = servedAnswer(declared);
     const table = bindings[surface];
     if (!table) {
-      failures.push(`${fixture}: ${surface} has an answer but no binding table, so its premise is unchecked`);
+      failures.push(`${fixture}: ${surface} has no binding table, so its premise is unchecked`);
       continue;
     }
     const { body: vendor, request } = bodyOf(fixture);
     // A field the answer carries that no binding covers is unchecked, and an
-    // unchecked field is where the next compensating fixture goes. Naming it is
-    // the smallest honest failure.
-    const covered = new Set(table.map(([field]) => field.split('.')[0]));
-    for (const field of Object.keys(answer)) {
-      if (!covered.has(field)) failures.push(`${fixture}: the answer sets ${field}, which no binding checks against the capture`);
+    // unchecked field is where the next compensating fixture goes. By LEAF, not
+    // by top-level key: `{usage: {anythingAtAll: 1}}` slipped past a scan of
+    // `Object.keys(answer)` because `usage` itself was covered.
+    const covered = new Set(table.map(([field]) => field));
+    // These reach the proxy and are compared by the rows that claim them; a
+    // fixture cannot use them to contradict a capture without the comparison
+    // saying so.
+    const free = new Set(['id', 'model', 'toolCalls', 'latencyMs', 'usage.source',
+      'usage.inputTokens', 'usage.outputTokens', 'usage.totalTokens', 'stopSequence',
+      // Not bound, on purpose. The fake backend does not reason, and the rows
+      // whose captures DID reason say so in `harnessGaps` with an asserted
+      // premise — `direct-responses-tools-parallel-false`'s vendor turn spent 9
+      // reasoning tokens. Binding this would require the fixture to claim a
+      // reasoning turn it never had, which is the opposite of what this check
+      // is for.
+      'usage.reasoningOutputTokens']);
+    for (const field of leafPaths(answer)) {
+      if (covered.has(field) || free.has(field) || field === 'text' || field === 'stopReason') continue;
+      failures.push(`${fixture}: the answer sets ${field}, which no binding checks against the capture`);
     }
     for (const [field, ofVendor, ofAnswer] of table) {
       const supplied = read(answer, field);
@@ -607,4 +669,77 @@ export function echoFailures({
     if ((comparedByRoot.get(path) ?? 0) === 0) failures.push(`${path} did not reach the comparison`);
   }
   return failures;
+}
+
+/**
+ * Keys every request on a surface must carry. They are the envelope, not an
+ * option, and no row is about them.
+ */
+export const MANDATORY_REQUEST_KEYS = {
+  '/v1/chat/completions': ['model', 'messages'],
+  '/v1/responses': ['model', 'input'],
+  '/v1/messages': ['model', 'messages', 'max_tokens'],
+};
+
+/**
+ * Request keys no row claims, each with the reason it is nobody's subject.
+ *
+ * An entry here is a decision, written down. It is NOT a blanket exemption: the
+ * rule below still requires every OTHER non-mandatory key in the store to be
+ * claimed by some row on its surface, so removing a key from the one row that
+ * claims it fails by name instead of silently deleting the only witness.
+ */
+export const UNCLAIMED_REQUEST_KEYS = {
+  '/v1/chat/completions': {
+    max_completion_tokens: 'every probe caps the turn so a capture costs a few tokens; '
+      + 'the cap is how the request was taken, not what any row is about',
+  },
+  '/v1/responses': {
+    max_output_tokens: 'the same cap under this surface\'s name',
+  },
+  '/v1/messages': {},
+};
+
+/**
+ * Every option the store's requests carry that no row on that surface claims.
+ *
+ * The `supplied` assertion ran ONE WAY: a row could not claim an option its
+ * request lacks, and nothing said a row must claim the options its request HAS.
+ * A review made a real echo defect — `top_logprobs` answered as a hard `0` where
+ * the client asked for `1` — invisible to the ENTIRE 2274-test suite by deleting
+ * one word from one row's `supplied`. The gate was that defect's only witness
+ * and the fixture dismissed it.
+ *
+ * Claiming through `declaredAbsent` counts: that row asserts the option's whole
+ * answer is missing, which is a claim about it.
+ */
+export function unclaimedRequestOptions(rows, requestKeysOf) {
+  const bySurface = new Map();
+  for (const row of rows) {
+    const seen = bySurface.get(row.surface) ?? { claimed: new Set(), present: new Set() };
+    for (const option of [...(row.supplied ?? []), ...(row.declaredAbsent ?? [])]) seen.claimed.add(option);
+    for (const key of requestKeysOf(row.fixture)) seen.present.add(key);
+    bySurface.set(row.surface, seen);
+  }
+  const unclaimed = [];
+  const staleExceptions = [];
+  for (const [surface, { claimed, present }] of bySurface) {
+    const mandatory = new Set(MANDATORY_REQUEST_KEYS[surface] ?? []);
+    const excused = UNCLAIMED_REQUEST_KEYS[surface] ?? {};
+    for (const key of [...present].sort()) {
+      if (mandatory.has(key) || claimed.has(key)) continue;
+      if (Object.prototype.hasOwnProperty.call(excused, key)) {
+        if (!excused[key]) staleExceptions.push(`${surface} ${key}: excused with no reason`);
+        continue;
+      }
+      unclaimed.push(`${surface} ${key}`);
+    }
+    // An exception for a key no capture sends, or for one a row does claim, has
+    // outlived whatever it was for.
+    for (const key of Object.keys(excused)) {
+      if (!present.has(key)) staleExceptions.push(`${surface} ${key}: excused but no capture's request carries it`);
+      else if (claimed.has(key)) staleExceptions.push(`${surface} ${key}: excused but a row claims it`);
+    }
+  }
+  return { unclaimed: unclaimed.sort(), staleExceptions: staleExceptions.sort() };
 }

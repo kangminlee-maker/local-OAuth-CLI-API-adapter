@@ -21,7 +21,7 @@
 // Usage:
 //   node scripts/aa-noise-floor.mjs                        # plan only, no calls
 //   node scripts/aa-noise-floor.mjs --live [--reps 24] [--resume <state.json>]
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, unlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
@@ -222,6 +222,30 @@ if (reportPath) {
   process.exit(0);
 }
 
+// One writer per state file. Without this, two invocations each start from the
+// same ledger and each spend the whole ceiling — and because `saveState()`
+// writes the WHOLE state object from its own snapshot, the second writer erases
+// rows the first had paid for. Through `--only`, which exists to partition a
+// batch across processes, that is the ordinary way to run it.
+let lockPath = null;
+if (statePath) {
+  lockPath = `${statePath}.lock`;
+  try {
+    writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx' });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    console.error(`another run holds ${lockPath} (pid ${readFileSync(lockPath, 'utf8').trim()}). `
+      + 'Two runs sharing one state file each spend the whole budget and the second erases the '
+      + "first's rows. If that process is gone, delete the lock deliberately.");
+    process.exit(1);
+  }
+  const release = () => { try { unlinkSync(lockPath); } catch { /* already gone */ } };
+  process.on('exit', release);
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => { release(); process.exit(130); });
+  }
+}
+
 const state = statePath && existsSync(statePath)
   ? JSON.parse(readFileSync(statePath, 'utf8'))
   : { rows: {}, spent: 0 };
@@ -320,6 +344,11 @@ for (const row of rows) {
         timeoutMs: 180_000,
         readAnswer: vendor.readAnswer,
       }),
+      // Before the call, so an interrupt cannot re-grant calls already made.
+      onSpend: ({ spent }) => {
+        state.spent = spent;
+        saveState();
+      },
       onSample: ({ index, chars, lens, samples }) => {
         state.rows[key] = { samples, updatedAt: new Date().toISOString() };
         // Booked from the sampler's own counter, not from the sample count: a

@@ -143,6 +143,10 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *     enough, which is the design's own sequential rule: start at 24, cap at
  *     60, stop when the interval decides.
  *
+ * `onSpend({index, attempt, spent})` is called after a call is booked and
+ * BEFORE it is made, so a caller persisting the ledger cannot lose a call it
+ * has already paid for.
+ *
  * `existing` resumes a row from whole SAMPLES, not from character lengths. A
  * bare-length state is refused: it cannot say what the token or thinking
  * readings for those calls were, and a floor taken over a partly-restored
@@ -162,6 +166,7 @@ export async function sampleRow({
   backoffCapMs = 60_000,
   budget = null,
   onSample = () => {},
+  onSpend = () => {},
   sleepFor = sleep,
   // Injected so a case can assert the GROWTH rather than the growth plus a
   // random number: with jitter in the way, "the second wait is longer" is true
@@ -201,6 +206,14 @@ export async function sampleRow({
           throw new SamplingAbort(`the run's call budget is spent (${budget.spent} used)`);
         }
         if (budget) { budget.remaining -= 1; budget.spent += 1; }
+        // Booked BEFORE the call, and the caller is told before the call too.
+        // `budget.spent` used to reach disk only when a sample arrived, and a
+        // retry leaves no sample: three consecutive indices at four retries
+        // each put fifteen live calls on the vendor's meter and none in the
+        // ledger, so an interrupt during a backoff re-granted every one of them
+        // on resume. Persisting first can over-book by at most one — the safe
+        // direction for a ceiling on spending.
+        await onSpend({ index, attempt, spent: budget?.spent ?? null });
         const sample = await take(index);
         samples.push({
           chars: sample.chars,

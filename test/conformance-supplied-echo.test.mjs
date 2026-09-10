@@ -36,6 +36,7 @@ import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterRepl
   createReplayBackend,
   answerPremiseFailures,
   echoFailures,
+  unclaimedRequestOptions,
 } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
@@ -374,22 +375,37 @@ test('the premise check catches an answer that contradicts its capture', () => {
     surface: '/v1/messages',
     answer: { stopReason: 'end_turn', usage: { cachedInputTokens: 1 } },
   }];
+  // The merged answer is what reaches the proxy, so that is what is checked.
   const { failures } = answerPremiseFailures(rows, () => ({
     body: { stop_reason: 'max_tokens', usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
     request: {},
   }));
-  assert.equal(failures.length, 2, `expected both fields to be caught, got ${JSON.stringify(failures)}`);
-  assert.match(failures.join('\n'), /stopReason/);
-  assert.match(failures.join('\n'), /cachedInputTokens/);
+  const said = failures.join('\n');
+  assert.match(said, /stopReason/);
+  assert.match(said, /cachedInputTokens/);
+  // And the DEFAULT half of the served answer is checked too — this row names no
+  // text, so it is served `OK` while its capture produced nothing. A default
+  // nobody checks is a default anybody can put a compensating value into, which
+  // is how a real proxy defect survived 122 green tests.
+  assert.match(said, /text/);
 });
 
 test('the premise check passes an answer that agrees with its capture', () => {
   const { failures, checked } = answerPremiseFailures(
     [{ fixture: 'made-up', surface: '/v1/messages', answer: { stopReason: 'max_tokens' } }],
-    () => ({ body: { stop_reason: 'max_tokens', usage: {} }, request: {} }),
+    () => ({
+      // Agreeing means agreeing with the MERGED answer, defaults included: this
+      // row names no text, so `DEFAULT_ANSWER.text` is what the proxy is served.
+      body: {
+        stop_reason: 'max_tokens',
+        content: [{ type: 'text', text: 'OK' }],
+        usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      request: {},
+    }),
   );
   assert.deepEqual(failures, []);
-  assert.equal(checked, 1);
+  assert.ok(checked >= 3, `only ${checked} field(s) were compared`);
 });
 
 // The echo rule's own controls, on synthetic readings. The rows above happen to
@@ -503,4 +519,18 @@ test('a root cannot be both supplied and declared absent', () => {
     rootOf,
   });
   assert.match(failures.join('\n'), /says one or the other about a root/);
+});
+
+// The `supplied` assertion used to run one way: a row could not claim an option
+// its request lacks, and nothing said a row must claim the options its request
+// HAS. Deleting one word from one row's `supplied` made a real echo defect —
+// `top_logprobs: 1` answered as `0` — invisible to the entire suite, because
+// that row was the defect's only witness.
+test('every option the store sends is claimed by some row', () => {
+  const { unclaimed, staleExceptions } = unclaimedRequestOptions(
+    CAPTURES,
+    (fixture) => Object.keys(JSON.parse(load(fixture).request)),
+  );
+  assert.deepEqual(unclaimed, [], 'options the captures send that no row asserts anything about');
+  assert.deepEqual(staleExceptions, [], 'exceptions that have outlived what they were for');
 });
