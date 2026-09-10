@@ -35,7 +35,9 @@ import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDecl
 import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder,
   createReplayBackend,
   answerPremiseFailures,
+  MINIMAL_SURFACES,
   echoFailures,
+  freeFieldsReached,
   harnessGapsFrom,
   missingRequiredEffects,
   unclaimedRequestOptions,
@@ -397,6 +399,18 @@ test('deleting the only effect path fails the row that supplies the option', () 
     missingRequiredEffects([{ fixture: 'fanout', surface: '/v1/chat/completions', supplied: ['n'] }]),
     ['fanout n: nothing compares .choices[]#, which is the only way this option shows'],
   );
+});
+
+test('the free reasons no roster reaches are the five that are held in reserve', () => {
+  // A reason nothing reads has the authority of a checked one and none of the
+  // checking — which is how "not passed through on this surface" survived three
+  // rounds of review while being false on all three. These five are kept because
+  // a row that sets `model` tomorrow needs an answer waiting for it; what must
+  // not happen is a roster starting to lean on one without anybody re-reading it.
+  const { heldInReserve } = freeFieldsReached([CAPTURES, MINIMAL_SURFACES]);
+  const perSurface = ['id', 'latencyMs', 'model', 'stopSequence', 'toolCalls'];
+  assert.deepEqual(heldInReserve, ['/v1/chat/completions', '/v1/messages', '/v1/responses']
+    .flatMap((surface) => perSurface.map((field) => `${surface} ${field}`)).sort());
 });
 
 test('the usage counts are free only while nothing compares a usage path', () => {

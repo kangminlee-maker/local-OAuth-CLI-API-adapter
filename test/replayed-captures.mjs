@@ -653,7 +653,7 @@ export const ANSWER_BINDINGS = {
  * how a premise stops being checked.
  */
 /** Every leaf path of an object, dotted. `{usage: {a: 1}}` -> `['usage.a']`. */
-function leafPaths(value, prefix = '') {
+export function leafPaths(value, prefix = '') {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return [prefix];
   const keys = Object.keys(value);
   if (keys.length === 0) return [prefix];
@@ -755,6 +755,38 @@ export function missingRequiredEffects(rows, required = REQUIRED_EFFECTS) {
     }
   }
   return failures;
+}
+
+/**
+ * Which `free` reasons the rosters actually reach, and which are held in reserve.
+ *
+ * A round found two of these reasons false and noted that five more describe
+ * fields no row sets, so their reasons had never been read against anything. An
+ * unreached entry is not a defect — a row that sets `model` tomorrow needs an
+ * answer waiting — but an unreached entry that nobody knows is unreached is a
+ * sentence with the authority of a checked one and none of the checking. So the
+ * split is written down and asserted: the day a roster reaches one of these, the
+ * gate says which, and its reason gets read before it counts.
+ */
+export function freeFieldsReached(rosters, bindings = ANSWER_BINDINGS, free = FREE_ANSWER_FIELDS) {
+  const reached = new Set();
+  const declared = new Set();
+  for (const [surface, table] of Object.entries(free)) {
+    for (const field of Object.keys(table)) declared.add(`${surface} ${field}`);
+  }
+  for (const rows of rosters) {
+    for (const { surface, answer } of rows) {
+      const covered = new Set((bindings[surface] ?? []).map(([field]) => field));
+      for (const field of leafPaths(servedAnswer(answer))) {
+        if (covered.has(field)) continue;
+        if (Object.prototype.hasOwnProperty.call(free[surface] ?? {}, field)) reached.add(`${surface} ${field}`);
+      }
+    }
+  }
+  return {
+    reached: [...reached].sort(),
+    heldInReserve: [...declared].filter((entry) => !reached.has(entry)).sort(),
+  };
 }
 
 export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS) {
