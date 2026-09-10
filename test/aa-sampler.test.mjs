@@ -350,12 +350,20 @@ test('a row with no proportion to take is unmeasured BY NAME, not a zero', () =>
   assert.equal(thinking.worstRow, 'openai/thinks');
 });
 
-test('a single-sample row cannot be the floor', () => {
+test('a single-sample row cannot be the floor, and is not "the vendor never varied"', () => {
   const floor = noiseFloor([finished('openai', 'one', [100], [50], [10])]);
   assert.equal(floor.series.chars.rowsMeasured, 0);
   assert.equal(floor.series.chars.worstCvPct, null);
   assert.equal(floor.series.chars.medianCvPct, null);
   assert.equal(floor.rowsTotal, 1);
+  // And NOT listed as unmeasured-for-lack-of-a-proportion. That list says
+  // something about the VENDOR — it never thought on this task. A row that was
+  // sampled once says something about the RUN, and putting it in the same list
+  // reports a fact about our budget as a fact about the vendor. A mutant that
+  // relaxed the two-sample filter survived until this line existed, because
+  // every other assertion here holds either way.
+  assert.deepEqual(floor.series.chars.rowsUnmeasured, []);
+  assert.deepEqual(floor.series.thinking.rowsUnmeasured, []);
 });
 
 test('the floor names the row it came from', () => {
