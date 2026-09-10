@@ -3,14 +3,14 @@
   "originRoot": "artifacts/direct-api-captures",
   "originRun": "66c57d12-a6db-4feb-8d39-0418b19bed2e",
   "originFile": "0001-echo-moderation-model-.json",
-  "promotedAt": "2026-09-10T14:50:08.135Z",
+  "promotedAt": "2026-09-10T15:06:30.144Z",
   "requiredContent": {
     "mustContain": null,
     "mustNotContain": null,
     "requestMustBe": "{\"model\":\"gpt-5.6-terra\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_completion_tokens\":32,\"reasoning_effort\":\"none\",\"moderation\":{\"model\":\"omni-moderation-latest\"}}"
   },
   "promotedFrom": {
-    "revision": "c909eda553a92a42798f6cbc641888bb054ee154",
+    "revision": "df547bcd475b5e798693be646f33335a5f1f103d",
     "sources": [
       {
         "path": "scripts/lib/capture-provenance.mjs",
