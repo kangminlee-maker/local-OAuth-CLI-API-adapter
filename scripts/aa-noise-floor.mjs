@@ -84,17 +84,18 @@ const PROVIDERS = {
       messages: [{ role: 'user', content: prompt }],
       max_completion_tokens: maxTokens,
     }),
-    // Roughly 3.7 characters per token, measured on these exact prompts from
-    // recorded usage in bench-results (avg 178 input tokens for a 652-character
-    // mean prompt). Output is estimated at 4 characters per token against the
-    // answer lengths the 2026-08-28 control actually observed.
-    charsPerToken: { in: 3.7, out: 4 },
+    // Measured, not assumed: a two-call smoke on 2026-09-10 billed a
+    // 1070-character prompt at 213 input tokens and a 365-character answer at 72
+    // output tokens. The earlier estimate used one ratio for both vendors and
+    // was wrong about this one in the cheap direction.
+    charsPerToken: { in: 5.02, out: 5.07 },
     // Sampling controls are left at their defaults ON PURPOSE: this measures the
     // vendor as the comparison actually calls it, and pinning temperature would
     // measure a configuration nothing else uses.
     readAnswer: (parsed) => ({
       text: parsed.choices?.[0]?.message?.content ?? '',
       outputTokens: parsed.usage?.completion_tokens ?? null,
+      thinkingTokens: parsed.usage?.completion_tokens_details?.reasoning_tokens ?? null,
       stopReason: parsed.choices?.[0]?.finish_reason ?? null,
     }),
   },
@@ -111,13 +112,16 @@ const PROVIDERS = {
       max_tokens: maxTokens,
       messages: [{ role: 'user', content: prompt }],
     }),
-    // Claude 4.7 and later use a tokenizer that produces about 30% more tokens
-    // for the same text, per the pricing page's own note. Ignoring it would
-    // under-price this side by roughly a third.
-    charsPerToken: { in: 3.7 / 1.3, out: 4 / 1.3 },
+    // Measured on the same smoke: 367 input tokens for that prompt, and 290
+    // OUTPUT tokens for a 405-character answer — because 154 of them were
+    // thinking tokens that never appear in the text. Billed as output all the
+    // same, so the price has to count them, and a ratio derived from visible
+    // characters is the only honest way to carry them here.
+    charsPerToken: { in: 2.92, out: 1.40 },
     readAnswer: (parsed) => ({
       text: parsed.content?.find((block) => block.type === 'text')?.text ?? '',
       outputTokens: parsed.usage?.output_tokens ?? null,
+      thinkingTokens: parsed.usage?.output_tokens_details?.thinking_tokens ?? null,
       stopReason: parsed.stop_reason ?? null,
     }),
   },

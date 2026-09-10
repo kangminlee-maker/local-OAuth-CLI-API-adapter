@@ -103,6 +103,7 @@ export async function sampleRow({
 }) {
   const lens = [...existing];
   const tokens = [];
+  const thinking = [];
   const latencies = [];
   const failures = [];
   let consecutive = 0;
@@ -119,6 +120,7 @@ export async function sampleRow({
         const sample = await take(index);
         lens.push(sample.chars);
         if (typeof sample.outputTokens === 'number') tokens.push(sample.outputTokens);
+        if (typeof sample.thinkingTokens === 'number') thinking.push(sample.thinkingTokens);
         if (typeof sample.latencyMs === 'number') latencies.push(sample.latencyMs);
         consecutive = 0;
         done = true;
@@ -130,7 +132,7 @@ export async function sampleRow({
           consecutive += 1;
           done = true;
           if (consecutive >= maxConsecutiveFailures) {
-            return { lens, tokens, latencies, failures, deadLettered: true, ...summarise(lens) };
+            return { lens, tokens, thinking, latencies, failures, deadLettered: true, ...summarise(lens) };
           }
         } else {
           attempt += 1;
@@ -147,7 +149,7 @@ export async function sampleRow({
         && lens.length >= minReps
         && reading.ciHalfWidth !== null
         && decisiveWhen(reading)) {
-      return { lens, tokens, latencies, failures, deadLettered: false, stoppedEarly: true, ...reading };
+      return { lens, tokens, thinking, latencies, failures, deadLettered: false, stoppedEarly: true, ...reading };
     }
   }
 
@@ -156,7 +158,7 @@ export async function sampleRow({
   // its retries, say — used to return `deadLettered: false` with `n: 0`, which
   // is a hole a summary has to be read carefully to notice.
   return {
-    lens, tokens, latencies, failures,
+    lens, tokens, thinking, latencies, failures,
     deadLettered: lens.length === 0,
     stoppedEarly: false,
     ...summarise(lens),
@@ -224,6 +226,10 @@ export async function takeSample({ url, headers, body, label, timeoutMs, readAns
   return {
     chars: visibleChars(answer.text),
     outputTokens: answer.outputTokens ?? null,
+    // Billed as output and never seen in the answer. A model that thinks before
+    // it writes varies in two places, and a floor that folded them together
+    // would attribute reasoning length to the text it measures.
+    thinkingTokens: answer.thinkingTokens ?? null,
     latencyMs: Math.round(performance.now() - startedAt),
     status: res.status,
   };
