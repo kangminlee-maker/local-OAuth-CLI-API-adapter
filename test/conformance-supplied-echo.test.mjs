@@ -51,6 +51,8 @@ const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 // advertised, and nothing replayed it. Advertising and reading are the same act
 // now.
 const ROSTER = new Set(CAPTURES.map((row) => row.fixture));
+/** The keys a capture's own request carries, which is what the rules ask about. */
+const requestKeysOf = (fixture) => Object.keys(JSON.parse(load(fixture).request));
 const load = (name) => {
   assert.ok(ROSTER.has(name), `${name} is not one of this gate's roster captures`);
   return JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
@@ -389,8 +391,23 @@ test('a gap that does not follow from the missing item is not derivable', () => 
   assert.ok(derived.includes('.output[].summary:array'), 'the derivation lost the paths the missing item does explain');
 });
 
-test('an option whose only effect is a path is compared by every row that supplies it', () => {
-  assert.deepEqual(missingRequiredEffects(CAPTURES), []);
+test('an option whose only effect is a path is compared by every row whose request carries it', () => {
+  // Of the REQUEST. Asked of `supplied`, the rule stood one door up from where it
+  // was aimed: a row that stopped claiming `n` also stopped owing `.choices[]#`.
+  // This gate's roster only: `load` refuses a fixture the roster does not name,
+  // which is what keeps a gate from reading off somebody else's list. The
+  // sibling gate asserts the same rule over its own rows.
+  assert.deepEqual(missingRequiredEffects(CAPTURES, undefined, requestKeysOf), []);
+});
+
+test('a row that stops claiming the option still owes its effect', () => {
+  // Both halves of the construction at once: `supplied` narrowed AND the effect
+  // path deleted. The request still carries `n`, so the requirement still holds.
+  assert.deepEqual(
+    missingRequiredEffects([{ fixture: 'narrowed', surface: '/v1/chat/completions', supplied: [] }],
+      undefined, () => ['model', 'messages', 'n']),
+    ['narrowed n: nothing compares .choices[]#, which is the only way this option shows'],
+  );
 });
 
 test('deleting the only effect path fails the row that supplies the option', () => {
@@ -682,10 +699,7 @@ test('a root cannot be both supplied and declared absent', () => {
 // `reasoning.effort: "none"` answered as `"medium"` pass all 2283 tests. It is
 // per row now, with the probe-shaping keys excused per row and by name.
 test('every option the store sends is claimed by the row that replays it', () => {
-  const { unclaimed, staleExceptions } = unclaimedRequestOptions(
-    CAPTURES,
-    (fixture) => Object.keys(JSON.parse(load(fixture).request)),
-  );
+  const { unclaimed, staleExceptions } = unclaimedRequestOptions(CAPTURES, requestKeysOf);
   assert.deepEqual(unclaimed, [], 'options the captures send that no row asserts anything about');
   assert.deepEqual(staleExceptions, [], 'exceptions that have outlived what they were for');
 });

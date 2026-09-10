@@ -33,6 +33,7 @@ import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
 import { MINIMAL_SURFACES as SURFACES, answerPremiseFailures, assertRosterReplayed, startReplayRecorder,
   createReplayBackend,
+  missingRequiredEffects,
 } from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
@@ -401,3 +402,14 @@ test('the default answer this gate is served describes the turns its captures re
   assert.deepEqual(failures, [], 'a fixture that contradicts its own capture can hide a defect');
   assert.ok(checked > 0, 'no answer field was bound to its capture, so this check compared nothing');
 });
+
+test('an option whose only effect is a path is compared by every row whose request carries it', () => {
+  // The same rule the sibling gate asserts, over this gate's own roster. Each
+  // gate reads only the captures its roster names, so a rule that is true of one
+  // roster says nothing about the other until it is asked here too.
+  assert.deepEqual(
+    missingRequiredEffects(SURFACES, undefined, (fixture) => Object.keys(JSON.parse(load(fixture).request))),
+    [],
+  );
+});
+

@@ -197,7 +197,17 @@ export function servedResult(answer, request) {
     id: 'local_test',
     model: request?.model,
     text: answer.text,
-    toolCalls: [],
+    // From the answer, not a constant. `chatFinishReason` and
+    // `anthropicStopReason` both branch on tool calls while `generate()`
+    // discarded them, so the derivations read an input the proxy never saw.
+    //
+    // NO CONTROL DISTINGUISHES THIS from the constant, and it is written down
+    // here rather than counted as covered: no roster row sets `toolCalls`, so
+    // both spellings behave identically on every input this suite has. What the
+    // change removes is a latent disagreement, not an observed defect. A row
+    // that did set it would now get a proxy answer carrying tool calls — items
+    // and keys the vendor body does not have — which the shape half reports.
+    toolCalls: answer.toolCalls ?? [],
     usage: answer.usage,
     latencyMs: 1,
     ...(answer.stopReason === undefined ? {} : { stopReason: answer.stopReason }),
@@ -717,9 +727,9 @@ export const FREE_ANSWER_FIELDS = {
       + "(`chatcmpl-${id}`, `resp_${id}`, `msg_${id}`) and no capture's id is reproducible, so nothing "
       + 'compares one: `id` is in `PER_CALL` and both sides carry `.id:string` whatever it says',
     model: 'not invented — `servedResult` returns `request.model`, the capture\'s own request bytes',
-    toolCalls: 'always empty here, and a non-empty one could not hide anything: it ADDS items and keys '
-      + 'the vendor body does not have, which is what the shape half reports first. A row that needs '
-      + 'tool calls would have to bind them',
+    toolCalls: 'empty on every row today, and a non-empty one could not hide anything: it ADDS items '
+      + 'and keys the vendor body does not have, which is what the shape half reports first — and it '
+      + 'moves `stopReason`, which IS bound, through the tool-call branch of both derivations',
     latencyMs: 'a constant the harness invents, and no surface puts it on the wire — `latencyMs` does '
       + 'not appear in src/proxy/http-server.ts at all',
     text: 'this surface compares echoed request options and shapes, not the answer text; '
@@ -790,12 +800,23 @@ export const REQUIRED_EFFECTS = {
   },
 };
 
-/** Every row that supplies an effect-bearing option without comparing its effect. */
-export function missingRequiredEffects(rows, required = REQUIRED_EFFECTS) {
+/**
+ * Every row whose REQUEST carries an effect-bearing option without comparing its
+ * effect.
+ *
+ * Of the request, not of `supplied`. Asking it of `supplied` left the rule one
+ * door up from where it was standing: a row that stopped claiming `n` also
+ * stopped owing `.choices[]#`, and the two edits are the same edit. The per-row
+ * claim rule catches the dropped claim, and this one has to hold on its own
+ * anyway — a requirement that can be switched off by the thing it constrains is
+ * the shape this whole round is about.
+ */
+export function missingRequiredEffects(rows, required = REQUIRED_EFFECTS, requestKeysOf = null) {
   const failures = [];
   for (const { fixture, surface, supplied, alsoCompare } of rows) {
     const table = required[surface] ?? {};
-    for (const option of supplied ?? []) {
+    const options = requestKeysOf ? requestKeysOf(fixture) : (supplied ?? []);
+    for (const option of options) {
       for (const path of table[option] ?? []) {
         if (!(alsoCompare ?? []).includes(path)) {
           failures.push(`${fixture} ${option}: nothing compares ${path}, which is the only way this option shows`);
