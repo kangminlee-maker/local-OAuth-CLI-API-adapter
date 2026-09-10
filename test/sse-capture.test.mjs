@@ -65,10 +65,6 @@ test('a refused stream is recorded with its body, not thrown away in a message',
   await assert.rejects(() => read(url), (error) => {
     assert.ok(error instanceof SseTransportError, `threw ${error?.name}`);
     assert.equal(error.status, 400);
-    // Whole, not the truncation the message carries: a prober treats a refusal
-    // as the answer it asked for, and reading it back off disk is the thing
-    // this field exists to avoid.
-    assert.equal(error.body, '{"error":{"message":"nope","code":"probe_refused"}}');
     return true;
   });
 
@@ -101,7 +97,9 @@ test('a stream that dies halfway is recorded with the bytes that arrived', async
   // frame, and the partial one that never finished.
   assert.match(record.stream.text, /"n":1/);
   assert.match(record.stream.text, /"n":2/);
-  assert.ok(record.error, 'a broken stream recorded no error');
+  // Which turn, and what it had already answered: a bare `terminated` says a
+  // stream stopped and not which one.
+  assert.match(record.error, /200, stream interrupted:/);
   assert.deepEqual(frames, ['data: {"n":1}'], 'a partial frame was handed on as if complete');
 });
 
@@ -222,6 +220,96 @@ test('a success with no body at all is refused, and recorded', async () => {
   assert.match(record.error, /did not return a readable stream/);
 });
 
+test('a caller that asked for the refusal gets it back, and no failure is recorded', async () => {
+  // The prober's mode. The same bytes, the same record, and `error: null` —
+  // recording a probe's answer as a failed exchange makes a run's failure count
+  // a lie about what happened.
+  const url = await serving((req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end('{"error":{"message":"bad stream_options"}}');
+  });
+  const run = capturing();
+
+  const { status, rawStream } = await readRecordedSse({
+    url, request, timeoutMs: 5000, label: 'probe', startedAt: performance.now(),
+    onFrame: () => {}, refusalIsFailure: false,
+  });
+  assert.equal(status, 400);
+  assert.equal(rawStream, '{"error":{"message":"bad stream_options"}}');
+
+  const record = soleRecord(run);
+  assert.equal(record.status, 400);
+  assert.equal(record.stream.text, rawStream);
+  assert.equal(record.error, null, 'an answer the caller asked for was recorded as a failure');
+});
+
+test('a body-less success is an answer too when the caller asked for one', async () => {
+  const url = await serving((req, res) => { res.writeHead(204); res.end(); });
+  const run = capturing();
+
+  const { status, rawStream } = await readRecordedSse({
+    url, request, timeoutMs: 5000, label: 'probe', startedAt: performance.now(),
+    onFrame: () => {}, refusalIsFailure: false,
+  });
+  assert.equal(status, 204);
+  assert.equal(rawStream, '');
+  assert.equal(soleRecord(run).error, null);
+});
+
+test('a body cut halfway is a failure even for a caller that wanted the refusal', async () => {
+  // The line the flag does NOT move: the caller asked a question and did not get
+  // the whole answer, whatever the status said.
+  const url = await serving((req, res) => {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.write('{"error":"cut', () => setTimeout(() => res.socket.destroy(), 10));
+  });
+  const run = capturing();
+
+  await assert.rejects(() => readRecordedSse({
+    url, request, timeoutMs: 5000, label: 'probe', startedAt: performance.now(),
+    onFrame: () => {}, refusalIsFailure: false,
+  }));
+
+  const record = soleRecord(run);
+  assert.equal(record.status, 400);
+  assert.equal(record.stream.text, '{"error":"cut');
+  assert.match(record.error, /body interrupted/);
+});
+
+test('a caller whose onFrame throws does not leave the request open', async () => {
+  // The exception reached the caller at once while the socket stayed open until
+  // an unrelated timeout fired, so a run's own timings and the vendor's view of
+  // when the call ended disagreed. The server below never ends the response.
+  let closed = null;
+  const opened = [];
+  const url = await serving((req, res) => {
+    opened.push(res);
+    res.on('close', () => { closed = performance.now(); });
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: {"n":1}\n\n');
+  });
+  const run = capturing();
+  const startedAt = performance.now();
+
+  await assert.rejects(
+    () => readRecordedSse({
+      url, request, timeoutMs: 30_000, label: 'probe', startedAt,
+      onFrame: () => { throw new Error('caller exploded'); },
+    }),
+    (error) => { assert.equal(error.message, 'caller exploded'); return true; },
+  );
+
+  // The timeout is 30 s and this must not wait for it.
+  const deadline = performance.now() + 2000;
+  while (closed === null && performance.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(closed !== null, 'the request was still open two seconds after the caller threw');
+  assert.ok(closed - startedAt < 2000, `the request stayed open ${Math.round(closed - startedAt)}ms`);
+
+  const record = soleRecord(run);
+  assert.equal(record.status, 200);
+  assert.match(record.error, /caller exploded/);
+});
+
 test('a long refusal is truncated in the message and kept whole in the record', async () => {
   // The two halves of the same rule. The message is a diagnostic and is cut to
   // the length the runner's buffered path cuts to — the extraction shortened it
@@ -237,7 +325,6 @@ test('a long refusal is truncated in the message and kept whole in the record', 
   await assert.rejects(() => read(url), (error) => {
     const shown = error.message.slice(`${url} 400: `.length);
     assert.equal(shown, `${body.slice(0, 2000)}...`, 'the message is not cut where the runner cuts');
-    assert.equal(error.body, body, 'the error carries the cut body rather than the whole one');
     return true;
   });
 
@@ -260,8 +347,8 @@ test('a whole refusal ending mid-character says the same thing twice', async () 
 
   const record = soleRecord(run);
   assert.equal(record.stream.text, '{"e":"\uFFFD');
-  assert.equal(thrown.body, record.stream.text, 'the caller and the record disagree about one body');
-  assert.equal(thrown.message, `${url} 400: ${record.stream.text}`);
+  assert.equal(thrown.message, `${url} 400: ${record.stream.text}`,
+    'the message and the record disagree about one body');
 });
 
 test('a refusal cut off mid-body keeps the bytes that arrived', async () => {

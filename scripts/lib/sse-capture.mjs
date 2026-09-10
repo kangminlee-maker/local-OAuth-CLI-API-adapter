@@ -23,21 +23,12 @@ import { recordExchange } from './capture-recorder.mjs';
  */
 const truncate = (text, limit = 2000) => (text.length > limit ? `${text.slice(0, limit)}...` : text);
 
-/**
- * A transport failure that already carries its status and its whole body, so a
- * caller need not re-read a response that has been consumed.
- *
- * `body` is the untruncated bytes; `message` carries only as much of them as a
- * diagnostic should. A caller that treats a refusal as an OBSERVATION rather
- * than a failure — a prober asking what the vendor says to a bad request — needs
- * the whole thing, and the alternative is reading the record back off disk.
- */
+/** A transport failure that already carries its status, so a caller need not re-read the response. */
 export class SseTransportError extends Error {
-  constructor(message, status, body = '') {
+  constructor(message, status) {
     super(message);
     this.name = 'SseTransportError';
     this.status = status;
-    this.body = body;
   }
 }
 
@@ -53,7 +44,15 @@ export class SseTransportError extends Error {
  * The recording is in a `finally`. Anything else is a list of exits someone has
  * to keep complete, and the two that were missed are the two that mattered.
  */
-export async function readRecordedSse({ url, request, timeoutMs, label, startedAt, onFrame }) {
+export async function readRecordedSse({
+  url, request, timeoutMs, label, startedAt, onFrame,
+  // Whether a non-2xx is a FAILURE or an ANSWER. The benchmark runner asks for a
+  // completion and a 4xx means it did not get one; the direct-API prober asks
+  // what the vendor says to a bad request and a 4xx is the whole point of the
+  // call. Recording a prober's answer as a failed exchange makes a run's failure
+  // count a lie, and the two callers cannot both be right about one default.
+  refusalIsFailure = true,
+} = {}) {
   let res = null;
   let rawStream = '';
   let failure = null;
@@ -102,7 +101,7 @@ export async function readRecordedSse({ url, request, timeoutMs, label, startedA
     });
 
     if (!res.ok) {
-      failure = `${url} ${res.status}`;
+      if (refusalIsFailure) failure = `${url} ${res.status}`;
       // Read the refusal the way a good stream is read, chunk by chunk into
       // `rawStream`. `res.text()` resolves only when the whole body has arrived,
       // so a refusal whose connection drops mid-body recorded an empty string —
@@ -118,42 +117,69 @@ export async function readRecordedSse({ url, request, timeoutMs, label, startedA
           }
           rawStream += decoder.decode();
         } catch (error) {
-          failure = `${failure}, body interrupted: ${String(error?.message ?? error)}`;
+          // Interrupted is a failure whatever the status was: the caller asked a
+          // question and did not get the whole answer.
+          failure = `${url} ${res.status}, body interrupted: ${String(error?.message ?? error)}`;
           throw error;
+        } finally {
+          await reader.cancel().catch(() => {});
         }
       }
-      throw new SseTransportError(`${url} ${res.status}: ${truncate(rawStream)}`, res.status, rawStream);
+      // An answer is returned, not thrown. A caller that asked for one would
+      // otherwise have to reconstruct it from an exception.
+      if (!refusalIsFailure) return { status: res.status, rawStream };
+      throw new SseTransportError(`${url} ${res.status}: ${truncate(rawStream)}`, res.status);
     }
     if (!res.body) {
+      // Same question as the refusal above, same answer: a caller asking what
+      // the vendor does with a bad request is told 204-and-nothing, while a
+      // caller that asked for a completion did not get one.
+      if (!refusalIsFailure) return { status: res.status, rawStream };
       failure = `${url} did not return a readable stream`;
-      throw new SseTransportError(failure, res.status, '');
+      throw new SseTransportError(failure, res.status);
     }
 
     const reader = res.body.getReader();
-    let buffer = '';
-    while (true) {
-      const read = await reader.read();
-      if (read.done) break;
-      const decoded = decoder.decode(read.value, { stream: true });
-      rawStream += decoded;
-      buffer += decoded;
-      let index;
-      while ((index = buffer.indexOf('\n\n')) !== -1) {
-        onFrame(buffer.slice(0, index));
-        buffer = buffer.slice(index + 2);
+    // Released on every exit that is not the stream ending on its own. A caller
+    // whose `onFrame` throws used to leave the request live until an unrelated
+    // timeout fired — the exception reached the caller at once while the socket
+    // stayed open for minutes, so a run's timings and the vendor's view of it
+    // disagreed about when the call ended.
+    let drained = false;
+    try {
+      let buffer = '';
+      while (true) {
+        const read = await reader.read();
+        if (read.done) { drained = true; break; }
+        const decoded = decoder.decode(read.value, { stream: true });
+        rawStream += decoded;
+        buffer += decoded;
+        let index;
+        while ((index = buffer.indexOf('\n\n')) !== -1) {
+          onFrame(buffer.slice(0, index));
+          buffer = buffer.slice(index + 2);
+        }
       }
+      // The flush goes to both: `buffer` so a final frame is handed on, and
+      // `rawStream` because that is what the record and the terminator gate read.
+      // It used to reach only `buffer`, so a good stream ending mid-character was
+      // recorded a byte short of what the frame callback had already seen.
+      const tail = decoder.decode();
+      rawStream += tail;
+      buffer += tail;
+      const finalFrame = buffer.trim();
+      if (finalFrame) onFrame(finalFrame);
+    } finally {
+      if (!drained) await reader.cancel().catch(() => {});
     }
-    // The flush goes to both: `buffer` so a final frame is handed on, and
-    // `rawStream` because that is what the record and the terminator gate read.
-    // It used to reach only `buffer`, so a good stream ending mid-character was
-    // recorded a byte short of what the frame callback had already seen.
-    const tail = decoder.decode();
-    rawStream += tail;
-    buffer += tail;
-    const finalFrame = buffer.trim();
-    if (finalFrame) onFrame(finalFrame);
   } catch (error) {
-    if (failure === null) failure = String(error?.message ?? error);
+    if (failure === null) {
+      // Labelled where there is something to label it with. A bare `terminated`
+      // in a record says a stream stopped and not which turn it was, and the
+      // status is the half a reader cannot recover from the bytes.
+      const said = String(error?.message ?? error);
+      failure = res ? `${url} ${res.status}, stream interrupted: ${said}` : said;
+    }
     throw error;
   } finally {
     record();

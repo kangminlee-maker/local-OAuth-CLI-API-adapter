@@ -9,8 +9,8 @@
 // expectation is exactly when an instrument fails silently. So the detectors run
 // against a known-opposite input before any capture is believed, and the run
 // refuses to continue if a detector cannot tell the two apart.
-import { recordExchange, startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
-import { SseTransportError, readRecordedSse } from './lib/sse-capture.mjs';
+import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
+import { readProbeExchange } from './lib/probe-exchange.mjs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,7 +21,7 @@ const anthropicModel = readArg('--anthropic-model') ?? 'claude-sonnet-5';
 const only = readArg('--only');
 // Generous: these are real vendor turns, and the point of a timeout here is that
 // a hung socket ends as a recorded exchange rather than a run that never returns.
-const STREAM_TIMEOUT_MS = 180_000;
+const PROBE_TIMEOUT_MS = 180_000;
 
 if (!process.env.OPENAI_API_KEY || !process.env.ANTHROPIC_API_KEY) {
   console.error('OPENAI_API_KEY and ANTHROPIC_API_KEY are required: these probes ask the vendors directly');
@@ -149,68 +149,20 @@ for (const probe of probes) {
     ? { authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'content-type': 'application/json' }
     : { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'content-type': 'application/json', ...(probe.omitVersionHeader ? {} : { 'anthropic-version': '2023-06-01' }) };
   const requestBody = JSON.stringify(probe.body);
-  const startedAt = Date.now();
-  let res; let text = ''; let wire = ''; let status = null;
-  if (probe.stream) {
-    // The same reader the runner uses, for the same reason: it records the
-    // exchange on every exit, so a stream cut halfway keeps the bytes that
-    // arrived and the status the response already gave. Read here with
-    // `res.text()` the way the buffered branch below does, a cut stream wrote a
-    // record with `status: null` and `stream: null` — which reads afterwards as
-    // a call that was never made, and this store is where every promoted
-    // fixture comes from.
-    try {
-      const read = await readRecordedSse({
-        url: probe.url,
-        request: { headers, body: requestBody },
-        timeoutMs: STREAM_TIMEOUT_MS,
-        label: probe.id,
-        startedAt: performance.now(),
-        onFrame: () => {},
-      });
-      status = read.status;
-      text = read.rawStream;
-      wire = read.rawStream;
-    } catch (err) {
-      // A refusal is an ANSWER to these probes, not a failure — P-10 exists to
-      // see one. The exchange is already recorded either way.
-      if (!(err instanceof SseTransportError)) {
-        results.push({ id: probe.id, why: probe.why, error: String(err) });
-        continue;
-      }
-      status = err.status;
-      text = err.body;
-      wire = err.body;
-    }
-  } else {
-    try {
-      res = await fetch(probe.url, { method: 'POST', headers, body: requestBody });
-      text = await res.text();
-      status = res.status;
-    } catch (err) {
-      // `res` is set as soon as the head arrives, so a body that dies mid-read
-      // still knows what the vendor answered. Recording nothing of it said the
-      // request never reached anyone.
-      recordExchange({
-        kind: 'json', label: probe.id, url: probe.url, requestHeaders: headers, requestBody,
-        status: res?.status ?? null, statusText: res?.statusText ?? null, responseHeaders: res?.headers ?? null,
-        error: err, durationMs: Date.now() - startedAt,
-      });
-      results.push({ id: probe.id, why: probe.why, error: String(err) });
-      continue;
-    }
-    recordExchange({
-      kind: 'json',
-      label: probe.id,
-      url: probe.url,
-      requestHeaders: headers,
-      requestBody,
-      status: res.status,
-      statusText: res.statusText,
-      responseHeaders: res.headers,
-      responseBody: text,
-      durationMs: Date.now() - startedAt,
-    });
+  // One function, in scripts/lib, because this file cannot be run without
+  // spending vendor calls: the check that this reads a stream without losing
+  // what arrived has to be able to call the thing that ships.
+  const { status, text, wire, failed } = await readProbeExchange({
+    url: probe.url,
+    headers,
+    requestBody,
+    stream: Boolean(probe.stream),
+    label: probe.id,
+    timeoutMs: PROBE_TIMEOUT_MS,
+  });
+  if (failed !== null) {
+    results.push({ id: probe.id, why: probe.why, error: failed });
+    continue;
   }
   let json = null;
   try { json = JSON.parse(text); } catch { /* streams and error pages are not one JSON object */ }
