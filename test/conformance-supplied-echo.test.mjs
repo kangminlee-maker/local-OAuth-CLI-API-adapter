@@ -563,6 +563,17 @@ test('an answer field that is neither bound nor named free is reported', () => {
   assert.match(failures.join('\n'), /somethingNew, which no binding checks/);
 });
 
+test('a NESTED answer field that no binding covers is reported', () => {
+  // The shape that walked past a scan of top-level keys: `usage` is covered, so
+  // anything under it rode along. This is where the next compensating fixture
+  // would go, and a top-level case cannot tell a leaf scan from a shallow one.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: { usage: { anythingAtAll: 1 } } }],
+    () => ({ body: { stop_reason: 'max_tokens', content: [], usage: {} }, request: {} }),
+  );
+  assert.match(failures.join('\n'), /usage\.anythingAtAll, which no binding checks/);
+});
+
 test('a free field with no reason given is itself a failure', () => {
   const { failures } = answerPremiseFailures(
     [{ fixture: 'made-up', surface: '/v1/nowhere-free', answer: {} }],
