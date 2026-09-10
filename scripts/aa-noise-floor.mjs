@@ -236,8 +236,8 @@ if (reportPath) {
 // writes the WHOLE state object from its own snapshot, the second writer erases
 // rows the first had paid for. Through `--only`, which exists to partition a
 // batch across processes, that is the ordinary way to run it.
-const hold = (path, what) => {
-  const { lockPath, heldBy, release } = acquireStateLock(path);
+const hold = (path, what, options = {}) => {
+  const { lockPath, heldBy, release } = acquireStateLock(path, options);
   if (!release) {
     console.error(`another run holds ${lockPath} (pid ${heldBy}). `
       + `Two runs sharing one ${what} each spend the whole budget and the second erases the `
@@ -254,7 +254,9 @@ if (statePath) hold(statePath, 'state file');
 // Taken whether or not there is a ledger. A partitioned run without `--resume`
 // is the shortest way to run one, and it used to take no lock at all — while
 // still writing the artifact every partition writes.
-if (live) hold(outPath, 'artifact');
+// `create: false` — the artifact must NOT exist, and a lock that made a
+// placeholder would be this run refusing itself one line later.
+if (live) hold(outPath, 'artifact', { create: false });
 if (live && existsSync(outPath)) {
   console.error(`${outPath} already exists. Writing it would erase a run that has already been paid `
     + 'for; pass --out with a name of your own, or move the old artifact aside deliberately.');
