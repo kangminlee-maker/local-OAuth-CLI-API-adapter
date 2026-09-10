@@ -58,6 +58,19 @@ const only = opt('--only', null);
 const outPath = opt('--out', resolve(repoRoot, 'bench-results',
   `aa-noise-floor-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}.json`));
 
+// Published list prices, read 2026-09-10 from developers.openai.com/api/docs/pricing
+// and platform.claude.com/docs/en/about-claude/pricing. They are here so the plan
+// can price itself before it spends anything; they are NOT authoritative, and a
+// run's real cost is whatever the invoice says.
+const PRICES = {
+  'gpt-5.6-terra': { inPerM: 2, outPerM: 12 },
+  'gpt-5.6-sol': { inPerM: 4, outPerM: 20 },
+  'gpt-5.6-luna': { inPerM: 0.2, outPerM: 1.2 },
+  'claude-sonnet-5': { inPerM: 2, outPerM: 10 },
+  'claude-opus-5': { inPerM: 5, outPerM: 25 },
+  'claude-haiku-4-5': { inPerM: 1, outPerM: 5 },
+};
+
 const PROVIDERS = {
   openai: {
     url: 'https://api.openai.com/v1/chat/completions',
@@ -71,6 +84,11 @@ const PROVIDERS = {
       messages: [{ role: 'user', content: prompt }],
       max_completion_tokens: maxTokens,
     }),
+    // Roughly 3.7 characters per token, measured on these exact prompts from
+    // recorded usage in bench-results (avg 178 input tokens for a 652-character
+    // mean prompt). Output is estimated at 4 characters per token against the
+    // answer lengths the 2026-08-28 control actually observed.
+    charsPerToken: { in: 3.7, out: 4 },
     // Sampling controls are left at their defaults ON PURPOSE: this measures the
     // vendor as the comparison actually calls it, and pinning temperature would
     // measure a configuration nothing else uses.
@@ -93,6 +111,10 @@ const PROVIDERS = {
       max_tokens: maxTokens,
       messages: [{ role: 'user', content: prompt }],
     }),
+    // Claude 4.7 and later use a tokenizer that produces about 30% more tokens
+    // for the same text, per the pricing page's own note. Ignoring it would
+    // under-price this side by roughly a third.
+    charsPerToken: { in: 3.7 / 1.3, out: 4 / 1.3 },
     readAnswer: (parsed) => ({
       text: parsed.content?.find((block) => block.type === 'text')?.text ?? '',
       outputTokens: parsed.usage?.output_tokens ?? null,
@@ -132,10 +154,61 @@ const plan = {
   only,
 };
 
+/**
+ * What the plan costs at list price, from measured token ratios.
+ *
+ * Observed answer lengths come from the 2026-08-28 control — the same rows, the
+ * same prompts — so this is an estimate with its inputs named rather than a
+ * guess. It is an UPPER bound in calls: every row taking all `reps`.
+ */
+function estimate() {
+  const observed = existsSync(resolve(repoRoot, 'bench-results/aa-control-terra-sonnet5-20260828.json'))
+    ? JSON.parse(readFileSync(resolve(repoRoot, 'bench-results/aa-control-terra-sonnet5-20260828.json'), 'utf8'))
+    : null;
+  const answerChars = {};
+  for (const row of observed?.rows ?? []) {
+    answerChars[row.provider] ??= {};
+    answerChars[row.provider][row.task] = row.mean;
+  }
+  const lines = [];
+  let usd = 0;
+  for (const provider of new Set(rows.map((row) => row.provider))) {
+    const vendor = PROVIDERS[provider];
+    const price = PRICES[vendor.model];
+    const mine = rows.filter((row) => row.provider === provider);
+    const inTokens = mine.reduce((total, row) => total + row.prompt.length / vendor.charsPerToken.in, 0) * reps;
+    // A row with no prior observation is priced at the observed mean, not at
+    // zero: an unmeasured row is unknown, and unknown is not free.
+    const means = Object.values(answerChars[provider] ?? {});
+    const fallback = means.length ? means.reduce((a, b) => a + b, 0) / means.length : 800;
+    const outTokens = mine.reduce(
+      (total, row) => total + (answerChars[provider]?.[row.task] ?? fallback) / vendor.charsPerToken.out, 0) * reps;
+    const cost = price
+      ? (inTokens / 1e6) * price.inPerM + (outTokens / 1e6) * price.outPerM
+      : null;
+    if (cost !== null) usd += cost;
+    lines.push({
+      provider,
+      model: vendor.model,
+      priced: Boolean(price),
+      calls: mine.length * reps,
+      inputTokens: Math.round(inTokens),
+      outputTokens: Math.round(outTokens),
+      usd: cost === null ? null : Number(cost.toFixed(2)),
+    });
+  }
+  return { perProvider: lines, usdTotal: Number(usd.toFixed(2)), pricesReadAt: '2026-09-10' };
+}
+
 if (!live) {
-  console.log(JSON.stringify({ plan, wouldWrite: outPath, note: 'no call was made; pass --live to run' }, null, 2));
+  const cost = estimate();
+  console.log(JSON.stringify({ plan, cost, wouldWrite: outPath, note: 'no call was made; pass --live to run' }, null, 2));
   console.log(`\n${plan.worstCaseCalls} live vendor calls at worst (${rows.length} rows × ${reps}), `
     + `fewer if rows settle inside ±${decisivePct}% of their mean after ${minReps}.`);
+  console.log(`Estimated list-price cost at the worst case: $${cost.usdTotal.toFixed(2)}.`);
+  if (cost.perProvider.some((line) => !line.priced)) {
+    console.log('A model in this plan has no published price on file; its cost is NOT in that total.');
+  }
   process.exit(0);
 }
 
