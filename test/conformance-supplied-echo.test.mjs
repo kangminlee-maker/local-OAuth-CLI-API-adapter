@@ -38,9 +38,12 @@ import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterRepl
   MINIMAL_SURFACES,
   bindingsReached,
   echoFailures,
+  expectedItemTypes,
   freeFieldsReached,
   harnessGapsFrom,
+  itemTypesOf,
   missingRequiredEffects,
+  servedResult,
   unclaimedRequestOptions,
 } from './replayed-captures.mjs';
 
@@ -224,7 +227,7 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
   return { compared, comparedByRoot, differences, exhibited, echoedPaths };
 }
 
-for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, harnessGaps, harnessPremise, vendorPaths } of CAPTURES) {
+for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, harnessGaps, vendorPaths } of CAPTURES) {
   test(`${fixture}: the proxy answers in the vendor's shape`, () => {
     const capture = load(fixture);
     const vendor = JSON.parse(capture.body);
@@ -259,16 +262,20 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, ha
     // our side a reasoning item of its own and the exemptions keep covering
     // disagreements that are no longer about a missing member.
     const gaps = harnessGaps ?? [];
-    if (gaps.length > 0) {
-      assert.ok(harnessPremise, `${fixture}: harness gaps without the premise that explains them`);
-      const typesOf = (body) => (body?.output ?? body?.choices ?? []).map((item) => item?.type ?? null);
-      assert.deepEqual(typesOf(vendor), harnessPremise.vendor, `${fixture}: the vendor's turn is not the one these gaps describe`);
-      assert.deepEqual(typesOf(ours.body), harnessPremise.ours, `${fixture}: our turn is not the one these gaps describe`);
-      // ...and the list itself follows from that missing item. A true premise
-      // used to license any path listed beside it.
-      assert.deepEqual([...gaps].sort(), harnessGapsFrom(vendor, harnessPremise),
-        `${fixture}: a declared harness gap does not follow from the item our turn lacks`);
-    }
+    // EVERY row, and from the HARNESS's table rather than the row's. The premise
+    // used to be a row field: a review made `/v1/responses` drop its message item
+    // for one request, changed that row's `ours` to `[]`, re-derived the list,
+    // and the client got no answer item at all with the suite green. The
+    // regression supplied the observation that validated the row edit exempting
+    // it. Our turn must answer with the vendor's items minus the ones the
+    // harness cannot produce — no row field is consulted.
+    assert.deepEqual(itemTypesOf(ours.body), expectedItemTypes(vendor, surface),
+      `${fixture}: our turn is not the vendor's turn minus what the harness cannot produce`);
+    // ...and the gap list follows from those items and nothing else. A row with
+    // no such item owes an empty list; one with them owes exactly the paths they
+    // took with them.
+    assert.deepEqual([...gaps].sort(), harnessGapsFrom(vendor, surface),
+      `${fixture}: a declared harness gap does not follow from the item our turn lacks`);
 
     const declared = [...new Set(expectedAbsentPaths(surface, theirs))].sort();
     const { credited, uncredited } = creditedAbsences(declared, gaps, onlyVendor, mine);
@@ -380,15 +387,42 @@ test('every capture in the store is replayed by a gate', () => {
 // these are those facts, so the next reason to go false says so.
 
 test('a gap that does not follow from the missing item is not derivable', () => {
-  // The construction: a real premise (`reasoning` gone from our turn) plus an
-  // unrelated top-level field the proxy stopped reporting.
+  // The construction: a real missing item (`reasoning`, which the fake backend
+  // cannot produce) plus an unrelated top-level field the proxy stopped
+  // reporting.
   const vendor = {
     billing: { payer: 'developer' },
     output: [{ type: 'reasoning', summary: [] }, { type: 'message', content: [] }],
   };
-  const derived = harnessGapsFrom(vendor, { vendor: ['reasoning', 'message'], ours: ['message'] });
+  const derived = harnessGapsFrom(vendor, '/v1/responses');
   assert.ok(!derived.includes('.billing:object'), 'the derivation credits a path the missing item cannot explain');
   assert.ok(derived.includes('.output[].summary:array'), 'the derivation lost the paths the missing item does explain');
+});
+
+test('a surface with no harness-missing item can derive no gap at all', () => {
+  // The duplicate-identity construction, and why it is now unreachable: the
+  // premise used to be two type arrays the ROW wrote, subtracted as multisets,
+  // so a Chat body with two untyped choices could declare "one of them is
+  // missing" and have the field the SURVIVING choice had lost credited as a
+  // consequence of the other one's absence. Chat has no harness-missing item, so
+  // there is nothing to subtract and no ambiguity to resolve.
+  const vendor = {
+    choices: [
+      { index: 0, message: { role: 'assistant', content: 'a', refusal: null } },
+      { index: 1, message: { role: 'assistant', content: 'b', refusal: null } },
+    ],
+  };
+  assert.deepEqual(harnessGapsFrom(vendor, '/v1/chat/completions'), []);
+  assert.deepEqual(expectedItemTypes(vendor, '/v1/chat/completions'), [null, null],
+    'a Chat answer owes every choice the vendor sent');
+});
+
+test('the item sequence our turn owes comes from the harness table, not from a row', () => {
+  const vendor = { output: [{ type: 'reasoning' }, { type: 'message' }, { type: 'reasoning' }] };
+  // EVERY item of a harness-missing type, not the first N a row claims.
+  assert.deepEqual(expectedItemTypes(vendor, '/v1/responses'), ['message']);
+  assert.deepEqual(expectedItemTypes(vendor, '/v1/messages'), ['reasoning', 'message', 'reasoning'],
+    'a surface that cannot lose an item is being allowed to lose one');
 });
 
 test('an option whose only effect is a path is compared by every row whose request carries it', () => {
@@ -730,6 +764,31 @@ test('an answer field that is neither bound nor named free is reported', () => {
     () => ({ body: { stop_reason: 'max_tokens', content: [], usage: {} }, request: {} }),
   );
   assert.match(failures.join('\n'), /somethingNew, which no binding checks/);
+});
+
+test('a projection that changes a bound VALUE, not just a name, is reported', () => {
+  // The other half of the same question, and the half the first control missed:
+  // it added a new NAME (`refusalMode`) and never moved a value at a name the
+  // table already binds. A review moved `usage.cachedInputTokens` by one inside
+  // the projection — the proxy answers 1 where the capture says 0 — and the
+  // check said nothing, because it was reading the binding's value off the row's
+  // answer rather than off what the backend serves.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'projected', surface: '/v1/chat/completions', answer: {} }],
+    () => ({
+      body: {
+        choices: [{ finish_reason: 'stop' }],
+        usage: { prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } },
+      },
+      request: {},
+    }),
+    undefined,
+    (answer, request) => {
+      const served = servedResult(answer, request);
+      return { ...served, usage: { ...served.usage, cachedInputTokens: served.usage.cachedInputTokens + 1 } };
+    },
+  );
+  assert.match(failures.join('\n'), /usage\.cachedInputTokens yields 1, the capture says 0/);
 });
 
 test('a constant the backend invents, that no row wrote, is reported', () => {

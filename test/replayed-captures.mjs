@@ -28,40 +28,73 @@ import { keyPaths } from '../scripts/lib/response-comparison.mjs';
 //
 // They are listed exactly as the reader emits them because an exemption covers
 // itself and nothing else — unlike a declaration, which owns what is beneath
-// it. And they are honoured only after the row's `harnessPremise` is checked
-// against both turns, so they cannot outlive the situation they describe.
+// it. And the list is DERIVED from the capture and the harness's own table of
+// items it cannot produce, so it cannot outlive the situation it describes and
+// no row can widen it.
+/**
+ * The output items OUR turn cannot produce, per surface, and why.
+ *
+ * Owned by the harness, outside every roster, because the row must not decide
+ * what it is allowed to be missing. `harnessPremise` used to carry that: a row
+ * wrote `{ vendor: [...], ours: [...] }`, the gate checked those two arrays
+ * against the frozen capture and the CURRENT proxy answer, and then accepted
+ * whatever the derivation produced. A review made `/v1/responses` drop its
+ * message item for one request, changed that row's `ours` from `['message']` to
+ * `[]`, and re-derived the list: the client received no answer item at all and
+ * the whole suite stayed green. The product regression supplied the very
+ * observation that validated the row edit exempting it.
+ *
+ * `reasoning` is here because the fake backend returns no reasoning item — it is
+ * a fact about `createReplayBackend`, not about any capture — and nothing else
+ * is, on any surface. A Chat choice or a `/v1/messages` block that goes missing
+ * is a defect with no exemption to reach for.
+ */
+export const HARNESS_MISSING_ITEMS = {
+  '/v1/chat/completions': [],
+  '/v1/responses': ['reasoning'],
+  '/v1/messages': [],
+};
+
+/** The output item types a body carries, `null` where a member has none. */
+export function itemTypesOf(body) {
+  return (body?.output ?? body?.choices ?? []).map((item) => item?.type ?? null);
+}
+
+/**
+ * The item sequence our turn must answer with: the vendor's, minus the items the
+ * HARNESS cannot produce. A row cannot widen it.
+ */
+export function expectedItemTypes(vendor, surface, missing = HARNESS_MISSING_ITEMS) {
+  const absent = new Set(missing[surface] ?? []);
+  return itemTypesOf(vendor).filter((type) => !absent.has(type));
+}
+
 /**
  * The paths a declared harness gap is ALLOWED to name, derived from the capture
  * rather than listed.
  *
- * `harnessPremise` says which output items our turn lacks. That premise was
- * checked and the LIST was not, so once the two type arrays matched, any path at
- * all could ride in the list beside them: a review made the proxy drop `billing`
- * from a Responses answer — a client-visible field loss, red at 115/116 — and
- * turned it green by appending `.billing:object` and `.billing.payer:string` to
- * this row's gaps. The premise was still true. It just never had anything to do
- * with `billing`.
+ * The list used to be trusted beside a checked premise, so once the two type
+ * arrays matched, any path at all could ride along: a review made the proxy drop
+ * `billing` from a Responses answer — a client-visible field loss, red at
+ * 115/116 — and turned it green by appending `.billing:object` and
+ * `.billing.payer:string` to this row's gaps. The premise was still true. It
+ * just never had anything to do with `billing`.
  *
- * So the gap set is now COMPUTED: remove from the vendor's own body exactly the
- * items the premise says we lack, and the paths that disappear are the gaps.
+ * So the gap set is COMPUTED: remove from the vendor's own body every item of a
+ * type the HARNESS cannot produce, and the paths that disappear are the gaps.
  * Nothing else can be one.
+ *
+ * By TYPE and not by count. An earlier version subtracted the row's two type
+ * arrays as multisets and removed the first vendor member of each missing type,
+ * which cannot tell two items of one type apart: a review gave a Chat body two
+ * untyped choices, declared one of them missing, and had the field its SURVIVING
+ * choice had lost credited as a consequence of the other one's absence.
  */
-export function harnessGapsFrom(vendor, premise) {
+export function harnessGapsFrom(vendor, surface, missing = HARNESS_MISSING_ITEMS) {
   const key = vendor?.output ? 'output' : 'choices';
-  const missing = [...(premise?.vendor ?? [])];
-  for (const type of premise?.ours ?? []) {
-    const at = missing.indexOf(type);
-    if (at !== -1) missing.splice(at, 1);
-  }
-  const kept = [];
-  for (const item of vendor?.[key] ?? []) {
-    const at = missing.indexOf(item?.type ?? null);
-    if (at !== -1) {
-      missing.splice(at, 1);
-      continue;
-    }
-    kept.push(item);
-  }
+  const absent = new Set(missing[surface] ?? []);
+  const kept = (vendor?.[key] ?? []).filter((item) => !absent.has(item?.type ?? null));
+  if (kept.length === (vendor?.[key] ?? []).length) return [];
   const theirs = keyPaths(vendor);
   const ours = keyPaths({ ...vendor, [key]: kept });
   return [...theirs.keys()].filter((path) => !ours.has(path)).sort();
@@ -265,7 +298,6 @@ export const SUPPLIED_ECHO_CAPTURES = [
     // The premise is asserted before any of these are honoured. A review gave
     // our side a reasoning item of its own, which left every exemption below
     // covering a disagreement that was no longer about a missing member.
-    harnessPremise: { vendor: ['reasoning', 'message'], ours: ['message'] },
     harnessGaps: HARNESS_GAPS_NO_REASONING_ITEM,
     vendorPaths: 99,
   },
@@ -943,6 +975,14 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, 
     // anybody can put a compensating value into.
     const answer = servedAnswer(declared);
     const { body: vendor, request } = bodyOf(fixture);
+    // What the backend actually hands the proxy. Computed ONCE and used for
+    // every bound value below: the first version read the binding's value off
+    // `answer`, so a projection that changed a bound leaf on its way through was
+    // invisible. A review set `usage.cachedInputTokens` one higher inside the
+    // projection — the proxy answered 1 against a capture that says 0 — and this
+    // check returned no failures, because it was comparing the vendor to a
+    // number the backend never served.
+    const served = resultOf(answer, request);
     const table = bindings[surface];
     if (!table) {
       failures.push(`${fixture}: ${surface} has no binding table, so its premise is unchecked`);
@@ -966,7 +1006,7 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, 
     // `toolCalls` or `latencyMs`: constants the harness invents, neither derived
     // from the capture nor checked against it, while the table read as an audit
     // of every input the proxy is given.
-    for (const field of new Set([...leafPaths(answer), ...leafPaths(resultOf(answer, request))])) {
+    for (const field of new Set([...leafPaths(answer), ...leafPaths(served)])) {
       if (covered.has(field)) continue;
       if (Object.prototype.hasOwnProperty.call(free, field)) {
         if (!free[field]) failures.push(`${fixture}: ${field} is free with no reason given`);
@@ -986,8 +1026,10 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, 
       if (!present.has(field)) continue;
       checked += 1;
       const theirs = ofVendor(vendor, request);
-      // Some fields are compared through the effect they have, not literally.
-      const ours = ofAnswer ? ofAnswer(answer, request) : read(answer, field);
+      // Presence comes from the ANSWER, where `undefined` is the claim that the
+      // turn simply ended. The VALUE comes from what the proxy was served, which
+      // is the only thing the capture can be compared against.
+      const ours = ofAnswer ? ofAnswer(served, request) : read(served, field);
       if (JSON.stringify(ours) !== JSON.stringify(theirs)) {
         failures.push(`${fixture}: the answer's ${field} yields ${JSON.stringify(ours)}, `
           + `the capture says ${JSON.stringify(theirs)}`);
