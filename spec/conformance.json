@@ -3,7 +3,7 @@
   "generatedBy": "scripts/build-conformance-manifest.mjs",
   "source": {
     "matrix": "docs/conformance-matrix.md",
-    "matrixDigest": "9dca31e6452f3599ee95e8e472a1450710e29df389a7cfd16c863a446977dadc",
+    "matrixDigest": "3fa4d5e015b72e190257a3bd941ee73dfcda03415f1aefdae152107a46c2b58c",
     "divergences": "spec/declared-divergences.json"
   },
   "counts": {
@@ -176,6 +176,18 @@
       "surface": "/v1/responses",
       "evidence": "spec/captures/direct-responses-reasoning-summary-auto.json; docs/conformance-matrix.md R-22",
       "measuredAt": "2026-09-09"
+    },
+    {
+      "id": "messages-vendor-routing-usage-is-not-reported",
+      "surface": "/v1/messages",
+      "evidence": "artifacts/direct-api-captures (six /v1/messages 200 responses), src/proxy/http-server.ts anthropicUsage; docs/design-task-unmeasured-thinking-tokens.md",
+      "measuredAt": "2026-09-10"
+    },
+    {
+      "id": "chat-moderation-results-are-not-reported",
+      "surface": "/v1/chat/completions",
+      "evidence": "spec/captures/direct-chat-moderation-model.json; docs/conformance-matrix.md row 49, §5.5.5",
+      "measuredAt": "2026-08-30"
     }
   ],
   "claims": [
@@ -1252,9 +1264,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated as the direct API validates it (`moderation.model` required) and not applied — the local runtimes moderate nothing, so the response carries no `moderation` object",
-      "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5)",
+      "claimedNote": "validated as the direct API validates it (`moderation.model` required) and not applied — the local runtimes moderate nothing, so the response carries no `moderation` object. The direct answer is not empty: it is 200 **plus a 127-path `moderation` block** — `input` and `output`, each a `moderation_results` carrying `flagged`, 13 `categories`, 13 `category_scores` and 13 `category_applied_input_types`. Since 2026-09-10 that absence is **declared** (`chat-moderation-results-are-not-reported`) and replayed, not described: the values are a classifier's verdicts, not counters, so a `flagged: false` would be this proxy asserting the outcome of a check it never ran. **Unmeasured on the request side**: this proxy reads only `moderation.model` while the type above shows a nested `policy`, and the direct API is strict about nested members elsewhere — whether `{model, bogus}` is a 400 there and a 200 here is one free refusal probe and is not claimed either way",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-chat-moderation-model.json`)",
       "liveParityRow": true
     },
     {
@@ -2148,15 +2160,15 @@
       "field": "`moderation`",
       "vendor": {
         "valueSpace": "`{model, policy}`",
-        "defaultWhenOmitted": "absent",
+        "defaultWhenOmitted": "**`null`** — measured, not absent",
         "observableEffect": "moderated output",
         "invalidValue": "UNKNOWN"
       },
       "claimedLead": "silently ignored",
       "claimedLeadInLegend": true,
-      "claimedNote": "silently ignored; `moderation` echoed as hard `null` (`http-server.ts:2009`)",
-      "evidenceGrade": "DOC",
-      "evidenceNote": "DOC",
+      "claimedNote": "silently ignored; `moderation` echoed as hard `null` (`http-server.ts:2384`). This cell read \"default when omitted: absent\" and cited a line number that had moved, until 2026-09-10: all **19** promoted `/v1/responses` captures carry `moderation: null`, and `conformance-echoed-defaults.test` compares it on every run. What the vendor answers when a request DOES carry `moderation` on this surface is **unmeasured** — if it fills the field there, this hard `null` is a value divergence rather than a mirror",
+      "evidenceGrade": "WIRE",
+      "evidenceNote": "WIRE (`spec/captures/direct-responses-minimal.json`)",
       "liveParityRow": true
     },
     {
@@ -3026,9 +3038,9 @@
       },
       "claimedLead": "realized",
       "claimedLeadInLegend": false,
-      "claimedNote": "**realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`)",
+      "claimedNote": "**realized**: the output is cut before the first sequence and the turn reports `stop_reason: stop_sequence` with the matched `stop_sequence`, buffered and streamed (a split-across-deltas sequence is caught by a hold-back). Validation mirrors the direct API (`Input should be a valid array`, `stop_sequences.0: … valid string`). Replayed since 2026-09-10 against three captures — a turn that hit the sequence (`spec/captures/direct-messages-stop-sequence-hit.json`, and the P-8 turn `spec/captures/direct-messages-stop-sequence-hit-p8.json`, both answering `stop_reason: \"stop_sequence\"` with `stop_sequence: \"ZZ\"`) and one whose `stop_sequences: []` never fires (`spec/captures/direct-messages-stop-sequences-empty.json`, `stop_reason: \"max_tokens\"`, `stop_sequence: null`). Those three sat unpromoted until the replay could tell its own backend what the vendor's turn had generated: a backend that answers `OK` to everything cannot hit a stop sequence, and the mismatch read as the proxy's. What the rows compare is the PROXY's own work on that text — `.stop_reason`, `.stop_sequence` and the cut `.content[0].text` — not the option coming back, which this surface never echoes. The first version of these rows compared `.model` and nothing else, and removing the buffered truncation left `AAZZtail` on the wire through a green gate; two independent reviews found that on 2026-09-10 and it is pinned now",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (P-8, §5.5.5-A)",
+      "evidenceNote": "VERIFIED (P-8, §5.5.5-A; `spec/captures/direct-messages-stop-sequence-hit.json`)",
       "liveParityRow": true
     },
     {
@@ -3246,9 +3258,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated as the direct API validates it — `user_id` only, and a string — then not applied",
+      "claimedNote": "validated as the direct API validates it — `user_id` only, and a string — then not applied. Not applied and **not echoed either**, which the replay compares: the direct API's own answer carries no `metadata` key back, so the two sides agree on the whole envelope (`spec/captures/direct-messages-metadata-user-id.json`, replayed by `conformance-supplied-echo.test`)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "evidenceNote": "VERIFIED (§5.5.5-A; `spec/captures/direct-messages-metadata-user-id.json`)",
       "liveParityRow": true
     },
     {
@@ -3268,9 +3280,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated (`Input should be 'auto' or 'standard_only'`) and not applied. `usage.service_tier` is **not emitted**, where the direct API always emits it: a local CLI runs in no tier, and the proxy reports the runtime's numbers rather than inventing one",
+      "claimedNote": "validated (`Input should be 'auto' or 'standard_only'`) and not applied. `usage.service_tier` is **not emitted**, where the direct API always emits it: a local CLI runs in no tier, and the proxy reports the runtime's numbers rather than inventing one. That absence stopped being prose on 2026-09-10 — it is declared as `messages-vendor-routing-usage-is-not-reported` in `spec/declared-divergences.json` and replayed against the capture, so a build that started emitting a tier fails the gate instead of quietly agreeing with a paragraph (`spec/captures/direct-messages-service-tier-standard-only.json`)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "evidenceNote": "VERIFIED (§5.5.5-A; `spec/captures/direct-messages-service-tier-standard-only.json`)",
       "liveParityRow": true
     },
     {
@@ -3312,9 +3324,9 @@
       },
       "claimedLead": "validated",
       "claimedLeadInLegend": false,
-      "claimedNote": "validated (`must be one of ['global', 'us']`) and not applied; `usage.inference_geo` is not emitted, for the same reason as A-28",
+      "claimedNote": "validated (`must be one of ['global', 'us']`) and not applied; `usage.inference_geo` is not emitted, for the same reason as A-28 and under the same declaration — the capture shows the direct API echoing the REQUESTED geography back in `usage.inference_geo: \"us\"`, which is exactly the routing claim this proxy has no route to make (`spec/captures/direct-messages-inference-geo-us.json`)",
       "evidenceGrade": "VERIFIED",
-      "evidenceNote": "VERIFIED (§5.5.5-A)",
+      "evidenceNote": "VERIFIED (§5.5.5-A; `spec/captures/direct-messages-inference-geo-us.json`)",
       "liveParityRow": true
     },
     {

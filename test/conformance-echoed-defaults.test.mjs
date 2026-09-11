@@ -30,8 +30,11 @@ import { fileURLToPath } from 'node:url';
 import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
-import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
-import { MINIMAL_SURFACES as SURFACES, assertRosterReplayed, startReplayRecorder } from './replayed-captures.mjs';
+import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, validateDeclarations } from '../scripts/lib/response-comparison.mjs';
+import { MINIMAL_SURFACES as SURFACES, answerPremiseFailures, assertRosterReplayed, startReplayRecorder,
+  createReplayBackend,
+  missingRequiredEffects,
+} from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 
@@ -58,36 +61,17 @@ test('the gate covers the surfaces it claims to, once each', () => {
 });
 
 let started;
+let replay;
 let recorder;
 const bodies = new Map();
 
 before(async () => {
+  replay = createReplayBackend();
   started = await startLocalApiProxy({
     host: '127.0.0.1',
     port: 0,
     requestTimeoutMs: 10_000,
-    backend: {
-      name: 'fake-backend',
-      model: 'fake-local-model',
-      async generate(request) {
-        return {
-          id: 'local_test',
-          model: request.model,
-          text: 'OK',
-          toolCalls: [],
-          usage: {
-            inputTokens: 7,
-            outputTokens: 1,
-            totalTokens: 8,
-            cachedInputTokens: 0,
-            reasoningOutputTokens: 0,
-            source: 'provider',
-          },
-          latencyMs: 1,
-        };
-      },
-      async close() {},
-    },
+    backend: replay.backend,
   });
   recorder = await startReplayRecorder(started.url);
 
@@ -96,8 +80,9 @@ before(async () => {
   // body is not "every optional field omitted" either: it supplies the output
   // cap to bound what the probe costs, which is why the check below counts
   // supplied echoes apart from defaults.
-  for (const { surface, fixture } of SURFACES) {
+  for (const { surface, fixture, answer } of SURFACES) {
     const capture = load(fixture);
+    replay.answerWith(answer);
     const res = await fetch(`${recorder.url}${surface}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -372,6 +357,7 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
 
     const vendorLeaves = leafValues(direct, '', new Map());
     const ourLeaves = leafValues(ours, '', new Map());
+    const ourFields = new Set(keyPaths(ours).values());
     const differences = [];
     const counts = { defaults: 0, echoes: 0 };
     for (const [path, value] of vendorLeaves) {
@@ -380,8 +366,11 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
       // and skipping the whole subtree hid it — so array counts survive the
       // skip even where the values below them do not.
       if (PER_CALL.has(rootOf(path)) && !path.endsWith('[]#')) continue;
-      // `[]` in a declaration stands for any index; leaves carry real ones.
-      if (absent.has(path) || absent.has(path.replace(/\[\d+\]/g, '[]'))) continue;
+      // The SAME reader the other gate uses. This was a third copy of the rule
+      // and already a different one — no `[]#` stripping, no ancestor walk — so
+      // one declaration meant three things depending on who asked. It had not
+      // bitten only because no defaults capture carries a declared array.
+      if (isDeclaredAbsent(absent, path, ourFields)) continue;
       counts[supplied.has(rootOf(path)) ? 'echoes' : 'defaults'] += 1;
       const ourValue = ourLeaves.get(path);
       if (ourValue !== value) differences.push(`${path}: vendor ${value}, proxy ${ourValue ?? '(absent)'}`);
@@ -399,3 +388,28 @@ for (const { surface, fixture, echoedDefaults, suppliedEchoes } of SURFACES) {
     assert.deepEqual(differences, [], `${surface} echoes different defaults than the vendor:\n  ${differences.join('\n  ')}`);
   });
 }
+
+// This gate's rows declare no answer at all, so every one of them is served
+// `DEFAULT_ANSWER` — which for a long time was bound to no capture anywhere. A
+// review moved a compensating value into that default and both gates went green
+// over a real proxy defect. A default nobody checks is a default anybody can put
+// a compensating value into.
+test('the default answer this gate is served describes the turns its captures recorded', () => {
+  const { failures, checked } = answerPremiseFailures(SURFACES, (fixture) => {
+    const capture = load(fixture);
+    return { body: JSON.parse(capture.body), request: JSON.parse(capture.request) };
+  });
+  assert.deepEqual(failures, [], 'a fixture that contradicts its own capture can hide a defect');
+  assert.ok(checked > 0, 'no answer field was bound to its capture, so this check compared nothing');
+});
+
+test('an option whose only effect is a path is compared by every row whose request carries it', () => {
+  // The same rule the sibling gate asserts, over this gate's own roster. Each
+  // gate reads only the captures its roster names, so a rule that is true of one
+  // roster says nothing about the other until it is asked here too.
+  assert.deepEqual(
+    missingRequiredEffects(SURFACES, undefined, (fixture) => Object.keys(JSON.parse(load(fixture).request))),
+    [],
+  );
+});
+

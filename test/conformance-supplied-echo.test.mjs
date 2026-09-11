@@ -32,7 +32,20 @@ import { after, before, test } from 'node:test';
 import { startLocalApiProxy } from '../dist/proxy/http-server.js';
 import { verifyCaptureStore } from '../scripts/lib/capture-provenance.mjs';
 import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDeclaredAbsent, keyPaths, leafValues, rootOf, valueDivergencesFor } from '../scripts/lib/response-comparison.mjs';
-import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder } from './replayed-captures.mjs';
+import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder,
+  createReplayBackend,
+  answerPremiseFailures,
+  MINIMAL_SURFACES,
+  bindingsReached,
+  echoFailures,
+  expectedItemTypes,
+  freeFieldsReached,
+  harnessGapsFrom,
+  itemTypesOf,
+  missingRequiredEffects,
+  servedResult,
+  unclaimedRequestOptions,
+} from './replayed-captures.mjs';
 
 const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 // A capture this gate's roster does not name cannot be read here. A review
@@ -41,12 +54,15 @@ const specDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'spec');
 // advertised, and nothing replayed it. Advertising and reading are the same act
 // now.
 const ROSTER = new Set(CAPTURES.map((row) => row.fixture));
+/** The keys a capture's own request carries, which is what the rules ask about. */
+const requestKeysOf = (fixture) => Object.keys(JSON.parse(load(fixture).request));
 const load = (name) => {
   assert.ok(ROSTER.has(name), `${name} is not one of this gate's roster captures`);
   return JSON.parse(readFileSync(join(specDir, 'captures', `${name}.json`), 'utf8'));
 };
 
 let started;
+let replay;
 let recorder;
 const answers = new Map();
 // A declared value divergence is identified by the WHOLE tuple. Keying it by
@@ -60,35 +76,25 @@ const answers = new Map();
 const tupleKey = (surface, entry) => JSON.stringify([surface, entry.path, entry.vendor, entry.proxy]);
 
 before(async () => {
+  replay = createReplayBackend();
   started = await startLocalApiProxy({
     host: '127.0.0.1',
     port: 0,
     requestTimeoutMs: 10_000,
-    backend: {
-      name: 'fake-backend',
-      model: 'fake-local-model',
-      async generate(request) {
-        return {
-          id: 'local_test',
-          model: request.model,
-          text: 'OK',
-          toolCalls: [],
-          usage: {
-            inputTokens: 7, outputTokens: 1, totalTokens: 8,
-            cachedInputTokens: 0, reasoningOutputTokens: 0, source: 'provider',
-          },
-          latencyMs: 1,
-        };
-      },
-      async close() {},
-    },
+    backend: replay.backend,
   });
   recorder = await startReplayRecorder(started.url);
 
   // The capture's own request bytes, forwarded verbatim: re-typing them would
   // ask a different question than the one the vendor answered.
-  for (const { fixture, surface } of CAPTURES) {
+  for (const { fixture, surface, answer } of CAPTURES) {
     const capture = load(fixture);
+    // What the backend behind the proxy says for THIS row. A vendor turn that
+    // ran out of tokens before writing anything, or ran its text into a stop
+    // sequence, has a shape our side cannot reach while the backend answers
+    // `OK` to everything — and reading that as "the proxy differs" is reading
+    // the answer we supplied as a fact about the proxy.
+    replay.answerWith(answer);
     const res = await fetch(`${recorder.url}${surface}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -117,9 +123,12 @@ after(async () => {
 
 test('the gate covers each capture once, on a surface it names', () => {
   assert.equal(new Set(CAPTURES.map((row) => row.fixture)).size, CAPTURES.length);
+  // Three surfaces now. `/v1/messages` arrived last because its turns are the
+  // ones whose shape follows what the vendor generated, and the gate could not
+  // answer the way those turns went until a row could name its own answer.
   assert.deepEqual(
     [...new Set(CAPTURES.map((row) => row.surface))].sort(),
-    ['/v1/chat/completions', '/v1/responses'],
+    ['/v1/chat/completions', '/v1/messages', '/v1/responses'],
   );
 });
 
@@ -169,9 +178,17 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
   }
   const vendorLeaves = leafValues(vendor, '', new Map());
   const ourLeaves = leafValues(ours.body, '', new Map());
+  // What WE report, by field. A declared ancestor stops answering for its
+  // descendants the moment our own answer carries it.
+  const ourFields = new Set(keyPaths(ours.body).values());
 
   const differences = [];
   const exhibited = new Set();
+  // Per ROOT, not one total. `compared > 0` summed every claimed root together,
+  // so a row supplying four options passed on the strength of whichever one
+  // echoed — `model`, in every row that had this shape. Two independent reviews
+  // built that case from different directions on the same day.
+  const comparedByRoot = new Map();
   let compared = 0;
   for (const [path, value] of vendorLeaves) {
     // Only what this row claims. The rest of the body is the sibling gate's
@@ -180,8 +197,10 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
     const claimed = supplied.includes(rootOf(path)) || (alsoCompare ?? []).includes(path);
     if (!claimed) continue;
     if (PER_CALL.has(rootOf(path)) && !path.endsWith('[]#')) continue;
-    if (isDeclaredAbsent(absent, path)) continue;
+    if (isDeclaredAbsent(absent, path, ourFields)) continue;
     compared += 1;
+    const claimedBy = supplied.includes(rootOf(path)) ? rootOf(path) : path;
+    comparedByRoot.set(claimedBy, (comparedByRoot.get(claimedBy) ?? 0) + 1);
     const ourValue = ourLeaves.get(path);
 
     if (ourValue === value) continue;
@@ -205,10 +224,10 @@ function readEcho({ fixture, surface, supplied, alsoCompare }) {
   }
 
   const echoedPaths = [...vendorLeaves.keys()].filter((path) => supplied.includes(rootOf(path)));
-  return { compared, differences, exhibited, echoedPaths };
+  return { compared, comparedByRoot, differences, exhibited, echoedPaths };
 }
 
-for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harnessPremise, vendorPaths } of CAPTURES) {
+for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, harnessGaps, vendorPaths } of CAPTURES) {
   test(`${fixture}: the proxy answers in the vendor's shape`, () => {
     const capture = load(fixture);
     const vendor = JSON.parse(capture.body);
@@ -243,12 +262,20 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harne
     // our side a reasoning item of its own and the exemptions keep covering
     // disagreements that are no longer about a missing member.
     const gaps = harnessGaps ?? [];
-    if (gaps.length > 0) {
-      assert.ok(harnessPremise, `${fixture}: harness gaps without the premise that explains them`);
-      const typesOf = (body) => (body?.output ?? body?.choices ?? []).map((item) => item?.type ?? null);
-      assert.deepEqual(typesOf(vendor), harnessPremise.vendor, `${fixture}: the vendor's turn is not the one these gaps describe`);
-      assert.deepEqual(typesOf(ours.body), harnessPremise.ours, `${fixture}: our turn is not the one these gaps describe`);
-    }
+    // EVERY row, and from the HARNESS's table rather than the row's. The premise
+    // used to be a row field: a review made `/v1/responses` drop its message item
+    // for one request, changed that row's `ours` to `[]`, re-derived the list,
+    // and the client got no answer item at all with the suite green. The
+    // regression supplied the observation that validated the row edit exempting
+    // it. Our turn must answer with the vendor's items minus the ones the
+    // harness cannot produce — no row field is consulted.
+    assert.deepEqual(itemTypesOf(ours.body), expectedItemTypes(vendor, surface),
+      `${fixture}: our turn is not the vendor's turn minus what the harness cannot produce`);
+    // ...and the gap list follows from those items and nothing else. A row with
+    // no such item owes an empty list; one with them owes exactly the paths they
+    // took with them.
+    assert.deepEqual([...gaps].sort(), harnessGapsFrom(vendor, surface),
+      `${fixture}: a declared harness gap does not follow from the item our turn lacks`);
 
     const declared = [...new Set(expectedAbsentPaths(surface, theirs))].sort();
     const { credited, uncredited } = creditedAbsences(declared, gaps, onlyVendor, mine);
@@ -261,23 +288,36 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, harnessGaps, harne
     const ours = answers.get(fixture);
     assert.equal(ours.status, capture.status, `${fixture}: refused, so there is no echo to read`);
 
-    const { compared, differences, echoedPaths } = readEcho({ fixture, surface, supplied, alsoCompare });
+    const { compared, comparedByRoot, differences, echoedPaths } = readEcho({ fixture, surface, supplied, alsoCompare });
 
-    if (echoed) {
-      // An option that contributes no leaf is an option this row cannot speak
-      // for: the check would pass by comparing nothing.
-      assert.ok(compared > 0, `${fixture}: none of ${supplied.join(', ')} reached the comparison`);
-    } else {
-      // The other direction is a claim too. Chat's answer carries no `n`, no
-      // `logprobs` and no `response_format`, so a client cannot read back what
-      // it asked for — and if that ever changes, this row should fail rather
-      // than quietly start comparing something new.
-      assert.deepEqual(echoedPaths, [], `${fixture}: the vendor now echoes ${supplied.join(', ')}, so this row's claim is stale`);
+    const vendorRoots = new Set([...keyPaths(JSON.parse(capture.body)).values()].map(rootOf));
+    const ourRoots = new Set([...keyPaths(ours.body).values()].map(rootOf));
+    assert.deepEqual(
+      echoFailures({
+        supplied, echoed, alsoCompare, declaredAbsent, comparedByRoot, echoedPaths,
+        vendorRoots, ourRoots, rootOf,
+      }),
+      [],
+      `${fixture}: this row's echo claim does not hold`,
+    );
+    // A row that claims no echoed option still has to have compared exactly the
+    // paths it named, and nothing else.
+    const speaksForNothing = supplied.every((root) => (typeof echoed === 'object' && echoed !== null ? echoed[root] !== true : echoed !== true));
+    if (speaksForNothing) {
       assert.equal(compared, (alsoCompare ?? []).length, `${fixture}: the paths this row claims did not all reach the comparison`);
     }
     assert.deepEqual(differences, [], `${fixture}: the proxy answers ${supplied.join(', ')} differently`);
   });
 }
+
+test('every row answer describes the turn its own capture recorded', () => {
+  const { failures, checked } = answerPremiseFailures(CAPTURES, (fixture) => {
+    const capture = load(fixture);
+    return { body: JSON.parse(capture.body), request: JSON.parse(capture.request) };
+  });
+  assert.deepEqual(failures, [], 'a fixture that contradicts its own capture can hide a defect');
+  assert.ok(checked > 0, 'no answer field was bound to its capture, so this check compared nothing');
+});
 
 // A declaration nothing exercises is a claim nobody checks — and "exercised"
 // has to mean a capture THIS GATE REPLAYS, not a capture that happens to sit in
@@ -332,4 +372,632 @@ test('every capture in the store is replayed by a gate', () => {
   // and the carve-out is what let the registry lose the stream gate unnoticed.
   const unread = stored.filter((name) => !REPLAYED_FIXTURES.has(name));
   assert.deepEqual(unread, [], 'promoted captures that no gate replays');
+});
+
+// The premise check's own controls, on a synthetic roster. The case above runs
+// it over the real one, where every surface happens to be bound and every answer
+// happens to agree — so nothing there can show what it does when they do not.
+// A free field's REASON is prose, and prose rots. A round found two of these
+// reasons already false: one said `stopReason` is "not passed through on this
+// surface" when all three surfaces pass it through, and one named `harnessGaps`
+// as the mechanism keeping `usage.reasoningOutputTokens` free when every path in
+// that list is under `.output[]` and none is a usage path. The first was not
+// merely mis-worded — two independent reviews walked through it — and is now a
+// binding rather than a reason. What is left free rests on checkable facts, and
+// these are those facts, so the next reason to go false says so.
+
+test('a gap that does not follow from the missing item is not derivable', () => {
+  // The construction: a real missing item (`reasoning`, which the fake backend
+  // cannot produce) plus an unrelated top-level field the proxy stopped
+  // reporting.
+  const vendor = {
+    billing: { payer: 'developer' },
+    output: [{ type: 'reasoning', summary: [] }, { type: 'message', content: [] }],
+  };
+  const derived = harnessGapsFrom(vendor, '/v1/responses');
+  assert.ok(!derived.includes('.billing:object'), 'the derivation credits a path the missing item cannot explain');
+  assert.ok(derived.includes('.output[].summary:array'), 'the derivation lost the paths the missing item does explain');
+});
+
+test('a surface with no harness-missing item can derive no gap at all', () => {
+  // The duplicate-identity construction, and why it is now unreachable: the
+  // premise used to be two type arrays the ROW wrote, subtracted as multisets,
+  // so a Chat body with two untyped choices could declare "one of them is
+  // missing" and have the field the SURVIVING choice had lost credited as a
+  // consequence of the other one's absence. Chat has no harness-missing item, so
+  // there is nothing to subtract and no ambiguity to resolve.
+  const vendor = {
+    choices: [
+      { index: 0, message: { role: 'assistant', content: 'a', refusal: null } },
+      { index: 1, message: { role: 'assistant', content: 'b', refusal: null } },
+    ],
+  };
+  assert.deepEqual(harnessGapsFrom(vendor, '/v1/chat/completions'), []);
+  assert.deepEqual(expectedItemTypes(vendor, '/v1/chat/completions'), [null, null],
+    'a Chat answer owes every choice the vendor sent');
+});
+
+test('the item sequence our turn owes comes from the harness table, not from a row', () => {
+  const vendor = { output: [{ type: 'reasoning' }, { type: 'message' }, { type: 'reasoning' }] };
+  // EVERY item of a harness-missing type, not the first N a row claims.
+  assert.deepEqual(expectedItemTypes(vendor, '/v1/responses'), ['message']);
+  assert.deepEqual(expectedItemTypes(vendor, '/v1/messages'), ['reasoning', 'message', 'reasoning'],
+    'a surface that cannot lose an item is being allowed to lose one');
+});
+
+test('an option whose only effect is a path is compared by every row whose request carries it', () => {
+  // Of the REQUEST. Asked of `supplied`, the rule stood one door up from where it
+  // was aimed: a row that stopped claiming `n` also stopped owing `.choices[]#`.
+  // This gate's roster only: `load` refuses a fixture the roster does not name,
+  // which is what keeps a gate from reading off somebody else's list. The
+  // sibling gate asserts the same rule over its own rows.
+  assert.deepEqual(missingRequiredEffects(CAPTURES, undefined, requestKeysOf), []);
+});
+
+test('a row that stops claiming the option still owes its effect', () => {
+  // Both halves of the construction at once: `supplied` narrowed AND the effect
+  // path deleted. The request still carries `n`, so the requirement still holds.
+  assert.deepEqual(
+    missingRequiredEffects([{ fixture: 'narrowed', surface: '/v1/chat/completions', supplied: [] }],
+      undefined, () => ['model', 'messages', 'n']),
+    ['narrowed n: nothing compares .choices[]#, which is the only way this option shows'],
+  );
+});
+
+test('deleting the only effect path fails the row that supplies the option', () => {
+  // The construction that broke the row-local version: `n: 2` answered as one
+  // choice, the row still claiming `n`, and `alsoCompare` simply gone.
+  assert.deepEqual(
+    missingRequiredEffects([{ fixture: 'fanout', surface: '/v1/chat/completions', supplied: ['n'] }]),
+    ['fanout n: nothing compares .choices[]#, which is the only way this option shows'],
+  );
+});
+
+test('every free reason is read by some row', () => {
+  // A reason nothing reads has the authority of a checked one and none of the
+  // checking — which is how "not passed through on this surface" survived three
+  // rounds of review while being false on all three. The list was five entries
+  // per surface when it was first measured, then one, and is now empty: each
+  // time an entry turned out to be reachable, its sentence was rewritten as part
+  // of becoming live. An entry that nothing reaches fails here by name, and the
+  // answer is either to serve the value so the reason gets read or to say in the
+  // reason why it is held.
+  const { heldInReserve } = freeFieldsReached([CAPTURES, MINIMAL_SURFACES]);
+  assert.deepEqual(heldInReserve, [],
+    'a free reason no roster reaches: read it before it counts, or say why it is held');
+});
+
+test('every binding is run by some row', () => {
+  // The mirror of the reserve list, and the reason it is not optional: a binding
+  // nothing runs certifies without being able to be wrong. Two of these had
+  // never been read against anything — both were rewritten to return a string no
+  // vendor sends and the suite stayed green — because only the six
+  // `/v1/messages` rows wrote a cache-write number. `DEFAULT_ANSWER` serves one
+  // now, so the two OpenAI surfaces read it too.
+  const { neverRun, runs } = bindingsReached([CAPTURES, MINIMAL_SURFACES]);
+  assert.deepEqual(neverRun, [],
+    'a binding is in the table and absent from every run; serve the value or say why it is held');
+  // ...and the count is per binding, not one number over all of them. The gate's
+  // only coverage assertion used to be `checked > 0`, which nine bindings
+  // satisfied on behalf of the two that never ran.
+  assert.ok(Object.values(runs).every((count) => count > 0));
+});
+
+test('the usage counts are free only while nothing compares a usage path', () => {
+  // Every usage count that is not bound BY NAME is free for one reason: the
+  // value half skips the root, and no row reaches into it by hand.
+  assert.ok(PER_CALL.has('usage'), '`usage` left PER_CALL: bind the counts or rewrite their reasons');
+  // A member-signature path is not reaching in; PER_CALL never skipped those.
+  const reaching = CAPTURES.filter(({ alsoCompare }) => (alsoCompare ?? [])
+    .some((path) => rootOf(path) === 'usage' && !path.endsWith('[]#')));
+  assert.deepEqual(reaching.map((row) => row.fixture), [],
+    'a row compares a usage path, so the free reasons no longer describe what happens');
+});
+
+test('every /v1/messages capture that carries a stop sequence has a row comparing it', () => {
+  // `stopSequence` is free on this surface for a different reason than on the
+  // other two: it IS reported here, as `stop_sequence`, and the rows that depend
+  // on it read it off the wire through `alsoCompare` rather than off the answer.
+  const unwatched = [];
+  for (const { fixture, surface, alsoCompare } of CAPTURES) {
+    if (surface !== '/v1/messages') continue;
+    const body = JSON.parse(load(fixture).body);
+    if (body.stop_sequence === null || body.stop_sequence === undefined) continue;
+    if (!(alsoCompare ?? []).includes('.stop_sequence')) unwatched.push(fixture);
+  }
+  assert.deepEqual(unwatched, [],
+    'a capture reports a stop sequence and no row compares it, so a fixture could move it unseen');
+});
+
+test('the premise check refuses an answer on a surface it cannot check', () => {
+  const { failures, checked } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/nowhere', answer: { stopReason: 'end_turn' } }],
+    () => ({ body: {}, request: {} }),
+  );
+  assert.equal(checked, 0);
+  assert.equal(failures.length, 1, 'an unbound surface was skipped instead of failing');
+  assert.match(failures[0], /no binding table/);
+});
+
+test('the premise check catches an answer that contradicts its capture', () => {
+  const rows = [{
+    fixture: 'made-up',
+    surface: '/v1/messages',
+    answer: { stopReason: 'end_turn', usage: { cachedInputTokens: 1 } },
+  }];
+  // The merged answer is what reaches the proxy, so that is what is checked.
+  const { failures } = answerPremiseFailures(rows, () => ({
+    body: { stop_reason: 'max_tokens', usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+    request: {},
+  }));
+  const said = failures.join('\n');
+  assert.match(said, /stopReason/);
+  assert.match(said, /cachedInputTokens/);
+  // And the DEFAULT half of the served answer is checked too — this row names no
+  // text, so it is served `OK` while its capture produced nothing. A default
+  // nobody checks is a default anybody can put a compensating value into, which
+  // is how a real proxy defect survived 122 green tests.
+  assert.match(said, /text/);
+});
+
+test('the premise check passes an answer that agrees with its capture', () => {
+  const { failures, checked } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: { stopReason: 'max_tokens' } }],
+    () => ({
+      // Agreeing means agreeing with the MERGED answer, defaults included: this
+      // row names no text, so `DEFAULT_ANSWER.text` is what the proxy is served.
+      body: {
+        stop_reason: 'max_tokens',
+        content: [{ type: 'text', text: 'OK' }],
+        usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      request: {},
+    }),
+  );
+  assert.deepEqual(failures, []);
+  assert.ok(checked >= 3, `only ${checked} field(s) were compared`);
+});
+
+test('an explicit undefined does not blank a bound field back to unchecked', () => {
+  // `undefined` is a VALUE the fixture can write, not an absence. Read as
+  // absence, it took a field out of the comparison entirely: this row's proxy
+  // answers `end_turn` while the capture says `max_tokens`, and nothing said so.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'blanked', surface: '/v1/messages', answer: { stopReason: undefined, text: '' } }],
+    () => ({
+      body: { stop_reason: 'max_tokens', content: [], usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } },
+      request: {},
+    }),
+  );
+  assert.match(failures.join('\n'), /blanked: the answer's stopReason yields "end_turn", the capture says "max_tokens"/);
+});
+
+test('a stop reason that contradicts its capture fails on every surface', () => {
+  // One fixture field, three surfaces, and each one carries the contradiction to
+  // a different place on the wire. Both round-4 seats built this construction on
+  // the OpenAI pair, where the answer used to be free.
+  const chat = answerPremiseFailures(
+    [{ fixture: 'cut-off-chat', surface: '/v1/chat/completions', answer: { stopReason: 'max_tokens' } }],
+    () => ({ body: { choices: [{ finish_reason: 'stop' }], usage: {} }, request: {} }),
+  ).failures.join('\n');
+  assert.match(chat, /stopReason yields \["length"\], the capture says \["stop"\]/);
+
+  const responses = answerPremiseFailures(
+    [{ fixture: 'cut-off-responses', surface: '/v1/responses', answer: { stopReason: 'max_tokens' } }],
+    () => ({ body: { status: 'completed', incomplete_details: null, completed_at: 1, usage: {} }, request: {} }),
+  ).failures.join('\n');
+  assert.match(responses, /stopReason yields \{"status":"incomplete"/);
+
+  const messages = answerPremiseFailures(
+    [{ fixture: 'cut-off-messages', surface: '/v1/messages', answer: { stopReason: 'max_tokens', text: '' } }],
+    () => ({ body: { stop_reason: 'end_turn', content: [], usage: {} }, request: {} }),
+  ).failures.join('\n');
+  assert.match(messages, /stopReason yields "max_tokens", the capture says "end_turn"/);
+});
+
+test('a turn cut off mid tool call is compared on the items too', () => {
+  // `responseCutOff` drives the function-call item's status as well as the
+  // top-level triple, and the projection that called itself "the whole cut-off
+  // envelope" stopped at the triple. No roster answer makes a tool call, so the
+  // binding ran on every row and this branch on none.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'cut-with-a-call', surface: '/v1/responses', answer: { stopReason: 'max_tokens', toolCalls: [{ id: 'c1' }] } }],
+    () => ({
+      body: {
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        completed_at: null,
+        output: [{ type: 'function_call', status: 'completed' }],
+        usage: { input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } },
+      },
+      request: {},
+    }),
+  );
+  assert.match(failures.join('\n'), /"callStatuses":\["incomplete"\].*"callStatuses":\["completed"\]/);
+});
+
+test('a stop sequence the text runs into is compared as the proxy applies it', () => {
+  // `applyStopSequences` rewrites both the reason and the sequence before the
+  // messages shaping sees the turn, and the oracle read the raw answer. A row
+  // could declare `max_tokens` with a sequence-hitting text and be certified
+  // while the wire said `stop_sequence`.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'cut-by-sequence', surface: '/v1/messages', answer: { text: 'ZZtail', stopReason: 'max_tokens' } }],
+    () => ({
+      body: {
+        stop_reason: 'max_tokens',
+        stop_sequence: null,
+        content: [],
+        usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      request: { stop_sequences: ['ZZ'] },
+    }),
+  );
+  const said = failures.join('\n');
+  assert.match(said, /stopReason yields "stop_sequence", the capture says "max_tokens"/);
+  assert.match(said, /stopSequence yields "ZZ", the capture says null/);
+});
+
+test('a turn that made tool calls keeps its reason and only its text is cut', () => {
+  // The proxy's own rule, reproduced rather than referenced: a match rewrites
+  // the reason ONLY when there are no tool calls.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'cut-with-calls', surface: '/v1/messages', answer: { text: 'ZZtail', stopReason: 'tool_use', toolCalls: [{ id: 'c1' }] } }],
+    () => ({
+      body: {
+        stop_reason: 'tool_use',
+        stop_sequence: null,
+        content: [],
+        usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      request: { stop_sequences: ['ZZ'] },
+    }),
+  );
+  assert.deepEqual(failures, []);
+});
+
+test('a fan-out answers every choice, not just the first', () => {
+  // The chat binding is per choice because `n` is: a fixture that could move one
+  // finish reason while the others stayed put would be the `n` hole again, one
+  // field along.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'fanout', surface: '/v1/chat/completions', answer: {} }],
+    () => ({ body: { choices: [{ finish_reason: 'stop' }], usage: {} }, request: { n: 2 } }),
+  );
+  assert.match(failures.join('\n'), /yields \["stop","stop"\], the capture says \["stop"\]/);
+});
+
+// The echo rule's own controls, on synthetic readings. The rows above happen to
+// agree under the per-root rule and an aggregate one, so nothing there can show
+// the difference — and a rule no input distinguishes is an un-run input, not a
+// guard that has been proved unnecessary.
+test('an echoed option that compared nothing fails even when a sibling compared plenty', () => {
+  const failures = echoFailures({
+    supplied: ['store', 'include'],
+    echoed: true,
+    alsoCompare: [],
+    comparedByRoot: new Map([['store', 9]]),
+    echoedPaths: [],
+    rootOf,
+  });
+  assert.equal(failures.length, 1, `expected include to fail, got ${JSON.stringify(failures)}`);
+  assert.match(failures[0], /^include reached no comparison/);
+});
+
+test('an echo map must say what happens to every option the row supplies', () => {
+  const failures = echoFailures({
+    supplied: ['store', 'include'],
+    echoed: { store: true },
+    alsoCompare: [],
+    comparedByRoot: new Map([['store', 1]]),
+    echoedPaths: [],
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /does not say what happens to include/);
+});
+
+test('a root the row says is silent must stay silent', () => {
+  const failures = echoFailures({
+    supplied: ['n'],
+    echoed: false,
+    alsoCompare: [],
+    comparedByRoot: new Map(),
+    echoedPaths: ['.n'],
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /now echoes \.n/);
+});
+
+test('an alsoCompare path that reached nothing fails by name', () => {
+  const failures = echoFailures({
+    supplied: ['stop_sequences'],
+    echoed: false,
+    alsoCompare: ['.stop_reason', '.stop_sequence'],
+    comparedByRoot: new Map([['.stop_reason', 1]]),
+    echoedPaths: [],
+    rootOf,
+  });
+  assert.deepEqual(failures, ['.stop_sequence did not reach the comparison']);
+});
+
+// The third row state's own controls. `declaredAbsent` says a whole root is
+// answered for by a declaration, which `echoed: true` and `echoed: false` both
+// get wrong: the vendor fills the root, we report none of it, so there is a
+// compared count of zero AND a long list of echoed paths.
+test('a declared-absent root that the vendor does not fill proves nothing', () => {
+  const failures = echoFailures({
+    supplied: ['reasoning_effort'],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map(),
+    echoedPaths: [],
+    vendorRoots: new Set(['id', 'choices']),
+    ourRoots: new Set(['id', 'choices']),
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /carries nothing under it, so this row proves nothing/);
+});
+
+test('a declared-absent root this answer reports is a failure', () => {
+  const failures = echoFailures({
+    supplied: ['reasoning_effort'],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map(),
+    echoedPaths: [],
+    vendorRoots: new Set(['moderation']),
+    ourRoots: new Set(['moderation']),
+    rootOf,
+  });
+  assert.deepEqual(failures, ['moderation is declared absent and this answer reports it']);
+});
+
+test('a declared-absent root whose leaves got compared is a failure', () => {
+  const failures = echoFailures({
+    supplied: [],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map([['moderation', 3]]),
+    echoedPaths: [],
+    vendorRoots: new Set(['moderation']),
+    ourRoots: new Set(),
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /3 of its leaves were compared/);
+});
+
+test('a root cannot be both supplied and declared absent', () => {
+  const failures = echoFailures({
+    supplied: ['moderation'],
+    echoed: false,
+    declaredAbsent: ['moderation'],
+    comparedByRoot: new Map(),
+    echoedPaths: [],
+    vendorRoots: new Set(['moderation']),
+    ourRoots: new Set(),
+    rootOf,
+  });
+  assert.match(failures.join('\n'), /says one or the other about a root/);
+});
+
+// The `supplied` assertion used to run one way: a row could not claim an option
+// its request lacks, and nothing said a row must claim the options its request
+// HAS. Deleting one word from one row's `supplied` made a real echo defect —
+// `top_logprobs: 1` answered as `0` — invisible to the entire suite, because
+// that row was the defect's only witness.
+//
+// The first fix asked the question PER SURFACE, which is a different property:
+// a key stays claimed by any row that names it, so the witness row could still
+// stop claiming it. A second review used exactly that to make
+// `reasoning.effort: "none"` answered as `"medium"` pass all 2283 tests. It is
+// per row now, with the probe-shaping keys excused per row and by name.
+test('every option the store sends is claimed by the row that replays it', () => {
+  const { unclaimed, staleExceptions } = unclaimedRequestOptions(CAPTURES, requestKeysOf);
+  assert.deepEqual(unclaimed, [], 'options the captures send that no row asserts anything about');
+  assert.deepEqual(staleExceptions, [], 'exceptions that have outlived what they were for');
+});
+
+// The rules below are true of this roster, so nothing in it can tell a working
+// rule from a broken one. Three mutants survived on exactly that: the roster is
+// clean, so removing the rule changed nothing. A rule no input distinguishes is
+// an un-run input, not a guard shown to be unnecessary.
+
+test('a row with NO answer is still checked against its capture', () => {
+  // The scope round 3 moved a compensating value into: rows that declare no
+  // answer are served `DEFAULT_ANSWER`, and it was bound to no capture.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages' }],
+    () => ({
+      body: { stop_reason: 'max_tokens', content: [], usage: { cache_creation_input_tokens: 4, cache_read_input_tokens: 0 } },
+      request: {},
+    }),
+  );
+  // `DEFAULT_ANSWER` says nothing was read from cache; this capture says 4 was.
+  assert.match(failures.join('\n'), /cachedInputTokens yields 0, the capture says 4/,
+    'a row with no answer of its own escaped the check entirely');
+});
+
+test('an answer field that is neither bound nor named free is reported', () => {
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: { somethingNew: 1 } }],
+    () => ({ body: { stop_reason: 'max_tokens', content: [], usage: {} }, request: {} }),
+  );
+  assert.match(failures.join('\n'), /somethingNew, which no binding checks/);
+});
+
+test('a projection that changes a bound VALUE, not just a name, is reported', () => {
+  // The other half of the same question, and the half the first control missed:
+  // it added a new NAME (`refusalMode`) and never moved a value at a name the
+  // table already binds. A review moved `usage.cachedInputTokens` by one inside
+  // the projection — the proxy answers 1 where the capture says 0 — and the
+  // check said nothing, because it was reading the binding's value off the row's
+  // answer rather than off what the backend serves.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'projected', surface: '/v1/chat/completions', answer: {} }],
+    () => ({
+      body: {
+        choices: [{ finish_reason: 'stop' }],
+        usage: { prompt_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } },
+      },
+      request: {},
+    }),
+    undefined,
+    (answer, request) => {
+      const served = servedResult(answer, request);
+      return { ...served, usage: { ...served.usage, cachedInputTokens: served.usage.cachedInputTokens + 1 } };
+    },
+  );
+  assert.match(failures.join('\n'), /usage\.cachedInputTokens yields 1, the capture says 0/);
+});
+
+test('a constant the backend invents, that no row wrote, is reported', () => {
+  // The scan reads what the proxy is HANDED, not only what the roster wrote.
+  // `id`, `toolCalls` and `latencyMs` are constants `servedResult()` invents and
+  // every one of them is named free; the case that has to fail is the next
+  // constant somebody adds to it.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: {} }],
+    () => ({ body: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'OK' }], usage: {} }, request: {} }),
+    undefined,
+    (answer) => ({ ...answer, refusalMode: 'invented-by-the-harness' }),
+  );
+  assert.match(failures.join('\n'), /refusalMode, which no binding checks/);
+});
+
+test('a NESTED answer field that no binding covers is reported', () => {
+  // The shape that walked past a scan of top-level keys: `usage` is covered, so
+  // anything under it rode along. This is where the next compensating fixture
+  // would go, and a top-level case cannot tell a leaf scan from a shallow one.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/messages', answer: { usage: { anythingAtAll: 1 } } }],
+    () => ({ body: { stop_reason: 'max_tokens', content: [], usage: {} }, request: {} }),
+  );
+  assert.match(failures.join('\n'), /usage\.anythingAtAll, which no binding checks/);
+});
+
+test('a free field with no reason given is itself a failure', () => {
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'made-up', surface: '/v1/nowhere-free', answer: {} }],
+    () => ({ body: {}, request: {} }),
+    { '/v1/nowhere-free': [] },
+  );
+  // No binding table entry for this surface in FREE_ANSWER_FIELDS either, so
+  // every leaf is reported rather than silently skipped.
+  assert.ok(failures.length > 0, 'an entirely unbound surface reported nothing');
+});
+
+test('an option THIS row does not claim is named, even if a sibling claims it', () => {
+  // Per ROW, not per surface. A key stays claimed on a surface by any row that
+  // names it, so the row that is a defect's only WITNESS could stop claiming it
+  // and the rule saw nothing: a review made `reasoning.effort: "none"` answered
+  // as `"medium"` pass all 2283 tests by deleting one word from the row that
+  // witnessed it, while another row on the same surface kept `reasoning` alive.
+  const { unclaimed } = unclaimedRequestOptions(
+    [
+      { fixture: 'witness', surface: '/v1/responses', supplied: ['top_logprobs'] },
+      { fixture: 'sibling', surface: '/v1/responses', supplied: ['reasoning'] },
+    ],
+    (fixture) => (fixture === 'witness'
+      ? ['model', 'input', 'top_logprobs', 'reasoning']
+      : ['model', 'input', 'reasoning']),
+    { '/v1/responses': ['model', 'input'] },
+    {},
+  );
+  assert.deepEqual(unclaimed, ['witness reasoning'],
+    'a row stopped claiming an option its own request carries and nothing said so');
+});
+
+test('a row opts out only where the surface already says the probe shapes the key', () => {
+  const rows = [
+    { fixture: 'excused', surface: '/v1/responses', supplied: ['top_logprobs'], unclaimed: ['reasoning'] },
+    { fixture: 'bare', surface: '/v1/responses', supplied: ['top_logprobs'] },
+  ];
+  const { unclaimed, staleExceptions } = unclaimedRequestOptions(
+    rows,
+    () => ['model', 'input', 'top_logprobs', 'reasoning'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+    { '/v1/responses': { reasoning: 'the probe sets it' } },
+  );
+  assert.deepEqual(unclaimed, ['bare reasoning'], 'the opt-out excused a row that did not take it');
+  assert.deepEqual(staleExceptions, []);
+});
+
+test('a row cannot mint its own excuse for the option it stopped claiming', () => {
+  // The construction: narrow `supplied` by one word AND write a true sentence
+  // about why this row need not claim it, in the same object. The rule asked the
+  // question per row and read the answer off the same row. The reasons live
+  // outside the rosters now, and a key that is not listed there cannot be opted
+  // out of at all.
+  const { unclaimed, staleExceptions } = unclaimedRequestOptions(
+    [{ fixture: 'narrowed', surface: '/v1/responses', supplied: ['top_logprobs'], unclaimed: ['reasoning'] }],
+    () => ['model', 'input', 'top_logprobs', 'reasoning'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+    { '/v1/responses': {} },
+  );
+  assert.match(staleExceptions.join('\n'),
+    /narrowed reasoning: opted out of a key this surface does not list as probe-shaped/);
+  assert.deepEqual(unclaimed, [], 'the key was reported twice, once as unclaimed and once as a bad opt-out');
+});
+
+test('an opt-out for a key the row claims, or one its request lacks, is stale', () => {
+  const { staleExceptions } = unclaimedRequestOptions(
+    [
+      { fixture: 'both-ways', surface: '/v1/responses', supplied: ['reasoning'], unclaimed: ['reasoning'] },
+      { fixture: 'absent-key', surface: '/v1/responses', supplied: ['store'], unclaimed: ['nowhere'] },
+    ],
+    () => ['model', 'input', 'store', 'reasoning'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+    { '/v1/responses': { reasoning: 'the probe sets it', nowhere: 'nothing sends it' } },
+  );
+  const said = staleExceptions.join('\n');
+  assert.match(said, /both-ways reasoning: excused but this row claims it/);
+  assert.match(said, /absent-key nowhere: excused but its request does not carry it/);
+});
+
+test('a probe-shaped key with no reason, or one nothing sends, is stale', () => {
+  const { staleExceptions } = unclaimedRequestOptions(
+    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['store'] }],
+    () => ['model', 'input', 'store'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+    { '/v1/responses': { store: '', gone: 'a reason for a key nothing sends' } },
+  );
+  const said = staleExceptions.join('\n');
+  assert.match(said, /store: listed as probe-shaped with no reason/);
+  assert.match(said, /gone: listed as probe-shaped but no capture's request carries it/);
+});
+
+test('a SURFACE exception no capture sends, or one a row claims, is stale', () => {
+  const tables = [{ '/v1/responses': ['model', 'input'] }, { '/v1/responses': { cap: 'the probe caps the turn' } }];
+  const { staleExceptions } = unclaimedRequestOptions(
+    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['cap'] }],
+    () => ['model', 'input', 'cap'],
+    ...tables,
+  );
+  assert.match(staleExceptions.join('\n'), /cap: excused but a row claims it/);
+
+  const { staleExceptions: gone } = unclaimedRequestOptions(
+    [{ fixture: 'made-up', surface: '/v1/responses', supplied: ['store'] }],
+    () => ['model', 'input', 'store'],
+    ...tables,
+  );
+  assert.match(gone.join('\n'), /cap: excused but no capture's request carries it/);
+});
+
+test('parking a claim on a mandatory key does not save the row', () => {
+  // `supplied: ['model']` satisfies `option in request`, `supplied.length > 0`
+  // and even `echoed: true` — `.model` really is echoed and really does match —
+  // so a row could park its claim there instead of dropping it and go on
+  // certifying while asserting nothing. Per row, the option it stopped claiming
+  // is the one that fails.
+  const { unclaimed } = unclaimedRequestOptions(
+    [{ fixture: 'parked', surface: '/v1/responses', supplied: ['model'] }],
+    () => ['model', 'input', 'service_tier'],
+    { '/v1/responses': ['model', 'input'] },
+    {},
+  );
+  assert.deepEqual(unclaimed, ['parked service_tier']);
 });

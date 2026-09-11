@@ -149,6 +149,36 @@
       "why": "One sample of one alias at one effort is not an alias table. Mirroring it would encode `auto -> detailed` for every effort and every model on the strength of a single turn, and the value is precisely the one a client reads to learn what it will get. Matrix R-22 records the larger fact: this proxy emits no reasoning summaries at all, so resolving the alias would name a summary style for a summary that never arrives. Measuring `auto` at the other efforts is three cheap calls and is listed in the probe plan.",
       "measuredAt": "2026-09-09",
       "evidence": "spec/captures/direct-responses-reasoning-summary-auto.json; docs/conformance-matrix.md R-22"
+    },
+    {
+      "id": "messages-vendor-routing-usage-is-not-reported",
+      "surface": "/v1/messages",
+      "claim": "supplied-echo",
+      "absentPaths": [
+        ".usage.service_tier",
+        ".usage.inference_geo",
+        ".usage.cache_creation",
+        ".usage.cache_creation.ephemeral_5m_input_tokens",
+        ".usage.cache_creation.ephemeral_1h_input_tokens",
+        ".usage.output_tokens_details",
+        ".usage.output_tokens_details.thinking_tokens"
+      ],
+      "behavior": "The direct API reports five things about how IT ran the turn: which service tier served it, which inference geography it ran in, a breakdown of cache writes by the TTL they were written at, and the thinking tokens the turn spent. This proxy reports none of them. It does report `cache_creation_input_tokens` and `cache_read_input_tokens` when the runtime behind it gives numbers for them — those are not in this declaration.",
+      "why": "Measured 2026-09-10 over the six anthropic captures in `artifacts/direct-api-captures`: `service_tier` is \"standard\" in all six, `inference_geo` is \"global\" or \"us\" following the request, `cache_creation` carries `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens` (0 in all six), and `output_tokens_details.thinking_tokens` is present in all six. The first four name a mechanism this proxy does not have rather than a number it is failing to pass on: there is no tier system behind a single local runtime, no inference geography to route to, and no cache that distinguishes a five-minute write from a one-hour one. `thinking_tokens` is a DIFFERENT case and is declared here for a different reason — the number exists, the runtime simply does not report it. `claude-code-backend.ts` never populates `reasoningOutputTokens`, so any value emitted here would be a constant. Publishing it as `?? 0` was tried on 2026-09-10 and reverted the same day: a thinking model reporting that it did not think is worse than reporting nothing, which is the judgement `anthropicUsage` already records for the cache counters. Reporting it when it IS measured is `docs/design-task-unmeasured-thinking-tokens.md`.",
+      "measuredAt": "2026-09-10",
+      "evidence": "artifacts/direct-api-captures (six /v1/messages 200 responses), src/proxy/http-server.ts anthropicUsage; docs/design-task-unmeasured-thinking-tokens.md"
+    },
+    {
+      "id": "chat-moderation-results-are-not-reported",
+      "surface": "/v1/chat/completions",
+      "claim": "supplied-echo",
+      "absentPaths": [
+        ".moderation"
+      ],
+      "behavior": "Sent `moderation: {model: \"omni-moderation-latest\"}`, the direct API answers 200 AND attaches a `moderation` object: `input` and `output`, each a `moderation_results` carrying one `moderation_result` with `flagged`, 13 `categories` booleans, 13 `category_scores` numbers and 13 `category_applied_input_types` arrays — 127 paths. This proxy validates the option exactly as the direct API does (`moderation.model` required, else `missing_required_parameter`), answers 200, and emits no `moderation` key at all.",
+      "why": "The local runtimes moderate nothing. Matrix §5.5.9's rule — a reporting field for a feature this proxy does not run is not filled by guessing — applies here HARDER than it does to `tool_usage`, because these are not counters: they are a classifier's verdicts. A `flagged: false` and 26 scores would be this proxy asserting the outcome of a check it never ran, on content it never screened, to a client that asked to have it screened. There is no honest constant. The cost is stated rather than hidden: a client reading `response.moderation` gets `undefined` instead of a verdict, and `docs/api-interface-contract.md` says so. Declared rather than described because matrix row 49 had recorded this in prose since 2026-08-30, which means a build that started emitting a `moderation` block would have agreed with a paragraph instead of failing a gate — the same argument that converted A-28 and A-30 a day earlier.",
+      "measuredAt": "2026-08-30",
+      "evidence": "spec/captures/direct-chat-moderation-model.json; docs/conformance-matrix.md row 49, §5.5.5"
     }
   ]
 }
