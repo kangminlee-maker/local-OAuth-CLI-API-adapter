@@ -453,20 +453,18 @@ test('deleting the only effect path fails the row that supplies the option', () 
   );
 });
 
-test('the free reasons no roster reaches are the ones held in reserve', () => {
+test('every free reason is read by some row', () => {
   // A reason nothing reads has the authority of a checked one and none of the
   // checking — which is how "not passed through on this surface" survived three
-  // rounds of review while being false on all three. Four of the five this
-  // started with turned out to be reachable the moment the scan read what the
-  // proxy is actually handed rather than what the roster wrote; their reasons
-  // were rewritten as part of becoming live. `stopSequence` is what is left:
-  // `servedResult` never returns it, so nothing has ever read this sentence.
+  // rounds of review while being false on all three. The list was five entries
+  // per surface when it was first measured, then one, and is now empty: each
+  // time an entry turned out to be reachable, its sentence was rewritten as part
+  // of becoming live. An entry that nothing reaches fails here by name, and the
+  // answer is either to serve the value so the reason gets read or to say in the
+  // reason why it is held.
   const { heldInReserve } = freeFieldsReached([CAPTURES, MINIMAL_SURFACES]);
-  assert.deepEqual(heldInReserve, [
-    '/v1/chat/completions stopSequence',
-    '/v1/messages stopSequence',
-    '/v1/responses stopSequence',
-  ], 'the set of never-read reasons changed: read the ones that became live before counting them');
+  assert.deepEqual(heldInReserve, [],
+    'a free reason no roster reaches: read it before it counts, or say why it is held');
 });
 
 test('every binding is run by some row', () => {
@@ -595,6 +593,67 @@ test('a stop reason that contradicts its capture fails on every surface', () => 
     () => ({ body: { stop_reason: 'end_turn', content: [], usage: {} }, request: {} }),
   ).failures.join('\n');
   assert.match(messages, /stopReason yields "max_tokens", the capture says "end_turn"/);
+});
+
+test('a turn cut off mid tool call is compared on the items too', () => {
+  // `responseCutOff` drives the function-call item's status as well as the
+  // top-level triple, and the projection that called itself "the whole cut-off
+  // envelope" stopped at the triple. No roster answer makes a tool call, so the
+  // binding ran on every row and this branch on none.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'cut-with-a-call', surface: '/v1/responses', answer: { stopReason: 'max_tokens', toolCalls: [{ id: 'c1' }] } }],
+    () => ({
+      body: {
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        completed_at: null,
+        output: [{ type: 'function_call', status: 'completed' }],
+        usage: { input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } },
+      },
+      request: {},
+    }),
+  );
+  assert.match(failures.join('\n'), /"callStatuses":\["incomplete"\].*"callStatuses":\["completed"\]/);
+});
+
+test('a stop sequence the text runs into is compared as the proxy applies it', () => {
+  // `applyStopSequences` rewrites both the reason and the sequence before the
+  // messages shaping sees the turn, and the oracle read the raw answer. A row
+  // could declare `max_tokens` with a sequence-hitting text and be certified
+  // while the wire said `stop_sequence`.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'cut-by-sequence', surface: '/v1/messages', answer: { text: 'ZZtail', stopReason: 'max_tokens' } }],
+    () => ({
+      body: {
+        stop_reason: 'max_tokens',
+        stop_sequence: null,
+        content: [],
+        usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      request: { stop_sequences: ['ZZ'] },
+    }),
+  );
+  const said = failures.join('\n');
+  assert.match(said, /stopReason yields "stop_sequence", the capture says "max_tokens"/);
+  assert.match(said, /stopSequence yields "ZZ", the capture says null/);
+});
+
+test('a turn that made tool calls keeps its reason and only its text is cut', () => {
+  // The proxy's own rule, reproduced rather than referenced: a match rewrites
+  // the reason ONLY when there are no tool calls.
+  const { failures } = answerPremiseFailures(
+    [{ fixture: 'cut-with-calls', surface: '/v1/messages', answer: { text: 'ZZtail', stopReason: 'tool_use', toolCalls: [{ id: 'c1' }] } }],
+    () => ({
+      body: {
+        stop_reason: 'tool_use',
+        stop_sequence: null,
+        content: [],
+        usage: { cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      },
+      request: { stop_sequences: ['ZZ'] },
+    }),
+  );
+  assert.deepEqual(failures, []);
 });
 
 test('a fan-out answers every choice, not just the first', () => {

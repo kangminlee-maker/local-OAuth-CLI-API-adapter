@@ -150,6 +150,12 @@ export const DEFAULT_ANSWER = {
   // against a finished one and calling the difference the proxy's. Left
   // undefined here because "the turn simply ended" is what most rows replay.
   stopReason: undefined,
+  // Undefined for the same reason `stopReason` is: on `/v1/messages` the wire
+  // always carries `stop_sequence`, and "no sequence ended this turn" is a claim
+  // the harness makes on every row. Omitting the key made the binding that
+  // checks it unreachable — a binding in the table and absent from every run,
+  // which is the state `bindingsReached()` exists to report.
+  stopSequence: undefined,
   // `cacheCreationInputTokens` is here so the binding that reads it RUNS. A
   // review measured the eleven bindings against both rosters and found two that
   // had never been read against anything — the cache-write number on the two
@@ -631,13 +637,41 @@ export function assertRosterReplayed(group, seen) {
  * is the rule matrix A-17 records.
  */
 function afterStopSequences(text, sequences) {
+  return withStopSequences({ text }, { stop_sequences: sequences }).text;
+}
+
+/**
+ * `applyStopSequences` (src/proxy/http-server.ts:2139) re-derived, whole.
+ *
+ * The text half of it was re-derived here from the start, and the REST of it was
+ * not: a match also rewrites `stopReason` to `stop_sequence` and sets
+ * `stopSequence`, before `anthropicMessagesResponse` ever sees the turn. The
+ * stop-reason binding read the raw answer instead, so it accepted a row that
+ * declared `max_tokens` with a sequence-hitting text while the wire said
+ * `stop_sequence` — an oracle certifying a turn the proxy ended some other way.
+ * A review built that row; no roster row is it, which is why it survived being
+ * read twice.
+ *
+ * A turn that made tool calls keeps its reason and only the text is cut, which
+ * is the proxy's rule and is reproduced here rather than referenced.
+ */
+function withStopSequences(answer, request) {
+  const sequences = request?.stop_sequences ?? [];
+  const text = answer.text ?? '';
   let cut = null;
-  for (const sequence of sequences ?? []) {
+  let matched = null;
+  for (const sequence of sequences) {
     if (typeof sequence !== 'string' || sequence === '') continue;
     const at = text.indexOf(sequence);
-    if (at !== -1 && (cut === null || at < cut)) cut = at;
+    if (at !== -1 && (cut === null || at < cut)) {
+      cut = at;
+      matched = sequence;
+    }
   }
-  return cut === null ? text : text.slice(0, cut);
+  if (matched === null) return { ...answer, text };
+  const cutText = text.slice(0, cut);
+  if ((answer.toolCalls ?? []).length > 0) return { ...answer, text: cutText };
+  return { ...answer, text: cutText, stopReason: 'stop_sequence', stopSequence: matched };
 }
 
 /**
@@ -704,16 +738,39 @@ export const ANSWER_BINDINGS = {
       status: body.status,
       incompleteReason: body.incomplete_details?.reason ?? null,
       completedAtIsSet: typeof body.completed_at === 'number',
+      // `responseCutOff` drives the ITEMS too, and a projection that stopped at
+      // the top-level triple called itself "the whole cut-off envelope" while
+      // leaving that out. Empty on both sides for every row today, because no
+      // roster answer makes a tool call — which is exactly why the omission was
+      // invisible to `bindingsReached()`: the binding runs, the branch does not.
+      callStatuses: (body.output ?? []).filter((item) => item?.type === 'function_call')
+        .map((item) => item?.status ?? null),
     }), (answer) => (answer.stopReason === 'max_tokens'
-      ? { status: 'incomplete', incompleteReason: 'max_output_tokens', completedAtIsSet: false }
-      : { status: 'completed', incompleteReason: null, completedAtIsSet: true })],
+      ? {
+        status: 'incomplete',
+        incompleteReason: 'max_output_tokens',
+        completedAtIsSet: false,
+        callStatuses: (answer.toolCalls ?? []).map(() => 'incomplete'),
+      }
+      : {
+        status: 'completed',
+        incompleteReason: null,
+        completedAtIsSet: true,
+        callStatuses: (answer.toolCalls ?? []).map(() => 'completed'),
+      })],
     ['usage.cachedInputTokens', (body) => body.usage?.input_tokens_details?.cached_tokens],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.input_tokens_details?.cache_write_tokens],
   ],
   '/v1/messages': [
     // Through the derivation, not raw. `undefined` is not "no claim" here — it
     // is a claim that the turn simply ended, and the wire says `end_turn`.
-    ['stopReason', (body) => body.stop_reason, (answer) => anthropicStopReason(answer)],
+    ['stopReason', (body) => body.stop_reason,
+      (answer, request) => anthropicStopReason(withStopSequences(answer, request))],
+    // Bound, not free: it is half of what `applyStopSequences` rewrites, and a
+    // binding that reads one half of a rewrite and not the other is an oracle
+    // with a blind spot rather than a check.
+    ['stopSequence', (body) => body.stop_sequence ?? null,
+      (answer, request) => withStopSequences(answer, request).stopSequence ?? null],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.cache_creation_input_tokens],
     ['usage.cacheReadInputTokens', (body) => body.usage?.cache_read_input_tokens],
     ['usage.cachedInputTokens', (body) => (body.usage?.cache_creation_input_tokens ?? 0)
@@ -727,7 +784,7 @@ export const ANSWER_BINDINGS = {
     ['text', (body, request) => (body.content ?? [])
       .filter((block) => block?.type === 'text')
       .map((block) => block.text ?? '')
-      .join(''), (answer, request) => afterStopSequences(answer.text ?? '', request.stop_sequences)],
+      .join(''), (answer, request) => withStopSequences(answer, request).text],
   ],
 };
 
@@ -817,15 +874,10 @@ FREE_ANSWER_FIELDS['/v1/messages'] = {
     + 'absence — so a fixture can move it without reaching any path on the wire, let alone a compared '
     + 'one. Binding it would require a fixture to claim a reasoning turn the fake backend never had; '
     + 'docs/design-task-unmeasured-thinking-tokens.md is where the three surfaces are settled together',
-  // `stop_sequence` IS shaped on this surface (src/proxy/http-server.ts:2233,
-  // 3720), so chat's reason would be false here. Three rows compare it directly
-  // through `alsoCompare: ['.stop_sequence']`, which is what makes it free: the
-  // rows that care read it off the wire, not off the answer.
-  stopSequence: 'reported here as `stop_sequence`, and the three rows that depend on it compare it by '
-    + 'path through `alsoCompare`, so a fixture cannot move it without one of them saying so',
 };
 // Bound on this surface, so not free here.
 delete FREE_ANSWER_FIELDS['/v1/messages'].text;
+delete FREE_ANSWER_FIELDS['/v1/messages'].stopSequence;
 
 /**
  * Options whose only observable effect is a path, and the path each one owes.
