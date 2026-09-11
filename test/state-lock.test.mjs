@@ -11,7 +11,7 @@ import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sym
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, test } from 'node:test';
-import { acquireStateLock, canonicalStatePath, stateIdentity } from '../scripts/lib/state-lock.mjs';
+import { acquireStateLock, canonicalStatePath, lockNamespace, stateIdentity } from '../scripts/lib/state-lock.mjs';
 
 const roots = [];
 const scratch = () => {
@@ -186,5 +186,23 @@ test('a name-keyed lock reserves a file that must not exist yet', () => {
   const second = locked(artifact, { create: false });
   assert.equal(second.release, undefined, 'two runs reserved one artifact name');
   first.release();
+});
+
+test('the lock namespace does not move with the environment', () => {
+  // `os.tmpdir()` reads TMPDIR/TMP/TEMP, so two runs with the same ledger and
+  // different environments took every lock and spent the ceiling twice. The
+  // rendezvous has to be somewhere both processes name the same way without
+  // being told.
+  const before = process.env.TMPDIR;
+  try {
+    process.env.TMPDIR = '/tmp/one';
+    const a = lockNamespace();
+    process.env.TMPDIR = '/tmp/two';
+    const b = lockNamespace();
+    assert.equal(a, b, 'the lock namespace follows the environment, so two runs can miss each other');
+  } finally {
+    if (before === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = before;
+  }
 });
 

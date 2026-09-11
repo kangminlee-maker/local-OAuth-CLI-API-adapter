@@ -13,6 +13,7 @@
 // that read a transcription instead of the shipped code reported PASS on an
 // implementation that made no HTTP request at all.
 import { recordExchange } from './capture-recorder.mjs';
+import { createHash } from 'node:crypto';
 
 /**
  * What the design says to count: visible characters.
@@ -167,6 +168,7 @@ export async function sampleRow({
   budget = null,
   onSample = () => {},
   onSpend = () => {},
+  shouldStop = () => false,
   sleepFor = sleep,
   // Injected so a case can assert the GROWTH rather than the growth plus a
   // random number: with jitter in the way, "the second wait is longer" is true
@@ -204,6 +206,17 @@ export async function sampleRow({
         // metered calls against a ceiling of one.
         if (budget && budget.remaining <= 0) {
           throw new SamplingAbort(`the run's call budget is spent (${budget.spent} used)`);
+        }
+        // Beside the budget check and for the same reason: both end the run
+        // BEFORE a call rather than during one. The runner used to answer an
+        // interrupt with `process.exit(130)` on the spot, so a call already past
+        // the point where a vendor bills it was abandoned with no sample, no
+        // terminal exchange and nothing on disk but an incremented counter.
+        // Stopping here lets the current call finish and leaves through the
+        // ordinary abort path, which saves the ledger and records the partial
+        // row.
+        if (shouldStop()) {
+          throw new SamplingAbort(`interrupted after ${budget?.spent ?? 0} call(s); the one in flight was allowed to finish`);
         }
         if (budget) { budget.remaining -= 1; budget.spent += 1; }
         // Booked BEFORE the call, and the caller is told before the call too.
@@ -350,9 +363,17 @@ export function ledgerFor({ resume = null, live = false, outPath = null } = {}) 
   return `${outPath}.state.json`;
 }
 
-export function defaultArtifactName(date, only) {
+export function defaultArtifactName(date, only, selected = null) {
   const day = date.toISOString().slice(0, 10).replace(/-/g, '');
-  return `aa-noise-floor-${day}${only ? `-${only.replace(/[^a-zA-Z0-9]+/g, '-')}` : ''}.json`;
+  const label = only ? `-${only.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '')}` : '';
+  // The COHORT decides identity; the filter text is a label on it. `--only
+  // openai` and `--only openai/` select the same ten rows and used to produce
+  // two names, two ledgers and two locks, so a review ran both and spent the
+  // ceiling twice over one cohort. Equivalent spellings now collide because the
+  // digest is taken over the rows, not over what was typed.
+  if (!selected) return `aa-noise-floor-${day}${label}.json`;
+  const cohort = createHash('sha256').update([...selected].sort().join('\n')).digest('hex').slice(0, 8);
+  return `aa-noise-floor-${day}${label}-${cohort}.json`;
 }
 
 /**

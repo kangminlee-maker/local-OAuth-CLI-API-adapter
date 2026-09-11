@@ -547,10 +547,17 @@ test('two partitions of one batch do not name one artifact', () => {
   // `--only` is how a batch is split across processes, and hundreds of metered
   // calls per partition used to land on one filename.
   const day = new Date('2026-09-10T11:00:00Z');
-  assert.equal(defaultArtifactName(day, 'openai'), 'aa-noise-floor-20260910-openai.json');
-  assert.notEqual(defaultArtifactName(day, 'openai'), defaultArtifactName(day, 'anthropic'));
+  const openai = ['openai/summarise', 'openai/explain'];
+  assert.notEqual(defaultArtifactName(day, 'openai', openai),
+    defaultArtifactName(day, 'anthropic', ['anthropic/summarise']));
+  // Identity is the COHORT, not the filter text: `--only openai` and
+  // `--only openai/` select the same rows, and used to name two artifacts, two
+  // ledgers and two locks — so both ran and both spent the whole ceiling.
+  assert.equal(defaultArtifactName(day, 'openai', openai),
+    defaultArtifactName(day, 'openai/', openai),
+    'two spellings of one cohort name two files');
+  assert.match(defaultArtifactName(day, 'openai', openai), /^aa-noise-floor-20260910-openai-[0-9a-f]{8}\.json$/);
   assert.equal(defaultArtifactName(day, null), 'aa-noise-floor-20260910.json');
-  assert.equal(defaultArtifactName(day, 'openai/summarise'), 'aa-noise-floor-20260910-openai-summarise.json');
 });
 
 test('a run that spends gets a ledger whether or not it was asked for one', () => {
@@ -569,5 +576,32 @@ test('a run that spends gets a ledger whether or not it was asked for one', () =
   assert.equal(ledgerFor({ resume: '/tmp/mine.json', live: true, outPath: '/runs/a.json' }), '/tmp/mine.json');
   assert.equal(ledgerFor({ live: false, outPath: '/runs/a.json' }), null);
   assert.equal(ledgerFor({ resume: '/tmp/mine.json' }), '/tmp/mine.json');
+});
+
+test('an interrupt stops before the next call and lets the one in flight finish', async () => {
+  // The runner used to answer an interrupt with `process.exit(130)` on the spot,
+  // so a call already past the point a vendor bills it was abandoned: no sample,
+  // no terminal exchange, and nothing on disk but a counter one higher. The stop
+  // is checked where the budget is — before a call, never during one.
+  const budget = { remaining: 10, spent: 0 };
+  const samples = [];
+  let stop = false;
+  await assert.rejects(
+    () => sampleRow({
+      reps: 5,
+      minReps: 5,
+      budget,
+      shouldStop: () => stop,
+      take: async (index) => {
+        // The interrupt lands while this call is in flight.
+        if (index === 1) stop = true;
+        return { chars: 100 + index, outputTokens: 10, thinkingTokens: 0, latencyMs: 1 };
+      },
+      onSample: ({ index }) => samples.push(index),
+    }),
+    (error) => error instanceof SamplingAbort && /interrupted after 2 call\(s\)/.test(error.message),
+  );
+  assert.deepEqual(samples, [0, 1], 'the call in flight when the interrupt landed was abandoned');
+  assert.equal(budget.spent, 2, 'a call was booked after the run was told to stop');
 });
 

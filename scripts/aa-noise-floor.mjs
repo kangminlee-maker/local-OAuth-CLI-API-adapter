@@ -28,6 +28,7 @@ import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
 import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
 import { acquireStateLock, canonicalStatePath } from './lib/state-lock.mjs';
+import { readLedger, saveLedger } from './lib/ledger.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -63,19 +64,6 @@ const reportPath = opt('--report', null);
 // A substring filter over `provider/task`, so the wiring can be proved on two
 // calls before four hundred and eighty are committed to it.
 const only = opt('--only', null);
-// The name carries `--only`, because the artifact needs the same protection the
-// ledger got and for the same reason. `--only` exists to partition a batch
-// across processes; with a name that carried the date alone, two partitions of
-// one batch — hundreds of metered calls each — wrote the same file and the
-// second erased the first. Worse after the state lock than before it: the lock
-// refuses two runs on one ledger, so the only way left to partition is separate
-// ledgers, which is exactly the configuration where the artifacts collide.
-const outPath = opt('--out', resolve(repoRoot, 'bench-results', defaultArtifactName(new Date(), only)));
-// A ledger is a consequence of SPENDING, not of a flag: a live run without
-// `--resume` used to keep every paid observation in memory until the last row,
-// so an interrupt lost all of them. Canonical from here down — the lock, the
-// reads and the writes all have to mean the same inode.
-const statePath = canonicalStatePath(ledgerFor({ resume: resumePath, live, outPath }));
 
 // Published list prices, read 2026-09-10 from developers.openai.com/api/docs/pricing
 // and platform.claude.com/docs/en/about-claude/pricing. They are here so the plan
@@ -159,6 +147,20 @@ if (rows.length === 0) {
   process.exit(2);
 }
 
+// The name carries the COHORT, not the filter text. `--only` exists to partition
+// a batch across processes; a name that carried the date alone had two
+// partitions — hundreds of metered calls each — writing one file, and a name
+// carrying the raw filter had `--only openai` and `--only openai/` selecting the
+// same ten rows under two names, two ledgers and two locks. It is computed here,
+// after the rows are chosen, because the rows are what it is about.
+const outPath = opt('--out', resolve(repoRoot, 'bench-results',
+  defaultArtifactName(new Date(), only, rows.map((row) => `${row.provider}/${row.task}`))));
+// A ledger is a consequence of SPENDING, not of a flag: a live run without
+// `--resume` used to keep every paid observation in memory until the last row,
+// so an interrupt lost all of them. Canonical from here down — the lock, the
+// reads and the writes all have to mean the same inode.
+const statePath = canonicalStatePath(ledgerFor({ resume: resumePath, live, outPath }));
+
 // The worst case by default: a budget larger than the plan cannot stop anything,
 // and one smaller is a deliberate cap the operator asked for.
 const budgetTotal = budgetCalls ?? rows.length * reps;
@@ -239,6 +241,24 @@ if (reportPath) {
 // writes the WHOLE state object from its own snapshot, the second writer erases
 // rows the first had paid for. Through `--only`, which exists to partition a
 // batch across processes, that is the ordinary way to run it.
+// Set by the first interrupt, read by the sampler before it books a call. The
+// handler used to `process.exit(130)` on the spot, which abandoned a call that
+// was already past the point a vendor bills it: no sample, no terminal exchange,
+// and nothing on disk but a counter one higher. A second interrupt still exits
+// at once, because an operator who asks twice means it.
+let stopRequested = false;
+const releases = [];
+const onSignal = () => {
+  if (stopRequested) {
+    for (const release of releases) release();
+    process.exit(130);
+  }
+  stopRequested = true;
+  process.stderr.write('\nSTOPPING: no further calls will be made; the one in flight is '
+    + 'allowed to finish so it reaches the ledger. Interrupt again to leave now.\n');
+};
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, onSignal);
+
 const hold = (path, what, options = {}) => {
   const { lockPath, heldBy, release } = acquireStateLock(path, options);
   if (!release) {
@@ -247,10 +267,8 @@ const hold = (path, what, options = {}) => {
       + "first's rows. If that process is gone, delete the lock deliberately.");
     process.exit(1);
   }
+  releases.push(release);
   process.on('exit', release);
-  for (const signal of ['SIGINT', 'SIGTERM']) {
-    process.on(signal, () => { release(); process.exit(130); });
-  }
 };
 
 if (statePath) hold(statePath, 'state file');
@@ -266,13 +284,10 @@ if (live && existsSync(outPath)) {
   process.exit(1);
 }
 
-const state = statePath && existsSync(statePath)
-  ? JSON.parse(readFileSync(statePath, 'utf8'))
-  : { rows: {}, spent: 0 };
+const state = (statePath && readLedger(statePath)) ?? { rows: {}, spent: 0 };
 const saveState = () => {
   if (!statePath) return;
-  mkdirSync(dirname(statePath), { recursive: true });
-  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+  saveLedger(statePath, state);
 };
 
 // A row whose state predates whole samples cannot say what its calls MEASURED —
@@ -365,6 +380,7 @@ for (const row of rows) {
         readAnswer: vendor.readAnswer,
       }),
       // Before the call, so an interrupt cannot re-grant calls already made.
+      shouldStop: () => stopRequested,
       onSpend: ({ spent }) => {
         state.spent = spent;
         saveState();

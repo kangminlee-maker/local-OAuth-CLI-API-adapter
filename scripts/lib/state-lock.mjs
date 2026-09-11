@@ -121,9 +121,27 @@ export function stateIdentity(statePath, { create = true } = {}) {
  * idempotent and ownership-checked: it unlinks only a lock file that still
  * carries THIS call's token.
  */
+/**
+ * The rendezvous two runs must compute identically, whatever their environment.
+ *
+ * `os.tmpdir()` reads `TMPDIR`/`TMP`/`TEMP`, so it is not a rendezvous at all: a
+ * review gave two runs the same ledger and the same artifact and different
+ * `TMPDIR`s, and both took every lock and spent the whole ceiling. The sidecar
+ * has to be somewhere both processes name the same way without being told, which
+ * is what `/tmp` is on the platforms this runs on. `tmpdir()` is the fallback
+ * only where `/tmp` is not a usable directory, and there the variance is back —
+ * said here rather than left to be discovered.
+ */
+export function lockNamespace() {
+  try {
+    if (statSync('/tmp').isDirectory()) return join(realpathSync('/tmp'), 'aa-noise-floor-locks');
+  } catch { /* not a usable directory on this platform */ }
+  return join(tmpdir(), 'aa-noise-floor-locks');
+}
+
 export function acquireStateLock(target, { pid = process.pid, lockDir = null, create = true } = {}) {
   const { path, key } = stateIdentity(target, { create });
-  const dir = lockDir ?? join(tmpdir(), 'aa-noise-floor-locks');
+  const dir = lockDir ?? lockNamespace();
   mkdirSync(dir, { recursive: true });
   const lockPath = join(dir, `${key}.lock`);
   const token = `${pid}:${randomUUID()}`;
