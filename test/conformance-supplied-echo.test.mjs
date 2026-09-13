@@ -37,6 +37,9 @@ import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterRepl
   answerPremiseFailures,
   MINIMAL_SURFACES,
   bindingsReached,
+  branchesReached,
+  BRANCH_CONTROLS,
+  runBranchControl,
   echoFailures,
   expectedItemTypes,
   freeFieldsReached,
@@ -269,7 +272,7 @@ for (const { fixture, surface, supplied, echoed, alsoCompare, declaredAbsent, ha
     // regression supplied the observation that validated the row edit exempting
     // it. Our turn must answer with the vendor's items minus the ones the
     // harness cannot produce — no row field is consulted.
-    assert.deepEqual(itemTypesOf(ours.body), expectedItemTypes(vendor, surface),
+    assert.deepEqual(itemTypesOf(ours.body, surface), expectedItemTypes(vendor, surface),
       `${fixture}: our turn is not the vendor's turn minus what the harness cannot produce`);
     // ...and the gap list follows from those items and nothing else. A row with
     // no such item owes an empty list; one with them owes exactly the paths they
@@ -421,8 +424,59 @@ test('the item sequence our turn owes comes from the harness table, not from a r
   const vendor = { output: [{ type: 'reasoning' }, { type: 'message' }, { type: 'reasoning' }] };
   // EVERY item of a harness-missing type, not the first N a row claims.
   assert.deepEqual(expectedItemTypes(vendor, '/v1/responses'), ['message']);
-  assert.deepEqual(expectedItemTypes(vendor, '/v1/messages'), ['reasoning', 'message', 'reasoning'],
+});
+
+test('each surface is read where its own items live', () => {
+  // This control used to hand a RESPONSES-shaped body to the `/v1/messages`
+  // question and conclude the surface was covered. It was not: Anthropic
+  // answers carry `content`, the reader sniffed `output ?? choices`, and every
+  // Messages row compared an empty list with an empty list. A control that
+  // feeds a surface a body that surface cannot produce certifies the reader's
+  // sniff, not the surface.
+  const messages = { content: [{ type: 'text', text: 'AA' }, { type: 'tool_use', id: 't1' }] };
+  const chat = { choices: [{ index: 0, message: { role: 'assistant', content: 'a' } }] };
+  const responses = { output: [{ type: 'reasoning' }, { type: 'message' }] };
+  assert.deepEqual(itemTypesOf(messages, '/v1/messages'), ['text', 'tool_use']);
+  assert.deepEqual(itemTypesOf(chat, '/v1/chat/completions'), [null]);
+  assert.deepEqual(itemTypesOf(responses, '/v1/responses'), ['reasoning', 'message']);
+  // A surface cannot lose an item it has no exemption for, and `/v1/messages`
+  // has none: its whole block sequence is owed.
+  assert.deepEqual(expectedItemTypes(messages, '/v1/messages'), ['text', 'tool_use'],
     'a surface that cannot lose an item is being allowed to lose one');
+  // The body is never asked which surface it is. A Responses body read as
+  // Messages has no items at all — which is exactly the answer the sniff gave
+  // for every real Anthropic body.
+  assert.deepEqual(itemTypesOf(responses, '/v1/messages'), []);
+});
+
+test('a repeated block is not the vendor block sequence', () => {
+  // The input the dead rule could not see: the proxy answers a `/v1/messages`
+  // turn with its text block twice. Every indexed value the row compares reads
+  // the unchanged FIRST block, and the shape reader collapses arrays, so
+  // cardinality is invisible to both. Only the item sequence names it.
+  const vendor = { content: [{ type: 'text', text: 'AA' }] };
+  const doubled = { content: [{ type: 'text', text: 'AA' }, { type: 'text', text: 'AA' }] };
+  const dropped = { content: [] };
+  assert.notDeepEqual(itemTypesOf(doubled, '/v1/messages'), expectedItemTypes(vendor, '/v1/messages'),
+    'a doubled answer block passes the item sequence');
+  assert.notDeepEqual(itemTypesOf(dropped, '/v1/messages'), expectedItemTypes(vendor, '/v1/messages'),
+    'a dropped answer block passes the item sequence');
+  // And a Chat choice, whose members carry no `type` at all, is counted the
+  // same way: the nulls are the cardinality.
+  const one = { choices: [{ index: 0 }] };
+  const two = { choices: [{ index: 0 }, { index: 1 }] };
+  assert.notDeepEqual(itemTypesOf(one, '/v1/chat/completions'),
+    expectedItemTypes(two, '/v1/chat/completions'), 'a lost Chat choice passes the item sequence');
+});
+
+test('a surface with no declared item key cannot be checked silently', () => {
+  // The reader's failure mode used to be an empty list, which reads as "this
+  // turn owes nothing". A surface nobody has entered in the table must stop the
+  // gate instead of certifying it.
+  assert.throws(() => itemTypesOf({ content: [{ type: 'text' }] }, '/v1/embeddings'),
+    /no item key is declared/);
+  assert.throws(() => harnessGapsFrom({ content: [{ type: 'text' }] }, '/v1/embeddings'),
+    /no item key is declared/);
 });
 
 test('an option whose only effect is a path is compared by every row whose request carries it', () => {
@@ -481,6 +535,35 @@ test('every binding is run by some row', () => {
   // only coverage assertion used to be `checked > 0`, which nine bindings
   // satisfied on behalf of the two that never ran.
   assert.ok(Object.values(runs).every((count) => count > 0));
+});
+
+test('every branch of every derivation is reached by some input', () => {
+  // "A binding runs" and "its branch runs" are different questions, and only the
+  // first was being asked. Four branches were reachable with the whole suite
+  // green: Chat's tool-call case (every Chat row answers `stop`), the completed
+  // half of the Responses item statuses — a branch this campaign ADDED, whose
+  // sibling it controlled in the same expression — a non-empty stop sequence the
+  // text misses, and `max_tokens` beating a tool call on Anthropic. Each could
+  // be made to return a value no vendor sends and nothing failed.
+  const { neverRun, undeclared, runs } = branchesReached([CAPTURES, MINIMAL_SURFACES]);
+  assert.deepEqual(neverRun, [],
+    'a derivation branch no input reaches: it certifies without being able to be wrong');
+  assert.deepEqual(undeclared, [],
+    'a derivation took a branch this table does not name');
+  assert.ok(Object.values(runs).every((count) => count > 0));
+});
+
+test('each branch control derives the value its branch owes', () => {
+  // Written out, not recomputed: a control that derives its expectation with the
+  // code under test agrees with any code at all. Flip a branch and the control
+  // naming it goes red.
+  for (const control of BRANCH_CONTROLS) {
+    const { value } = runBranchControl(control);
+    assert.deepEqual(value, control.expect, `${control.name}: the derivation disagrees with its control`);
+  }
+  // And every declared branch has one. A branch with no control is a branch
+  // whose only witness is a roster row that could stop witnessing it tomorrow.
+  assert.ok(BRANCH_CONTROLS.length > 0);
 });
 
 test('the usage counts are free only while nothing compares a usage path', () => {
@@ -848,6 +931,36 @@ test('a projection that changes a bound VALUE, not just a name, is reported', ()
     },
   );
   assert.match(failures.join('\n'), /usage\.cachedInputTokens yields 1, the capture says 0/);
+});
+
+test('a bound field the projection adds, that no row wrote, is still compared', () => {
+  // The gap between the two checks. The scan sees the projected field, finds the
+  // name in the binding table and skips it as covered; the binding loop used to
+  // decide presence from the ROW's answer alone, so it never reached a field the
+  // row had stopped writing. A review dropped `usage.cacheReadInputTokens` from
+  // one messages row and had the projection put it back as 1 against a capture
+  // that says 0: the proxy answered `cache_read_input_tokens: 1` and neither
+  // check said anything, each believing the other had it.
+  //
+  // The row here writes no usage at all, exactly as that review's row did.
+  const { failures, checked } = answerPremiseFailures(
+    [{ fixture: 'projected-only', surface: '/v1/messages', answer: { usage: undefined } }],
+    () => ({
+      body: {
+        stop_reason: 'end_turn',
+        content: [{ type: 'text', text: 'OK' }],
+        usage: { cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+      request: {},
+    }),
+    undefined,
+    (answer, request) => {
+      const served = servedResult(answer, request);
+      return { ...served, usage: { ...served.usage, cacheReadInputTokens: 1 } };
+    },
+  );
+  assert.ok(checked > 0, 'the binding loop ran nothing at all');
+  assert.match(failures.join('\n'), /usage\.cacheReadInputTokens yields 1, the capture says 0/);
 });
 
 test('a constant the backend invents, that no row wrote, is reported', () => {

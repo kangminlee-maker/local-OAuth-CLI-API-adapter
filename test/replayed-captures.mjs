@@ -55,9 +55,37 @@ export const HARNESS_MISSING_ITEMS = {
   '/v1/messages': [],
 };
 
+/**
+ * Where each surface's answer items live.
+ *
+ * This used to be sniffed off the body — `body.output ?? body.choices ?? []` —
+ * and the sniff decided which surfaces the item-sequence rule covered. Anthropic
+ * answers carry neither key: their blocks are `content`. So on `/v1/messages`
+ * the rule compared `[]` to `[]` for every body that surface can produce, and a
+ * review made the proxy answer one `/v1/messages` turn with its text block
+ * TWICE — the client receiving the answer doubled — with all 2328 tests green.
+ * The rule was dead exactly where the comment above promises it is live.
+ *
+ * A body cannot say which surface it came from, so it is not asked. The surface
+ * is passed in and this table is the only thing that answers, which also means a
+ * surface nobody has entered here throws rather than reporting no items.
+ */
+const SURFACE_ITEM_KEY = {
+  '/v1/chat/completions': 'choices',
+  '/v1/responses': 'output',
+  '/v1/messages': 'content',
+};
+
+/** The answer items a body carries on `surface`. */
+function itemsOf(body, surface) {
+  const key = SURFACE_ITEM_KEY[surface];
+  assert.ok(key, `no item key is declared for ${surface}, so its item sequence cannot be checked`);
+  return body?.[key] ?? [];
+}
+
 /** The output item types a body carries, `null` where a member has none. */
-export function itemTypesOf(body) {
-  return (body?.output ?? body?.choices ?? []).map((item) => item?.type ?? null);
+export function itemTypesOf(body, surface) {
+  return itemsOf(body, surface).map((item) => item?.type ?? null);
 }
 
 /**
@@ -66,7 +94,7 @@ export function itemTypesOf(body) {
  */
 export function expectedItemTypes(vendor, surface, missing = HARNESS_MISSING_ITEMS) {
   const absent = new Set(missing[surface] ?? []);
-  return itemTypesOf(vendor).filter((type) => !absent.has(type));
+  return itemTypesOf(vendor, surface).filter((type) => !absent.has(type));
 }
 
 /**
@@ -91,10 +119,16 @@ export function expectedItemTypes(vendor, surface, missing = HARNESS_MISSING_ITE
  * choice had lost credited as a consequence of the other one's absence.
  */
 export function harnessGapsFrom(vendor, surface, missing = HARNESS_MISSING_ITEMS) {
-  const key = vendor?.output ? 'output' : 'choices';
+  // From the SURFACE, not from whichever key the body happens to have. Sniffing
+  // sent `/v1/messages` down the `choices` branch, where every Anthropic body
+  // has no items and no gap is derivable for a reason that has nothing to do
+  // with the harness.
+  const key = SURFACE_ITEM_KEY[surface];
+  assert.ok(key, `no item key is declared for ${surface}, so its gaps cannot be derived`);
+  const items = vendor?.[key] ?? [];
   const absent = new Set(missing[surface] ?? []);
-  const kept = (vendor?.[key] ?? []).filter((item) => !absent.has(item?.type ?? null));
-  if (kept.length === (vendor?.[key] ?? []).length) return [];
+  const kept = items.filter((item) => !absent.has(item?.type ?? null));
+  if (kept.length === items.length) return [];
   const theirs = keyPaths(vendor);
   const ours = keyPaths({ ...vendor, [key]: kept });
   return [...theirs.keys()].filter((path) => !ours.has(path)).sort();
@@ -656,6 +690,18 @@ function afterStopSequences(text, sequences) {
  * is the proxy's rule and is reproduced here rather than referenced.
  */
 function withStopSequences(answer, request) {
+  return stopSequenceCut(answer, request).value;
+}
+
+/**
+ * The same derivation, saying WHICH branch it took.
+ *
+ * Not a second copy of the rule: the branch label and the value come out of one
+ * evaluation, so a coverage report cannot say a branch ran while the derivation
+ * went somewhere else. `withStopSequences` above is the thin wrapper that throws
+ * the label away.
+ */
+function stopSequenceCut(answer, request) {
   const sequences = request?.stop_sequences ?? [];
   const text = answer.text ?? '';
   let cut = null;
@@ -668,10 +714,15 @@ function withStopSequences(answer, request) {
       matched = sequence;
     }
   }
-  if (matched === null) return { ...answer, text };
+  if (matched === null) return { branch: 'no-match', value: { ...answer, text } };
   const cutText = text.slice(0, cut);
-  if ((answer.toolCalls ?? []).length > 0) return { ...answer, text: cutText };
-  return { ...answer, text: cutText, stopReason: 'stop_sequence', stopSequence: matched };
+  if ((answer.toolCalls ?? []).length > 0) {
+    return { branch: 'match-with-tool-calls', value: { ...answer, text: cutText } };
+  }
+  return {
+    branch: 'match-plain',
+    value: { ...answer, text: cutText, stopReason: 'stop_sequence', stopSequence: matched },
+  };
 }
 
 /**
@@ -695,23 +746,71 @@ function withStopSequences(answer, request) {
 const ANTHROPIC_PASSTHROUGH_STOP_REASONS = new Set(['end_turn', 'max_tokens', 'stop_sequence', 'refusal', 'pause_turn']);
 
 function chatFinishReason(answer) {
-  if (answer.stopReason === 'max_tokens') return 'length';
-  return (answer.toolCalls ?? []).length > 0 ? 'tool_calls' : 'stop';
+  return chatFinish(answer).value;
+}
+
+function chatFinish(answer) {
+  if (answer.stopReason === 'max_tokens') return { branch: 'max-tokens', value: 'length' };
+  if ((answer.toolCalls ?? []).length > 0) return { branch: 'tool-calls', value: 'tool_calls' };
+  return { branch: 'plain', value: 'stop' };
 }
 
 function anthropicStopReason(answer) {
-  // Deliberately the RAW answer, not the answer after `applyStopSequences`
-  // (src/proxy/http-server.ts:2139) has had its way with it: that function can
-  // overwrite `result.stopReason` with `'stop_sequence'` before the messages
-  // shaping sees it, and this derivation does not. The disagreement runs in the
-  // failing direction — the binding demands the capture agree with the
-  // UNREWRITTEN answer, so a row whose text runs into a sequence has to declare
-  // `stopReason: 'stop_sequence'` itself, which both hit rows do. It cannot
-  // certify a turn the proxy ended some other way.
+  return anthropicStop(answer).value;
+}
+
+/**
+ * This takes the answer AFTER `stopSequenceCut`, because its only caller does.
+ *
+ * It used to say the opposite, and the paragraph outlived the edit that made it
+ * false: "deliberately the RAW answer... it cannot certify a turn the proxy
+ * ended some other way". That argument was refuted in round 5 — `applyStopSequences`
+ * (src/proxy/http-server.ts:2139) rewrites `stopReason` and `stopSequence`
+ * before the messages shaping sees them, so a row could declare `max_tokens`
+ * with a sequence-hitting text and be certified while the wire said
+ * `stop_sequence` — and the binding at the call site was changed to compose the
+ * two. The sentence stayed, contradicting the line that calls it.
+ *
+ * `max_tokens` wins over a tool call here, which is the proxy's precedence and
+ * the branch nothing used to reach.
+ */
+function anthropicStop(answer) {
   const hasToolCalls = (answer.toolCalls ?? []).length > 0;
-  if (hasToolCalls && answer.stopReason !== 'max_tokens') return 'tool_use';
+  if (hasToolCalls && answer.stopReason !== 'max_tokens') return { branch: 'tool-use', value: 'tool_use' };
   const reported = answer.stopReason;
-  return reported && ANTHROPIC_PASSTHROUGH_STOP_REASONS.has(reported) ? reported : 'end_turn';
+  const passed = reported && ANTHROPIC_PASSTHROUGH_STOP_REASONS.has(reported);
+  if (hasToolCalls) return { branch: 'max-tokens-over-tool-use', value: passed ? reported : 'end_turn' };
+  return passed ? { branch: 'passthrough', value: reported } : { branch: 'default-end-turn', value: 'end_turn' };
+}
+
+/**
+ * The cut-off envelope, and which of its four cases an answer lands in.
+ *
+ * The item statuses are a branch of their own, not a field of the outer one: a
+ * projection that stopped at the top-level triple called itself "the whole
+ * cut-off envelope" and `bindingsReached()` reported the binding as run, because
+ * the binding DID run — on rows with no tool calls, where both sides are empty.
+ * Running and reaching are different questions, so the empty and non-empty cases
+ * are named separately and each owes an input.
+ */
+function responsesEnvelope(answer) {
+  const calls = answer.toolCalls ?? [];
+  const cutOff = answer.stopReason === 'max_tokens';
+  const value = cutOff
+    ? {
+      status: 'incomplete',
+      incompleteReason: 'max_output_tokens',
+      completedAtIsSet: false,
+      callStatuses: calls.map(() => 'incomplete'),
+    }
+    : {
+      status: 'completed',
+      incompleteReason: null,
+      completedAtIsSet: true,
+      callStatuses: calls.map(() => 'completed'),
+    };
+  const branch = `${cutOff ? 'cut-off' : 'completed'}-${calls.length > 0 ? 'with-calls' : 'no-calls'}`;
+  return { branch, value };
 }
 
 /**
@@ -745,19 +844,7 @@ export const ANSWER_BINDINGS = {
       // invisible to `bindingsReached()`: the binding runs, the branch does not.
       callStatuses: (body.output ?? []).filter((item) => item?.type === 'function_call')
         .map((item) => item?.status ?? null),
-    }), (answer) => (answer.stopReason === 'max_tokens'
-      ? {
-        status: 'incomplete',
-        incompleteReason: 'max_output_tokens',
-        completedAtIsSet: false,
-        callStatuses: (answer.toolCalls ?? []).map(() => 'incomplete'),
-      }
-      : {
-        status: 'completed',
-        incompleteReason: null,
-        completedAtIsSet: true,
-        callStatuses: (answer.toolCalls ?? []).map(() => 'completed'),
-      })],
+    }), (answer) => responsesEnvelope(answer).value],
     ['usage.cachedInputTokens', (body) => body.usage?.input_tokens_details?.cached_tokens],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.input_tokens_details?.cache_write_tokens],
   ],
@@ -994,6 +1081,228 @@ export function freeFieldsReached(rosters, bindings = ANSWER_BINDINGS, free = FR
  * The gate's only coverage assertion was `checked > 0`, one number over three
  * surfaces and eleven bindings, which the other nine satisfy on their own.
  */
+/**
+ * The BRANCHES each derivation has, and the inputs that reach them.
+ *
+ * `bindingsReached()` answers "does some row carry this field". Two reviews
+ * arrived at the same place from opposite directions: that is not the question.
+ * A binding runs the moment its field is present, and a derivation with three
+ * branches then certifies on one of them while the other two have never seen an
+ * input. Four such branches were reachable with the whole suite green —
+ * `chatFinish`'s tool-call case (every Chat row answers `stop`), the completed
+ * half of the Responses item statuses (a branch THIS patch added, whose sibling
+ * it controlled in the same expression), a non-matching non-empty stop sequence,
+ * and Anthropic's `max_tokens` winning over a tool call.
+ *
+ * So the obligation is per BRANCH. Each derivation reports which branch it took
+ * out of the same evaluation that produced the value, so this table cannot say a
+ * branch ran while the code went elsewhere, and every branch here owes an input:
+ * a roster row, or a named control below.
+ */
+export const DERIVATION_BRANCHES = {
+  '/v1/chat/completions': { chatFinish: ['max-tokens', 'tool-calls', 'plain'] },
+  '/v1/responses': {
+    responsesEnvelope: ['cut-off-no-calls', 'cut-off-with-calls', 'completed-no-calls', 'completed-with-calls'],
+  },
+  '/v1/messages': {
+    stopSequenceCut: ['no-match', 'match-with-tool-calls', 'match-plain'],
+    anthropicStop: ['tool-use', 'max-tokens-over-tool-use', 'passthrough', 'default-end-turn'],
+  },
+};
+
+const DERIVATIONS = {
+  chatFinish: (answer) => chatFinish(answer),
+  responsesEnvelope: (answer) => responsesEnvelope(answer),
+  stopSequenceCut: (answer, request) => stopSequenceCut(answer, request),
+  // Composed exactly as the binding composes it, so the branch reported is the
+  // branch the bound value came out of.
+  anthropicStop: (answer, request) => anthropicStop(stopSequenceCut(answer, request).value),
+};
+
+const TOOL_CALL = { id: 'call_1', name: 'lookup', arguments: '{}' };
+
+/**
+ * One named input per branch no roster row reaches, each pinned to the value the
+ * branch must produce.
+ *
+ * The value is written out rather than derived: a control that recomputes the
+ * answer with the code it is checking agrees with any code at all. Flip a branch
+ * in a derivation and the control that names it goes red; delete a control and
+ * the branch it fed is reported as reaching no input.
+ */
+export const BRANCH_CONTROLS = [
+  {
+    name: 'a Chat turn that made tool calls',
+    surface: '/v1/chat/completions',
+    derivation: 'chatFinish',
+    answer: { ...DEFAULT_ANSWER, toolCalls: [TOOL_CALL] },
+    request: {},
+    expect: 'tool_calls',
+  },
+  {
+    name: 'a Chat turn cut off at its token cap',
+    surface: '/v1/chat/completions',
+    derivation: 'chatFinish',
+    answer: { ...DEFAULT_ANSWER, stopReason: 'max_tokens' },
+    request: {},
+    expect: 'length',
+  },
+  {
+    name: 'a Responses turn whose function call completed',
+    surface: '/v1/responses',
+    derivation: 'responsesEnvelope',
+    answer: { ...DEFAULT_ANSWER, toolCalls: [TOOL_CALL] },
+    request: {},
+    expect: {
+      status: 'completed', incompleteReason: null, completedAtIsSet: true, callStatuses: ['completed'],
+    },
+  },
+  {
+    name: 'a Responses turn cut off mid function call',
+    surface: '/v1/responses',
+    derivation: 'responsesEnvelope',
+    answer: { ...DEFAULT_ANSWER, stopReason: 'max_tokens', toolCalls: [TOOL_CALL] },
+    request: {},
+    expect: {
+      status: 'incomplete',
+      incompleteReason: 'max_output_tokens',
+      completedAtIsSet: false,
+      callStatuses: ['incomplete'],
+    },
+  },
+  {
+    name: 'a Responses turn cut off with no call to cut',
+    surface: '/v1/responses',
+    derivation: 'responsesEnvelope',
+    answer: { ...DEFAULT_ANSWER, stopReason: 'max_tokens' },
+    request: {},
+    expect: {
+      status: 'incomplete', incompleteReason: 'max_output_tokens', completedAtIsSet: false, callStatuses: [],
+    },
+  },
+  {
+    name: 'stop sequences the text never runs into',
+    surface: '/v1/messages',
+    derivation: 'stopSequenceCut',
+    answer: { ...DEFAULT_ANSWER, text: 'AABB' },
+    request: { stop_sequences: ['ZZ'] },
+    // Nothing is cut and nothing is rewritten. The empty-sequence case reaches
+    // this branch too; a NON-EMPTY list that simply misses is the one nothing
+    // was feeding it.
+    expect: { text: 'AABB', stopReason: undefined, stopSequence: undefined },
+  },
+  {
+    name: 'a turn that made tool calls and ran into a stop sequence',
+    surface: '/v1/messages',
+    derivation: 'stopSequenceCut',
+    answer: { ...DEFAULT_ANSWER, text: 'AAZZBB', toolCalls: [TOOL_CALL] },
+    request: { stop_sequences: ['ZZ'] },
+    // The text is cut and the REASON is kept: this turn ended at its tool call.
+    expect: { text: 'AA', stopReason: undefined, stopSequence: undefined },
+  },
+  {
+    name: 'a turn whose text runs into a stop sequence',
+    surface: '/v1/messages',
+    derivation: 'stopSequenceCut',
+    answer: { ...DEFAULT_ANSWER, text: 'AAZZBB' },
+    request: { stop_sequences: ['ZZ'] },
+    expect: { text: 'AA', stopReason: 'stop_sequence', stopSequence: 'ZZ' },
+  },
+  {
+    name: 'an Anthropic turn that made tool calls',
+    surface: '/v1/messages',
+    derivation: 'anthropicStop',
+    answer: { ...DEFAULT_ANSWER, toolCalls: [TOOL_CALL] },
+    request: {},
+    expect: 'tool_use',
+  },
+  {
+    name: 'an Anthropic turn cut off at its cap mid tool call',
+    surface: '/v1/messages',
+    derivation: 'anthropicStop',
+    answer: { ...DEFAULT_ANSWER, stopReason: 'max_tokens', toolCalls: [TOOL_CALL] },
+    request: {},
+    // The cap wins over the tool call. Predicting `tool_use` here is the
+    // known-opposite, and it is what the binding said for every turn until this
+    // branch was named.
+    expect: 'max_tokens',
+  },
+  {
+    name: 'an Anthropic turn with a reason no vendor sends',
+    surface: '/v1/messages',
+    derivation: 'anthropicStop',
+    answer: { ...DEFAULT_ANSWER, stopReason: 'invented_by_a_backend' },
+    request: {},
+    expect: 'end_turn',
+  },
+];
+
+/**
+ * A row's own request bytes, read the way the rosters read them.
+ *
+ * Not this gate's `load()`: that one refuses a capture the gate's roster does
+ * not name, which is the right rule for a DRIVER and the wrong one here — the
+ * coverage report walks both rosters and a branch is reached or not regardless
+ * of which list the row is on.
+ */
+function capturedRequest(fixture) {
+  return JSON.parse(JSON.parse(readFileSync(join(captureDir, `${fixture}.json`), 'utf8')).request);
+}
+
+/** What one control derives, and which branch it took getting there. */
+export function runBranchControl(control) {
+  const run = DERIVATIONS[control.derivation];
+  assert.ok(run, `no derivation named ${control.derivation}`);
+  const { branch, value } = run(servedAnswer(control.answer), control.request);
+  // `stopSequenceCut` returns a whole answer; a control pins the three fields the
+  // rewrite touches, not the constants it carries through.
+  const pinned = control.derivation === 'stopSequenceCut'
+    ? { text: value.text, stopReason: value.stopReason, stopSequence: value.stopSequence }
+    : value;
+  return { branch, value: pinned };
+}
+
+/**
+ * Which declared branches some input reaches, and which reach none.
+ *
+ * Rows first, controls second: a branch a real capture already exercises does
+ * not need a synthetic input, and one that needs a synthetic input says so here.
+ */
+export function branchesReached(rosters, requestOf = capturedRequest, controls = BRANCH_CONTROLS,
+  declared = DERIVATION_BRANCHES) {
+  const runs = new Map();
+  const undeclared = new Set();
+  for (const [surface, table] of Object.entries(declared)) {
+    for (const [derivation, branches] of Object.entries(table)) {
+      for (const branch of branches) runs.set(`${surface} ${derivation} ${branch}`, 0);
+    }
+  }
+  const count = (surface, derivation, branch) => {
+    const key = `${surface} ${derivation} ${branch}`;
+    // A branch the code produces that this table does not name. It cannot be
+    // reported as uncovered — nothing knows it exists — so it is reported as
+    // undeclared instead of being silently counted.
+    if (!runs.has(key)) undeclared.add(key);
+    else runs.set(key, runs.get(key) + 1);
+  };
+  for (const rows of rosters) {
+    for (const { fixture, surface, answer } of rows) {
+      const request = requestOf(fixture);
+      for (const derivation of Object.keys(declared[surface] ?? {})) {
+        count(surface, derivation, DERIVATIONS[derivation](servedAnswer(answer), request).branch);
+      }
+    }
+  }
+  for (const control of controls) {
+    count(control.surface, control.derivation, runBranchControl(control).branch);
+  }
+  return {
+    runs: Object.fromEntries([...runs].sort(([a], [b]) => a.localeCompare(b))),
+    neverRun: [...runs].filter(([, n]) => n === 0).map(([key]) => key).sort(),
+    undeclared: [...undeclared].sort(),
+  };
+}
+
 export function bindingsReached(rosters, bindings = ANSWER_BINDINGS) {
   const runs = new Map();
   for (const [surface, table] of Object.entries(bindings)) {
@@ -1001,7 +1310,12 @@ export function bindingsReached(rosters, bindings = ANSWER_BINDINGS) {
   }
   for (const rows of rosters) {
     for (const { surface, answer } of rows) {
-      const present = new Set(leafPaths(servedAnswer(answer)));
+      // The same union the premise check uses. Presence off the ROW alone
+      // reported a binding as never run while the premise check was running it
+      // on a value only the projection produces — and reported one as run whose
+      // value the row does not decide.
+      const merged = servedAnswer(answer);
+      const present = new Set([...leafPaths(merged), ...leafPaths(servedResult(merged, {}))]);
       for (const [field] of bindings[surface] ?? []) {
         const key = `${surface} ${field}`;
         if (present.has(field)) runs.set(key, (runs.get(key) ?? 0) + 1);
@@ -1066,7 +1380,17 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, 
       }
       failures.push(`${fixture}: the answer sets ${field}, which no binding checks against the capture`);
     }
-    const present = new Set(leafPaths(answer));
+    // The union of what the roster WRITES and what the proxy RECEIVES.
+    //
+    // Presence used to come from the answer alone, one object further in than
+    // the value being judged: a review dropped `usage.cacheReadInputTokens`
+    // from one row and had the projection add it back with a different number.
+    // The proxy answered `cache_read_input_tokens: 1` against a capture that
+    // says 0 — and nothing failed. The unchecked-input scan saw the field,
+    // found it in the binding table and skipped it as covered; the binding loop
+    // never reached it, because the row no longer wrote it. The field fell
+    // between the two checks, each of which believed the other had it.
+    const present = new Set([...leafPaths(answer), ...leafPaths(served)]);
     for (const [field, ofVendor, ofAnswer] of table) {
       // Skipped only when the served answer has no such PATH. `undefined` is not
       // absence: `DEFAULT_ANSWER.stopReason` is an own key whose value is
@@ -1078,9 +1402,9 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, 
       if (!present.has(field)) continue;
       checked += 1;
       const theirs = ofVendor(vendor, request);
-      // Presence comes from the ANSWER, where `undefined` is the claim that the
-      // turn simply ended. The VALUE comes from what the proxy was served, which
-      // is the only thing the capture can be compared against.
+      // The VALUE comes from what the proxy was served, which is the only thing
+      // the capture can be compared against. The answer's half of the union is
+      // what keeps an explicit `undefined` a claim rather than an absence.
       const ours = ofAnswer ? ofAnswer(served, request) : read(served, field);
       if (JSON.stringify(ours) !== JSON.stringify(theirs)) {
         failures.push(`${fixture}: the answer's ${field} yields ${JSON.stringify(ours)}, `
