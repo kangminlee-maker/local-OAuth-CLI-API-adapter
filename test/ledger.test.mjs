@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { after, test } from 'node:test';
 import { readLedger, saveLedger, UnreadableLedgerError } from '../scripts/lib/ledger.mjs';
 
@@ -76,22 +77,38 @@ test('a ledger nobody wrote is a fresh run, not a crash', () => {
 
 test('the only copy that parses is not the one a failing write consumes', () => {
   // The construction a review ended two unreadable files with: an invalid ledger
-  // beside a valid shadow, then one more save. The save used to truncate the
-  // shadow first — the only copy that parsed — so a write that failed partway
-  // destroyed the last recoverable state.
-  const path = join(scratch(), 'state.json');
-  const paid = { rows: { 'openai/a': { samples: [{ chars: 60 }] } }, spent: 60 };
+  // beside a valid shadow, then one more save under a deterministic size limit.
+  // The save used to truncate the shadow first — the only copy that parsed — so
+  // a write that failed part-way destroyed the last recoverable state.
+  //
+  // The limit is the input. Making the file unwritable is not: the write fails
+  // before it truncates anything, so both orders survive it and the case proves
+  // nothing. A partial write is the only way to see which copy a save is willing
+  // to spend, and `ulimit -f` is the only portable way to force one.
+  const dir = scratch();
+  const path = join(dir, 'state.json');
+  const paid = { rows: { 'openai/a': { samples: Array.from({ length: 40 }, (_, i) => ({ chars: i })) } }, spent: 40 };
   saveLedger(path, paid);
   writeFileSync(path, '{"rows":{"openai/a":{"samp');
-  chmodSync(path, 0o444);
-  try {
-    assert.throws(() => saveLedger(path, { rows: {}, spent: 61 }));
-    // The shadow was replaced by rename, so it is whole whatever happened next.
-    assert.deepEqual(readLedger(path), { rows: {}, spent: 61 },
-      'the save consumed the only copy that parsed');
-  } finally {
-    chmodSync(path, 0o644);
-  }
+
+  // A separate process, because the limit has to be set before the write and
+  // cannot be set from inside this one.
+  const script = join(dir, 'save-under-a-limit.mjs');
+  writeFileSync(script, [
+    `import { saveLedger } from ${JSON.stringify(new URL('../scripts/lib/ledger.mjs', import.meta.url).href)};`,
+    // Bigger than the limit, so the write is stopped PART WAY rather than
+    // refused: a refused write leaves both copies untouched and proves nothing.
+    `saveLedger(${JSON.stringify(path)}, ${JSON.stringify({
+      rows: { 'openai/a': { samples: Array.from({ length: 60 }, (_, i) => ({ chars: i, outputTokens: i })) } },
+      spent: 41,
+    })});`,
+  ].join('\n'));
+  const child = spawnSync('sh', ['-c', `ulimit -f 1; exec node ${JSON.stringify(script)}`], { encoding: 'utf8' });
+  assert.notEqual(child.status, 0, 'the size limit did not stop the write, so this case measures nothing');
+
+  // The shadow was replaced by rename, so the partial write consumed a scratch
+  // name and the paid state is still there to resume.
+  assert.deepEqual(readLedger(path), paid, 'the save consumed the only copy that parsed');
 });
 
 test('the shadow is replaced, and the ledger is not', () => {
