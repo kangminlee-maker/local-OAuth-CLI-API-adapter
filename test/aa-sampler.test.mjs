@@ -7,12 +7,12 @@
 // reported PASS on an implementation that made no HTTP request at all.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 import { startCaptureRun } from '../scripts/lib/capture-recorder.mjs';
-import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, sampleRow, SamplingAbort, SERIES, summarise, takeSample, visibleChars } from '../scripts/lib/aa-sampler.mjs';
+import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, resumeRefusal, runIdentity, sampleRow, SamplingAbort, SERIES, summarise, takeSample, visibleChars } from '../scripts/lib/aa-sampler.mjs';
 
 const servers = [];
 after(async () => {
@@ -543,21 +543,132 @@ test('a row that collected nothing leaves no row behind', () => {
   assert.equal(abortedRow({ provider: 'openai' }, undefined), null);
 });
 
+const CONFIG = {
+  tasksDigest: 'digest-1', openAiModel: 'gpt-5.6-sol', anthropicModel: 'claude-sonnet-5', maxTokens: 1024,
+};
+
 test('two partitions of one batch do not name one artifact', () => {
   // `--only` is how a batch is split across processes, and hundreds of metered
   // calls per partition used to land on one filename.
   const day = new Date('2026-09-10T11:00:00Z');
   const openai = ['openai/summarise', 'openai/explain'];
-  assert.notEqual(defaultArtifactName(day, 'openai', openai),
-    defaultArtifactName(day, 'anthropic', ['anthropic/summarise']));
-  // Identity is the COHORT, not the filter text: `--only openai` and
-  // `--only openai/` select the same rows, and used to name two artifacts, two
-  // ledgers and two locks — so both ran and both spent the whole ceiling.
-  assert.equal(defaultArtifactName(day, 'openai', openai),
-    defaultArtifactName(day, 'openai/', openai),
-    'two spellings of one cohort name two files');
-  assert.match(defaultArtifactName(day, 'openai', openai), /^aa-noise-floor-20260910-openai-[0-9a-f]{8}\.json$/);
+  const name = (selected) => defaultArtifactName(day, runIdentity({ ...CONFIG, selected }), selected);
+  assert.notEqual(name(openai), name(['anthropic/summarise']));
+  assert.match(name(openai), /^aa-noise-floor-20260910-openai-[0-9a-f]{16}\.json$/);
   assert.equal(defaultArtifactName(day, null), 'aa-noise-floor-20260910.json');
+});
+
+test('the operator\'s filter text decides nothing about identity', () => {
+  // Identity is the COHORT, not the filter text: `--only openai` and
+  // `--only openai/` select the same rows and used to name two artifacts, two
+  // ledgers and two locks, so both ran and both spent the whole ceiling. The
+  // cohort digest closed those two spellings and left the label in front of it,
+  // which kept the typed text inside the name — `--only openai/implementation`
+  // and `--only openai/implementation_review` both select the single row
+  // `openai/implementation_review` and still produced two runs and four calls
+  // against a two-call ceiling. The filter is no longer an input to either half
+  // of the name.
+  const day = new Date('2026-09-10T11:00:00Z');
+  const selected = ['openai/implementation_review'];
+  const identity = runIdentity({ ...CONFIG, selected });
+  assert.equal(defaultArtifactName(day, identity, selected),
+    defaultArtifactName(day, identity, selected));
+  assert.match(defaultArtifactName(day, identity, selected), /^aa-noise-floor-20260910-openai-/);
+  // The readable half comes from the cohort's own providers, so it cannot carry
+  // a spelling either.
+  assert.match(defaultArtifactName(day, identity, ['anthropic/x', 'openai/y']),
+    /^aa-noise-floor-20260910-anthropic-openai-/);
+});
+
+test('a paid response survives a capture sink that cannot be written', async () => {
+  // The construction: a real HTTP 200 read in full, and the capture run's
+  // directory made unwritable underneath it. `recordExchange` threw `EACCES`
+  // from inside `take`, so the row came back `n: 0, deadLettered: true` with
+  // `spent: 1` in the ledger and the observation in neither durable sink. The
+  // call had been billed and both places that could have kept it were empty.
+  const dir = mkdtempSync(join(tmpdir(), 'aa-capture-'));
+  const run = startCaptureRun({ dir, meta: { probe: 'aa-sampler.test' } });
+  const { url } = await serving((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ text: 'an answer worth keeping', tokens: 7 }));
+  });
+  chmodSync(run.runDir, 0o555);
+  let taken = null;
+  try {
+    taken = await sample(url);
+  } finally {
+    chmodSync(run.runDir, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // The observation is intact and says why its evidence is missing.
+  assert.equal(taken.chars, visibleChars('an answer worth keeping'));
+  assert.equal(taken.outputTokens, 7);
+  assert.match(taken.captureError, /could not be recorded/);
+});
+
+test('a sample whose evidence could not be written is kept, and ends the run', async () => {
+  // Two obligations, and the old behaviour met neither: keep the paid
+  // observation, and stop spending. Raising from inside `take` lost the sample
+  // AND read as a failed call, so the run went on to make more.
+  const kept = [];
+  await assert.rejects(sampleRow({
+    reps: 4,
+    minReps: 4,
+    budget: { remaining: 4, spent: 0 },
+    onSample: ({ chars }) => { kept.push(chars); },
+    take: async () => ({
+      chars: 120, outputTokens: 30, thinkingTokens: null, latencyMs: 5,
+      captureError: 'the exchange could not be recorded: EACCES',
+    }),
+  }), (error) => {
+    assert.ok(error instanceof SamplingAbort);
+    assert.match(error.message, /could not be recorded/);
+    assert.match(error.message, /the sample was kept/);
+    return true;
+  });
+  // One call made, one observation persisted, and no second call attempted.
+  assert.deepEqual(kept, [120]);
+});
+
+test('a ledger from another configuration is refused, not merged', () => {
+  // The reproduction: an interrupted one-row run under one pin, holding one paid
+  // sample, resumed by an invocation that selects the same row under a different
+  // pin. The ledger derived identically, the old sample was accepted, and the
+  // published series was `[101, 202]` — two models' observations under the name
+  // of the second one, self-variance 1.0% reported as 53.3%.
+  const mine = 'aaaaaaaaaaaaaaaa';
+  const theirs = 'bbbbbbbbbbbbbbbb';
+  assert.match(resumeRefusal({ identity: theirs, rows: { 'openai/x': {} }, spent: 1 }, mine),
+    /holds samples from run bbbbbbbbbbbbbbbb/);
+  // An empty ledger of ANY identity is nothing to merge, so it is not refused;
+  // it is about to be stamped with this run's.
+  assert.equal(resumeRefusal({ rows: {}, spent: 0 }, mine), null);
+  assert.equal(resumeRefusal(null, mine), null);
+  assert.equal(resumeRefusal({ identity: mine, rows: { 'openai/x': {} }, spent: 1 }, mine), null);
+  // Paid and unaccounted-for is not the same as new. A ledger with spending and
+  // no identity used to be read as a fresh run and re-grant the whole ceiling.
+  assert.match(resumeRefusal({ rows: {}, spent: 4 }, mine), /before a ledger recorded which run/);
+  assert.match(resumeRefusal({ rows: { 'openai/x': {} }, spent: 0 }, mine), /before a ledger recorded which run/);
+});
+
+test('a run pinned to a different model is a different run', () => {
+  // The cohort was the whole of identity, so two invocations that selected the
+  // same rows under different pins shared one ledger and one lock: the second
+  // accepted the first's samples and published a floor over two models'
+  // observations under one model's name (1.0% self-variance read as 53.3%).
+  const selected = ['openai/implementation'];
+  const base = runIdentity({ ...CONFIG, selected });
+  assert.notEqual(base, runIdentity({ ...CONFIG, selected, openAiModel: 'gpt-5.6-terra' }),
+    'two model pins are one run');
+  assert.notEqual(base, runIdentity({ ...CONFIG, selected, anthropicModel: 'claude-opus-5' }),
+    'two Anthropic pins are one run');
+  assert.notEqual(base, runIdentity({ ...CONFIG, selected, maxTokens: 2048 }),
+    'two output caps are one run');
+  assert.notEqual(base, runIdentity({ ...CONFIG, selected, tasksDigest: 'digest-2' }),
+    'two prompt sets are one run');
+  // ...and the same configuration is the same run however the cohort is ordered.
+  assert.equal(runIdentity({ ...CONFIG, selected: ['a/x', 'b/y'] }),
+    runIdentity({ ...CONFIG, selected: ['b/y', 'a/x'] }));
 });
 
 test('a run that spends gets a ledger whether or not it was asked for one', () => {

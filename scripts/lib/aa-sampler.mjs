@@ -237,6 +237,15 @@ export async function sampleRow({
         consecutive = 0;
         done = true;
         onSample({ index, ...sample, samples: [...samples], lens: lensOf() });
+        // The observation is in the ledger by now. The OTHER durable sink could
+        // not take it, which is a reason to stop spending — a floor whose samples
+        // have no raw record behind them is a number with no evidence under it —
+        // but it is not a reason to have thrown the paid sample away, which is
+        // what raising from inside `take` did.
+        if (sample.captureError) {
+          throw new SamplingAbort(`${sample.captureError}; the sample was kept and the run stopped `
+            + `after ${budget?.spent ?? 0} call(s)`);
+        }
       } catch (error) {
         // An exhausted budget ends the RUN. Booking it as this row's failure
         // would let the next row start, and the three-failures rule would read
@@ -363,17 +372,79 @@ export function ledgerFor({ resume = null, live = false, outPath = null } = {}) 
   return `${outPath}.state.json`;
 }
 
-export function defaultArtifactName(date, only, selected = null) {
+/**
+ * What makes two invocations the same RUN.
+ *
+ * The cohort is not enough. Two invocations that select the same rows but pin
+ * different models, or a different output cap, or run after a prompt was edited,
+ * are not measuring the same thing — and they derived the same ledger, so the
+ * second accepted the first's samples and published a floor over two models'
+ * observations under one model's name. A review reproduced it offline: one
+ * interrupted row measured under one pin, resumed under another, `[101, 202]` in
+ * one series, self-variance 1.0% reported as 53.3%, and `plan.openAiModel` named
+ * only the second pin.
+ *
+ * So identity is the whole measurement configuration: which rows, which prompts
+ * (by content, not by name), which model answers each provider, and the cap that
+ * decides how much of an answer there is to measure. Anything that changes what
+ * a sample MEANS belongs here; the stopping rules — `reps`, `minReps`,
+ * `decisivePct` — do not, because they decide when to stop collecting samples
+ * that mean the same thing.
+ */
+export function runIdentity({ selected, tasksDigest, openAiModel, anthropicModel, maxTokens }) {
+  const canonical = JSON.stringify({
+    cohort: [...selected].sort(),
+    tasksDigest,
+    models: { openai: openAiModel, anthropic: anthropicModel },
+    maxTokens,
+  });
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+}
+
+/**
+ * Why this ledger may not be resumed as this run, or `null` when it may.
+ *
+ * Extracted from the runner so a synthetic ledger can be handed to it: the rule
+ * lived inline beside the read, where the only way to exercise it was to run the
+ * script, and a rule nothing can be handed is a rule nothing checks.
+ */
+export function resumeRefusal(state, identity) {
+  const rows = Object.keys(state?.rows ?? {}).length;
+  const spent = state?.spent ?? 0;
+  if (state?.identity && state.identity !== identity) {
+    return `this ledger holds samples from run ${state.identity}, and this invocation is run ${identity}: `
+      + 'the cohort, the prompts, the models or the output cap differ, so its observations do not measure '
+      + 'what this one measures';
+  }
+  // A ledger from before identity was recorded cannot say what it measured. It
+  // is not empty — it is unaccounted for, which is a different thing from new.
+  if (!state?.identity && (rows > 0 || spent > 0)) {
+    return 'this ledger was written before a ledger recorded which run it belongs to, so nothing here can '
+      + 'tell whether its samples were taken under this cohort, these prompts, these models and this cap';
+  }
+  return null;
+}
+
+/**
+ * A name for the run, and nothing in it that the operator typed.
+ *
+ * The raw `--only` text used to sit in front of the cohort digest, which made
+ * the DISPLAY label part of identity: `--only openai/implementation` and
+ * `--only openai/implementation_review` both select the single row
+ * `openai/implementation_review`, and they produced two filenames, two ledgers,
+ * two locks and four calls against a two-call ceiling. The filter text is
+ * recorded in the artifact's plan, where it describes the invocation without
+ * deciding anything.
+ *
+ * The readable half of the name is derived from the cohort itself — its
+ * providers, sorted — so two spellings that select the same rows cannot differ.
+ */
+export function defaultArtifactName(date, identity, selected = null) {
   const day = date.toISOString().slice(0, 10).replace(/-/g, '');
-  const label = only ? `-${only.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '')}` : '';
-  // The COHORT decides identity; the filter text is a label on it. `--only
-  // openai` and `--only openai/` select the same ten rows and used to produce
-  // two names, two ledgers and two locks, so a review ran both and spent the
-  // ceiling twice over one cohort. Equivalent spellings now collide because the
-  // digest is taken over the rows, not over what was typed.
-  if (!selected) return `aa-noise-floor-${day}${label}.json`;
-  const cohort = createHash('sha256').update([...selected].sort().join('\n')).digest('hex').slice(0, 8);
-  return `aa-noise-floor-${day}${label}-${cohort}.json`;
+  if (!identity) return `aa-noise-floor-${day}.json`;
+  const providers = [...new Set((selected ?? []).map((key) => String(key).split('/')[0]))].sort();
+  const label = providers.length > 0 ? `-${providers.join('-')}` : '';
+  return `aa-noise-floor-${day}${label}-${identity}.json`;
 }
 
 /**
@@ -410,16 +481,29 @@ export async function takeSample({ url, headers, body, label, timeoutMs, readAns
     throw failure;
   }
 
-  recordExchange({
-    kind: 'json', label, url, requestHeaders: headers, requestBody: body,
-    status: res.status, statusText: res.statusText, responseHeaders: res.headers,
-    responseBody: read ? text : undefined,
-    durationMs: performance.now() - startedAt,
-    error: res.ok ? null : `${url} ${res.status}`,
-  });
+  // The response has been READ, which is the thing the vendor bills for. Writing
+  // the capture record is evidence ABOUT that observation and is not the
+  // observation, and it used to be able to destroy it: a review made the run's
+  // capture directory unwritable, `recordExchange` threw `EACCES`, and the row
+  // came back `n: 0, deadLettered: true` with `spent: 1` in the ledger and
+  // nothing in either durable sink. The call was paid for and neither place kept
+  // it — and the failure read as a failed CALL, so the run went on to make more.
+  let captureError = null;
+  try {
+    recordExchange({
+      kind: 'json', label, url, requestHeaders: headers, requestBody: body,
+      status: res.status, statusText: res.statusText, responseHeaders: res.headers,
+      responseBody: read ? text : undefined,
+      durationMs: performance.now() - startedAt,
+      error: res.ok ? null : `${url} ${res.status}`,
+    });
+  } catch (error) {
+    captureError = `the exchange could not be recorded: ${String(error?.message ?? error)}`;
+  }
 
   if (!res.ok) {
-    const failure = new Error(`${url} ${res.status}: ${text.slice(0, 400)}`);
+    const failure = new Error(`${url} ${res.status}: ${text.slice(0, 400)}`
+      + (captureError ? ` (${captureError})` : ''));
     // 429 and 5xx are the vendor asking to be asked again. A 4xx that is not 429
     // is this run being wrong about something, and retrying it is a retry storm
     // with extra steps.
@@ -443,6 +527,10 @@ export async function takeSample({ url, headers, body, label, timeoutMs, readAns
     thinkingTokens: answer.thinkingTokens ?? null,
     latencyMs: Math.round(performance.now() - startedAt),
     status: res.status,
+    // Carried, not thrown. The caller keeps the observation and then ends the
+    // run: a sink that cannot write is a reason to stop making calls, not a
+    // reason to throw away the one already made.
+    captureError,
   };
 }
 

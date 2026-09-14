@@ -26,9 +26,9 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
-import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, resumeRefusal, runIdentity, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
 import { acquireStateLock, canonicalStatePath } from './lib/state-lock.mjs';
-import { readLedger, saveLedger } from './lib/ledger.mjs';
+import { readLedger, saveLedger, UnreadableLedgerError } from './lib/ledger.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -147,14 +147,25 @@ if (rows.length === 0) {
   process.exit(2);
 }
 
-// The name carries the COHORT, not the filter text. `--only` exists to partition
-// a batch across processes; a name that carried the date alone had two
-// partitions — hundreds of metered calls each — writing one file, and a name
-// carrying the raw filter had `--only openai` and `--only openai/` selecting the
-// same ten rows under two names, two ledgers and two locks. It is computed here,
-// after the rows are chosen, because the rows are what it is about.
+// The name carries the run's IDENTITY, and nothing anybody typed. `--only`
+// exists to partition a batch across processes; a name that carried the date
+// alone had two partitions — hundreds of metered calls each — writing one file,
+// and a name carrying the raw filter had `--only openai` and `--only openai/`
+// selecting the same ten rows under two names, two ledgers and two locks. The
+// cohort digest fixed the spellings; it did not fix the rest of the
+// configuration, so two runs pinned to different MODELS were still one run with
+// one ledger. Identity is the whole measurement configuration, computed here
+// because the rows are part of it.
+const selected = rows.map((row) => `${row.provider}/${row.task}`);
+const identity = runIdentity({
+  selected,
+  tasksDigest: qualityTasksDigest(),
+  openAiModel,
+  anthropicModel,
+  maxTokens,
+});
 const outPath = opt('--out', resolve(repoRoot, 'bench-results',
-  defaultArtifactName(new Date(), only, rows.map((row) => `${row.provider}/${row.task}`))));
+  defaultArtifactName(new Date(), identity, selected)));
 // A ledger is a consequence of SPENDING, not of a flag: a live run without
 // `--resume` used to keep every paid observation in memory until the last row,
 // so an interrupt lost all of them. Canonical from here down — the lock, the
@@ -176,7 +187,10 @@ const plan = {
   anthropicModel,
   maxTokens,
   tasksDigest: qualityTasksDigest(),
+  // The invocation's own text, recorded and deciding nothing. It used to be part
+  // of the artifact's NAME, which made it part of identity.
   only,
+  identity,
 };
 
 /**
@@ -284,7 +298,32 @@ if (live && existsSync(outPath)) {
   process.exit(1);
 }
 
-const state = (statePath && readLedger(statePath)) ?? { rows: {}, spent: 0 };
+// A ledger that exists and cannot be read used to answer the same `null` as no
+// ledger at all, and the next line turned that into a fresh run with the whole
+// ceiling to spend again. It stops the run now.
+let loaded = null;
+try {
+  loaded = statePath ? readLedger(statePath) : null;
+} catch (error) {
+  if (!(error instanceof UnreadableLedgerError)) throw error;
+  console.error(`${error.message} Re-read the run's capture records, or move the pair aside deliberately.`);
+  process.exit(1);
+}
+const state = loaded ?? { rows: {}, spent: 0 };
+
+// A ledger belongs to a measurement configuration, not to a path. Resuming one
+// under a different model, cap or prompt set accepts the earlier samples and
+// then publishes a floor computed over two different things under the second
+// one's name — a review did exactly that offline and watched a 1.0% self-variance
+// be reported as 53.3%. The ledger carries the identity it was opened with, and
+// a mismatch is refused rather than merged.
+const refusal = resumeRefusal(state, identity);
+if (refusal) {
+  console.error(`${statePath}: ${refusal}. Resume that configuration, or pass --out for a run of your own.`);
+  process.exit(1);
+}
+state.identity = identity;
+
 const saveState = () => {
   if (!statePath) return;
   saveLedger(statePath, state);
