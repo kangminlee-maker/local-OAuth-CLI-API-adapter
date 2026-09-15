@@ -6,3 +6,4 @@ artifacts/
 .env
 .onto/
 bench-results/
+.claude/
