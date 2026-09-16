@@ -71,6 +71,24 @@ proves nothing about the rule it was aimed at: if an unconditional change fails
 fourteen tests and twelve have nothing to do with the gate, narrow the mutant
 until only the gate can see it.
 
+## Where `review-artifacts/...` points
+
+Thirty-four paths across the docs and receipts in this repository cite
+`review-artifacts/<something>` — a seat's report, a round's evidence directory,
+a probe's output. Until 2026-09-16 that was a sibling directory on one machine,
+so none of those citations resolved for anyone else.
+
+They resolve here:
+
+    https://github.com/kangminlee-maker/local-OAuth-CLI-API-adapter-review
+
+Private, and holding what each review WROTE: seat reports, the packets they
+answered, run logs, and these receipts. The checkouts each round worked in are
+NOT there — every report names the revision it reviewed, and
+`git worktree add --detach <dir> <rev>` brings the tree back.
+
+A path written `review-artifacts/x/y` in this repository means `x/y` in that one.
+
 ## Logs
 
 `review/tables/<rev>/` holds the table summaries the receipts cite by name — the
