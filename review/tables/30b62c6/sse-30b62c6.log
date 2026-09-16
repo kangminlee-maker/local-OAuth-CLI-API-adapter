@@ -1,0 +1,35 @@
+SUBJECT scripts/lib/sse-capture.mjs sha256 a9344281f412a8fc2e750f6733f09d3751141bbb98f89c152d536d80df0ce98f
+BASELINE rc=0 tests=15 pass=15 skipped=0 todo=0 cancelled=0 roster=15
+[C1-record-twice] KILLED (rc=1) — removed the once-only guard, and recording again on the way out of the catch
+         failing: ['a refused stream is recorded with its body, not thrown away in a message', 'a stream that dies halfway is recorded with the bytes that arrived', 'a stream cut inside a character records that something arrived', 'a request that never reached a response is recorded too', 'a success with no body at all is refused, and recorded', 'a body cut halfway is a failure even for a caller that wanted the refusal', 'a caller whose onFrame throws does not leave the request open', 'a long refusal is truncated in the message and kept whole in the record', 'a whole refusal ending mid-character says the same thing twice', 'a refusal cut off mid-body keeps the bytes that arrived']
+[C2-null-body-succeeds] KILLED (rc=1) — removed the refusal of a response with no stream to read
+         failing: ['a success with no body at all is refused, and recorded']
+[C3-refusal-all-or-nothing] KILLED (rc=1) — removed the chunked read of a refusal body, restoring res.text()
+         failing: ['a body cut halfway is a failure even for a caller that wanted the refusal', 'a refusal cut off mid-body keeps the bytes that arrived']
+[C5-no-flush-on-exit] KILLED (rc=1) — removed the decoder flush on the way out, which is what a byte held mid-character needs
+         failing: ['a stream cut inside a character records that something arrived']
+[C6-goodpath-tail-not-recorded] KILLED (rc=1) — removed the good path's flush into rawStream, which the record and the terminator gate read
+         failing: ['a good stream ending mid-character records what the callback saw']
+[C7-goodpath-tail-not-framed] KILLED (rc=1) — removed the good path's flush into buffer, which is what makes a final partial frame complete
+         failing: ['a good stream ending mid-character records what the callback saw']
+[C8-refusal-inner-flush] KILLED (rc=1) — removed the refusal branch's flush, which runs before the thrown message is built
+         failing: ['a whole refusal ending mid-character says the same thing twice']
+[C4-short-truncation] KILLED (rc=1) — removed the runner's diagnostic length
+         failing: ['a long refusal is truncated in the message and kept whole in the record']
+[C10-refusal-mode-ignored] KILLED (rc=1) — removed the caller's say in whether a non-2xx is a failure, making every refusal one
+         failing: ['a caller that asked for the refusal gets it back, and no failure is recorded']
+[C11-refusal-mode-never-returns] KILLED (rc=1) — removed the answer a caller asked for, throwing it instead
+         failing: ['a caller that asked for the refusal gets it back, and no failure is recorded']
+[C12-reader-not-released] KILLED (rc=1) — removed the reader release, leaving the request open until an unrelated timeout
+         failing: ['a caller whose onFrame throws does not leave the request open']
+[C14-null-body-answer-throws] KILLED (rc=1) — removed the answer a caller asked for when there is no stream at all, throwing 204 instead
+         failing: ['a body-less success is an answer too when the caller asked for one']
+[C15-frames-split-on-one-newline] KILLED (rc=1) — removed the blank line that ends an SSE frame, cutting on every newline instead
+         failing: ['a stream that dies halfway is recorded with the bytes that arrived', 'a whole stream is recorded once, with the terminator', 'a good stream ending mid-character records what the callback saw']
+[C16-empty-turn-not-recorded] KILLED (rc=1) — removed the record for a turn that carried no bytes, which is the one a reader cannot reconstruct
+         failing: ['a stream cut inside a character records that something arrived', 'a request that never reached a response is recorded too', 'a 200 whose stream carries nothing is recorded as the empty turn it was', 'a success with no body at all is refused, and recorded', 'a body-less success is an answer too when the caller asked for one']
+[C13-mid-stream-failure-unlabelled] KILLED (rc=1) — removed the turn a stopped stream names, leaving a bare `terminated` in the record
+         failing: ['a stream that dies halfway is recorded with the bytes that arrived']
+RESTORED True (a9344281f412)
+
+ALL KILLED: True   (15/15)
