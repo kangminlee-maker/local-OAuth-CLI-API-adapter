@@ -13,7 +13,10 @@
 // that read a transcription instead of the shipped code reported PASS on an
 // implementation that made no HTTP request at all.
 import { recordExchange } from './capture-recorder.mjs';
+import { readLedger, UnreadableLedgerError } from './ledger.mjs';
 import { createHash } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 /**
  * What the design says to count: visible characters.
@@ -152,7 +155,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * as `captureError` — ends the run with a `SamplingAbort` naming the sink and
  * where the paid sample still is. It is never booked as a failed call: a full
  * disk is not a broken row, and reading it as one let a run pay for every rep
- * while keeping none of them.
+ * while keeping none of them. A call that FAILED carries its `captureError` on
+ * the thrown failure: the failure is booked as what the vendor did, and the run
+ * stops for what the disk did.
  *
  * `existing` resumes a row from whole SAMPLES, not from character lengths. A
  * bare-length state is refused: it cannot say what the token or thinking
@@ -289,6 +294,13 @@ export async function sampleRow({
         if (error instanceof SamplingAbort) throw error;
         const retryable = error?.retryable === true && attempt < maxRetries;
         failures.push({ index, attempt, retryable, said: String(error?.message ?? error) });
+        // The call failed, and so did the record of it. Only the second is a
+        // reason to stop: going on would make calls whose failures nothing keeps,
+        // and a vendor outage would read as a clean run.
+        if (error?.captureError) {
+          throw new SamplingAbort(`${error.captureError}. Call ${budget?.spent ?? samples.length} failed `
+            + `(${String(error?.message ?? error)}) and its record was not kept; the run stopped`);
+        }
         if (!retryable) {
           consecutive += 1;
           done = true;
@@ -487,6 +499,80 @@ export function resumeRefusal(state, identity) {
 }
 
 /**
+ * Unfinished runs of THIS configuration, wherever their ledgers are named.
+ *
+ * The ledger sits beside the artifact, and the artifact's name carries the UTC
+ * day. Identity says two invocations are one run; the day says they are not,
+ * and the day decided: the same command re-run after midnight UTC found no
+ * ledger, was granted the whole ceiling again, and left the first invocation's
+ * paid samples in a file nothing opens. A review measured it: thirty calls
+ * spent before midnight, and all six hundred available again after it.
+ *
+ * A new day is still allowed to be a new run. What it may not do is start one
+ * while an earlier run of the same configuration is unfinished — a ledger with
+ * spending, stamped with this identity, whose artifact is missing or says it
+ * was aborted. Those are returned by path, so the caller can name the one to
+ * resume. A ledger here that cannot be read is returned too: nothing can say
+ * which run it belongs to, and unaccounted-for is not the same as new.
+ *
+ * `own` is the ledger this invocation would use itself; resuming that one is
+ * the ordinary path and is not a conflict. Only `dirs` are searched — a ledger
+ * kept anywhere else is not found, and that is a limit, not a guarantee.
+ */
+export function unfinishedRuns({ dirs, identity, own = null }) {
+  const sameFile = (a, b) => {
+    if (resolve(a) === resolve(b)) return true;
+    try {
+      return realpathSync(a) === realpathSync(b);
+    } catch {
+      return false;
+    }
+  };
+  const finished = (artifact) => {
+    if (!existsSync(artifact)) return false;
+    try {
+      return JSON.parse(readFileSync(artifact, 'utf8')).aborted === null;
+    } catch {
+      // An artifact that does not parse cannot say the run finished.
+      return false;
+    }
+  };
+  const found = [];
+  const seen = new Set();
+  for (const dir of new Set(dirs.map((entry) => resolve(entry)))) {
+    let names;
+    try {
+      names = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const name of names.sort()) {
+      // The shadow counts: a ledger whose primary is gone is still a ledger.
+      const base = name.endsWith('.state.json.next') ? name.slice(0, -'.next'.length) : name;
+      if (!base.endsWith('.state.json')) continue;
+      const ledger = join(dir, base);
+      if (seen.has(ledger) || (own && sameFile(own, ledger))) continue;
+      seen.add(ledger);
+      let state;
+      try {
+        state = readLedger(ledger);
+      } catch (error) {
+        if (!(error instanceof UnreadableLedgerError)) throw error;
+        found.push({ ledger, unreadable: true });
+        continue;
+      }
+      if (!state || state.identity !== identity) continue;
+      const spent = state.spent ?? 0;
+      if (spent === 0 && Object.keys(state.rows ?? {}).length === 0) continue;
+      const artifact = ledger.slice(0, -'.state.json'.length);
+      if (finished(artifact)) continue;
+      found.push({ ledger, spent, artifact: existsSync(artifact) ? 'not finished' : 'missing' });
+    }
+  }
+  return found;
+}
+
+/**
  * A name for the run, and nothing in it that the operator typed.
  *
  * The raw `--only` text used to sit in front of the cohort digest, which made
@@ -517,6 +603,18 @@ export function defaultArtifactName(date, identity, selected = null) {
  */
 export async function takeSample({ url, headers, body, label, timeoutMs, readAnswer }) {
   const startedAt = performance.now();
+  // Every record goes through here, so no path can let a sink failure replace
+  // the failure it was recording. The transport path used to call the recorder
+  // bare: its `EACCES` became the call's error, `retryable` was lost with it,
+  // and a reset under a full disk read as a broken row.
+  const recording = (entry) => {
+    try {
+      recordExchange(entry);
+      return null;
+    } catch (error) {
+      return `the exchange could not be recorded: ${String(error?.message ?? error)}`;
+    }
+  };
   let res = null;
   let text = '';
   let read = false;
@@ -530,15 +628,15 @@ export async function takeSample({ url, headers, body, label, timeoutMs, readAns
     text = await res.text();
     read = true;
   } catch (error) {
-    recordExchange({
+    const failure = new Error(`${url}: ${String(error?.message ?? error)}`);
+    // A timeout or a reset is worth another try; a malformed request is not.
+    failure.retryable = true;
+    failure.captureError = recording({
       kind: 'json', label, url, requestHeaders: headers, requestBody: body,
       status: res?.status ?? null, statusText: res?.statusText ?? null,
       responseHeaders: res?.headers ?? null,
       durationMs: performance.now() - startedAt, error,
     });
-    const failure = new Error(`${url}: ${String(error?.message ?? error)}`);
-    // A timeout or a reset is worth another try; a malformed request is not.
-    failure.retryable = true;
     throw failure;
   }
 
@@ -549,34 +647,41 @@ export async function takeSample({ url, headers, body, label, timeoutMs, readAns
   // came back `n: 0, deadLettered: true` with `spent: 1` in the ledger and
   // nothing in either durable sink. The call was paid for and neither place kept
   // it — and the failure read as a failed CALL, so the run went on to make more.
-  let captureError = null;
-  try {
-    recordExchange({
-      kind: 'json', label, url, requestHeaders: headers, requestBody: body,
-      status: res.status, statusText: res.statusText, responseHeaders: res.headers,
-      responseBody: read ? text : undefined,
-      durationMs: performance.now() - startedAt,
-      error: res.ok ? null : `${url} ${res.status}`,
-    });
-  } catch (error) {
-    captureError = `the exchange could not be recorded: ${String(error?.message ?? error)}`;
-  }
+  const captureError = recording({
+    kind: 'json', label, url, requestHeaders: headers, requestBody: body,
+    status: res.status, statusText: res.statusText, responseHeaders: res.headers,
+    responseBody: read ? text : undefined,
+    durationMs: performance.now() - startedAt,
+    error: res.ok ? null : `${url} ${res.status}`,
+  });
 
   if (!res.ok) {
-    const failure = new Error(`${url} ${res.status}: ${text.slice(0, 400)}`
-      + (captureError ? ` (${captureError})` : ''));
+    const failure = new Error(`${url} ${res.status}: ${text.slice(0, 400)}`);
     // 429 and 5xx are the vendor asking to be asked again. A 4xx that is not 429
     // is this run being wrong about something, and retrying it is a retry storm
     // with extra steps.
     failure.retryable = res.status === 429 || res.status >= 500;
     failure.status = res.status;
+    // A field, not a phrase in the message: the caller has to be able to act on
+    // it, and it used to be appended to text nothing reads.
+    failure.captureError = captureError;
     throw failure;
   }
 
-  const answer = readAnswer(JSON.parse(text));
+  let answer;
+  try {
+    answer = readAnswer(JSON.parse(text));
+  } catch (error) {
+    const failure = new Error(`${url} ${res.status}: the answer could not be read `
+      + `(${String(error?.message ?? error)})`);
+    failure.retryable = false;
+    failure.captureError = captureError;
+    throw failure;
+  }
   if (typeof answer?.text !== 'string' || answer.text === '') {
     const failure = new Error(`${url} ${res.status}: no answer text to measure`);
     failure.retryable = false;
+    failure.captureError = captureError;
     throw failure;
   }
   return {

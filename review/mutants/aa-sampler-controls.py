@@ -18,6 +18,9 @@ if sys_path not in sys.path:
 from control_baseline import read_baseline
 
 SOURCE = 'scripts/lib/aa-sampler.mjs'
+# The sampler's capture sink. A mutant names it as a fifth element; every other
+# mutant edits SOURCE.
+RECORDER = 'scripts/lib/capture-recorder.mjs'
 TEST = 'test/aa-sampler.test.mjs'
 
 ROSTER = [
@@ -65,6 +68,11 @@ ROSTER = [
     'an async sink is awaited, so its rejection is not lost',
     'a pin for a provider with no row in the run decides nothing',
     'identity reads the prompts a run sends, not the name they are sent under',
+    'a dropped call whose record cannot be written stops the run, and keeps its own failure',
+    'a refused call whose record cannot be written stops the run',
+    'an answer that cannot be measured, with no record of it, stops the run',
+    "an unfinished run of this configuration is found under any day's name",
+    'a ledger with nothing in it, one without identity, a shadow alone and an unreadable one',
 ]
 
 MUTANTS = [
@@ -112,8 +120,10 @@ MUTANTS = [
      'a row stops early only once its interval is tight enough'),
     ('A10-failure-not-recorded',
      'the record for a call that never came back, leaving no evidence under the number',
-     [("  } catch (error) {\n    recordExchange({\n      kind: 'json', label, url, requestHeaders: headers, requestBody: body,\n      status: res?.status ?? null, statusText: res?.statusText ?? null,\n      responseHeaders: res?.headers ?? null,\n      durationMs: performance.now() - startedAt, error,\n    });",
-       "  } catch (error) {")],
+     [("    failure.captureError = recording({\n      kind: 'json', label, url, requestHeaders: headers, requestBody: body,\n"
+       "      status: res?.status ?? null, statusText: res?.statusText ?? null,\n      responseHeaders: res?.headers ?? null,\n"
+       "      durationMs: performance.now() - startedAt, error,\n    });",
+       "    failure.captureError = null;")],
      'a call that never reached a response is recorded, and worth retrying'),
     ('A12-row-stops-at-the-floor',
      'the full sample count, letting a row that never settles stop at the minimum',
@@ -318,9 +328,9 @@ MUTANTS = [
      'a ledger from another configuration is refused, not merged'),
     ('A42-capture-failure-discards-the-response',
      'the carried capture error, so an unwritable sink throws away a response the vendor billed for',
-     [("  } catch (error) {\n    captureError = `the exchange could not be recorded: "
-       "${String(error?.message ?? error)}`;\n  }",
-       "  } catch (error) {\n    throw error;\n  }")],
+     [("    } catch (error) {\n      return `the exchange could not be recorded: "
+       "${String(error?.message ?? error)}`;\n    }",
+       "    } catch (error) {\n      throw error;\n    }")],
      'a paid response survives a capture sink that cannot be written'),
     ('A43-capture-failure-does-not-stop-the-run',
      'the abort, so a run whose evidence sink is gone keeps spending',
@@ -378,6 +388,72 @@ MUTANTS = [
      [("          await onSpend({ index, attempt, spent: budget?.spent ?? null });",
        "          onSpend({ index, attempt, spent: budget?.spent ?? null });")],
      'an async sink is awaited, so its rejection is not lost'),
+    ('A54-failed-call-unrecorded-keeps-going',
+     'the abort for a failed call whose record was not kept, so an outage under a full disk exits clean',
+     [("        if (error?.captureError) {", "        if (false) {")],
+     'a refused call whose record cannot be written stops the run'),
+    ('A55-transport-record-unguarded',
+     "the guard on the transport path's record, so the recorder's error replaces the call's",
+     [("    failure.captureError = recording({\n      kind: 'json', label, url, requestHeaders: headers, requestBody: body,\n"
+       "      status: res?.status ?? null,",
+       "    failure.captureError = recordExchange({\n      kind: 'json', label, url, requestHeaders: headers, requestBody: body,\n"
+       "      status: res?.status ?? null,")],
+     'a dropped call whose record cannot be written stops the run, and keeps its own failure'),
+    ('A56-refusal-drops-its-capture-error',
+     'the capture error on a refused call, so the caller cannot act on it',
+     [("    failure.status = res.status;\n    // A field, not a phrase in the message: the caller has to be able to act on\n"
+       "    // it, and it used to be appended to text nothing reads.\n    failure.captureError = captureError;\n",
+       "    failure.status = res.status;\n")],
+     'a refused call whose record cannot be written stops the run'),
+    ('A57-empty-answer-drops-its-capture-error',
+     'the capture error on an answer with no text',
+     [("    const failure = new Error(`${url} ${res.status}: no answer text to measure`);\n"
+       "    failure.retryable = false;\n    failure.captureError = captureError;\n",
+       "    const failure = new Error(`${url} ${res.status}: no answer text to measure`);\n"
+       "    failure.retryable = false;\n")],
+     'an answer that cannot be measured, with no record of it, stops the run'),
+    ('A58-unreadable-answer-drops-its-capture-error',
+     'the capture error on an answer that does not parse',
+     [("      + `(${String(error?.message ?? error)})`);\n    failure.retryable = false;\n"
+       "    failure.captureError = captureError;\n",
+       "      + `(${String(error?.message ?? error)})`);\n    failure.retryable = false;\n")],
+     'an answer that cannot be measured, with no record of it, stops the run'),
+    ('A59-unwritten-record-counted',
+     'the unrecorded count, so a summary reports exchanges nothing wrote',
+     [("    state.unrecorded += 1;\n", "")],
+     'a dropped call whose record cannot be written stops the run, and keeps its own failure',
+     RECORDER),
+    ('A60-finished-run-still-refused',
+     'the finished-run check, so a new day can never start a new run',
+     [("      if (finished(artifact)) continue;\n", "")],
+     "an unfinished run of this configuration is found under any day's name"),
+    ('A61-aborted-artifact-reads-finished',
+     'the aborted flag, so any artifact on disk reads as a finished run',
+     [("      return JSON.parse(readFileSync(artifact, 'utf8')).aborted === null;",
+       "      return JSON.parse(readFileSync(artifact, 'utf8')) !== null;")],
+     "an unfinished run of this configuration is found under any day's name"),
+    ('A62-any-configuration-is-this-run',
+     'the identity filter, so another configuration blocks this one',
+     [("      if (!state || state.identity !== identity) continue;", "      if (!state) continue;")],
+     "an unfinished run of this configuration is found under any day's name"),
+    ('A63-own-ledger-refused',
+     "the exclusion of this invocation's own ledger, so an ordinary resume is refused",
+     [("      if (seen.has(ledger) || (own && sameFile(own, ledger))) continue;",
+       "      if (seen.has(ledger)) continue;")],
+     "an unfinished run of this configuration is found under any day's name"),
+    ('A64-empty-ledger-refused',
+     'the skip for a ledger that spent nothing',
+     [("      if (spent === 0 && Object.keys(state.rows ?? {}).length === 0) continue;\n", "")],
+     'a ledger with nothing in it, one without identity, a shadow alone and an unreadable one'),
+    ('A65-shadow-alone-missed',
+     'the shadow, so a ledger whose primary is gone is not found',
+     [("      const base = name.endsWith('.state.json.next') ? name.slice(0, -'.next'.length) : name;",
+       "      const base = name;")],
+     'a ledger with nothing in it, one without identity, a shadow alone and an unreadable one'),
+    ('A66-unreadable-ledger-ignored',
+     'the report of a ledger nothing can read, so unaccounted-for reads as absent',
+     [("        found.push({ ledger, unreadable: true });\n", "")],
+     'a ledger with nothing in it, one without identity, a shadow alone and an unreadable one'),
 ]
 
 
@@ -390,10 +466,14 @@ def main() -> int:
                     help='read the baseline and exit; used by --self-test')
     args = ap.parse_args()
     root = pathlib.Path(args.root).resolve()
-    source = root / SOURCE
-    original = source.read_bytes()
-    digest = hashlib.sha256(original).hexdigest()
-    print(f'SUBJECT {SOURCE} sha256 {digest}', flush=True)
+    originals = {name: (root / name).read_bytes() for name in (SOURCE, RECORDER)}
+    digests = {name: hashlib.sha256(data).hexdigest() for name, data in originals.items()}
+    for name, digest in digests.items():
+        print(f'SUBJECT {name} sha256 {digest}', flush=True)
+
+    def restore_all():
+        for name, data in originals.items():
+            (root / name).write_bytes(data)
 
     def run_suite():
         done = subprocess.run(['node', '--test', '--test-reporter=tap', TEST], cwd=root,
@@ -410,7 +490,7 @@ def main() -> int:
           f'roster={len(ROSTER)}', flush=True)
     if code != 0 or not accepted:
         if not args.baseline_only:
-            source.write_bytes(original)
+            restore_all()
         print(f'BASELINE-FAIL: {why or f"rc={code}"}. No control below means anything until the '
               'whole roster runs and passes — if a case was added or renamed on purpose, edit '
               'ROSTER with it.')
@@ -422,8 +502,10 @@ def main() -> int:
     backed = set()
     results = []
     try:
-        for tag, removes, edits, expected_test in MUTANTS:
-            text = original.decode()
+        for tag, removes, edits, expected_test, *where in MUTANTS:
+            target = where[0] if where else SOURCE
+            source = root / target
+            text = originals[target].decode()
             planted = True
             for before, after in edits:
                 if text.count(before) != 1:
@@ -438,11 +520,15 @@ def main() -> int:
             source.write_text(text)
             checked = subprocess.run(['node', '--check', str(source)], capture_output=True, text=True)
             if checked.returncode != 0:
+                restore_all()
                 results.append((tag, 'NOT PLANTED'))
                 print(f'[{tag}] NOT PLANTED — the mutant does not parse, so a failure below would '
                       'be the syntax error and not the mechanism', flush=True)
                 continue
             code, out = run_suite()
+            # Put back before the next mutant, which may edit the OTHER file and
+            # would otherwise run with this one still planted.
+            restore_all()
             failed_names = re.findall(r'^not ok \d+ - (.+)$', out, re.M)
             backed.update(failed_names)
             hit = any(expected_test in name for name in failed_names)
@@ -451,9 +537,10 @@ def main() -> int:
             print(f'[{tag}] {verdict} (rc={code}) — removed {removes}\n'
                   f'         failing: {failed_names or "none"}', flush=True)
     finally:
-        source.write_bytes(original)
-        restored = hashlib.sha256(source.read_bytes()).hexdigest()
-        print(f'RESTORED {restored == digest} ({restored[:12]})', flush=True)
+        restore_all()
+        for name, digest in digests.items():
+            restored = hashlib.sha256((root / name).read_bytes()).hexdigest()
+            print(f'RESTORED {restored == digest} ({restored[:12]}) {name}', flush=True)
 
     unbacked = [case for case in ROSTER if case not in backed]
     if unbacked:

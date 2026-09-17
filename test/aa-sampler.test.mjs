@@ -7,12 +7,13 @@
 // reported PASS on an implementation that made no HTTP request at all.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
-import { startCaptureRun } from '../scripts/lib/capture-recorder.mjs';
-import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, resumeRefusal, runIdentity, sampleRow, SamplingAbort, SERIES, summarise, takeSample, visibleChars } from '../scripts/lib/aa-sampler.mjs';
+import { captureSummary, startCaptureRun } from '../scripts/lib/capture-recorder.mjs';
+import { saveLedger } from '../scripts/lib/ledger.mjs';
+import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, resumeRefusal, runIdentity, sampleRow, SamplingAbort, SERIES, summarise, takeSample, unfinishedRuns, visibleChars } from '../scripts/lib/aa-sampler.mjs';
 
 const servers = [];
 after(async () => {
@@ -849,3 +850,141 @@ test('an interrupt stops before the next call and lets the one in flight finish'
   assert.equal(budget.spent, 2, 'a call was booked after the run was told to stop');
 });
 
+
+/**
+ * A capture run whose directory cannot be written, for the length of `during`.
+ */
+async function withUnwritableCapture(during) {
+  const dir = mkdtempSync(join(tmpdir(), 'aa-capture-'));
+  const run = startCaptureRun({ dir, meta: { probe: 'aa-sampler.test' } });
+  chmodSync(run.runDir, 0o555);
+  try {
+    return await during();
+  } finally {
+    chmodSync(run.runDir, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+const failedCallUnrecorded = (seen) => async () => withUnwritableCapture(async () => {
+  const budget = { remaining: 5, spent: 0 };
+  let failure = null;
+  await assert.rejects(sampleRow({
+    reps: 5,
+    minReps: 5,
+    budget,
+    sleepFor: async () => {},
+    take: async () => {
+      try {
+        return await sample(seen.url);
+      } catch (error) {
+        failure = error;
+        throw error;
+      }
+    },
+  }), (error) => {
+    assert.ok(error instanceof SamplingAbort, `a failed call with no record did not stop the run: ${error}`);
+    assert.match(error.message, /could not be recorded/);
+    assert.match(error.message, /its record was not kept; the run stopped/);
+    return true;
+  });
+  assert.equal(budget.spent, 1, 'the run went on making calls it could not record');
+  assert.equal(seen.seen.length, 1);
+  // The failure is still the vendor's, not the disk's.
+  assert.doesNotMatch(failure.message, /EACCES|could not be recorded/);
+  assert.match(failure.captureError, /could not be recorded/);
+  return failure;
+});
+
+test('a dropped call whose record cannot be written stops the run, and keeps its own failure', async () => {
+  // A review reset the connection with the capture directory unwritable. The
+  // recorder's `EACCES` replaced the transport error, `retryable` went with it,
+  // and every row dead-lettered for a disk fault while the run exited 0.
+  const seen = await serving((req, res) => { res.socket.destroy(); });
+  const failure = await failedCallUnrecorded(seen)();
+  assert.equal(failure.retryable, true, 'a dropped connection stopped being worth retrying');
+  // Counted as what is on disk: nothing.
+  const summary = captureSummary();
+  assert.equal(summary.exchanges, 0, 'an exchange nothing wrote was counted as recorded');
+  assert.equal(summary.unrecordedExchanges, 1);
+});
+
+test('a refused call whose record cannot be written stops the run', async () => {
+  // The same sink under a 529: the capture error was a phrase appended to the
+  // message, which nothing reads, and the row made fifteen calls.
+  const seen = await serving((req, res) => {
+    res.writeHead(529, { 'content-type': 'application/json' });
+    res.end('{"error":"overloaded"}');
+  });
+  const failure = await failedCallUnrecorded(seen)();
+  assert.equal(failure.status, 529);
+});
+
+test('an answer that cannot be measured, with no record of it, stops the run', async () => {
+  // Paid for, unusable, and unrecorded: two of those are the vendor's and one
+  // is the disk's, and the disk's is the one that has to stop the run.
+  const empty = await serving((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ text: '' }));
+  });
+  await failedCallUnrecorded(empty)();
+  const unreadable = await serving((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end('not json');
+  });
+  const failure = await failedCallUnrecorded(unreadable)();
+  assert.match(failure.message, /the answer could not be read/);
+});
+
+test('an unfinished run of this configuration is found under any day\'s name', () => {
+  // The day is in the ledger's name and not in identity. A review interrupted a
+  // run after thirty paid calls and re-ran it after midnight UTC: no ledger was
+  // found, and all six hundred calls were available again.
+  const dir = mkdtempSync(join(tmpdir(), 'aa-unfinished-'));
+  try {
+    const name = (day, id = 'aaaaaaaaaaaaaaaa') => join(dir, `aa-noise-floor-${day}-anthropic-${id}.json`);
+    const paid = { identity: 'aaaaaaaaaaaaaaaa', rows: { 'anthropic/x': { samples: [] } }, spent: 30 };
+    saveLedger(`${name('20260917')}.state.json`, paid);
+    const find = (own = null) => unfinishedRuns({ dirs: [dir], identity: 'aaaaaaaaaaaaaaaa', own });
+    assert.deepEqual(find(), [{ ledger: `${name('20260917')}.state.json`, spent: 30, artifact: 'missing' }]);
+    // The ledger this invocation would use is resumed, not refused.
+    assert.deepEqual(find(`${name('20260917')}.state.json`), []);
+    // Another configuration's ledger is not this run.
+    assert.deepEqual(unfinishedRuns({ dirs: [dir], identity: 'bbbbbbbbbbbbbbbb' }), []);
+    // An aborted artifact is not a finished one, and neither is one that does not parse.
+    writeFileSync(name('20260917'), JSON.stringify({ aborted: 'interrupted after 30 call(s)' }));
+    assert.equal(find()[0]?.artifact, 'not finished');
+    writeFileSync(name('20260917'), '{');
+    assert.equal(find()[0]?.artifact, 'not finished');
+    // A finished run is finished: a later day may start a new one.
+    writeFileSync(name('20260917'), JSON.stringify({ aborted: null }));
+    assert.deepEqual(find(), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a ledger with nothing in it, one without identity, a shadow alone and an unreadable one', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aa-unfinished-'));
+  const id = 'aaaaaaaaaaaaaaaa';
+  const find = () => unfinishedRuns({ dirs: [dir], identity: id });
+  try {
+    // Opened and never spent: nothing to lose.
+    saveLedger(join(dir, 'empty.json.state.json'), { identity: id, rows: {}, spent: 0 });
+    // From before identity was recorded: not this run, and `resumeRefusal`
+    // already refuses it where it is actually resumed.
+    saveLedger(join(dir, 'legacy.json.state.json'), { rows: {}, spent: 9 });
+    assert.deepEqual(find(), []);
+    // The primary gone and the shadow whole is still a paid ledger.
+    const shadowed = join(dir, 'shadowed.json.state.json');
+    saveLedger(shadowed, { identity: id, rows: {}, spent: 2 });
+    unlinkSync(shadowed);
+    assert.deepEqual(find(), [{ ledger: shadowed, spent: 2, artifact: 'missing' }]);
+    unlinkSync(`${shadowed}.next`);
+    // Nothing can say whose this is.
+    writeFileSync(join(dir, 'broken.json.state.json'), '{"identity":');
+    assert.deepEqual(find(), [{ ledger: join(dir, 'broken.json.state.json'), unreadable: true }]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

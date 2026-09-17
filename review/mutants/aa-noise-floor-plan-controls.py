@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Negative controls for the noise-floor runner's identity call.
+"""Negative controls for what the noise-floor runner decides a run is.
 
 `aa-sampler-controls.py` mutates the library. The defect round 7 found was one
 step out, at the CALL: the runner handed `runIdentity` both model pins and the
 bytes of the tasks file whatever the cohort. The library cannot see what it is
 handed, so this table mutates the runner and requires
-`test/aa-noise-floor-plan.test.mjs` to notice.
+`test/aa-noise-floor-plan.test.mjs` to notice. The fold review found the same
+thing one step further out — the NAME the ledger is derived from, and the day
+in it — so P5 to P8 mutate those.
 
 That test starts the mutated runner, so what it does to a mutant matters: it
 never passes `--live` or `--resume`, it strips both vendor keys from the
@@ -29,6 +31,7 @@ ROSTER = [
     'a partition is the same run whatever the pin of the provider it leaves out',
     "the runner's identity is its selected prompts, their providers' pins and the cap",
     'an edit to the tasks file is a new run only where it changes a selected prompt',
+    "an unfinished run under another day's name is refused, and a finished one is not",
 ]
 
 CALL = '  rows,\n  models: Object.fromEntries(Object.entries(PROVIDERS)'
@@ -54,6 +57,26 @@ MUTANTS = [
              '({ provider, task: task.id, prompt: task.prompt }))),\n'
              '  models: Object.fromEntries(Object.entries(PROVIDERS)')],
      "the runner's identity is its selected prompts, their providers' pins and the cap"),
+    # P5: the fold review's M11 — identity is right and the NAME the ledger is
+    # derived from carries a pin beside it. Every identity assertion stays true.
+    ('P5-name-carries-a-pin',
+     'the identity-only name, putting the OpenAI pin into every partition\'s ledger path',
+     [('  defaultArtifactName(new Date(), identity, selected)));',
+       '  defaultArtifactName(new Date(), `${identity}-${openAiModel}`, selected)));')],
+     'a partition is the same run whatever the pin of the provider it leaves out'),
+    ('P6-unfinished-runs-not-searched',
+     'the search, so a new day grants the ceiling again beside an unfinished run',
+     [('if (!resumePath) {\n  const unfinished = unfinishedRuns({', 'if (false) {\n  const unfinished = unfinishedRuns({')],
+     "an unfinished run under another day's name is refused, and a finished one is not"),
+    ('P7-only-the-artifact-directory-searched',
+     "the results directory, so --out steps around an unfinished run",
+     [("    dirs: [dirname(outPath), resolve(repoRoot, 'bench-results')],", '    dirs: [dirname(outPath)],')],
+     "an unfinished run under another day's name is refused, and a finished one is not"),
+    ('P8-refusal-does-not-stop',
+     'the exit, so the refusal is printed and the run goes ahead',
+     [("or move the ledger aside deliberately.');\n    process.exit(1);",
+       "or move the ledger aside deliberately.');")],
+     "an unfinished run under another day's name is refused, and a finished one is not"),
 ]
 
 

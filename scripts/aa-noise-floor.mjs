@@ -26,7 +26,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startCaptureRun, captureSummary } from './lib/capture-recorder.mjs';
 import { qualityTasks, qualityTasksDigest } from './lib/quality-tasks.mjs';
-import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, resumeRefusal, runIdentity, SamplingAbort, sampleRow, summarise, takeSample } from './lib/aa-sampler.mjs';
+import { abortedRow, defaultArtifactName, ledgerFor, noiseFloor, resumePlan, resumeRefusal, runIdentity, SamplingAbort, sampleRow, summarise, takeSample, unfinishedRuns } from './lib/aa-sampler.mjs';
 import { acquireStateLock, canonicalStatePath } from './lib/state-lock.mjs';
 import { readLedger, saveLedger, UnreadableLedgerError } from './lib/ledger.mjs';
 
@@ -252,6 +252,29 @@ if (reportPath) {
   process.exit(0);
 }
 
+// The day is in the ledger's name and not in identity, so an unfinished run of
+// this configuration can sit under yesterday's name while today's is empty.
+// Starting beside it granted the whole ceiling again. The refusal comes before
+// the plan is printed, so plan mode says exactly what a live run would do.
+if (!resumePath) {
+  const unfinished = unfinishedRuns({
+    dirs: [dirname(outPath), resolve(repoRoot, 'bench-results')],
+    identity,
+    own: ledgerFor({ live: true, outPath }),
+  });
+  if (unfinished.length > 0) {
+    for (const run of unfinished) {
+      console.error(run.unreadable
+        ? `${run.ledger} cannot be read, so nothing can say whether it is an unfinished run of this configuration.`
+        : `${run.ledger} is an unfinished run of this configuration (run ${identity}): `
+          + `${run.spent} call(s) paid for, artifact ${run.artifact}.`);
+    }
+    console.error('Starting another would grant the whole ceiling again and leave those samples where nothing '
+      + 'resumes them. Resume with --resume <ledger> --out <a new artifact>, or move the ledger aside deliberately.');
+    process.exit(1);
+  }
+}
+
 // One writer per state file. Without this, two invocations each start from the
 // same ledger and each spend the whole ceiling — and because `saveState()`
 // writes the WHOLE state object from its own snapshot, the second writer erases
@@ -295,8 +318,12 @@ if (statePath) hold(statePath, 'state file');
 // placeholder would be this run refusing itself one line later.
 if (live) hold(outPath, 'artifact', { create: false });
 if (live && existsSync(outPath)) {
+  // `--out` alone used to be the whole advice, and following it started a second
+  // run of the same configuration beside an unfinished one. The search above now
+  // refuses that, and this says what it will ask for.
   console.error(`${outPath} already exists. Writing it would erase a run that has already been paid `
-    + 'for; pass --out with a name of your own, or move the old artifact aside deliberately.');
+    + 'for; pass --out with a name of your own — with --resume <its ledger> if that run did not finish — '
+    + 'or move the old artifact aside deliberately.');
   process.exit(1);
 }
 
