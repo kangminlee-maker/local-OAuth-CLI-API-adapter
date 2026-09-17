@@ -421,11 +421,17 @@ export function ledgerFor({ resume = null, live = false, outPath = null } = {}) 
  * only the second pin.
  *
  * So identity is the measurement configuration, and only what the selected rows
- * send: each row's prompt (by content, not by name), the model pinned for each
+ * send: each row by its key and its prompt by content, the model pinned for each
  * provider that HAS a row, and the cap that decides how much of an answer there
- * is to measure. Anything that changes what a sample MEANS belongs here; the
- * stopping rules — `reps`, `minReps`, `decisivePct` — do not, because they decide
- * when to stop collecting samples that mean the same thing.
+ * is to measure. What an operator or a prompt edit can change about what a
+ * sample MEANS belongs here; the stopping rules — `reps`, `minReps`,
+ * `decisivePct` — do not, because they decide when to stop collecting samples
+ * that mean the same thing.
+ *
+ * The runner's own code is outside it. How a request body is built, which
+ * headers go with it, how an answer is read: an edit to any of those changes
+ * what a sample means and leaves this digest alone. Resuming a ledger across
+ * such an edit is a decision this function cannot see, and it does not claim to.
  *
  * "Only" is half of the rule, and the half the first version missed. It hashed
  * both pins whatever the cohort, and the prompts as the bytes of the file that
