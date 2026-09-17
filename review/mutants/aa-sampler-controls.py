@@ -485,11 +485,14 @@ def self_test(root: pathlib.Path) -> int:
     refusals = []
     try:
         for target in ROSTER:
-            before = f"test('{target}'"
+            # Spelled as the test file spells it: a name with an apostrophe is
+            # written `\'` there, and the bare name matched nothing.
+            spelled = target.replace("'", "\\'")
+            before = f"test('{spelled}'"
             if text.count(before) != 1:
                 print(f'SELF-TEST NOT PLANTED: {target!r} does not appear exactly once in {TEST}')
                 return 2
-            test.write_text(text.replace(before, f"test.skip('{target}'", 1))
+            test.write_text(text.replace(before, f"test.skip('{spelled}'", 1))
             done = subprocess.run([sys.executable, __file__, '--root', str(root), '--baseline-only'],
                                   capture_output=True, text=True)
             refused = (done.returncode == 2 and 'BASELINE-FAIL' in done.stdout
