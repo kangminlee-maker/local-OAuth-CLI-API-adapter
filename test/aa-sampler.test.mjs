@@ -623,11 +623,100 @@ test('a sample whose evidence could not be written is kept, and ends the run', a
   }), (error) => {
     assert.ok(error instanceof SamplingAbort);
     assert.match(error.message, /could not be recorded/);
-    assert.match(error.message, /the sample was kept/);
+    assert.match(error.message, /it is in the ledger/);
     return true;
   });
   // One call made, one observation persisted, and no second call attempted.
   assert.deepEqual(kept, [120]);
+});
+
+test('a ledger that cannot be written stops the run; it is not a failed call', async () => {
+  // A review filled the disk mid-run under the runner's own wiring. The ledger
+  // said seven calls were paid for and held six observations, and the seventh
+  // was booked in `failures` as `said: "EFBIG: file too large, write"` — the
+  // list a vendor 500 lands in. `sampleRow` returned normally and the run
+  // published as complete.
+  let calls = 0;
+  const failures = [];
+  await assert.rejects(sampleRow({
+    reps: 5,
+    minReps: 5,
+    budget: { remaining: 5, spent: 0 },
+    sleepFor: async () => {},
+    onSample: () => { throw new Error('EFBIG: file too large, write'); },
+    take: async () => { calls += 1; return { chars: 100, outputTokens: 10, thinkingTokens: null, latencyMs: 1 }; },
+  }).then((outcome) => { failures.push(...outcome.failures); }), (error) => {
+    assert.ok(error instanceof SamplingAbort, `a sink failure was not an abort: ${error}`);
+    assert.match(error.message, /the ledger could not be written \(EFBIG/);
+    assert.match(error.message, /in its capture record, not in the ledger/);
+    return true;
+  });
+  assert.equal(calls, 1, 'the run kept paying for calls its ledger could not keep');
+  assert.deepEqual(failures, [], 'a sink failure was booked as a failed call');
+});
+
+test('a call neither sink could keep stops the run and says so', async () => {
+  // The same review's second input: the capture record and the ledger both
+  // fail on one paid call. The abort for the capture half was written AFTER the
+  // ledger write, so a ledger that threw jumped past it — five reps paid for,
+  // nothing in either sink, and the row reported itself complete.
+  let calls = 0;
+  await assert.rejects(sampleRow({
+    reps: 5,
+    minReps: 5,
+    budget: { remaining: 5, spent: 0 },
+    sleepFor: async () => {},
+    onSample: () => { throw new Error('EFBIG: file too large, write'); },
+    take: async () => {
+      calls += 1;
+      return {
+        chars: 100, outputTokens: 10, thinkingTokens: null, latencyMs: 1,
+        captureError: 'the exchange could not be recorded: EACCES',
+      };
+    },
+  }), (error) => {
+    assert.ok(error instanceof SamplingAbort);
+    assert.match(error.message, /the ledger could not be written/);
+    assert.match(error.message, /could not be recorded: EACCES/);
+    assert.match(error.message, /NEITHER durable sink kept it/);
+    return true;
+  });
+  assert.equal(calls, 1, 'the run paid for every rep while keeping none of them');
+});
+
+test('a ledger that cannot record the next call means that call is not made', async () => {
+  // Before the call is the one moment a ledger failure costs nothing. It fell
+  // into the same `catch` as a vendor failure and counted against the row.
+  let calls = 0;
+  await assert.rejects(sampleRow({
+    reps: 3,
+    minReps: 3,
+    budget: { remaining: 3, spent: 0 },
+    sleepFor: async () => {},
+    onSpend: () => { throw new Error('EACCES: ledger'); },
+    take: async () => { calls += 1; return { chars: 1, outputTokens: 1, thinkingTokens: null, latencyMs: 1 }; },
+  }), (error) => {
+    assert.ok(error instanceof SamplingAbort);
+    assert.match(error.message, /could not record the call about to be made \(EACCES/);
+    assert.match(error.message, /that call was not made/);
+    return true;
+  });
+  assert.equal(calls, 0, 'a call was made that the ledger had refused to record');
+});
+
+test('an async sink is awaited, so its rejection is not lost', async () => {
+  // `onSample` was called without `await`: a sink that returned a rejected
+  // promise would not have been seen at all.
+  let calls = 0;
+  await assert.rejects(sampleRow({
+    reps: 3,
+    minReps: 3,
+    budget: { remaining: 3, spent: 0 },
+    sleepFor: async () => {},
+    onSample: async () => { throw new Error('ENOSPC: async ledger'); },
+    take: async () => { calls += 1; return { chars: 1, outputTokens: 1, thinkingTokens: null, latencyMs: 1 }; },
+  }), /the ledger could not be written \(ENOSPC/);
+  assert.equal(calls, 1);
 });
 
 test('a ledger from another configuration is refused, not merged', () => {

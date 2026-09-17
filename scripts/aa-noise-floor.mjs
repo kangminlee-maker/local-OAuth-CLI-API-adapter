@@ -440,7 +440,16 @@ for (const row of rows) {
     if (!(error instanceof SamplingAbort)) throw error;
     aborted = error.message;
     state.spent = budget.spent;
-    saveState();
+    // The abort may BE a ledger that cannot be written. Writing it again here
+    // would throw out of this handler and end the process before the artifact
+    // is attempted — the last place this row's paid samples can still land.
+    // No test reaches this line: the loop only runs under `--live`.
+    try {
+      saveState();
+    } catch (saveError) {
+      process.stderr.write(`\nthe ledger is still unwritable (${saveError?.message ?? saveError}); `
+        + 'the artifact is attempted anyway\n');
+    }
     // The samples this row DID collect are paid for and already in the state
     // file. Breaking without recording them left them out of the artifact, which
     // is where `--report` re-derives the floor from — a paid observation the

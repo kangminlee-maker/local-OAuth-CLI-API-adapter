@@ -148,6 +148,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * BEFORE it is made, so a caller persisting the ledger cannot lose a call it
  * has already paid for.
  *
+ * A sink that THROWS — `onSpend`, `onSample`, or a capture record carried back
+ * as `captureError` — ends the run with a `SamplingAbort` naming the sink and
+ * where the paid sample still is. It is never booked as a failed call: a full
+ * disk is not a broken row, and reading it as one let a run pay for every rep
+ * while keeping none of them.
+ *
  * `existing` resumes a row from whole SAMPLES, not from character lengths. A
  * bare-length state is refused: it cannot say what the token or thinking
  * readings for those calls were, and a floor taken over a partly-restored
@@ -226,7 +232,14 @@ export async function sampleRow({
         // ledger, so an interrupt during a backoff re-granted every one of them
         // on resume. Persisting first can over-book by at most one — the safe
         // direction for a ceiling on spending.
-        await onSpend({ index, attempt, spent: budget?.spent ?? null });
+        try {
+          await onSpend({ index, attempt, spent: budget?.spent ?? null });
+        } catch (error) {
+          // The one moment a ledger failure costs nothing: the call has not been
+          // made. It used to fall into the `catch` below as a failed CALL.
+          throw new SamplingAbort(`the ledger could not record the call about to be made `
+            + `(${String(error?.message ?? error)}); that call was not made, and the run stopped`);
+        }
         const sample = await take(index);
         samples.push({
           chars: sample.chars,
@@ -234,18 +247,39 @@ export async function sampleRow({
           thinkingTokens: sample.thinkingTokens,
           latencyMs: sample.latencyMs,
         });
-        consecutive = 0;
         done = true;
-        onSample({ index, ...sample, samples: [...samples], lens: lensOf() });
-        // The observation is in the ledger by now. The OTHER durable sink could
-        // not take it, which is a reason to stop spending — a floor whose samples
-        // have no raw record behind them is a number with no evidence under it —
-        // but it is not a reason to have thrown the paid sample away, which is
-        // what raising from inside `take` did.
-        if (sample.captureError) {
-          throw new SamplingAbort(`${sample.captureError}; the sample was kept and the run stopped `
-            + `after ${budget?.spent ?? 0} call(s)`);
+        // BOTH sinks are asked before either failure is reported, so "neither
+        // kept it" is a state this code can name.
+        //
+        // The previous version wrote "the observation is in the ledger by now"
+        // above a capture check placed AFTER the ledger write — an assumption,
+        // not a check. A ledger that threw jumped past the check into the
+        // `catch`, where only a `SamplingAbort` is re-raised, and was booked as a
+        // failed call. A review filled the disk mid-run: every rep was paid for,
+        // neither sink kept a single one, and the row returned as complete.
+        let ledgerError = null;
+        try {
+          await onSample({ index, ...sample, samples: [...samples], lens: lensOf() });
+        } catch (error) {
+          ledgerError = String(error?.message ?? error);
         }
+        if (ledgerError !== null || sample.captureError) {
+          const lost = [
+            ledgerError === null ? null : `the ledger could not be written (${ledgerError})`,
+            sample.captureError ?? null,
+          ].filter(Boolean).join('; ');
+          const where = ledgerError === null
+            ? 'it is in the ledger'
+            : !sample.captureError
+              ? 'it is in its capture record, not in the ledger'
+              : 'NEITHER durable sink kept it — it is held only by this process';
+          throw new SamplingAbort(`${lost}. Call ${budget?.spent ?? samples.length} was paid for and ${where}; `
+            + 'the run stopped');
+        }
+        // Reset only by a sample that was KEPT. It used to be reset before the
+        // ledger write, so a sink that failed every time could never reach
+        // `maxConsecutiveFailures`.
+        consecutive = 0;
       } catch (error) {
         // An exhausted budget ends the RUN. Booking it as this row's failure
         // would let the next row start, and the three-failures rule would read
