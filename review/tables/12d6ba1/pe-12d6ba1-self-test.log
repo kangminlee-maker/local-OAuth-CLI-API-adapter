@@ -1,0 +1,5 @@
+SUBJECT scripts/lib/probe-exchange.mjs sha256 b732158ccf3cca7a930270fb0414dcbff4fb8416940ab88b5e715cbc7dd30e55
+SELF-TEST unmodified baseline accepted: True
+RESTORED True (8d81f5a385d5)
+
+BASELINE REFUSES EVERY DISABLED CASE: True   (8/8, unmodified accepted)

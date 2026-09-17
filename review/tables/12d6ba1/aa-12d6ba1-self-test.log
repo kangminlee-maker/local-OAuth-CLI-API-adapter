@@ -1,0 +1,5 @@
+SUBJECT scripts/lib/aa-sampler.mjs sha256 9cb1907eb19d557fae8550d3b9cd2ae74fa1abbfbcf9f4c931798022177c953f
+SELF-TEST unmodified baseline accepted: True
+RESTORED True (8731a50749b0)
+
+BASELINE REFUSES EVERY DISABLED CASE: True   (44/44, unmodified accepted)

@@ -1,0 +1,109 @@
+SUBJECT scripts/lib/aa-sampler.mjs sha256 9cb1907eb19d557fae8550d3b9cd2ae74fa1abbfbcf9f4c931798022177c953f
+BASELINE rc=0 tests=44 pass=44 skipped=0 todo=0 cancelled=0 roster=44
+[A1-whitespace-counted] KILLED (rc=1) — removed the collapse of layout, putting indentation into a vendor's variance
+         failing: ['visible characters ignore how an answer is laid out']
+[A2-empty-answer-is-zero] KILLED (rc=1) — removed the refusal of an answer with no text, counting it as a very short one
+         failing: ['an answer with no text is a failure, not a zero-length sample']
+[A3-every-refusal-retried] KILLED (rc=1) — removed the line between a vendor asking to be asked again and this run being wrong
+         failing: ['a refusal is recorded, and retried only when the vendor asked to be', 'a rate limit is retryable and a server error is too']
+[A4-one-sample-has-no-spread] KILLED (rc=1) — removed the difference between "does not vary" and "was not measured"
+         failing: ['a summary of one sample reports no spread rather than none']
+[A5-backoff-does-not-grow] KILLED (rc=1) — removed the growth in the wait, turning a backoff into a fixed-rate retry
+         failing: ['a retryable failure backs off and is retried in place']
+[A6-row-never-dead-lettered] KILLED (rc=1) — removed the limit on consecutive failures, so a dead row is asked its full count
+         failing: ['three consecutive failures dead-letter the row instead of hammering it']
+[A7-budget-not-spent] KILLED (rc=1) — removed the shared budget's accounting, so a run cannot know what it has spent
+         failing: ['the shared budget ends the run rather than the row', 'a retry cannot spend past the shared budget', 'a retry inside the budget still happens', 'a call is booked before it is made, not when its sample arrives', 'an interrupt stops before the next call and lets the one in flight finish']
+[A8-resume-restarts] KILLED (rc=1) — removed the samples a resumed row already has, re-spending every call
+         failing: ['a resumed row keeps what it already has and asks only for the rest']
+[A9-stops-before-the-floor] KILLED (rc=1) — removed the minimum sample count, letting two identical draws decide a row
+         failing: ['a row stops early only once its interval is tight enough', 'the stopping rule is asked about the reading, not about a character count']
+[A10-failure-not-recorded] KILLED (rc=1) — removed the record for a call that never came back, leaving no evidence under the number
+         failing: ['a call that never reached a response is recorded, and worth retrying']
+[A12-row-stops-at-the-floor] KILLED (rc=1) — removed the full sample count, letting a row that never settles stop at the minimum
+         failing: ['the stopping rule is asked about the reading, not about a character count', 'a row that never settles takes its full budget and no more']
+[A13-no-retry-at-all] KILLED (rc=1) — removed the retry itself, so a rate limit ends a row on its first refusal
+         failing: ['a retryable failure backs off and is retried in place', 'a retry inside the budget still happens', 'a call is booked before it is made, not when its sample arrives']
+[A14-one-retry-too-many] KILLED (rc=1) — removed the exact bound on retries — off by one is still unbounded in the direction that matters
+         failing: ['a retryable failure gives up rather than retrying forever']
+[A15-stopping-rule-ignores-the-reading] KILLED (rc=1) — removed the predicate itself, stopping every row at the floor whatever its interval says
+         failing: ['the stopping rule is asked about the reading, not about a character count', 'a row that never settles takes its full budget and no more']
+[A11-request-body-dropped] KILLED (rc=1) — removed the sampler's own body, so every row asks the vendor something else
+         failing: ['one sample is measured and recorded, with what the server received']
+[A16-unmeasured-row-counts-as-zero] KILLED (rc=1) — removed the exclusion of a row with no proportion to take, reading it as 0% variance
+         failing: ['a row with no proportion to take is unmeasured BY NAME, not a zero']
+[A17-floor-covers-only-the-visible-series] KILLED (rc=1) — removed the other two series, publishing the one a reader sees and not the one a bill is drawn on
+         failing: ['the floor covers every series a row records, not just the visible one', 'a row with no proportion to take is unmeasured BY NAME, not a zero', 'a single-sample row cannot be the floor, and is not "the vendor never varied"']
+[A18-one-sample-row-enters-the-floor] KILLED (rc=1) — removed the two-sample requirement, letting a row that has no spread set the floor
+         failing: ['a single-sample row cannot be the floor, and is not "the vendor never varied"']
+[A19-worst-row-is-whichever-came-first] KILLED (rc=1) — removed the search for the widest row, naming the first one instead
+         failing: ['the floor names the row it came from']
+[A21-budget-checked-once-per-sample] KILLED (rc=1) — removed the budget check in front of every CALL, leaving it in front of every SAMPLE
+         failing: ['a retry cannot spend past the shared budget']
+[A22-budget-abort-becomes-a-row-failure] KILLED (rc=1) — removed the rethrow that lets an exhausted budget end the RUN
+         failing: ['the shared budget ends the run rather than the row', 'a retry cannot spend past the shared budget', 'a sample whose evidence could not be written is kept, and ends the run', 'a ledger that cannot be written stops the run; it is not a failed call', 'a call neither sink could keep stops the run and says so', 'a ledger that cannot record the next call means that call is not made', 'an async sink is awaited, so its rejection is not lost', 'an interrupt stops before the next call and lets the one in flight finish']
+[A23-bare-length-resume-accepted] KILLED (rc=1) — removed the refusal of a resume state that cannot say what its calls measured
+         failing: ['a resume state holding bare lengths is refused, not half-restored']
+[A24-series-not-derived-from-samples] KILLED (rc=1) — removed the derivation of every series from the samples that produced it
+         failing: ['a resumed row keeps what it already has and asks only for the rest', 'an aborted row still reaches the artifact with what it paid for']
+[A25-resume-forgets-what-it-spent] KILLED (rc=1) — removed the ledger a resumed run reads, reopening the whole batch every invocation
+         failing: ['a resumed run continues the budget it already spent', 'a run with budget left resumes with what is left, not with all of it']
+[A29-spend-not-announced-before-the-call] KILLED (rc=1) — removed the announcement that a call has been paid for, made BEFORE the call
+         failing: ['a call is booked before it is made, not when its sample arrives', 'a ledger that cannot record the next call means that call is not made', 'an async sink is awaited, so its rejection is not lost']
+[A28-missing-ledger-reads-as-spent] KILLED (rc=1) — removed the reading of a state that has no ledger, treating it as a batch already paid for
+         failing: ['a state with no ledger is a fresh run, not an overspent one']
+[A26-exhausted-budget-is-never-exhausted] KILLED (rc=1) — removed the test that says a batch has been paid for
+         failing: ['a resumed run continues the budget it already spent']
+[A27-legacy-row-not-named] KILLED (rc=1) — removed the naming of a row recorded before whole samples were kept
+         failing: ['a row recorded before whole samples were kept is named, not silently restarted']
+[A20-run-level-counts-are-constants] KILLED (rc=1) — removed the counts of what happened to the rows, reporting none of either
+         failing: ['dead-lettered and settled rows are counted, not silently dropped']
+[A30-aborted-row-dropped] KILLED (rc=1) — removed the row an abort leaves behind, so its paid samples never reach the artifact
+         failing: ['an aborted row still reaches the artifact with what it paid for']
+[A31-empty-row-recorded] KILLED (rc=1) — removed the emptiness check, so a row that collected nothing is published as a reading
+         failing: ['a row that collected nothing leaves no row behind']
+[A33-spending-without-a-ledger] KILLED (rc=1) — removed the ledger a live run gets by default, so an interrupt loses every call it has paid for
+         failing: ['a run that spends gets a ledger whether or not it was asked for one']
+[A34-interrupt-not-checked] KILLED (rc=1) — removed the stop check beside the budget check, so an interrupt abandons the call in flight
+         failing: ['an interrupt stops before the next call and lets the one in flight finish']
+[A35-artifact-name-ignores-the-cohort] KILLED (rc=1) — removed the identity digest, so every run of a day shares one artifact, one ledger and one lock
+         failing: ['two partitions of one batch do not name one artifact', "the operator's filter text decides nothing about identity"]
+[A36-name-carries-what-was-typed] KILLED (rc=1) — removed the cohort-derived label, putting the raw filter text back inside the name
+         failing: ['two partitions of one batch do not name one artifact', "the operator's filter text decides nothing about identity"]
+[A37-identity-is-the-cohort-alone] KILLED (rc=1) — removed the measurement configuration, so two runs under different model pins are one run
+         failing: ['a run pinned to a different model is a different run']
+[A38-identity-ignores-the-output-cap] KILLED (rc=1) — removed the cap from identity, so two runs measuring different amounts of answer share a ledger
+         failing: ['a run pinned to a different model is a different run']
+[A39-cohort-order-is-identity] KILLED (rc=1) — removed the sort, so the order the rows were selected in decides whether this is the same run
+         failing: ['a run pinned to a different model is a different run']
+[A40-mismatched-resume-is-merged] KILLED (rc=1) — removed the refusal, so another configuration's paid samples join this run's series
+         failing: ['a ledger from another configuration is refused, not merged']
+[A41-unstamped-ledger-is-a-fresh-run] KILLED (rc=1) — removed the refusal for a ledger written before identity was recorded, so paid and unaccounted-for reads as new
+         failing: ['a ledger from another configuration is refused, not merged']
+[A42-capture-failure-discards-the-response] KILLED (rc=1) — removed the carried capture error, so an unwritable sink throws away a response the vendor billed for
+         failing: ['a paid response survives a capture sink that cannot be written']
+[A43-capture-failure-does-not-stop-the-run] KILLED (rc=1) — removed the abort, so a run whose evidence sink is gone keeps spending
+         failing: ['a sample whose evidence could not be written is kept, and ends the run']
+[A44-capture-failure-loses-the-sample] KILLED (rc=1) — removed the persist-before-abort ordering, so the paid observation never reaches the ledger
+         failing: ['a sample whose evidence could not be written is kept, and ends the run', 'a call neither sink could keep stops the run and says so']
+[A45-identity-carries-every-pin] KILLED (rc=1) — removed the cohort's own providers, so a pin for a provider with no row re-grants the ceiling
+         failing: ['a pin for a provider with no row in the run decides nothing']
+[A46-prompt-by-name-only] KILLED (rc=1) — removed the prompt digest, so an edited prompt resumes as the same run
+         failing: ['a run pinned to a different model is a different run', 'identity reads the prompts a run sends, not the name they are sent under']
+[A47-prompt-without-its-row] KILLED (rc=1) — removed the row key, so one prompt under two names is one row
+         failing: ['identity reads the prompts a run sends, not the name they are sent under']
+[A48-missing-pin-hashes-as-nothing] KILLED (rc=1) — removed the refusal of a provider with rows and no pin
+         failing: ['a pin for a provider with no row in the run decides nothing']
+[A49-ledger-failure-is-a-failed-call] KILLED (rc=1) — removed the ledger catch, so a full disk is booked as a vendor failure and the run keeps paying
+         failing: ['a ledger that cannot be written stops the run; it is not a failed call', 'a call neither sink could keep stops the run and says so', 'an async sink is awaited, so its rejection is not lost']
+[A50-neither-sink-reported-as-one] KILLED (rc=1) — removed the both-sinks case, so a call nothing kept is reported as held by its capture record
+         failing: ['a call neither sink could keep stops the run and says so']
+[A51-booking-failure-is-a-failed-call] KILLED (rc=1) — removed the booking catch, so a ledger that refused the booking counts against the row
+         failing: ['a ledger that cannot record the next call means that call is not made', 'an async sink is awaited, so its rejection is not lost']
+[A52-ledger-not-awaited] KILLED (rc=1) — removed the await on the ledger sink, so an async rejection is never seen
+         failing: ['an async sink is awaited, so its rejection is not lost']
+[A53-booking-not-awaited] KILLED (rc=1) — removed the await on the booking sink, so the call is made before its booking is known to have failed
+         failing: ['an async sink is awaited, so its rejection is not lost']
+RESTORED True (9cb1907eb19d)
+
+ALL KILLED: True   (52/52)

@@ -1,0 +1,5 @@
+SUBJECT scripts/lib/sse-capture.mjs sha256 a9344281f412a8fc2e750f6733f09d3751141bbb98f89c152d536d80df0ce98f
+SELF-TEST unmodified baseline accepted: True
+RESTORED True (7415c4fb8375)
+
+BASELINE REFUSES EVERY DISABLED CASE: True   (15/15, unmodified accepted)

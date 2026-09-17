@@ -965,3 +965,167 @@ that refusal costs a re-run of any such ledger. There are none outside this
 campaign's own scratch runs, and the alternative — accepting it — is the exact
 merge the refusal exists to prevent, with nothing on disk able to say whether it
 was safe.
+
+## Round 7 — one seat, and three findings that were not the old shape
+
+One seat, `d9dab65`, offline, to a verdict. The codex seat was dispatched on the
+same packet and stopped on its provider's usage limit before it wrote anything.
+That is not a weak review, it is an absent one: this round has one reader, and
+the codex seat reads the fixes below as the gate before merge once its quota
+returns (2026-09-19, 17:11).
+
+Three findings, each reproduced by the seat and each re-verified against the code
+before anything was changed.
+
+| # | finding | severity | introduced by | closed by |
+| --- | --- | --- | --- | --- |
+| 42 | a sink failure is booked as a failed call; with the disk full, both sinks fail and the row reports itself complete | High | the ledger half predates round 6; round 6 made the both-sinks case silent | `6af4fc4` |
+| 43 | run identity hashes the pins of providers with no row, and the tasks file's bytes; on the default path a new identity is a new ledger and a fresh ceiling | Medium | round 6 (`b9d98cc`) | `6db5e85`, `12d6ba1` |
+| 44 | `DERIVATION_BRANCHES` decides which derivations are measured; removing one together with its controls leaves the gate at 145/145 | Medium | round 6 (a new instrument) | `a05c8a6` |
+
+#42 at `3eb578f`, checked rather than assumed. A capture-only failure billed three
+calls and dead-lettered the row; it now bills one and stops. A ledger-only failure
+was booked as a failed call before round 6 as well. Both sinks failing together is
+the case round 6 made silent: five calls paid for, none kept, and the row
+returned normally. The seat's own attribution of the a/ side says the same.
+
+### Not the shape of rounds 4 to 6
+
+Rounds 4, 5 and 6 each found a rule that had been moved out of its object while
+something was left behind. Round 7 found three other shapes.
+
+- **An over-correction (#43).** Round 6 moved identity out of the cohort and took
+  it further than what a run measures. Wider looks like the safe direction, and it
+  is not: on the default path a wider identity is a new ledger, and a new ledger
+  grants the spending ceiling again while the first invocation's paid samples sit
+  where nothing resumes them.
+- **A scope boundary (#44).** Two tables were built in the same patch to answer the
+  same question. `SURFACE_ITEM_KEY` throws for a surface nobody entered.
+  `DERIVATION_BRANCHES` skipped a derivation nobody entered, and said nothing.
+- **A misclassification (#42).** A full disk went into the list where a vendor 500
+  lands, and the three-failures rule could never fire, because the counter was
+  reset before the write that failed.
+
+### What the fixes moved
+
+| what used to decide | now |
+| --- | --- |
+| every provider's pin and the tasks file's bytes, for identity | the selected rows' keys and prompt contents, the pins of the providers that have rows, and the cap |
+| the branch table, for which derivations are evaluated | the bindings' own compared evaluations, traced through `derive()` and checked against the table |
+| the row's answer, for what a branch control is handed | the served object a binding is handed |
+| the generic `catch`, for what a sink failure is | an abort that names the sink and where the paid sample is |
+| the flags the test remembered to leave out, for whether the runner can spend | plan mode, both keys stripped, and a preload that ends the process on any fetch |
+
+The runner's identity call is now under test (`test/aa-noise-floor-plan.test.mjs`).
+The library cannot see what the runner hands it, and #43 was at that call.
+
+### Each new test was run against the code it replaces
+
+| fix | against | result |
+| --- | --- | --- |
+| #42 | `d9dab65` with `6af4fc4`'s test file | 5 of 42 fail: the four new cases, plus the earlier capture case, now held to "it is in the ledger" |
+| #43 | `d9dab65` with the plan-mode test | 3 of 3 fail. Two fail on their own messages ("an Anthropic-only run changed identity with the OpenAI pin", "a comment in the tasks file made a new run"); the third fails on the old signature |
+| #44 | `d9dab65`'s instrument with `a05c8a6`'s gate | 3 of 147 fail: the round-7 construction, the new report arms, and the extended coverage case |
+
+### Stated limits
+
+- **#44.** Logic a binding writes inline beside `derive()` is not walked. The Chat
+  fan-out, `request.n ?? 1`, is such logic. It keeps its own mutant (S43) and has
+  no branch obligation.
+- **#43.** The runner's own code is outside identity: how a body is built, the
+  headers, how an answer is read. Resuming a ledger across such an edit is a
+  decision the digest cannot see, and its doc now says so. The first version of
+  that doc said "anything that changes what a sample MEANS belongs here", which
+  was not true. It was corrected before the tables ran (`12d6ba1`), and a table
+  run already under way was stopped and discarded rather than cited against a
+  revision that was no longer the tip.
+- **#42.** The runner's abort-time save is guarded, and no test reaches it,
+  because the loop only runs under `--live`. Where the consecutive-failure reset
+  sits no longer has an observable effect, since a sink failure ends the run
+  first. The comment says so, and no control is claimed.
+- Branch controls are now handed the served object. The seat found no input that
+  tells it apart from the row's answer. This removes a latent disagreement; no
+  defect was observed.
+
+### What the seat could not break
+
+- `SURFACE_ITEM_KEY` and the surface-told item reader.
+- Ledger generations and the rename, under a size-limited child process that
+  stops a save part way: both copies stayed whole at the previous generation.
+- The capture half of `captureError`.
+- Its strongest hypothesis: that a branch reached only by a control is
+  unprotected in the PRODUCT. It installed the known-opposite in
+  `src/proxy/http-server.ts` and the conformance gates stayed green, but
+  `test/output-limit-projection.test.mjs:184` failed. Restored by digest.
+- Stream item parity is still **unmeasured**, as round 6 left it.
+- `anthropicStop`'s `max-tokens-over-tool-use` arm has a dead half
+  (`passed ? reported : 'end_turn'`, where `passed` is always true). It is dead,
+  not wrong, below medium, and unchanged.
+
+### Round 7's tables
+
+```
+supplied-echo-mutants.py          80/80 killed, restored, dist matches tree   (se-12d6ba1.log)
+echoed-defaults-mutants.py        14/14 killed, restored, dist matches tree   (ed-12d6ba1.log)
+aa-sampler-controls.py            52/52 killed, no unbacked case              (aa-12d6ba1.log)
+aa-noise-floor-plan-controls.py    4/4  killed, no unbacked case              (ap-12d6ba1.log)
+state-lock-controls.py            11/11 killed, no unbacked case              (sl-12d6ba1.log)
+ledger-controls.py                 9/9  killed, no unbacked case              (lg-12d6ba1.log)
+sse-capture-controls.py           15/15 killed, restored                      (sse-12d6ba1.log)
+probe-exchange-controls.py        10/10 killed, restored                      (pe-12d6ba1.log)
+```
+
+These logs are in `review/tables/12d6ba1/`. They were taken on a clean detached
+worktree at that revision, and it was still clean when the run finished. The
+suite on that worktree reads 2354/2354. The conformance gates read 173/173,
+`verifyCaptureStore()` checks 52 captures with 0 unbound, and
+`conformance-coverage` puts a live parity row under 134 of 148.
+
+There are twenty-one new mutants (eight, nine and four), and nine old ones were
+re-aimed at code this round moved (four and five):
+
+- supplied-echo: S74 to S81. S74 is the round-7 construction itself, and it is a
+  special that asserts it removed the table entry and exactly three controls.
+  S43, S45, S60 and S61 were re-aimed at the new binding text.
+- aa-sampler: A45 to A53, re-aiming A37, A38, A39, A43 and A44. The roster gained
+  the six cases this round added.
+- aa-noise-floor-plan: P1 to P4, a new table. It mutates the runner's identity
+  call and is scored by the plan-mode test, which starts the mutated runner the
+  way the test always does: no `--live`, both keys stripped, fetch refused.
+
+Each new supplied-echo mutant was checked for why it died, not only that it died.
+S74 died because "a derivation took a branch this table does not name". S75 died
+because "a binding compared a value no named derivation produced". S81 died
+because "the stop reason was compared without the cut it is read after". S76, S77
+and S78 each failed on the report list they disable.
+
+### A self-test that had not run since round 6
+
+The roster self-tests disable each case in turn and require the baseline to
+refuse. They are not part of a table run, and round 6 did not run them. This
+round did. `aa-sampler-controls.py --self-test` stopped at NOT PLANTED: it
+searched for `test('<name>'`, and the test file writes the apostrophe in "the
+operator's filter text…" as `\'`. The case had been on the roster since round 6.
+The two other runners that carry the same code have no apostrophe on their
+rosters. All three were fixed (`6330c89`). The fixed runners were run against
+the `12d6ba1` worktree. The plan-mode runner was run from `12d6ba1` itself,
+because it spelled names this way from the start. Every self-test refuses every
+disabled case:
+
+```
+aa-sampler-controls.py            44/44   (aa-12d6ba1-self-test.log)
+aa-noise-floor-plan-controls.py    3/3    (ap-12d6ba1-self-test.log)
+probe-exchange-controls.py         8/8    (pe-12d6ba1-self-test.log)
+sse-capture-controls.py           15/15   (sse-12d6ba1-self-test.log)
+```
+
+For three of these four lines the runner is one commit newer than the subject,
+and that commit changes only the self-test's spelling of a name.
+
+### How this round closes
+
+The Claude seat reads the fixes above and nothing else. The codex seat reads the
+same fixes once its quota returns, and that reading is the gate before merge. The
+stopping rule is the one this campaign has used since round 4. It is not that
+nothing more can be found. It is whether the loop still reaches the thing it
+measures.

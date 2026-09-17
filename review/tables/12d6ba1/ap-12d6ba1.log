@@ -1,0 +1,13 @@
+SUBJECT scripts/aa-noise-floor.mjs sha256 c4cfa09b0825017a9314a9cc2e8f27948b67dd8f760e19e696a40ccd5a22eab1
+BASELINE rc=0 tests=3 pass=3 skipped=0 todo=0 cancelled=0 roster=3
+[P1-file-bytes-back-in-identity] KILLED (rc=1) — removed the prompt-only digest, putting the tasks file back into every row
+         failing: ["the runner's identity is its selected prompts, their providers' pins and the cap", 'an edit to the tasks file is a new run only where it changes a selected prompt']
+[P2-pins-not-from-the-invocation] KILLED (rc=1) — removed the operator's pins, so every model is one run
+         failing: ['a partition is the same run whatever the pin of the provider it leaves out', "the runner's identity is its selected prompts, their providers' pins and the cap"]
+[P3-cap-not-from-the-invocation] KILLED (rc=1) — removed the operator's cap, so two caps are one run
+         failing: ["the runner's identity is its selected prompts, their providers' pins and the cap"]
+[P4-identity-over-every-row] KILLED (rc=1) — removed the selection, so every partition is named for the whole batch
+         failing: ['a partition is the same run whatever the pin of the provider it leaves out', "the runner's identity is its selected prompts, their providers' pins and the cap", 'an edit to the tasks file is a new run only where it changes a selected prompt']
+RESTORED True (c4cfa09b0825)
+
+ALL KILLED: True   (4/4)
