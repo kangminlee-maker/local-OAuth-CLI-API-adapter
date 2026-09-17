@@ -1122,10 +1122,105 @@ sse-capture-controls.py           15/15   (sse-12d6ba1-self-test.log)
 For three of these four lines the runner is one commit newer than the subject,
 and that commit changes only the self-test's spelling of a name.
 
-### How this round closes
+### How this round was to close
 
-The Claude seat reads the fixes above and nothing else. The codex seat reads the
-same fixes once its quota returns, and that reading is the gate before merge. The
-stopping rule is the one this campaign has used since round 4. It is not that
-nothing more can be found. It is whether the loop still reaches the thing it
-measures.
+The Claude seat was to read the fixes above and nothing else, and the codex seat
+the same fixes once its quota returned, as the gate before merge. The stopping
+rule is the one this campaign has used since round 4. It is not that nothing
+more can be found. It is whether the loop still reaches the thing it measures.
+The fold below is what the first of those readings found.
+
+## Round 7, fold — the fixes held, and two siblings did not
+
+One Claude seat read `d9dab65..7f53f34`, offline, and reached a verdict. It
+rebuilt round 7's three constructions against the fixes. The full disk under
+both sinks now stops after one paid call. The Anthropic-only partition keeps
+its identity when the OpenAI pin moves or a comment is added. Removing
+`stopSequenceCut` with its controls now fails two cases. None of the three fixes
+over-corrected.
+
+Its harness would not let a subagent write a report file. The report came back
+as the seat's final message and was written to disk unchanged, with a note
+saying so.
+
+It found two Medium defects. Both reproduce at `d9dab65`, so the fold did not
+introduce them, and each sits on a sibling path that a fix's own sentence claimed
+to cover.
+
+| # | finding | introduced by | closed by |
+| --- | --- | --- | --- |
+| 45 | a capture-sink failure on a call that did NOT succeed: the transport path let the recorder's `EACCES` replace the reset, and a refused call carried the error as a phrase nothing reads. Rows dead-lettered for a disk fault, retries were skipped, the run exited 0, and the summary counted nine exchanges beside an empty directory | predates round 6 (`takeSample` is byte-identical at `d9dab65`) | `3029919` |
+| 46 | the ledger path is identity plus the UTC day: the same command re-run after midnight UTC got a new ledger and the whole ceiling again. The new plan test compared identity and never the name, so a name carrying a pin beside a correct identity passed every assertion | the day predates round 6; the test gap is this round's | `3029919` |
+
+### A decision, recorded as one
+
+#46 had three honest answers: search for an unfinished run, key the ledger by
+identity alone, or accept the day and say so. The user chose the first. **A new
+day may still be a new run, but it may not start while an earlier run of the
+same configuration is unfinished.** Unfinished means a ledger stamped with this
+identity that has spending, and whose artifact is missing or did not finish.
+`unfinishedRuns()` looks for one under any name in the artifact's directory and
+in `bench-results/`. The runner refuses before it prints a plan, so plan mode
+says exactly what a live run would do.
+
+The runner's "already exists" advice was the other half. It said to pass
+`--out`, and following it started a second run beside the unfinished one. The
+search refuses that now, and the advice says `--resume`.
+
+### Each new test against the code it replaces
+
+| fix | against | result |
+| --- | --- | --- |
+| #45 | the `12d6ba1` sampler | 3 of 47 fail. Two find no abort at all ("Missing expected rejection"). One runs until the budget stops it, and that abort does not name the capture sink |
+| #46 | the `12d6ba1` runner with the new plan test | 1 of 4 fails: "a run started beside an unfinished run of its own configuration" |
+
+### Stated limits
+
+- Only the artifact's directory and `bench-results/` are searched. A ledger kept
+  anywhere else is not found.
+- A ledger in those directories that cannot be read also refuses a run. Nothing
+  can say whose it is, and this code has treated unaccounted-for as not new since
+  round 6.
+- The fold seat's Low finding is unchanged. When the primary ledger is
+  unwritable and its shadow is not, the abort says the sample is "not in the
+  ledger" although `readLedger` returns it. Nothing is lost, and each retried
+  booking under that fault over-books by one call, which is the safe direction.
+
+### The fold's tables
+
+```
+supplied-echo-mutants.py          80/80 killed, restored, dist matches tree   (se-3029919.log)
+echoed-defaults-mutants.py        14/14 killed, restored, dist matches tree   (ed-3029919.log)
+aa-sampler-controls.py            65/65 killed, no unbacked case              (aa-3029919.log)
+aa-noise-floor-plan-controls.py    8/8  killed, no unbacked case              (ap-3029919.log)
+state-lock-controls.py            11/11 killed, no unbacked case              (sl-3029919.log)
+ledger-controls.py                 9/9  killed, no unbacked case              (lg-3029919.log)
+sse-capture-controls.py           15/15 killed, restored                      (sse-3029919.log)
+probe-exchange-controls.py        10/10 killed, restored                      (pe-3029919.log)
+
+self-tests: aa-sampler 49/49, aa-noise-floor-plan 4/4   (*-3029919-self-test.log)
+```
+
+These are in `review/tables/3029919/`, taken on a clean detached worktree at that
+revision. There the suite reads 2360/2360 and the conformance gates 173/173.
+
+The table has seventeen new mutants, and two old ones were re-aimed:
+
+- `aa-sampler-controls.py` now also mutates the capture recorder. It restores
+  every file after each mutant, because a mutant that edits the other file
+  would otherwise run with the previous one still planted.
+- A54 to A59 cover #45: the abort, the guard on the transport record, the
+  capture error on each of the three failed-call paths, and the unrecorded
+  count. A10 and A42 were re-aimed at the guarded writer.
+- A60 to A66 cover the search. Each removes one of its rules: finished runs,
+  the aborted flag, the identity filter, the invocation's own ledger, empty
+  ledgers, the lone shadow, and unreadable ledgers.
+- P5 is the fold seat's M11: a correct identity with a pin in the name. P6 to P8
+  cover the search, the results directory, and the exit.
+
+### How the campaign closes
+
+The fold seat's recommendation was "fix or explicitly accept F1 and F2, have
+that change read once, and close". Both are fixed. The one reading is the codex
+seat's, once its quota returns (2026-09-19, 17:11). It reads round 7's fixes and
+this fold's together, as the gate before merge.

@@ -1,0 +1,21 @@
+SUBJECT scripts/aa-noise-floor.mjs sha256 690d8ed6836aa7f2ccd57b22c0f5a946126a320c71a4f67e88976e86dbdf8822
+BASELINE rc=0 tests=4 pass=4 skipped=0 todo=0 cancelled=0 roster=4
+[P1-file-bytes-back-in-identity] KILLED (rc=1) — removed the prompt-only digest, putting the tasks file back into every row
+         failing: ["the runner's identity is its selected prompts, their providers' pins and the cap", 'an edit to the tasks file is a new run only where it changes a selected prompt']
+[P2-pins-not-from-the-invocation] KILLED (rc=1) — removed the operator's pins, so every model is one run
+         failing: ['a partition is the same run whatever the pin of the provider it leaves out', "the runner's identity is its selected prompts, their providers' pins and the cap"]
+[P3-cap-not-from-the-invocation] KILLED (rc=1) — removed the operator's cap, so two caps are one run
+         failing: ["the runner's identity is its selected prompts, their providers' pins and the cap"]
+[P4-identity-over-every-row] KILLED (rc=1) — removed the selection, so every partition is named for the whole batch
+         failing: ['a partition is the same run whatever the pin of the provider it leaves out', "the runner's identity is its selected prompts, their providers' pins and the cap", 'an edit to the tasks file is a new run only where it changes a selected prompt', "an unfinished run under another day's name is refused, and a finished one is not"]
+[P5-name-carries-a-pin] KILLED (rc=1) — removed the identity-only name, putting the OpenAI pin into every partition's ledger path
+         failing: ['a partition is the same run whatever the pin of the provider it leaves out']
+[P6-unfinished-runs-not-searched] KILLED (rc=1) — removed the search, so a new day grants the ceiling again beside an unfinished run
+         failing: ["an unfinished run under another day's name is refused, and a finished one is not"]
+[P7-only-the-artifact-directory-searched] KILLED (rc=1) — removed the results directory, so --out steps around an unfinished run
+         failing: ["an unfinished run under another day's name is refused, and a finished one is not"]
+[P8-refusal-does-not-stop] KILLED (rc=1) — removed the exit, so the refusal is printed and the run goes ahead
+         failing: ["an unfinished run under another day's name is refused, and a finished one is not"]
+RESTORED True (690d8ed6836a)
+
+ALL KILLED: True   (8/8)
