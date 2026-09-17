@@ -1,0 +1,27 @@
+SUBJECT scripts/lib/state-lock.mjs sha256 11be4d1beb263692d6b0b00ad7070d339876da7b61d4d305233f7e490649b117
+BASELINE rc=0 tests=11 pass=11 skipped=0 todo=0 cancelled=0 roster=11
+[L1-lock-keyed-on-the-spelling] KILLED (rc=1) — removed inode identity, so every alias of one ledger takes a lock of its own
+         failing: ['a symlink alias of the state file is the same writer', 'a state file that does not exist yet resolves through its directory', 'two hard links to one ledger are one writer', 'two hard links in different directories are still one writer', 'a dangling symlink is the file it will become, not a name of its own', 'a run that creates the ledger and one that finds it agree']
+[L1b-realpath-only] KILLED (rc=1) — removed the inode key while keeping realpath, which collapses symlinks and cannot collapse hard links
+         failing: ['two hard links to one ledger are one writer', 'two hard links in different directories are still one writer']
+[L1c-sidecar-beside-the-file] KILLED (rc=1) — removed the one lock directory, so one inode under two directories takes two locks
+         failing: ['two hard links in different directories are still one writer']
+[L1d-dangling-link-is-its-own-name] KILLED (rc=1) — removed the symlink walk, so a link to a file that is not there yet keeps its own basename
+         failing: ['a dangling symlink is the file it will become, not a name of its own']
+[L1e-ledger-not-created] KILLED (rc=1) — removed the up-front creation, so a run that arrives before the file keys on a name and one that arrives after keys on an inode
+         failing: ['a state file that does not exist yet resolves through its directory', 'a dangling symlink is the file it will become, not a name of its own', 'a run that creates the ledger and one that finds it agree', 'a late release does not free the lock somebody else now holds', "a release after the lock was cleared by hand does not take the next run's", 'the holder is reported by pid, not by token']
+[L1f-artifact-lock-creates-the-artifact] KILLED (rc=1) — removed the name key, so reserving a file that must not exist creates it
+         failing: ['a name-keyed lock reserves a file that must not exist yet']
+[L2-release-is-blind] KILLED (rc=1) — removed the ownership check, so a departing process unlinks whatever holds the name
+         failing: ['a late release does not free the lock somebody else now holds', "a release after the lock was cleared by hand does not take the next run's"]
+[L3-release-runs-once-but-unchecked] KILLED (rc=1) — removed the token check alone, leaving only the once-flag — which a second PROCESS does not share
+         failing: ["a release after the lock was cleared by hand does not take the next run's"]
+[L4-not-yet-existing-file-is-not-resolved] KILLED (rc=1) — removed the directory resolution, so two spellings disagree until the file exists
+         failing: ['a state file that does not exist yet resolves through its directory', 'a dangling symlink is the file it will become, not a name of its own']
+[L5-holder-reported-whole] KILLED (rc=1) — removed the pid split, so the message names a token nobody can look up
+         failing: ['the holder is reported by pid, not by token']
+[L6-namespace-follows-the-environment] KILLED (rc=1) — removed the environment-invariant rendezvous, so two runs with different TMPDIRs never contend
+         failing: ['the lock namespace does not move with the environment']
+RESTORED True (11be4d1beb26)
+
+ALL KILLED: True   (11/11)

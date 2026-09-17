@@ -1,0 +1,25 @@
+SUBJECT scripts/lib/probe-exchange.mjs sha256 b732158ccf3cca7a930270fb0414dcbff4fb8416940ab88b5e715cbc7dd30e55
+BASELINE rc=0 tests=8 pass=8 skipped=0 todo=0 cancelled=0 roster=8
+[P1-refusal-is-a-failure] KILLED (rc=1) — removed the prober's refusal mode, making an answer it asked for a failed exchange
+         failing: ['a refusal is an observation, not a failed exchange', 'a streamed 204 is an observation too']
+[P2-wire-blanked] KILLED (rc=1) — removed the wire handed to the reading, which several probes read for the terminator
+         failing: ['a streamed answer comes back whole, and is recorded once', 'a refusal is an observation, not a failed exchange']
+[P3-text-blanked] KILLED (rc=1) — removed the text handed to the reading, which is what a refusal is parsed out of
+         failing: ['a streamed answer comes back whole, and is recorded once', 'a refusal is an observation, not a failed exchange']
+[P4-reader-never-called] KILLED (rc=1) — removed the call itself, fabricating a result behind `if (false)`
+         failing: ['a streamed answer comes back whole, and is recorded once', 'a refusal is an observation, not a failed exchange', 'a streamed 204 is an observation too', 'a stream cut halfway keeps its status and its bytes', 'a request that never reached a response is still recorded']
+[P5-throw-after-the-reader] KILLED (rc=1) — removed everything after the read, by throwing before the result is used
+         failing: ['a streamed answer comes back whole, and is recorded once', 'a refusal is an observation, not a failed exchange', 'a streamed 204 is an observation too']
+[P6-buffered-catch-forgets-status] KILLED (rc=1) — removed the status a buffered turn already had when its body died
+         failing: ['a buffered answer is recorded with its body', 'a buffered body that dies mid-read keeps the status the vendor gave']
+[P8-request-body-dropped] KILLED (rc=1) — removed the probe's own body, sending something else to the socket while the record keeps the original
+         failing: ['a buffered request that never reached a response records no body', 'a buffered answer is recorded with its body', 'a buffered body that dies mid-read keeps the status the vendor gave']
+[P9-request-headers-dropped] KILLED (rc=1) — removed the headers the probe supplied, which is how a vendor is told what is being asked
+         failing: ['a streamed answer comes back whole, and is recorded once', 'a refusal is an observation, not a failed exchange', 'a streamed 204 is an observation too', 'a stream cut halfway keeps its status and its bytes', 'a request that never reached a response is still recorded']
+[P10-pre-response-body-invented] KILLED (rc=1) — removed the distinction between a body that never arrived and one that was empty, at the buffered exit where no response exists at all
+         failing: ['a buffered request that never reached a response records no body']
+[P7-cut-stream-reported-readable] KILLED (rc=1) — removed the failure a stopped turn reports, calling it an answer instead
+         failing: ['a stream cut halfway keeps its status and its bytes', 'a request that never reached a response is still recorded']
+RESTORED True (b732158ccf3c)
+
+ALL KILLED: True   (10/10)

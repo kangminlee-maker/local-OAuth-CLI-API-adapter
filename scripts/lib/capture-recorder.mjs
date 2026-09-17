@@ -42,7 +42,7 @@ export function startCaptureRun({ dir, meta = {} } = {}) {
   const runId = randomUUID();
   const runDir = join(dir, runId);
   mkdirSync(runDir, { recursive: true });
-  state = { runId, runDir, seq: 0, bytes: 0, failures: 0 };
+  state = { runId, runDir, seq: 0, bytes: 0, failures: 0, unrecorded: 0 };
   writeFileSync(join(runDir, 'run.json'), `${JSON.stringify({
     runId,
     startedAt: new Date().toISOString(),
@@ -89,9 +89,17 @@ export function recordExchange(entry) {
     durationMs: entry.durationMs ?? null,
     error: entry.error ? String(entry.error).slice(0, 2000) : null,
   };
-  if (record.error) state.failures += 1;
   const serialized = `${JSON.stringify(record, null, 2)}\n`;
-  writeFileSync(join(state.runDir, `${seq}-${label}.json`), serialized);
+  try {
+    writeFileSync(join(state.runDir, `${seq}-${label}.json`), serialized);
+  } catch (error) {
+    // The sequence number stays spent, so the gap in the files says a record is
+    // missing. The summary used to count it as an exchange on disk: a run whose
+    // every write failed reported nine exchanges beside an empty directory.
+    state.unrecorded += 1;
+    throw error;
+  }
+  if (record.error) state.failures += 1;
   state.bytes += Buffer.byteLength(serialized);
   return record.seq;
 }
@@ -102,8 +110,9 @@ export function captureSummary() {
     enabled: true,
     runId: state.runId,
     dir: state.runDir,
-    exchanges: state.seq,
+    exchanges: state.seq - state.unrecorded,
     failedExchanges: state.failures,
+    unrecordedExchanges: state.unrecorded,
     bytes: state.bytes,
   };
 }

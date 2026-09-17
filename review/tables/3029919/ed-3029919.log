@@ -1,0 +1,38 @@
+SUBJECT 3029919ea6b7a70360dba90f6b1e18e7eba8a260 — 239 tracked inputs verified against that revision
+RUNNER  echoed-defaults-mutants.py sha256 0e7f0455157ee4c64fa5f29a5f4c0efd18b00057318df6321621a637e8c3da9f
+RUNNER  mutation_harness.py sha256 fdf431e8587ad0c1c5cf809ac6962cb0189c947c2a7c31e2d5c15a8a74c28ae9
+DIST BUILT CLEAN: 56 compiler outputs, every one with a source under src/
+BASELINE test/conformance-echoed-defaults.test.mjs: tests=15 pass=15 fail=0 -> OK
+BASELINE test/proxy-http.test.mjs: tests=69 pass=69 fail=0 -> OK
+E1-responses-cache-write-dropped: KILLED (tests=2 fail=1)
+E2-chat-cache-write-dropped: KILLED (tests=2 fail=1)
+E3-reasoning-context-reverted: KILLED (tests=2 fail=1)
+E4-cache-read-sums-writes: KILLED (tests=1 fail=1)
+E5-invented-field: KILLED (tests=2 fail=1)
+E6-images-inherit-responses-usage: KILLED (tests=17 fail=1)
+E7-declaration-emptied: KILLED (tests=2 fail=2)
+E8-fixture-tampered: KILLED (tests=1 fail=1)
+E9-scalar-array-leaked: KILLED (tests=2 fail=2)
+E10-empty-object-becomes-null: KILLED (tests=2 fail=1)
+E11-model-not-echoed: KILLED (tests=2 fail=1)
+E12-output-item-duplicated: KILLED (tests=2 fail=1)
+E13-fanout-total-drops-cache: KILLED (tests=1 fail=1)
+E14-chat-choice-duplicated: KILLED (tests=2 fail=1)
+
+=== SUMMARY ===
+  E1-responses-cache-write-dropped: KILLED (tests=2 fail=1)
+  E2-chat-cache-write-dropped: KILLED (tests=2 fail=1)
+  E3-reasoning-context-reverted: KILLED (tests=2 fail=1)
+  E4-cache-read-sums-writes: KILLED (tests=1 fail=1)
+  E5-invented-field: KILLED (tests=2 fail=1)
+  E6-images-inherit-responses-usage: KILLED (tests=17 fail=1)
+  E7-declaration-emptied: KILLED (tests=2 fail=2)
+  E8-fixture-tampered: KILLED (tests=1 fail=1)
+  E9-scalar-array-leaked: KILLED (tests=2 fail=2)
+  E10-empty-object-becomes-null: KILLED (tests=2 fail=1)
+  E11-model-not-echoed: KILLED (tests=2 fail=1)
+  E12-output-item-duplicated: KILLED (tests=2 fail=1)
+  E13-fanout-total-drops-cache: KILLED (tests=1 fail=1)
+  E14-chat-choice-duplicated: KILLED (tests=2 fail=1)
+
+BASELINE OK: True   ALL KILLED: True   RESTORED: True   DIST MATCHES TREE: True

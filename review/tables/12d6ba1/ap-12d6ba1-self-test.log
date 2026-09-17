@@ -1,0 +1,4 @@
+SUBJECT scripts/aa-noise-floor.mjs sha256 c4cfa09b0825017a9314a9cc2e8f27948b67dd8f760e19e696a40ccd5a22eab1
+RESTORED True (520ac8fedc8c)
+
+BASELINE REFUSES EVERY DISABLED CASE: True   (3/3, unmodified accepted)

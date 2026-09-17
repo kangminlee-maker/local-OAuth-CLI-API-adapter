@@ -6,3 +6,6 @@ artifacts/
 .env
 .onto/
 bench-results/
+.claude/
+review/logs/
+__pycache__/

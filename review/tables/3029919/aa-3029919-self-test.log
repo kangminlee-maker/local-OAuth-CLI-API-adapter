@@ -1,0 +1,6 @@
+SUBJECT scripts/lib/aa-sampler.mjs sha256 278db8370f4eb54ffbe018c7d4b028d55976f0f81018e633bd9369c18a1c3dfe
+SUBJECT scripts/lib/capture-recorder.mjs sha256 bae3d4ac2912d02fedaf5ba8b162e8c53c7a543858b6c328048b24012bd3e536
+SELF-TEST unmodified baseline accepted: True
+RESTORED True (8fef42578423)
+
+BASELINE REFUSES EVERY DISABLED CASE: True   (49/49, unmodified accepted)

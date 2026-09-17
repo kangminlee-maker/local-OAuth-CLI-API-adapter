@@ -1,0 +1,23 @@
+SUBJECT scripts/lib/ledger.mjs sha256 195cf9995343810674cef047d3876e3f620092d1ecf84f65287a73508ed3a883
+BASELINE rc=0 tests=9 pass=9 skipped=0 todo=0 cancelled=0 roster=9
+[D1-no-shadow-before-the-truncation] KILLED (rc=1) — removed the complete copy written BESIDE the ledger, so the dangerous instant has zero readable copies
+         failing: ['a saved ledger reads back, and the copy beside it is kept', 'the complete new content is on disk before the ledger is opened for truncation', 'the only copy that parses is not the one a failing write consumes', 'the shadow is replaced, and the ledger is not', 'the newest generation wins, whichever file holds it']
+[D2-shadow-never-read] KILLED (rc=1) — removed the fallback, so a truncated ledger reads as a fresh run and the paid rows are gone
+         failing: ['the complete new content is on disk before the ledger is opened for truncation', 'a ledger truncated mid-write is recovered from the shadow', 'the only copy that parses is not the one a failing write consumes', 'the newest generation wins, whichever file holds it']
+[D3-newest-decided-by-position] KILLED (rc=1) — removed the generation comparison, so which copy is current is whichever name was tried first
+         failing: ['the complete new content is on disk before the ledger is opened for truncation', 'the newest generation wins, whichever file holds it']
+[D4-unreadable-is-a-fresh-run] KILLED (rc=1) — removed the refusal, so a ledger that exists and cannot be read re-grants the whole ceiling
+         failing: ['a ledger that exists and cannot be read is not a run that has not started']
+[D5-save-replaces-the-inode] KILLED (rc=1) — removed the in-place rewrite, replacing the ledger the lock is keyed on
+         failing: ['a saved ledger reads back, and the copy beside it is kept', 'the complete new content is on disk before the ledger is opened for truncation', 'the only copy that parses is not the one a failing write consumes', 'the shadow is replaced, and the ledger is not', 'the newest generation wins, whichever file holds it', 'the ledger keeps its inode, because the lock is keyed on it']
+[D6-shadow-truncated-in-place] KILLED (rc=1) — removed the rename, so a write that fails part-way consumes the only copy that parses
+         failing: ['the only copy that parses is not the one a failing write consumes', 'the shadow is replaced, and the ledger is not']
+[D7-generation-never-advances] KILLED (rc=1) — removed the increment, so every copy claims the same age and the newer one cannot be found
+         failing: ['the complete new content is on disk before the ledger is opened for truncation', 'the newest generation wins, whichever file holds it']
+[D8-generation-leaks-into-the-state] KILLED (rc=1) — removed the strip, so a caller round-trips a counter it does not maintain
+         failing: ['a saved ledger reads back, and the copy beside it is kept', 'the complete new content is on disk before the ledger is opened for truncation', 'the only copy that parses is not the one a failing write consumes']
+[D9-absent-is-a-crash] KILLED (rc=1) — removed the null for a ledger nobody wrote, so a fresh run throws instead of starting
+         failing: ['a ledger nobody wrote is a fresh run, not a crash', 'a ledger that exists and cannot be read is not a run that has not started']
+RESTORED True (195cf9995343)
+
+ALL KILLED: True   (9/9)
