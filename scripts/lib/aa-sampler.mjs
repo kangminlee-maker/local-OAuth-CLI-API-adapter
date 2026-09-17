@@ -418,18 +418,37 @@ export function ledgerFor({ resume = null, live = false, outPath = null } = {}) 
  * one series, self-variance 1.0% reported as 53.3%, and `plan.openAiModel` named
  * only the second pin.
  *
- * So identity is the whole measurement configuration: which rows, which prompts
- * (by content, not by name), which model answers each provider, and the cap that
- * decides how much of an answer there is to measure. Anything that changes what
- * a sample MEANS belongs here; the stopping rules — `reps`, `minReps`,
- * `decisivePct` — do not, because they decide when to stop collecting samples
- * that mean the same thing.
+ * So identity is the measurement configuration, and only what the selected rows
+ * send: each row's prompt (by content, not by name), the model pinned for each
+ * provider that HAS a row, and the cap that decides how much of an answer there
+ * is to measure. Anything that changes what a sample MEANS belongs here; the
+ * stopping rules — `reps`, `minReps`, `decisivePct` — do not, because they decide
+ * when to stop collecting samples that mean the same thing.
+ *
+ * "Only" is half of the rule, and the half the first version missed. It hashed
+ * both pins whatever the cohort, and the prompts as the bytes of the file that
+ * holds them. An Anthropic-only partition then changed identity when the OpenAI
+ * pin changed, and when a comment or an unselected task was edited — and on the
+ * default path a new identity is a new ledger, a fresh ceiling and the old run's
+ * paid samples left where nothing resumes them. Over-wide identity is not the
+ * safe direction; it re-spends.
  */
-export function runIdentity({ selected, tasksDigest, openAiModel, anthropicModel, maxTokens }) {
+export function runIdentity({ rows, models, maxTokens }) {
+  const digest = (text) => createHash('sha256').update(String(text)).digest('hex');
+  const cohort = rows
+    .map((row) => [`${row.provider}/${row.task}`, digest(row.prompt)])
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  const providers = [...new Set(rows.map((row) => row.provider))].sort();
+  for (const provider of providers) {
+    // A row whose provider has no pin would hash as "no model", and every pin
+    // would then be the same run.
+    if (typeof models?.[provider] !== 'string' || models[provider] === '') {
+      throw new Error(`no model is pinned for ${provider}, which has rows in this run`);
+    }
+  }
   const canonical = JSON.stringify({
-    cohort: [...selected].sort(),
-    tasksDigest,
-    models: { openai: openAiModel, anthropic: anthropicModel },
+    cohort,
+    models: Object.fromEntries(providers.map((provider) => [provider, models[provider]])),
     maxTokens,
   });
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16);

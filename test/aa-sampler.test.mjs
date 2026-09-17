@@ -544,15 +544,20 @@ test('a row that collected nothing leaves no row behind', () => {
 });
 
 const CONFIG = {
-  tasksDigest: 'digest-1', openAiModel: 'gpt-5.6-sol', anthropicModel: 'claude-sonnet-5', maxTokens: 1024,
+  models: { openai: 'gpt-5.6-sol', anthropic: 'claude-sonnet-5' }, maxTokens: 1024,
 };
+const rowsOf = (selected, promptOf = (key) => `the prompt ${key} sends`) => selected.map((key) => {
+  const [provider, task] = key.split('/');
+  return { provider, task, prompt: promptOf(key) };
+});
+const pinned = (models) => ({ ...CONFIG, models: { ...CONFIG.models, ...models } });
 
 test('two partitions of one batch do not name one artifact', () => {
   // `--only` is how a batch is split across processes, and hundreds of metered
   // calls per partition used to land on one filename.
   const day = new Date('2026-09-10T11:00:00Z');
   const openai = ['openai/summarise', 'openai/explain'];
-  const name = (selected) => defaultArtifactName(day, runIdentity({ ...CONFIG, selected }), selected);
+  const name = (selected) => defaultArtifactName(day, runIdentity({ ...CONFIG, rows: rowsOf(selected) }), selected);
   assert.notEqual(name(openai), name(['anthropic/summarise']));
   assert.match(name(openai), /^aa-noise-floor-20260910-openai-[0-9a-f]{16}\.json$/);
   assert.equal(defaultArtifactName(day, null), 'aa-noise-floor-20260910.json');
@@ -570,7 +575,7 @@ test('the operator\'s filter text decides nothing about identity', () => {
   // of the name.
   const day = new Date('2026-09-10T11:00:00Z');
   const selected = ['openai/implementation_review'];
-  const identity = runIdentity({ ...CONFIG, selected });
+  const identity = runIdentity({ ...CONFIG, rows: rowsOf(selected) });
   assert.equal(defaultArtifactName(day, identity, selected),
     defaultArtifactName(day, identity, selected));
   assert.match(defaultArtifactName(day, identity, selected), /^aa-noise-floor-20260910-openai-/);
@@ -745,19 +750,47 @@ test('a run pinned to a different model is a different run', () => {
   // same rows under different pins shared one ledger and one lock: the second
   // accepted the first's samples and published a floor over two models'
   // observations under one model's name (1.0% self-variance read as 53.3%).
-  const selected = ['openai/implementation'];
-  const base = runIdentity({ ...CONFIG, selected });
-  assert.notEqual(base, runIdentity({ ...CONFIG, selected, openAiModel: 'gpt-5.6-terra' }),
+  const selected = ['openai/implementation', 'anthropic/implementation'];
+  const base = runIdentity({ ...CONFIG, rows: rowsOf(selected) });
+  assert.notEqual(base, runIdentity({ ...pinned({ openai: 'gpt-5.6-terra' }), rows: rowsOf(selected) }),
     'two model pins are one run');
-  assert.notEqual(base, runIdentity({ ...CONFIG, selected, anthropicModel: 'claude-opus-5' }),
+  assert.notEqual(base, runIdentity({ ...pinned({ anthropic: 'claude-opus-5' }), rows: rowsOf(selected) }),
     'two Anthropic pins are one run');
-  assert.notEqual(base, runIdentity({ ...CONFIG, selected, maxTokens: 2048 }),
+  assert.notEqual(base, runIdentity({ ...CONFIG, maxTokens: 2048, rows: rowsOf(selected) }),
     'two output caps are one run');
-  assert.notEqual(base, runIdentity({ ...CONFIG, selected, tasksDigest: 'digest-2' }),
-    'two prompt sets are one run');
+  assert.notEqual(base, runIdentity({
+    ...CONFIG,
+    rows: rowsOf(selected, (key) => (key === 'anthropic/implementation' ? 'an edited prompt' : `the prompt ${key} sends`)),
+  }), 'two prompts for one selected row are one run');
   // ...and the same configuration is the same run however the cohort is ordered.
-  assert.equal(runIdentity({ ...CONFIG, selected: ['a/x', 'b/y'] }),
-    runIdentity({ ...CONFIG, selected: ['b/y', 'a/x'] }));
+  assert.equal(runIdentity({ ...CONFIG, rows: rowsOf(['openai/x', 'anthropic/y']) }),
+    runIdentity({ ...CONFIG, rows: rowsOf(['anthropic/y', 'openai/x']) }));
+});
+
+test('a pin for a provider with no row in the run decides nothing', () => {
+  // The over-correction: identity hashed both pins whatever the cohort, so an
+  // Anthropic-only partition became a different run when the OpenAI pin moved.
+  // On the default path that is a new ledger and a fresh ceiling, and the paid
+  // samples of the first invocation left where nothing resumes them.
+  const anthropicOnly = rowsOf(['anthropic/implementation', 'anthropic/triage']);
+  assert.equal(runIdentity({ ...CONFIG, rows: anthropicOnly }),
+    runIdentity({ ...pinned({ openai: 'gpt-5.6-luna' }), rows: anthropicOnly }));
+  const openaiOnly = rowsOf(['openai/implementation']);
+  assert.equal(runIdentity({ ...CONFIG, rows: openaiOnly }),
+    runIdentity({ ...pinned({ anthropic: 'claude-opus-5' }), rows: openaiOnly }));
+  // A pin nobody gave is not "no model": every pin would then be the same run.
+  assert.throws(() => runIdentity({ models: { openai: 'gpt-5.6-sol' }, maxTokens: 1024, rows: anthropicOnly }),
+    /no model is pinned for anthropic/);
+});
+
+test('identity reads the prompts a run sends, not the name they are sent under', () => {
+  // The first version hashed the tasks FILE, so a comment in it was a new run;
+  // this one hashes each selected row's prompt text. The row keys still count —
+  // one prompt under two names is two rows.
+  const one = runIdentity({ ...CONFIG, rows: [{ provider: 'openai', task: 'a', prompt: 'same text' }] });
+  assert.equal(one, runIdentity({ ...CONFIG, rows: [{ provider: 'openai', task: 'a', prompt: 'same text' }] }));
+  assert.notEqual(one, runIdentity({ ...CONFIG, rows: [{ provider: 'openai', task: 'b', prompt: 'same text' }] }));
+  assert.notEqual(one, runIdentity({ ...CONFIG, rows: [{ provider: 'openai', task: 'a', prompt: 'same text.' }] }));
 });
 
 test('a run that spends gets a ledger whether or not it was asked for one', () => {

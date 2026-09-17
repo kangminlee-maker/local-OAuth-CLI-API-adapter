@@ -154,14 +154,14 @@ if (rows.length === 0) {
 // selecting the same ten rows under two names, two ledgers and two locks. The
 // cohort digest fixed the spellings; it did not fix the rest of the
 // configuration, so two runs pinned to different MODELS were still one run with
-// one ledger. Identity is the whole measurement configuration, computed here
-// because the rows are part of it.
+// one ledger. Identity is the measurement configuration of the rows selected —
+// their prompts, the pins of the providers they belong to, the cap — computed
+// here because the rows are part of it. Nothing about a provider with no row,
+// and nothing about the prompts' file but the prompts, enters it.
 const selected = rows.map((row) => `${row.provider}/${row.task}`);
 const identity = runIdentity({
-  selected,
-  tasksDigest: qualityTasksDigest(),
-  openAiModel,
-  anthropicModel,
+  rows,
+  models: Object.fromEntries(Object.entries(PROVIDERS).map(([provider, vendor]) => [provider, vendor.model])),
   maxTokens,
 });
 const outPath = opt('--out', resolve(repoRoot, 'bench-results',
@@ -186,6 +186,8 @@ const plan = {
   openAiModel,
   anthropicModel,
   maxTokens,
+  // Which file the prompts were read from, recorded and deciding nothing: it
+  // changes with a comment, and identity hashes the prompts themselves.
   tasksDigest: qualityTasksDigest(),
   // The invocation's own text, recorded and deciding nothing. It used to be part
   // of the artifact's NAME, which made it part of identity.
