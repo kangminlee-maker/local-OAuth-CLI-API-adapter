@@ -261,17 +261,17 @@ export function servedAnswer(rowAnswer) {
  * `stopReason` is deliberately OMITTED when the answer leaves it undefined —
  * that is what makes the proxy derive `end_turn` — while the answer keeps it as
  * an own key, because there "undefined" is the CLAIM that the turn simply
- * ended. The two objects therefore answer two different questions, and the
- * premise check asks each of them the one it can answer: bindings off the
- * answer, unchecked inputs off the result.
+ * ended. The two objects therefore answer two different questions: the
+ * premise check reads a binding's PRESENCE off both and its VALUE off this one,
+ * and the unchecked-input scan reads the union.
  */
 export function servedResult(answer, request) {
   return {
     id: 'local_test',
     model: request?.model,
     text: answer.text,
-    // From the answer, not a constant. `chatFinishReason` and
-    // `anthropicStopReason` both branch on tool calls while `generate()`
+    // From the answer, not a constant. `chatFinish` and `anthropicStop` both
+    // branch on tool calls while `generate()`
     // discarded them, so the derivations read an input the proxy never saw.
     //
     // NO CONTROL DISTINGUISHES THIS from the constant, and it is written down
@@ -745,18 +745,10 @@ function stopSequenceCut(answer, request) {
  */
 const ANTHROPIC_PASSTHROUGH_STOP_REASONS = new Set(['end_turn', 'max_tokens', 'stop_sequence', 'refusal', 'pause_turn']);
 
-function chatFinishReason(answer) {
-  return chatFinish(answer).value;
-}
-
 function chatFinish(answer) {
   if (answer.stopReason === 'max_tokens') return { branch: 'max-tokens', value: 'length' };
   if ((answer.toolCalls ?? []).length > 0) return { branch: 'tool-calls', value: 'tool_calls' };
   return { branch: 'plain', value: 'stop' };
-}
-
-function anthropicStopReason(answer) {
-  return anthropicStop(answer).value;
 }
 
 /**
@@ -825,7 +817,7 @@ export const ANSWER_BINDINGS = {
     // that could move one finish reason without the others saying so would be
     // the `n` hole in a second place.
     ['stopReason', (body) => (body.choices ?? []).map((choice) => choice?.finish_reason ?? null),
-      (answer, request) => Array.from({ length: request.n ?? 1 }, () => chatFinishReason(answer))],
+      (answer, request) => Array.from({ length: request.n ?? 1 }, () => derive('chatFinish', answer).value)],
     ['usage.cachedInputTokens', (body) => body.usage?.prompt_tokens_details?.cached_tokens],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.prompt_tokens_details?.cache_write_tokens],
   ],
@@ -844,7 +836,7 @@ export const ANSWER_BINDINGS = {
       // invisible to `bindingsReached()`: the binding runs, the branch does not.
       callStatuses: (body.output ?? []).filter((item) => item?.type === 'function_call')
         .map((item) => item?.status ?? null),
-    }), (answer) => responsesEnvelope(answer).value],
+    }), (answer) => derive('responsesEnvelope', answer).value],
     ['usage.cachedInputTokens', (body) => body.usage?.input_tokens_details?.cached_tokens],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.input_tokens_details?.cache_write_tokens],
   ],
@@ -852,12 +844,12 @@ export const ANSWER_BINDINGS = {
     // Through the derivation, not raw. `undefined` is not "no claim" here — it
     // is a claim that the turn simply ended, and the wire says `end_turn`.
     ['stopReason', (body) => body.stop_reason,
-      (answer, request) => anthropicStopReason(withStopSequences(answer, request))],
+      (answer, request) => derive('anthropicStop', answer, request).value],
     // Bound, not free: it is half of what `applyStopSequences` rewrites, and a
     // binding that reads one half of a rewrite and not the other is an oracle
     // with a blind spot rather than a check.
     ['stopSequence', (body) => body.stop_sequence ?? null,
-      (answer, request) => withStopSequences(answer, request).stopSequence ?? null],
+      (answer, request) => derive('stopSequenceCut', answer, request).value.stopSequence ?? null],
     ['usage.cacheCreationInputTokens', (body) => body.usage?.cache_creation_input_tokens],
     ['usage.cacheReadInputTokens', (body) => body.usage?.cache_read_input_tokens],
     ['usage.cachedInputTokens', (body) => (body.usage?.cache_creation_input_tokens ?? 0)
@@ -871,7 +863,7 @@ export const ANSWER_BINDINGS = {
     ['text', (body, request) => (body.content ?? [])
       .filter((block) => block?.type === 'text')
       .map((block) => block.text ?? '')
-      .join(''), (answer, request) => withStopSequences(answer, request).text],
+      .join(''), (answer, request) => derive('stopSequenceCut', answer, request).value.text],
   ],
 };
 
@@ -1098,6 +1090,19 @@ export function freeFieldsReached(rosters, bindings = ANSWER_BINDINGS, free = FR
  * out of the same evaluation that produced the value, so this table cannot say a
  * branch ran while the code went elsewhere, and every branch here owes an input:
  * a roster row, or a named control below.
+ *
+ * The table is not what gets walked. It used to be: the report evaluated the
+ * derivations this table named, so a derivation left out of it was never
+ * evaluated, and a review removed `stopSequenceCut` and its controls with the
+ * gate green. The walk now follows the BINDINGS — every derivation a compared
+ * binding evaluation takes, through `derive` — and this table is what those
+ * branches are checked against. A derivation the bindings use and the table does
+ * not name comes back as undeclared; one the table names and no binding uses
+ * comes back as unbound.
+ *
+ * What the walk cannot see is logic a binding writes inline beside its
+ * derivation. The Chat binding's fan-out, `request.n ?? 1`, is such logic: it
+ * has a mutant of its own and no branch obligation here.
  */
 export const DERIVATION_BRANCHES = {
   '/v1/chat/completions': { chatFinish: ['max-tokens', 'tool-calls', 'plain'] },
@@ -1114,10 +1119,39 @@ const DERIVATIONS = {
   chatFinish: (answer) => chatFinish(answer),
   responsesEnvelope: (answer) => responsesEnvelope(answer),
   stopSequenceCut: (answer, request) => stopSequenceCut(answer, request),
-  // Composed exactly as the binding composes it, so the branch reported is the
-  // branch the bound value came out of.
-  anthropicStop: (answer, request) => anthropicStop(stopSequenceCut(answer, request).value),
+  // The reason is read after the cut, and the cut goes through `derive` too, so
+  // the branch it took is counted where the bound value came out of it.
+  anthropicStop: (answer, request) => anthropicStop(derive('stopSequenceCut', answer, request).value),
 };
+
+let taking = null;
+
+/**
+ * The one way a binding reaches a derivation, so the walk can see it.
+ *
+ * A name nobody registered stops the gate, as an unnamed surface does in
+ * `itemsOf`: a lookup that answered `undefined` would be a derivation nothing
+ * measures.
+ */
+function derive(name, answer, request) {
+  const run = DERIVATIONS[name];
+  assert.ok(run, `no derivation named ${name}`);
+  const taken = run(answer, request);
+  taking?.push({ derivation: name, branch: taken.branch });
+  return taken;
+}
+
+/** Evaluate, and say which derivation branches the evaluation took. */
+function tracing(evaluate) {
+  const outer = taking;
+  taking = [];
+  try {
+    const value = evaluate();
+    return { value, branches: taking };
+  } finally {
+    taking = outer;
+  }
+}
 
 const TOOL_CALL = { id: 'call_1', name: 'lookup', arguments: '{}' };
 
@@ -1238,22 +1272,28 @@ export const BRANCH_CONTROLS = [
 ];
 
 /**
- * A row's own request bytes, read the way the rosters read them.
+ * A row's own capture, read the way the rosters read it.
  *
  * Not this gate's `load()`: that one refuses a capture the gate's roster does
  * not name, which is the right rule for a DRIVER and the wrong one here — the
  * coverage report walks both rosters and a branch is reached or not regardless
  * of which list the row is on.
  */
-function capturedRequest(fixture) {
-  return JSON.parse(JSON.parse(readFileSync(join(captureDir, `${fixture}.json`), 'utf8')).request);
+function capturedExchange(fixture) {
+  const capture = JSON.parse(readFileSync(join(captureDir, `${fixture}.json`), 'utf8'));
+  return { body: JSON.parse(capture.body), request: JSON.parse(capture.request) };
 }
 
-/** What one control derives, and which branch it took getting there. */
+/**
+ * What one control derives, and which branch it took getting there.
+ *
+ * Handed the object a binding is handed — what the proxy is served — rather than
+ * the row's answer one step earlier. No input told the two apart when a review
+ * checked, which is the reason to stop them being two objects.
+ */
 export function runBranchControl(control) {
-  const run = DERIVATIONS[control.derivation];
-  assert.ok(run, `no derivation named ${control.derivation}`);
-  const { branch, value } = run(servedAnswer(control.answer), control.request);
+  const { branch, value } = derive(control.derivation,
+    servedResult(servedAnswer(control.answer), control.request), control.request);
   // `stopSequenceCut` returns a whole answer; a control pins the three fields the
   // rewrite touches, not the constants it carries through.
   const pinned = control.derivation === 'stopSequenceCut'
@@ -1267,11 +1307,19 @@ export function runBranchControl(control) {
  *
  * Rows first, controls second: a branch a real capture already exercises does
  * not need a synthetic input, and one that needs a synthetic input says so here.
+ *
+ * The rows' branches are the ones the premise check's own evaluations took —
+ * the same bindings, on the same served object, skipped where it skips — so a
+ * branch is counted only where a bound value was compared. A binding evaluation
+ * that took no derivation at all is `underived`: its value came from somewhere
+ * this report cannot follow.
  */
-export function branchesReached(rosters, requestOf = capturedRequest, controls = BRANCH_CONTROLS,
-  declared = DERIVATION_BRANCHES) {
+export function branchesReached(rosters, exchangeOf = capturedExchange, controls = BRANCH_CONTROLS,
+  declared = DERIVATION_BRANCHES, bindings = ANSWER_BINDINGS) {
   const runs = new Map();
   const undeclared = new Set();
+  const bound = new Set();
+  const underived = new Set();
   for (const [surface, table] of Object.entries(declared)) {
     for (const [derivation, branches] of Object.entries(table)) {
       for (const branch of branches) runs.set(`${surface} ${derivation} ${branch}`, 0);
@@ -1286,20 +1334,30 @@ export function branchesReached(rosters, requestOf = capturedRequest, controls =
     else runs.set(key, runs.get(key) + 1);
   };
   for (const rows of rosters) {
-    for (const { fixture, surface, answer } of rows) {
-      const request = requestOf(fixture);
-      for (const derivation of Object.keys(declared[surface] ?? {})) {
-        count(surface, derivation, DERIVATIONS[derivation](servedAnswer(answer), request).branch);
+    for (const { surface, field, branches } of answerPremiseFailures(rows, exchangeOf, bindings).taken) {
+      if (branches.length === 0) underived.add(`${surface} ${field}`);
+      for (const { derivation, branch } of branches) {
+        bound.add(`${surface} ${derivation}`);
+        count(surface, derivation, branch);
       }
     }
   }
+  // A control counts toward a branch being REACHED, never toward its derivation
+  // being bound: a control feeds a derivation whether or not anything reads it.
   for (const control of controls) {
-    count(control.surface, control.derivation, runBranchControl(control).branch);
+    for (const { derivation, branch } of tracing(() => runBranchControl(control)).branches) {
+      count(control.surface, derivation, branch);
+    }
   }
+  const unbound = Object.entries(declared)
+    .flatMap(([surface, table]) => Object.keys(table).map((derivation) => `${surface} ${derivation}`))
+    .filter((key) => !bound.has(key));
   return {
     runs: Object.fromEntries([...runs].sort(([a], [b]) => a.localeCompare(b))),
     neverRun: [...runs].filter(([, n]) => n === 0).map(([key]) => key).sort(),
     undeclared: [...undeclared].sort(),
+    unbound: unbound.sort(),
+    underived: [...underived].sort(),
   };
 }
 
@@ -1334,6 +1392,7 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, 
     answer,
   );
   const failures = [];
+  const taken = [];
   let checked = 0;
   for (const { fixture, surface, answer: declared } of rows) {
     // EVERY row, not only the ones that declare an answer. A row with no answer
@@ -1405,14 +1464,17 @@ export function answerPremiseFailures(rows, bodyOf, bindings = ANSWER_BINDINGS, 
       // The VALUE comes from what the proxy was served, which is the only thing
       // the capture can be compared against. The answer's half of the union is
       // what keeps an explicit `undefined` a claim rather than an absence.
-      const ours = ofAnswer ? ofAnswer(served, request) : read(served, field);
+      const { value: ours, branches } = ofAnswer
+        ? tracing(() => ofAnswer(served, request))
+        : { value: read(served, field), branches: null };
+      if (branches) taken.push({ fixture, surface, field, branches });
       if (JSON.stringify(ours) !== JSON.stringify(theirs)) {
         failures.push(`${fixture}: the answer's ${field} yields ${JSON.stringify(ours)}, `
           + `the capture says ${JSON.stringify(theirs)}`);
       }
     }
   }
-  return { failures, checked };
+  return { failures, checked, taken };
 }
 
 /**

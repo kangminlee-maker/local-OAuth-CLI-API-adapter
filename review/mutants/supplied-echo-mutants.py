@@ -307,8 +307,8 @@ MUTANTS = [
     # S43: the Chat binding reads the first choice instead of every one, so a
     # fan-out could move the others unseen.
     ('S43-fan-out-reads-one-choice', ROSTER, GATE, 'fan-out answers every choice',
-     "      (answer, request) => Array.from({ length: request.n ?? 1 }, () => chatFinishReason(answer))],",
-     "      (answer) => [chatFinishReason(answer)]],"),
+     "      (answer, request) => Array.from({ length: request.n ?? 1 }, () => derive('chatFinish', answer).value)],",
+     "      (answer) => [derive('chatFinish', answer).value]],"),
     # S44: `undefined` is read as absence again, which lets a fixture blank a
     # BOUND field back to unchecked.
     ('S44-undefined-blanks-a-binding', ROSTER, GATE, 'explicit undefined does not blank',
@@ -317,7 +317,7 @@ MUTANTS = [
     # S45: the messages derivation goes raw, so `undefined` no longer means the
     # `end_turn` the wire actually carries.
     ('S45-anthropic-stop-reason-raw', ROSTER, GATE, 'explicit undefined does not blank',
-     "    ['stopReason', (body) => body.stop_reason,\n      (answer, request) => anthropicStopReason(withStopSequences(answer, request))],",
+     "    ['stopReason', (body) => body.stop_reason,\n      (answer, request) => derive('anthropicStop', answer, request).value],",
      "    ['stopReason', (body) => body.stop_reason],"),
     # S46: a gap list grows a path the missing item cannot explain — the shape a
     # dropped `billing` field took when a review reclassified it as a reasoning
@@ -366,8 +366,9 @@ MUTANTS = [
     # so a row declaring `max_tokens` with a sequence-hitting text is certified
     # while the wire says `stop_sequence`.
     ('S61-stop-sequence-rewrite-not-derived', ROSTER, GATE, 'stop sequence the text runs into',
-     "      (answer, request) => anthropicStopReason(withStopSequences(answer, request))],",
-     "      (answer) => anthropicStopReason(answer)],"),
+     "      (answer, request) => derive('anthropicStop', answer, request).value],",
+     # No request, so no sequence can cut: the raw answer's reason.
+     "      (answer) => derive('anthropicStop', answer, {}).value],"),
     # S62: the rewrite applies even when the turn made tool calls, which is not
     # the proxy's rule.
     ('S62-stop-sequence-ignores-tool-calls', ROSTER, GATE, 'made tool calls keeps its reason',
@@ -408,8 +409,8 @@ MUTANTS = [
     # S60: the bound VALUE is read off the row again instead of off what the
     # backend serves, so a projection can move a bound leaf unseen.
     ('S60-binding-reads-the-row-not-the-turn', ROSTER, GATE, 'changes a bound VALUE',
-     "      const ours = ofAnswer ? ofAnswer(served, request) : read(served, field);",
-     "      const ours = ofAnswer ? ofAnswer(answer, request) : read(answer, field);"),
+     "        ? tracing(() => ofAnswer(served, request))\n        : { value: read(served, field), branches: null };",
+     "        ? tracing(() => ofAnswer(answer, request))\n        : { value: read(answer, field), branches: null };"),
     # S52: a row can mint its own excuse again — the shape round 5 walked
     # through, where narrowing `supplied` by one word and writing one true
     # sentence in the same object took a client-visible defect back to green.
@@ -510,6 +511,45 @@ MUTANTS = [
      "    : result.text\n    ? (result.text === 'AA'\n"
      "      ? [{ type: 'text', text: result.text }, { type: 'text', text: result.text }]\n"
      "      : [{ type: 'text', text: result.text }])\n    : [];"),
+    # S74: the round-7 construction. `stopSequenceCut` leaves the branch table
+    # together with its three controls, which left 145 of 145 green while the
+    # report walked the table. It walks the bindings now, and two of them still
+    # take the cut.
+    ('S74-derivation-left-out-of-the-table', ROSTER, GATE, 'every branch of every derivation is reached by some input',
+     None, 'DROP_DERIVATION_AND_CONTROLS'),
+    # S75: one binding computes its value beside `derive` instead of through it.
+    # The derivation is still bound by its two siblings, so only the underived
+    # report can name this one.
+    ('S75-binding-bypasses-derive', ROSTER, GATE, 'every branch of every derivation is reached by some input',
+     "      .join(''), (answer, request) => derive('stopSequenceCut', answer, request).value.text],",
+     "      .join(''), (answer, request) => withStopSequences(answer, request).text],"),
+    # S76: the underived report never fires.
+    ('S76-underived-never-reported', ROSTER, GATE, 'a binding that reads no derivation',
+     "      if (branches.length === 0) underived.add(`${surface} ${field}`);\n",
+     ""),
+    # S77: the unbound report never fires.
+    ('S77-unbound-never-reported', ROSTER, GATE, 'a binding that reads no derivation',
+     "    .filter((key) => !bound.has(key));",
+     "    .filter(() => false);"),
+    # S78: the walk goes back to asking the table which derivations to count, so
+    # a derivation it leaves out is skipped instead of reported.
+    ('S78-walk-asks-the-table', ROSTER, GATE, 'cannot be left out of the table',
+     "        bound.add(`${surface} ${derivation}`);\n        count(surface, derivation, branch);",
+     "        bound.add(`${surface} ${derivation}`);\n"
+     "        if (declared[surface]?.[derivation]) count(surface, derivation, branch);"),
+    # S79: the trace records nothing, so every row's branches go uncounted.
+    ('S79-trace-goes-blind', ROSTER, GATE, 'every branch of every derivation is reached by some input',
+     "  taking?.push({ derivation: name, branch: taken.branch });\n",
+     ""),
+    # S80: an unregistered derivation name is no longer refused by name.
+    ('S80-unknown-derivation-not-refused', ROSTER, GATE, 'a binding that reads no derivation',
+     "  assert.ok(run, `no derivation named ${name}`);\n",
+     ""),
+    # S81: the Anthropic reason reads the cut without going through `derive`, so
+    # the cut its value came out of is no longer counted for that binding.
+    ('S81-composed-cut-untraced', ROSTER, GATE, 'cannot be left out of the table',
+     "  anthropicStop: (answer, request) => anthropicStop(derive('stopSequenceCut', answer, request).value),",
+     "  anthropicStop: (answer, request) => anthropicStop(stopSequenceCut(answer, request).value),"),
 ]
 
 
@@ -551,6 +591,17 @@ def plant_coercible_divergence(text):
         'behavior': 'planted by the mutation runner', 'why': 'planted', 'measuredAt': '2026-09-10', 'evidence': 'none',
     })
     return json.dumps(data, ensure_ascii=False, indent=2) + '\n'
+
+
+def drop_derivation_and_controls(text):
+    import re
+    line = "    stopSequenceCut: ['no-match', 'match-with-tool-calls', 'match-plain'],\n"
+    assert text.count(line) == 1, 'the table entry this mutant removes is not in the roster'
+    out = text.replace(line, '')
+    out, n = re.subn(r"  \{\n    name: '[^']*',\n    surface: '/v1/messages',\n    derivation: 'stopSequenceCut',\n.*?\n  \},\n",
+                     '', out, flags=re.S)
+    assert n == 3, f'expected to remove three stopSequenceCut controls, removed {n}'
+    return out
 
 
 def drop_wire_capture_row(text):
@@ -599,6 +650,7 @@ run_mutation_suite(
         'PLANT_BARE_WIRE': plant_bare_wire,
         'PLANT_COERCIBLE_DIVERGENCE': plant_coercible_divergence,
         'DROP_WIRE_CAPTURE_ROW': drop_wire_capture_row,
+        'DROP_DERIVATION_AND_CONTROLS': drop_derivation_and_controls,
     },
     runner_file=__file__,
 )

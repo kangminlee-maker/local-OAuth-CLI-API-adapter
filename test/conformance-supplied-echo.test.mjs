@@ -35,10 +35,12 @@ import { PER_CALL, absentPathsFor, creditedAbsences, expectedAbsentPaths, isDecl
 import { REPLAYED_FIXTURES, SUPPLIED_ECHO_CAPTURES as CAPTURES, assertRosterReplayed, startReplayRecorder,
   createReplayBackend,
   answerPremiseFailures,
+  ANSWER_BINDINGS,
   MINIMAL_SURFACES,
   bindingsReached,
   branchesReached,
   BRANCH_CONTROLS,
+  DERIVATION_BRANCHES,
   runBranchControl,
   echoFailures,
   expectedItemTypes,
@@ -545,12 +547,76 @@ test('every branch of every derivation is reached by some input', () => {
   // sibling it controlled in the same expression — a non-empty stop sequence the
   // text misses, and `max_tokens` beating a tool call on Anthropic. Each could
   // be made to return a value no vendor sends and nothing failed.
-  const { neverRun, undeclared, runs } = branchesReached([CAPTURES, MINIMAL_SURFACES]);
+  const { neverRun, undeclared, unbound, underived, runs } = branchesReached([CAPTURES, MINIMAL_SURFACES]);
   assert.deepEqual(neverRun, [],
     'a derivation branch no input reaches: it certifies without being able to be wrong');
   assert.deepEqual(undeclared, [],
     'a derivation took a branch this table does not name');
+  assert.deepEqual(unbound, [],
+    'the table names a derivation no compared binding evaluates, so its branches certify nothing');
+  assert.deepEqual(underived, [],
+    'a binding compared a value no named derivation produced, so none of its branches is counted');
   assert.ok(Object.values(runs).every((count) => count > 0));
+});
+
+test('a derivation the bindings use cannot be left out of the table', () => {
+  // The construction a review built: `stopSequenceCut` removed from the table
+  // together with its three controls, and 145 of 145 green. The report walked
+  // the TABLE, so a derivation it did not name was never evaluated. It walks
+  // the bindings now, and the two `/v1/messages` bindings that read the cut
+  // still take it.
+  const declared = structuredClone(DERIVATION_BRANCHES);
+  assert.ok(declared['/v1/messages'].stopSequenceCut, 'the derivation this removes is not in the table');
+  delete declared['/v1/messages'].stopSequenceCut;
+  const controls = BRANCH_CONTROLS.filter((control) => control.derivation !== 'stopSequenceCut');
+  assert.equal(controls.length, BRANCH_CONTROLS.length - 3);
+  const { undeclared } = branchesReached([CAPTURES, MINIMAL_SURFACES], undefined, controls, declared);
+  assert.deepEqual(undeclared, [
+    '/v1/messages stopSequenceCut match-plain',
+    '/v1/messages stopSequenceCut no-match',
+  ]);
+  // The Anthropic reason is read after the cut, and the stop-reason binding
+  // takes both — so the cut stays counted even for a surface whose only
+  // derived binding is that one.
+  const { taken } = answerPremiseFailures(CAPTURES.filter((row) => row.surface === '/v1/messages'), (fixture) => {
+    const capture = load(fixture);
+    return { body: JSON.parse(capture.body), request: JSON.parse(capture.request) };
+  });
+  const reasons = taken.filter(({ field }) => field === 'stopReason');
+  assert.ok(reasons.length > 0, 'no /v1/messages row compared a stop reason');
+  for (const { fixture, branches } of reasons) {
+    assert.deepEqual(branches.map(({ derivation }) => derivation), ['stopSequenceCut', 'anthropicStop'],
+      `${fixture}: the stop reason was compared without the cut it is read after`);
+  }
+});
+
+test('a table entry no binding reads, and a binding that reads no derivation, are both named', () => {
+  // A derivation declared where no binding evaluates it is reached by its
+  // controls alone — branches that feed nothing the gate compares.
+  const declared = structuredClone(DERIVATION_BRANCHES);
+  declared['/v1/chat/completions'].anthropicStop = DERIVATION_BRANCHES['/v1/messages'].anthropicStop;
+  assert.deepEqual(branchesReached([CAPTURES, MINIMAL_SURFACES], undefined, BRANCH_CONTROLS, declared).unbound,
+    ['/v1/chat/completions anthropicStop']);
+  // A binding that computes its value in place is compared and counted
+  // nowhere: the same envelope, written inline instead of through `derive`.
+  const inline = (answer) => ({
+    status: answer.stopReason === 'max_tokens' ? 'incomplete' : 'completed',
+    incompleteReason: answer.stopReason === 'max_tokens' ? 'max_output_tokens' : null,
+    completedAtIsSet: answer.stopReason !== 'max_tokens',
+    callStatuses: [],
+  });
+  const bindings = {
+    ...ANSWER_BINDINGS,
+    '/v1/responses': ANSWER_BINDINGS['/v1/responses'].map(([field, ofVendor, ofAnswer]) => (
+      field === 'stopReason' ? [field, ofVendor, inline] : [field, ofVendor, ofAnswer])),
+  };
+  const { underived, unbound } = branchesReached([CAPTURES, MINIMAL_SURFACES], undefined, BRANCH_CONTROLS,
+    DERIVATION_BRANCHES, bindings);
+  assert.deepEqual(underived, ['/v1/responses stopReason']);
+  assert.deepEqual(unbound, ['/v1/responses responsesEnvelope']);
+  // And a name nobody registered stops the gate rather than measuring nothing.
+  assert.throws(() => runBranchControl({ ...BRANCH_CONTROLS[0], derivation: 'chatFinishV2' }),
+    /no derivation named chatFinishV2/);
 });
 
 test('each branch control derives the value its branch owes', () => {
