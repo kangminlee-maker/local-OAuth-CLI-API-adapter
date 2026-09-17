@@ -276,9 +276,11 @@ export async function sampleRow({
           throw new SamplingAbort(`${lost}. Call ${budget?.spent ?? samples.length} was paid for and ${where}; `
             + 'the run stopped');
         }
-        // Reset only by a sample that was KEPT. It used to be reset before the
+        // Reset once both sinks have answered. It used to be reset before the
         // ledger write, so a sink that failed every time could never reach
-        // `maxConsecutiveFailures`.
+        // `maxConsecutiveFailures`. A sink failure now ends the run above, so
+        // the two placements can no longer be told apart by any input, and no
+        // control is claimed for this line.
         consecutive = 0;
       } catch (error) {
         // An exhausted budget ends the RUN. Booking it as this row's failure

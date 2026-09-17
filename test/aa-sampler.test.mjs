@@ -722,6 +722,17 @@ test('an async sink is awaited, so its rejection is not lost', async () => {
     take: async () => { calls += 1; return { chars: 1, outputTokens: 1, thinkingTokens: null, latencyMs: 1 }; },
   }), /the ledger could not be written \(ENOSPC/);
   assert.equal(calls, 1);
+  // ...and the booking sink, which answers before the call is made.
+  calls = 0;
+  await assert.rejects(sampleRow({
+    reps: 3,
+    minReps: 3,
+    budget: { remaining: 3, spent: 0 },
+    sleepFor: async () => {},
+    onSpend: async () => { throw new Error('ENOSPC: async booking'); },
+    take: async () => { calls += 1; return { chars: 1, outputTokens: 1, thinkingTokens: null, latencyMs: 1 }; },
+  }), /could not record the call about to be made \(ENOSPC/);
+  assert.equal(calls, 0, 'a call was made before its booking was known to have failed');
 });
 
 test('a ledger from another configuration is refused, not merged', () => {
